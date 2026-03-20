@@ -15,7 +15,7 @@ use crate::error::{VaultError, VaultResult};
 
 // ── Cosine similarity ──────────────────────────────────────────────────
 
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let (dot, norm_a, norm_b) = a
         .iter()
         .zip(b)

@@ -725,4 +725,105 @@ mod vault_semantic_search {
             "deleted note should not appear in semantic search"
         );
     }
+
+    // ── hybrid search (E7) ──────────────────────────────────────────
+
+    fn hybrid_config(vault_root: &Path) -> Config {
+        Config {
+            tantivy: true,
+            ..embeddings_config(vault_root)
+        }
+    }
+
+    async fn open_hybrid(vault_root: &Path) -> Vault {
+        let _guard = MODEL_LOCK.lock().await;
+        let config = hybrid_config(vault_root);
+        Vault::open(&config)
+            .await
+            .expect("open vault with tantivy + embeddings")
+    }
+
+    #[tokio::test]
+    async fn search_hybrid_returns_results() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".obsidian")).unwrap();
+        let vault = open_hybrid(tmp.path()).await;
+
+        vault
+            .write_note(
+                Path::new("rust.md"),
+                "# Rust\nRust is a systems programming language known for memory safety.\n",
+            )
+            .unwrap();
+        vault
+            .write_note(
+                Path::new("python.md"),
+                "# Python\nPython is a dynamic language for scripting and data science.\n",
+            )
+            .unwrap();
+
+        let results = vault
+            .search_hybrid("systems programming", 5, 50, 0.4)
+            .unwrap();
+        assert!(!results.is_empty(), "hybrid search should return results");
+        assert!(
+            results.iter().any(|(p, _)| p == Path::new("rust.md")),
+            "rust.md should be in hybrid results for 'systems programming'"
+        );
+        if results.len() >= 2 {
+            assert!(
+                results[0].1 >= results[1].1,
+                "results should be sorted by descending combined score"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn search_hybrid_empty_query_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".obsidian")).unwrap();
+        let vault = open_hybrid(tmp.path()).await;
+
+        vault
+            .write_note(Path::new("note.md"), "# Note\nSome content.\n")
+            .unwrap();
+
+        let results = vault.search_hybrid("", 5, 50, 0.4).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_hybrid_without_tantivy_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".obsidian")).unwrap();
+        let vault = open_with_embeddings(tmp.path()).await;
+
+        let result = vault.search_hybrid("test", 5, 50, 0.4);
+        assert!(
+            result.is_err(),
+            "hybrid search should fail when Tantivy is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_hybrid_syncs_after_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".obsidian")).unwrap();
+        let vault = open_hybrid(tmp.path()).await;
+
+        vault
+            .write_note(
+                Path::new("quantum.md"),
+                "# Quantum Computing\nQuantum computers use qubits for exponential parallelism.\n",
+            )
+            .unwrap();
+
+        let results = vault
+            .search_hybrid("quantum computing", 5, 50, 0.4)
+            .unwrap();
+        assert!(
+            results.iter().any(|(p, _)| p == Path::new("quantum.md")),
+            "newly written note should appear in hybrid search"
+        );
+    }
 }

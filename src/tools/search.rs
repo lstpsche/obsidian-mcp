@@ -176,6 +176,11 @@ pub async fn search_frontmatter(
 
 // ── search_semantic ──────────────────────────────────────────────────
 
+#[cfg(feature = "embeddings")]
+const DEFAULT_PREFETCH_COUNT: usize = 50;
+#[cfg(feature = "embeddings")]
+const DEFAULT_ALPHA: f32 = 0.4;
+
 #[derive(Deserialize, JsonSchema, Default)]
 pub struct SearchSemanticParams {
     /// Natural-language query for semantic search. Does not require exact
@@ -187,6 +192,12 @@ pub struct SearchSemanticParams {
     /// If true, include the full note content in each result. Default: false.
     #[serde(default)]
     pub include_content: Option<bool>,
+    /// When true, first retrieves top candidates via BM25 lexical search,
+    /// then re-ranks by combining lexical and semantic scores. Produces
+    /// higher-quality results than either approach alone. Requires both
+    /// Tantivy and embeddings to be enabled. Default: false.
+    #[serde(default)]
+    pub lexical_prefetch: Option<bool>,
 }
 
 #[cfg(feature = "embeddings")]
@@ -215,8 +226,13 @@ pub async fn search_semantic(
 
     let top_k = params.top_k.unwrap_or(10);
     let include_content = params.include_content.unwrap_or(false);
+    let lexical_prefetch = params.lexical_prefetch.unwrap_or(false);
 
-    let hits = vault.search_semantic(&params.query, top_k)?;
+    let hits = if lexical_prefetch {
+        vault.search_hybrid(&params.query, top_k, DEFAULT_PREFETCH_COUNT, DEFAULT_ALPHA)?
+    } else {
+        vault.search_semantic(&params.query, top_k)?
+    };
 
     let mut results = Vec::with_capacity(hits.len());
     for (path, score) in hits {

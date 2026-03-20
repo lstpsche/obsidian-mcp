@@ -361,6 +361,66 @@ impl Vault {
         self.inner.embedding_model.is_some() && self.inner.embedding_store.is_some()
     }
 
+    /// Hybrid search: BM25 prefetch via Tantivy, then re-rank by combining
+    /// normalized BM25 scores with semantic cosine similarity.
+    ///
+    /// Requires both Tantivy and embeddings to be enabled.
+    ///
+    /// `alpha` controls the balance: `final = alpha * norm_bm25 + (1-alpha) * cosine_sim`.
+    /// Lower alpha = more weight to semantic meaning.
+    #[cfg(feature = "embeddings")]
+    pub fn search_hybrid(
+        &self,
+        query: &str,
+        top_k: usize,
+        prefetch_count: usize,
+        alpha: f32,
+    ) -> VaultResult<Vec<(PathBuf, f32)>> {
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let tv = self.inner.tantivy.as_ref().ok_or_else(|| {
+            VaultError::Other("hybrid search requires Tantivy (set OBSIDIAN_TANTIVY=true)".into())
+        })?;
+        let model = self.inner.embedding_model.as_ref().ok_or_else(|| {
+            VaultError::Embedding("embeddings not enabled (OBSIDIAN_EMBEDDINGS=false)".into())
+        })?;
+        let store = self
+            .inner
+            .embedding_store
+            .as_ref()
+            .ok_or_else(|| VaultError::Embedding("embedding store not initialized".into()))?;
+
+        let prefetch = prefetch_count.max(top_k);
+        let bm25_hits = tv.search(query, prefetch)?;
+        if bm25_hits.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let query_vec = model.embed_one(query)?;
+        let store_guard = store.read().expect("embedding store lock poisoned");
+
+        let norm_bm25 = normalize_bm25_scores(&bm25_hits);
+
+        let mut combined: Vec<(PathBuf, f32)> = norm_bm25
+            .into_iter()
+            .map(|(path, norm_score)| {
+                let semantic_score = store_guard
+                    .get(&path)
+                    .map(|emb| embeddings::cosine_similarity(&query_vec, emb))
+                    .unwrap_or(0.0);
+                let final_score = alpha * norm_score + (1.0 - alpha) * semantic_score;
+                (path, final_score)
+            })
+            .collect();
+
+        combined
+            .sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        combined.truncate(top_k);
+        Ok(combined)
+    }
+
     pub fn search_by_tag(&self, tag: &str) -> VaultResult<Vec<NoteMetadata>> {
         Ok(self
             .read_index()
@@ -735,6 +795,36 @@ impl Vault {
             }
         }
     }
+}
+
+// ── Hybrid search helpers ──────────────────────────────────────────────
+
+/// Min-max normalize BM25 scores to [0, 1].
+///
+/// When all scores are identical (max == min), all normalized values are 1.0.
+#[cfg(feature = "embeddings")]
+fn normalize_bm25_scores(hits: &[(PathBuf, f32)]) -> Vec<(PathBuf, f32)> {
+    if hits.is_empty() {
+        return Vec::new();
+    }
+
+    let min = hits.iter().map(|(_, s)| *s).fold(f32::INFINITY, f32::min);
+    let max = hits
+        .iter()
+        .map(|(_, s)| *s)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let range = max - min;
+
+    hits.iter()
+        .map(|(path, score)| {
+            let normalized = if range == 0.0 {
+                1.0
+            } else {
+                (score - min) / range
+            };
+            (path.clone(), normalized)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1327,5 +1417,86 @@ mod tests {
             results[0].score.is_none(),
             "regex fallback should not populate BM25 scores"
         );
+    }
+
+    // ── normalize_bm25_scores ────────────────────────────────────────
+
+    #[cfg(feature = "embeddings")]
+    mod normalize_tests {
+        use super::*;
+
+        #[test]
+        fn normalize_empty() {
+            assert!(normalize_bm25_scores(&[]).is_empty());
+        }
+
+        #[test]
+        fn normalize_single_score() {
+            let hits = vec![(PathBuf::from("a.md"), 5.0)];
+            let norm = normalize_bm25_scores(&hits);
+            assert_eq!(norm.len(), 1);
+            assert!(
+                (norm[0].1 - 1.0).abs() < 1e-6,
+                "single item normalizes to 1.0"
+            );
+        }
+
+        #[test]
+        fn normalize_identical_scores() {
+            let hits = vec![
+                (PathBuf::from("a.md"), 3.0),
+                (PathBuf::from("b.md"), 3.0),
+                (PathBuf::from("c.md"), 3.0),
+            ];
+            let norm = normalize_bm25_scores(&hits);
+            for (_, score) in &norm {
+                assert!(
+                    (score - 1.0).abs() < 1e-6,
+                    "identical scores should all normalize to 1.0"
+                );
+            }
+        }
+
+        #[test]
+        fn normalize_min_max_range() {
+            let hits = vec![
+                (PathBuf::from("high.md"), 10.0),
+                (PathBuf::from("mid.md"), 5.0),
+                (PathBuf::from("low.md"), 0.0),
+            ];
+            let norm = normalize_bm25_scores(&hits);
+
+            let high = norm
+                .iter()
+                .find(|(p, _)| p == Path::new("high.md"))
+                .unwrap()
+                .1;
+            let mid = norm
+                .iter()
+                .find(|(p, _)| p == Path::new("mid.md"))
+                .unwrap()
+                .1;
+            let low = norm
+                .iter()
+                .find(|(p, _)| p == Path::new("low.md"))
+                .unwrap()
+                .1;
+
+            assert!((high - 1.0).abs() < 1e-6);
+            assert!((mid - 0.5).abs() < 1e-6);
+            assert!(low.abs() < 1e-6);
+        }
+
+        #[test]
+        fn normalize_preserves_order() {
+            let hits = vec![
+                (PathBuf::from("first.md"), 8.0),
+                (PathBuf::from("second.md"), 4.0),
+                (PathBuf::from("third.md"), 2.0),
+            ];
+            let norm = normalize_bm25_scores(&hits);
+            assert!(norm[0].1 > norm[1].1);
+            assert!(norm[1].1 > norm[2].1);
+        }
     }
 }
