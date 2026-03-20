@@ -272,6 +272,8 @@ impl TantivyIndex {
                 }
                 (tf, tags)
             }
+            // Tags are not included as facet queries here because they're already
+            // covered by `frontmatter_text` (which contains stringified tag values).
             None => (
                 vec![
                     (self.ts.f_title, TITLE_BOOST),

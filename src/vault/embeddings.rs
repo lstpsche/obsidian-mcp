@@ -58,6 +58,13 @@ impl EmbeddingStore {
 
     /// Insert or replace the embedding for a note.
     pub fn insert(&mut self, path: PathBuf, vec: Vec<f32>) {
+        debug_assert_eq!(
+            vec.len(),
+            self.dim,
+            "embedding dimension mismatch: expected {}, got {}",
+            self.dim,
+            vec.len()
+        );
         self.embeddings.insert(path, vec);
     }
 
@@ -126,6 +133,15 @@ impl EmbeddingStore {
 
         let mut embeddings = HashMap::with_capacity(data.entries.len());
         for (path_str, vec) in data.entries {
+            if vec.len() != data.dim {
+                tracing::warn!(
+                    path = %path_str,
+                    expected = data.dim,
+                    got = vec.len(),
+                    "skipping cache entry with mismatched embedding dimension"
+                );
+                continue;
+            }
             embeddings.insert(PathBuf::from(path_str), vec);
         }
 

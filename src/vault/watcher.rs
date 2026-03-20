@@ -242,6 +242,7 @@ fn process_event(
                     && let Ok(mut s) = store.write()
                 {
                     s.remove(&relative);
+                    save_embedding_cache(vault_root, &s);
                 }
             }
             Err(e) => {
@@ -269,11 +270,23 @@ fn embed_and_insert(
         Ok(vec) => {
             if let Ok(mut s) = store.write() {
                 s.insert(relative.to_path_buf(), vec);
+                save_embedding_cache(vault_root, &s);
             }
         }
         Err(e) => {
             tracing::warn!(path = %relative.display(), error = %e, "embedding failed in watcher");
         }
+    }
+}
+
+#[cfg(feature = "embeddings")]
+fn save_embedding_cache(vault_root: &Path, store: &super::embeddings::EmbeddingStore) {
+    let cache_path = vault_root
+        .join(".obsidian")
+        .join("obsidian-mcp")
+        .join("embeddings.bin");
+    if let Err(e) = store.save(&cache_path) {
+        tracing::warn!(error = %e, "failed to save embedding cache from watcher");
     }
 }
 
