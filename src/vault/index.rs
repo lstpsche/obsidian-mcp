@@ -191,6 +191,10 @@ impl VaultIndex {
 
     // ── query methods ───────────────────────────────────────────────
 
+    pub fn notes(&self) -> &HashMap<PathBuf, NoteMetadata> {
+        &self.notes
+    }
+
     pub fn get_note(&self, path: &Path) -> Option<&NoteMetadata> {
         self.notes.get(path)
     }

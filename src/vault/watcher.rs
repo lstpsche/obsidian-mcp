@@ -16,6 +16,7 @@ use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer};
 use tokio::runtime::Handle;
 
 use super::index::VaultIndex;
+use super::tantivy_index::TantivyIndex;
 use crate::error::{VaultError, VaultResult};
 
 const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -31,6 +32,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 pub fn start_watcher(
     vault_root: PathBuf,
     index: Arc<RwLock<VaultIndex>>,
+    tantivy: Option<Arc<TantivyIndex>>,
 ) -> VaultResult<Debouncer<notify::RecommendedWatcher>> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<DebounceEventResult>(EVENT_CHANNEL_CAPACITY);
     let rt = Handle::current();
@@ -59,7 +61,7 @@ pub fn start_watcher(
             match result {
                 Ok(events) => {
                     for event in events {
-                        process_event(&vault_root, &index, &event.path);
+                        process_event(&vault_root, &index, tantivy.as_deref(), &event.path);
                     }
                 }
                 Err(e) => {
@@ -125,7 +127,12 @@ fn is_obsidian_dir(relative: &Path) -> bool {
 }
 
 /// Process a single debounced event for a path that passed filtering.
-fn process_event(vault_root: &Path, index: &Arc<RwLock<VaultIndex>>, absolute: &Path) {
+fn process_event(
+    vault_root: &Path,
+    index: &Arc<RwLock<VaultIndex>>,
+    tantivy: Option<&TantivyIndex>,
+    absolute: &Path,
+) {
     if !should_process_path(vault_root, absolute) {
         return;
     }
@@ -141,6 +148,13 @@ fn process_event(vault_root: &Path, index: &Arc<RwLock<VaultIndex>>, absolute: &
             Ok(mut idx) => {
                 if let Err(e) = idx.reindex_file(vault_root, &relative) {
                     tracing::warn!(path = %relative.display(), error = %e, "reindex failed");
+                    return;
+                }
+                if let Some(tv) = tantivy
+                    && let Some(meta) = idx.get_note(&relative)
+                    && let Err(e) = tv.reindex_file(vault_root, &relative, meta)
+                {
+                    tracing::warn!(path = %relative.display(), error = %e, "tantivy reindex failed");
                 }
             }
             Err(e) => {
@@ -150,7 +164,14 @@ fn process_event(vault_root: &Path, index: &Arc<RwLock<VaultIndex>>, absolute: &
     } else {
         tracing::debug!(path = %relative.display(), "removing (delete)");
         match index.write() {
-            Ok(mut idx) => idx.remove_file(&relative),
+            Ok(mut idx) => {
+                idx.remove_file(&relative);
+                if let Some(tv) = tantivy
+                    && let Err(e) = tv.remove_file(&relative)
+                {
+                    tracing::warn!(path = %relative.display(), error = %e, "tantivy remove failed");
+                }
+            }
             Err(e) => {
                 tracing::error!("index lock poisoned: {e}");
             }
@@ -225,7 +246,7 @@ mod tests {
         let vault_root = dir.path().to_path_buf();
         let index = Arc::new(RwLock::new(VaultIndex::empty()));
 
-        let debouncer = start_watcher(vault_root, index);
+        let debouncer = start_watcher(vault_root, index, None);
         assert!(debouncer.is_ok(), "watcher should start without error");
 
         drop(debouncer.unwrap());
@@ -238,7 +259,7 @@ mod tests {
         let vault_root = dir.path().to_path_buf();
         let index = Arc::new(RwLock::new(VaultIndex::empty()));
 
-        let _debouncer = start_watcher(vault_root.clone(), index).unwrap();
+        let _debouncer = start_watcher(vault_root.clone(), index, None).unwrap();
 
         // Create files the watcher should ignore.
         std::fs::write(vault_root.join("image.png"), b"fake png").unwrap();

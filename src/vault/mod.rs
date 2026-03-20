@@ -26,11 +26,13 @@ use crate::models::{
 };
 
 use self::index::VaultIndex;
+use self::tantivy_index::TantivyIndex;
 
 /// Internal shared state wrapped in `Arc` for cheap cloning.
 struct VaultInner {
     root: PathBuf,
     index: Arc<RwLock<VaultIndex>>,
+    tantivy: Option<Arc<TantivyIndex>>,
     /// Kept alive to sustain filesystem watching; never accessed after construction.
     /// Wrapped in `Mutex` to guarantee `Sync` (`Debouncer` contains a `mpsc::Sender`
     /// which is `Send` but not `Sync`).
@@ -65,10 +67,23 @@ impl Vault {
         }
 
         let vi = VaultIndex::build(&root).await?;
+
+        let tantivy = if config.tantivy {
+            let tv = TantivyIndex::build(&root, vi.notes())?;
+            tracing::info!(notes = vi.notes().len(), "tantivy BM25 index built");
+            Some(Arc::new(tv))
+        } else {
+            None
+        };
+
         let index = Arc::new(RwLock::new(vi));
 
         let watcher_handle = if config.watch {
-            Some(watcher::start_watcher(root.clone(), Arc::clone(&index))?)
+            Some(watcher::start_watcher(
+                root.clone(),
+                Arc::clone(&index),
+                tantivy.clone(),
+            )?)
         } else {
             None
         };
@@ -77,6 +92,7 @@ impl Vault {
             inner: Arc::new(VaultInner {
                 root,
                 index,
+                tantivy,
                 _watcher: Mutex::new(watcher_handle),
             }),
         })
@@ -85,6 +101,11 @@ impl Vault {
     /// Vault root path (canonicalized).
     pub fn root(&self) -> &Path {
         &self.inner.root
+    }
+
+    /// Access the Tantivy BM25 index (if enabled via `Config::tantivy`).
+    pub fn tantivy(&self) -> Option<&TantivyIndex> {
+        self.inner.tantivy.as_deref()
     }
 
     // ── fs delegation ──────────────────────────────────────────────────
@@ -152,13 +173,24 @@ impl Vault {
     pub fn delete_note(&self, path: &Path) -> VaultResult<()> {
         fs::delete_file(&self.inner.root, path)?;
         self.write_index().remove_file(path);
+        if let Some(tv) = &self.inner.tantivy {
+            tv.remove_file(path)?;
+        }
         Ok(())
     }
 
     pub fn move_note(&self, from: &Path, to: &Path) -> VaultResult<PathBuf> {
         let new_path = fs::move_file(&self.inner.root, from, to)?;
-        self.write_index()
-            .rename_file(&self.inner.root, from, &new_path)?;
+        {
+            let mut idx = self.write_index();
+            idx.rename_file(&self.inner.root, from, &new_path)?;
+            if let Some(tv) = &self.inner.tantivy {
+                tv.remove_file(from)?;
+                if let Some(meta) = idx.get_note(&new_path) {
+                    tv.reindex_file(&self.inner.root, &new_path, meta)?;
+                }
+            }
+        }
         Ok(new_path)
     }
 
@@ -398,7 +430,14 @@ impl Vault {
     }
 
     fn reindex(&self, path: &Path) -> VaultResult<()> {
-        self.write_index().reindex_file(&self.inner.root, path)
+        let mut idx = self.write_index();
+        idx.reindex_file(&self.inner.root, path)?;
+        if let Some(tv) = &self.inner.tantivy
+            && let Some(meta) = idx.get_note(path)
+        {
+            tv.reindex_file(&self.inner.root, path, meta)?;
+        }
+        Ok(())
     }
 }
 
@@ -755,5 +794,99 @@ mod tests {
     fn vault_is_send_sync_clone() {
         fn assert_send_sync_clone<T: Send + Sync + Clone>() {}
         assert_send_sync_clone::<Vault>();
+    }
+
+    fn tantivy_config(vault_root: &Path) -> Config {
+        Config {
+            vault_path: vault_root.to_path_buf(),
+            watch: false,
+            log_level: "error".into(),
+            tantivy: true,
+            embeddings: false,
+            embeddings_model: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn vault_open_with_tantivy() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+
+        std::fs::write(
+            dir.path().join("note.md"),
+            "# Rust\nRust is a systems language.\n",
+        )
+        .unwrap();
+
+        let vault = Vault::open(&tantivy_config(dir.path())).await.unwrap();
+        assert!(vault.tantivy().is_some());
+    }
+
+    #[tokio::test]
+    async fn vault_tantivy_syncs_on_write() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&tantivy_config(dir.path())).await.unwrap();
+
+        vault
+            .write_note(
+                Path::new("alpha.md"),
+                "# Alpha\nUnique content about zebras.\n",
+            )
+            .unwrap();
+
+        let tv = vault.tantivy().unwrap();
+        let results = tv.search("zebras", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, PathBuf::from("alpha.md"));
+    }
+
+    #[tokio::test]
+    async fn vault_tantivy_syncs_on_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&tantivy_config(dir.path())).await.unwrap();
+
+        vault
+            .write_note(Path::new("del.md"), "# Deletable\nEphemeral content.\n")
+            .unwrap();
+        assert_eq!(
+            vault
+                .tantivy()
+                .unwrap()
+                .search("ephemeral", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        vault.delete_note(Path::new("del.md")).unwrap();
+        assert!(
+            vault
+                .tantivy()
+                .unwrap()
+                .search("ephemeral", 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn vault_tantivy_syncs_on_move() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&tantivy_config(dir.path())).await.unwrap();
+
+        vault
+            .write_note(Path::new("src.md"), "# Source\nMovable content.\n")
+            .unwrap();
+        vault
+            .move_note(Path::new("src.md"), Path::new("dest.md"))
+            .unwrap();
+
+        let tv = vault.tantivy().unwrap();
+        let results = tv.search("movable", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, PathBuf::from("dest.md"));
     }
 }
