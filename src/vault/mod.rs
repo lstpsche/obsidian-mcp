@@ -9,6 +9,7 @@ pub mod index;
 pub mod parser;
 pub mod patch;
 pub mod periodic;
+pub mod tantivy_index;
 pub mod watcher;
 pub mod wikilink;
 
@@ -414,6 +415,9 @@ mod tests {
             vault_path: vault_root.to_path_buf(),
             watch: false,
             log_level: "error".into(),
+            tantivy: false,
+            embeddings: false,
+            embeddings_model: String::new(),
         }
     }
 
@@ -446,6 +450,9 @@ mod tests {
             vault_path: PathBuf::from("/nonexistent/path/that/does/not/exist"),
             watch: false,
             log_level: "error".into(),
+            tantivy: false,
+            embeddings: false,
+            embeddings_model: String::new(),
         };
 
         let result = Vault::open(&config).await;

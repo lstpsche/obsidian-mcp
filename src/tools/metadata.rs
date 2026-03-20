@@ -163,6 +163,9 @@ mod tests {
             vault_path: vault_root.to_path_buf(),
             watch: false,
             log_level: "error".into(),
+            tantivy: false,
+            embeddings: false,
+            embeddings_model: String::new(),
         }
     }
 

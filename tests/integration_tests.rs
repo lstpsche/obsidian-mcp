@@ -17,6 +17,9 @@ fn fixture_config() -> Config {
         vault_path: fixture_path(),
         watch: false,
         log_level: "error".into(),
+        tantivy: false,
+        embeddings: false,
+        embeddings_model: String::new(),
     }
 }
 
@@ -34,6 +37,9 @@ async fn copy_fixture_to_temp() -> (tempfile::TempDir, Vault) {
         vault_path: tmp.path().to_path_buf(),
         watch: false,
         log_level: "error".into(),
+        tantivy: false,
+        embeddings: false,
+        embeddings_model: String::new(),
     };
     let vault = Vault::open(&config)
         .await

@@ -46,6 +46,12 @@ pub enum VaultError {
     #[error("Watcher error: {0}")]
     Watcher(String),
 
+    #[error("Tantivy index error: {0}")]
+    Tantivy(#[from] tantivy::TantivyError),
+
+    #[error("Embedding error: {0}")]
+    Embedding(String),
+
     #[error("{0}")]
     Other(String),
 }
@@ -64,9 +70,11 @@ impl From<VaultError> for rmcp::ErrorData {
             | VaultError::PatchTargetNotFound { .. }
             | VaultError::InvalidRegex { .. } => ErrorCode::INVALID_PARAMS,
             VaultError::FrontmatterParse { .. } => ErrorCode::PARSE_ERROR,
-            VaultError::Io(_) | VaultError::Watcher(_) | VaultError::Other(_) => {
-                ErrorCode::INTERNAL_ERROR
-            }
+            VaultError::Io(_)
+            | VaultError::Watcher(_)
+            | VaultError::Tantivy(_)
+            | VaultError::Embedding(_)
+            | VaultError::Other(_) => ErrorCode::INTERNAL_ERROR,
         };
 
         rmcp::ErrorData::new(code, err.to_string(), None)
