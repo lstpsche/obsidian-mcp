@@ -122,6 +122,17 @@ pub struct PatchRequest {
     pub content: String,
 }
 
+/// Fields available for targeted full-text search via Tantivy.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchField {
+    Title,
+    Headings,
+    Tags,
+    Body,
+    Frontmatter,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum NotePeriod {

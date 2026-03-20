@@ -147,7 +147,7 @@ impl ObsidianMcp {
 
     #[tool(
         name = "search_text",
-        description = "Full-text search across all notes (case-insensitive). Returns matching files with context snippets around each match."
+        description = "BM25-ranked full-text search across all notes. Returns matching files with relevance scores and context snippets. Supports stemming (e.g. 'program' matches 'programming'), optional fuzzy matching for typo tolerance, and field-level filtering."
     )]
     async fn search_text(
         &self,

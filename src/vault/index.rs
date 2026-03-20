@@ -480,7 +480,7 @@ fn parse_note_metadata(vault_root: &Path, path: &Path) -> VaultResult<NoteMetada
 
 /// Extract a context window around a regex match.
 /// Returns `(context_string, char_offset_start, char_offset_end, line_number)`.
-fn extract_match_context(
+pub(crate) fn extract_match_context(
     content: &str,
     match_byte_start: usize,
     match_byte_end: usize,

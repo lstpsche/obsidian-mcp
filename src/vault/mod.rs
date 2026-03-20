@@ -19,10 +19,13 @@ use std::sync::{Arc, Mutex, RwLock};
 use chrono::{Local, NaiveDate};
 use notify_debouncer_mini::Debouncer;
 
+use regex::Regex;
+
 use crate::config::Config;
 use crate::error::{VaultError, VaultResult};
 use crate::models::{
-    DocumentMap, NoteMetadata, NotePeriod, PatchRequest, SearchResult, VaultStats, WikiLink,
+    DocumentMap, NoteMetadata, NotePeriod, PatchRequest, SearchField, SearchMatch, SearchResult,
+    VaultStats, WikiLink,
 };
 
 use self::index::VaultIndex;
@@ -247,8 +250,38 @@ impl Vault {
     }
 
     pub fn search_text(&self, query: &str, context_len: usize) -> VaultResult<Vec<SearchResult>> {
-        self.read_index()
-            .search_text(&self.inner.root, query, context_len)
+        match &self.inner.tantivy {
+            Some(tv) => self.tantivy_search_with_context(tv, query, context_len, 200, false, None),
+            None => self
+                .read_index()
+                .search_text(&self.inner.root, query, context_len),
+        }
+    }
+
+    /// Full-text search with additional Tantivy options (fuzzy, field filter).
+    ///
+    /// Falls back to `VaultIndex::search_text` (ignoring fuzzy/fields) when
+    /// Tantivy is disabled.
+    pub fn search_text_with_options(
+        &self,
+        query: &str,
+        context_len: usize,
+        max_results: usize,
+        fuzzy: bool,
+        fields: Option<&[SearchField]>,
+    ) -> VaultResult<Vec<SearchResult>> {
+        match &self.inner.tantivy {
+            Some(tv) => {
+                self.tantivy_search_with_context(tv, query, context_len, max_results, fuzzy, fields)
+            }
+            None => {
+                let mut results =
+                    self.read_index()
+                        .search_text(&self.inner.root, query, context_len)?;
+                results.truncate(max_results);
+                Ok(results)
+            }
+        }
     }
 
     pub fn search_regex(
@@ -420,6 +453,70 @@ impl Vault {
     }
 
     // ── private helpers ────────────────────────────────────────────────
+
+    /// Two-phase Tantivy search: BM25 ranking then context extraction.
+    ///
+    /// 1. Rank: Tantivy returns top-K `(path, score)` via BM25.
+    /// 2. Context: For each hit, read the file and locate query words with a
+    ///    case-insensitive regex to produce `SearchMatch` snippets.
+    ///
+    /// If the query matched only through stemming (no literal occurrence of
+    /// any query word), the `matches` vec will be empty but `score` is populated.
+    fn tantivy_search_with_context(
+        &self,
+        tv: &TantivyIndex,
+        query: &str,
+        context_len: usize,
+        max_results: usize,
+        fuzzy: bool,
+        fields: Option<&[SearchField]>,
+    ) -> VaultResult<Vec<SearchResult>> {
+        let hits = if fuzzy || fields.is_some() {
+            tv.search_with_options(query, max_results, fuzzy, fields)?
+        } else {
+            tv.search(query, max_results)?
+        };
+
+        let word_pattern: String = query
+            .split_whitespace()
+            .map(regex::escape)
+            .collect::<Vec<_>>()
+            .join("|");
+
+        let word_re = if word_pattern.is_empty() {
+            None
+        } else {
+            Regex::new(&format!("(?i){word_pattern}")).ok()
+        };
+
+        let mut results = Vec::with_capacity(hits.len());
+        for (path, score) in hits {
+            let matches = match (word_re.as_ref(), fs::read_file(&self.inner.root, &path)) {
+                (Some(re), Ok(content)) if context_len > 0 => re
+                    .find_iter(&content)
+                    .map(|m| {
+                        let (context, match_start, match_end, line) =
+                            index::extract_match_context(&content, m.start(), m.end(), context_len);
+                        SearchMatch {
+                            line,
+                            context,
+                            match_start,
+                            match_end,
+                        }
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+
+            results.push(SearchResult {
+                path,
+                matches,
+                score: Some(score as f64),
+            });
+        }
+
+        Ok(results)
+    }
 
     fn read_index(&self) -> std::sync::RwLockReadGuard<'_, VaultIndex> {
         self.inner.index.read().expect("index lock poisoned")
@@ -888,5 +985,77 @@ mod tests {
         let results = tv.search("movable", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, PathBuf::from("dest.md"));
+    }
+
+    #[tokio::test]
+    async fn vault_search_text_tantivy_returns_scores() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&tantivy_config(dir.path())).await.unwrap();
+
+        vault
+            .write_note(
+                Path::new("a.md"),
+                "# Quantum\nQuantum computing is fascinating.\n",
+            )
+            .unwrap();
+        vault
+            .write_note(Path::new("b.md"), "# Other\nNothing related.\n")
+            .unwrap();
+
+        let results = vault.search_text("quantum", 40).unwrap();
+        assert!(!results.is_empty());
+        assert!(results[0].score.is_some());
+        assert!(results[0].score.unwrap() > 0.0);
+        assert_eq!(results[0].path, PathBuf::from("a.md"));
+    }
+
+    #[tokio::test]
+    async fn vault_search_text_with_options_fuzzy() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&tantivy_config(dir.path())).await.unwrap();
+
+        vault
+            .write_note(Path::new("target.md"), "# Algorithm\nSorting algorithms.\n")
+            .unwrap();
+
+        // "algorihm" is a typo for "algorithm"
+        let results = vault
+            .search_text_with_options("algorihm", 40, 10, true, None)
+            .unwrap();
+        assert!(
+            results.iter().any(|r| r.path == PathBuf::from("target.md")),
+            "fuzzy search should find 'algorithm' from typo 'algorihm'"
+        );
+    }
+
+    #[tokio::test]
+    async fn vault_search_text_with_options_field_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&tantivy_config(dir.path())).await.unwrap();
+
+        vault
+            .write_note(
+                Path::new("headingmatch.md"),
+                "# Something Else\n## Cryptography Section\nBasic text.\n",
+            )
+            .unwrap();
+
+        let heading_only = vault
+            .search_text_with_options(
+                "cryptography",
+                40,
+                10,
+                false,
+                Some(&[SearchField::Headings]),
+            )
+            .unwrap();
+        assert!(
+            heading_only
+                .iter()
+                .any(|r| r.path == PathBuf::from("headingmatch.md"))
+        );
     }
 }

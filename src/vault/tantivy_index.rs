@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
+use tantivy::query::{BooleanQuery, BoostQuery, Occur, QueryParser, TermQuery};
 use tantivy::schema::{
     Facet, Field, IndexRecordOption, OwnedValue, STORED, STRING, Schema, SchemaBuilder,
     TextFieldIndexing, TextOptions,
@@ -15,7 +15,7 @@ use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Te
 use super::frontmatter;
 use super::fs;
 use crate::error::{VaultError, VaultResult};
-use crate::models::NoteMetadata;
+use crate::models::{NoteMetadata, SearchField};
 
 pub const TITLE_BOOST: f32 = 5.0;
 pub const HEADINGS_BOOST: f32 = 3.0;
@@ -229,6 +229,110 @@ impl TantivyIndex {
 
         Ok(results)
     }
+
+    /// BM25-ranked search with optional fuzzy matching and field filtering.
+    ///
+    /// - `fuzzy`: when true, enables edit-distance-1 fuzzy matching on all text fields
+    ///   via `QueryParser::set_field_fuzzy`.
+    /// - `fields`: when `Some`, restricts the search to the specified fields.
+    ///   `Tags` field creates exact facet term queries (not stemmed).
+    ///
+    /// Delegates to `search()` when neither option is active.
+    pub fn search_with_options(
+        &self,
+        query: &str,
+        top_k: usize,
+        fuzzy: bool,
+        fields: Option<&[SearchField]>,
+    ) -> VaultResult<Vec<(PathBuf, f32)>> {
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if !fuzzy && fields.is_none() {
+            return self.search(query, top_k);
+        }
+
+        let searcher = self.reader.searcher();
+
+        let (text_fields, include_tags) = match fields {
+            Some(fs) => {
+                let mut tf = Vec::new();
+                let mut tags = false;
+                for f in fs {
+                    match f {
+                        SearchField::Title => tf.push((self.ts.f_title, TITLE_BOOST)),
+                        SearchField::Headings => tf.push((self.ts.f_headings, HEADINGS_BOOST)),
+                        SearchField::Body => tf.push((self.ts.f_body, 1.0)),
+                        SearchField::Frontmatter => {
+                            tf.push((self.ts.f_frontmatter_text, FRONTMATTER_BOOST));
+                        }
+                        SearchField::Tags => tags = true,
+                    }
+                }
+                (tf, tags)
+            }
+            None => (
+                vec![
+                    (self.ts.f_title, TITLE_BOOST),
+                    (self.ts.f_headings, HEADINGS_BOOST),
+                    (self.ts.f_body, 1.0),
+                    (self.ts.f_frontmatter_text, FRONTMATTER_BOOST),
+                ],
+                false,
+            ),
+        };
+
+        let mut subqueries: Vec<(Occur, Box<dyn tantivy::query::Query>)> = Vec::new();
+
+        if !text_fields.is_empty() {
+            let field_list: Vec<Field> = text_fields.iter().map(|(f, _)| *f).collect();
+            let mut qp = QueryParser::for_index(searcher.index(), field_list);
+            for &(field, boost) in &text_fields {
+                qp.set_field_boost(field, boost);
+                if fuzzy {
+                    qp.set_field_fuzzy(field, false, 1, true);
+                }
+            }
+            let parsed = qp
+                .parse_query(query)
+                .map_err(|e| VaultError::Other(format!("tantivy query parse error: {e}")))?;
+            subqueries.push((Occur::Should, parsed));
+        }
+
+        if include_tags {
+            for word in query.split_whitespace() {
+                let components: Vec<&str> = word.split('/').collect();
+                let facet = Facet::from_path(components);
+                let term = Term::from_facet(self.ts.f_tags, &facet);
+                let tq = TermQuery::new(term, IndexRecordOption::Basic);
+                let boosted = BoostQuery::new(Box::new(tq), TAGS_BOOST);
+                subqueries.push((Occur::Should, Box::new(boosted)));
+            }
+        }
+
+        if subqueries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let final_query: Box<dyn tantivy::query::Query> = if subqueries.len() == 1 {
+            subqueries.into_iter().next().unwrap().1
+        } else {
+            Box::new(BooleanQuery::new(subqueries))
+        };
+
+        let top_docs = searcher.search(&*final_query, &TopDocs::with_limit(top_k))?;
+
+        let mut results = Vec::with_capacity(top_docs.len());
+        for (score, doc_address) in top_docs {
+            let retrieved: TantivyDocument = searcher.doc(doc_address)?;
+            if let Some(OwnedValue::Str(path_str)) = retrieved.get_first(self.ts.f_path) {
+                results.push((PathBuf::from(path_str), score));
+            }
+        }
+
+        Ok(results)
+    }
 }
 
 /// Construct a Tantivy document from note metadata and raw file content.
@@ -267,7 +371,8 @@ fn build_document(
     );
 
     for tag in &meta.tags {
-        doc.add_facet(ts.f_tags, Facet::from_text(tag).unwrap_or(Facet::root()));
+        let components: Vec<&str> = tag.split('/').collect();
+        doc.add_facet(ts.f_tags, Facet::from_path(components));
     }
 
     doc
@@ -566,5 +671,116 @@ mod tests {
         assert!(text.contains("mcp"));
         assert!(text.contains("draft"));
         assert!(text.contains("1"));
+    }
+
+    // ── search_with_options tests ──────────────────────────────────────
+
+    #[test]
+    fn search_with_options_delegates_to_search_when_no_options() {
+        let (dir, notes) = setup_vault();
+        let idx = TantivyIndex::build(dir.path(), &notes).unwrap();
+
+        let plain = idx.search("rust", 10).unwrap();
+        let via_opts = idx.search_with_options("rust", 10, false, None).unwrap();
+        assert_eq!(plain.len(), via_opts.len());
+    }
+
+    #[test]
+    fn search_fuzzy_tolerates_typo() {
+        let (dir, notes) = setup_vault();
+        let idx = TantivyIndex::build(dir.path(), &notes).unwrap();
+
+        // "rast" is one edit away from "rust"
+        let strict = idx.search("rast", 10).unwrap();
+        let fuzzy = idx.search_with_options("rast", 10, true, None).unwrap();
+        assert!(
+            fuzzy.len() > strict.len(),
+            "fuzzy should find more results than strict for a typo query"
+        );
+        assert!(fuzzy.iter().any(|(p, _)| p == Path::new("rust.md")));
+    }
+
+    #[test]
+    fn search_with_field_filter_title_only() {
+        let (dir, notes) = setup_vault();
+        let idx = TantivyIndex::build(dir.path(), &notes).unwrap();
+
+        let results = idx
+            .search_with_options("rust", 10, false, Some(&[SearchField::Title]))
+            .unwrap();
+        assert!(results.iter().any(|(p, _)| p == Path::new("rust.md")));
+        // "cooking" has no title relation to "rust"
+        assert!(!results.iter().any(|(p, _)| p == Path::new("cooking.md")));
+    }
+
+    #[test]
+    fn search_with_field_filter_body_only() {
+        let (dir, notes) = setup_vault();
+        let idx = TantivyIndex::build(dir.path(), &notes).unwrap();
+
+        // "pasta" appears only in cooking.md body
+        let results = idx
+            .search_with_options("pasta", 10, false, Some(&[SearchField::Body]))
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, PathBuf::from("cooking.md"));
+    }
+
+    #[test]
+    fn facet_term_query_roundtrip() {
+        let (dir, notes) = setup_vault();
+        let idx = TantivyIndex::build(dir.path(), &notes).unwrap();
+
+        let searcher = idx.reader.searcher();
+        let facet = Facet::from_path(["programming"]);
+        let term = Term::from_facet(idx.ts.f_tags, &facet);
+        let tq = TermQuery::new(term, IndexRecordOption::Basic);
+        let top_docs = searcher.search(&tq, &TopDocs::with_limit(10)).unwrap();
+        assert!(
+            !top_docs.is_empty(),
+            "direct facet TermQuery should find rust.md"
+        );
+    }
+
+    #[test]
+    fn search_with_field_filter_tags() {
+        let (dir, notes) = setup_vault();
+        let idx = TantivyIndex::build(dir.path(), &notes).unwrap();
+
+        // "programming" is a tag on rust.md
+        let results = idx
+            .search_with_options("programming", 10, false, Some(&[SearchField::Tags]))
+            .unwrap();
+        assert!(
+            results.iter().any(|(p, _)| p == Path::new("rust.md")),
+            "tag search should find rust.md tagged 'programming'"
+        );
+    }
+
+    #[test]
+    fn search_with_options_empty_query() {
+        let (dir, notes) = setup_vault();
+        let idx = TantivyIndex::build(dir.path(), &notes).unwrap();
+
+        assert!(
+            idx.search_with_options("", 10, true, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn search_fuzzy_and_field_combined() {
+        let (dir, notes) = setup_vault();
+        let idx = TantivyIndex::build(dir.path(), &notes).unwrap();
+
+        // "pythn" is a typo for "python", search only in titles
+        let results = idx
+            .search_with_options("pythn", 10, true, Some(&[SearchField::Title]))
+            .unwrap();
+        assert!(
+            results.iter().any(|(p, _)| p == Path::new("python.md")),
+            "fuzzy + title filter should find python.md for 'pythn'"
+        );
     }
 }

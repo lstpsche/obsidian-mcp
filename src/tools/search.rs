@@ -5,13 +5,15 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::error::VaultError;
+use crate::models::SearchField;
 use crate::vault::Vault;
 
 // ── search_text ─────────────────────────────────────────────────────
 
 #[derive(Deserialize, JsonSchema, Default)]
 pub struct SearchTextParams {
-    /// Full-text search query (case-insensitive).
+    /// Natural-language search query. Supports stemming (e.g. "program"
+    /// matches "programming"). Results are ranked by BM25 relevance.
     pub query: String,
     /// Characters of context around each match (default: 100).
     #[serde(default)]
@@ -19,6 +21,13 @@ pub struct SearchTextParams {
     /// Maximum number of file results to return (default: 20).
     #[serde(default)]
     pub max_results: Option<usize>,
+    /// Enable fuzzy matching with edit distance 1 (tolerates typos). Default: false.
+    #[serde(default)]
+    pub fuzzy: Option<bool>,
+    /// Restrict search to specific note fields. Default: all fields.
+    /// Allowed values: `title`, `headings`, `tags`, `body`, `frontmatter`.
+    #[serde(default)]
+    pub fields: Option<Vec<SearchField>>,
 }
 
 pub async fn search_text(
@@ -27,11 +36,23 @@ pub async fn search_text(
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     let context_length = params.context_length.unwrap_or(100);
     let max_results = params.max_results.unwrap_or(20);
+    let fuzzy = params.fuzzy.unwrap_or(false);
 
-    let results = vault.search_text(&params.query, context_length)?;
-    let limited: Vec<_> = results.into_iter().take(max_results).collect();
+    let results = if fuzzy || params.fields.is_some() {
+        let fields_slice = params.fields.as_deref();
+        vault.search_text_with_options(
+            &params.query,
+            context_length,
+            max_results,
+            fuzzy,
+            fields_slice,
+        )?
+    } else {
+        let all = vault.search_text(&params.query, context_length)?;
+        all.into_iter().take(max_results).collect()
+    };
 
-    let json = serde_json::to_string_pretty(&limited)
+    let json = serde_json::to_string_pretty(&results)
         .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
     Ok(CallToolResult::success(vec![Content::text(json)]))
 }
@@ -497,5 +518,154 @@ mod tests {
         .await;
 
         assert!(result.is_err());
+    }
+
+    // ── search_text with Tantivy BM25 ──────────────────────────────
+
+    fn tantivy_config(vault_root: &Path) -> Config {
+        Config {
+            vault_path: vault_root.to_path_buf(),
+            watch: false,
+            log_level: "error".into(),
+            tantivy: true,
+            embeddings: false,
+            embeddings_model: String::new(),
+        }
+    }
+
+    async fn setup_tantivy_vault() -> (tempfile::TempDir, Vault) {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+
+        let vault = Vault::open(&tantivy_config(dir.path())).await.unwrap();
+
+        vault
+            .write_note(
+                Path::new("rust.md"),
+                "---\ntags: [lang, systems]\nstatus: stable\n---\n# Rust\nRust is a systems programming language.\n",
+            )
+            .unwrap();
+        vault
+            .write_note(
+                Path::new("python.md"),
+                "---\ntags: [lang, scripting]\nstatus: in progress\n---\n# Python\nPython is a dynamic scripting language.\n",
+            )
+            .unwrap();
+        vault
+            .write_note(
+                Path::new("cooking.md"),
+                "# Cooking Tips\nHow to make a great pasta dish.\n",
+            )
+            .unwrap();
+
+        (dir, vault)
+    }
+
+    #[tokio::test]
+    async fn search_text_tantivy_returns_scores() {
+        let (_dir, vault) = setup_tantivy_vault().await;
+        let result = search_text(
+            &vault,
+            SearchTextParams {
+                query: "systems".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let text = extract_text(&result);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
+
+        assert!(!parsed.is_empty());
+        assert!(text.contains("rust.md"));
+        // BM25 results should have a score
+        assert!(parsed[0].get("score").is_some());
+        assert!(parsed[0]["score"].as_f64().unwrap() > 0.0);
+    }
+
+    #[tokio::test]
+    async fn search_text_tantivy_ranked_descending() {
+        let (_dir, vault) = setup_tantivy_vault().await;
+        let result = search_text(
+            &vault,
+            SearchTextParams {
+                query: "language".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let text = extract_text(&result);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
+
+        if parsed.len() >= 2 {
+            let s0 = parsed[0]["score"].as_f64().unwrap();
+            let s1 = parsed[1]["score"].as_f64().unwrap();
+            assert!(s0 >= s1, "results should be sorted by score descending");
+        }
+    }
+
+    #[tokio::test]
+    async fn search_text_tantivy_fuzzy() {
+        let (_dir, vault) = setup_tantivy_vault().await;
+        let result = search_text(
+            &vault,
+            SearchTextParams {
+                query: "pyhton".into(),
+                fuzzy: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let text = extract_text(&result);
+
+        assert!(
+            text.contains("python.md"),
+            "fuzzy should match 'pyhton' to 'python'"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_text_tantivy_field_filter() {
+        let (_dir, vault) = setup_tantivy_vault().await;
+        let result = search_text(
+            &vault,
+            SearchTextParams {
+                query: "cooking".into(),
+                fields: Some(vec![SearchField::Title]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let text = extract_text(&result);
+
+        assert!(
+            text.contains("cooking.md"),
+            "title search for 'cooking' should find cooking.md"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_text_tantivy_context_snippets() {
+        let (_dir, vault) = setup_tantivy_vault().await;
+        let result = search_text(
+            &vault,
+            SearchTextParams {
+                query: "pasta".into(),
+                context_length: Some(50),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let text = extract_text(&result);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
+
+        assert!(!parsed.is_empty());
+        let matches = parsed[0]["matches"].as_array().unwrap();
+        assert!(!matches.is_empty(), "should have context matches");
+        assert!(matches[0]["context"].as_str().unwrap().contains("pasta"));
     }
 }

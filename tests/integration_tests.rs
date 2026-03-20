@@ -299,6 +299,130 @@ mod vault_graph {
     }
 }
 
+// ── Tantivy BM25 search (temp copies with tantivy enabled) ──────────────
+
+mod vault_tantivy_search {
+    use super::*;
+    use obsidian_mcp::models::SearchField;
+
+    async fn copy_fixture_with_tantivy() -> (tempfile::TempDir, Vault) {
+        let tmp = tempfile::tempdir().unwrap();
+        copy_dir_recursive(&fixture_path(), tmp.path());
+        let config = Config {
+            vault_path: tmp.path().to_path_buf(),
+            watch: false,
+            log_level: "error".into(),
+            tantivy: true,
+            embeddings: false,
+            embeddings_model: String::new(),
+        };
+        let vault = Vault::open(&config)
+            .await
+            .expect("failed to open tantivy vault");
+        (tmp, vault)
+    }
+
+    #[tokio::test]
+    async fn search_text_returns_ranked_results() {
+        let (_tmp, vault) = copy_fixture_with_tantivy().await;
+        let results = vault.search_text("quantum entanglement", 40).unwrap();
+        assert!(!results.is_empty());
+        assert!(
+            results[0].score.is_some(),
+            "Tantivy search should populate scores"
+        );
+
+        if results.len() >= 2 {
+            let s0 = results[0].score.unwrap();
+            let s1 = results[1].score.unwrap();
+            assert!(s0 >= s1, "results should be sorted by score descending");
+        }
+    }
+
+    #[tokio::test]
+    async fn search_text_stemming_finds_related_terms() {
+        let (_tmp, vault) = copy_fixture_with_tantivy().await;
+        // "server" appears in rust-mcp.md; "servers" stems to the same root
+        let results = vault.search_text("servers", 40).unwrap();
+        assert!(
+            !results.is_empty(),
+            "stemming should match 'servers' → 'server'"
+        );
+        assert!(results[0].score.is_some());
+    }
+
+    #[tokio::test]
+    async fn search_text_with_options_fuzzy() {
+        let (_tmp, vault) = copy_fixture_with_tantivy().await;
+
+        vault
+            .write_note(
+                Path::new("fuzzy_target.md"),
+                "# Architecture\nMicroservices architecture patterns.\n",
+            )
+            .unwrap();
+
+        // "architeture" has a typo (missing 'c')
+        let results = vault
+            .search_text_with_options("architeture", 40, 10, true, None)
+            .unwrap();
+        assert!(
+            results
+                .iter()
+                .any(|r| r.path == PathBuf::from("fuzzy_target.md")),
+            "fuzzy should find 'architecture' from 'architeture'"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_text_with_options_field_filter() {
+        let (_tmp, vault) = copy_fixture_with_tantivy().await;
+
+        vault
+            .write_note(
+                Path::new("elasticsearch.md"),
+                "# Elasticsearch\nDatabase internals and indexing.\n",
+            )
+            .unwrap();
+
+        // Title field = filename stem = "elasticsearch"
+        let title_results = vault
+            .search_text_with_options("elasticsearch", 40, 10, false, Some(&[SearchField::Title]))
+            .unwrap();
+        assert!(
+            title_results
+                .iter()
+                .any(|r| r.path == PathBuf::from("elasticsearch.md"))
+        );
+
+        // "indexing" appears only in the body, not title
+        let body_results = vault
+            .search_text_with_options("indexing", 40, 10, false, Some(&[SearchField::Body]))
+            .unwrap();
+        assert!(
+            body_results
+                .iter()
+                .any(|r| r.path == PathBuf::from("elasticsearch.md"))
+        );
+    }
+
+    #[tokio::test]
+    async fn search_text_context_snippets_from_tantivy() {
+        let (_tmp, vault) = copy_fixture_with_tantivy().await;
+        let results = vault.search_text("quantum entanglement", 80).unwrap();
+
+        assert!(!results.is_empty());
+        let first = &results[0];
+        assert!(!first.matches.is_empty(), "should have context snippets");
+        let ctx = &first.matches[0].context;
+        let has_any_word = ctx.contains("quantum") || ctx.contains("entanglement");
+        assert!(
+            has_any_word,
+            "context should contain at least one query word"
+        );
+    }
+}
+
 // ── Write operations (temp copies) ───────────────────────────────────────
 
 mod vault_write {
