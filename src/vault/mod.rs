@@ -988,6 +988,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vault_tantivy_syncs_on_create() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&tantivy_config(dir.path())).await.unwrap();
+
+        let fm = serde_json::json!({"tags": ["science"]});
+        vault
+            .create_note(
+                Path::new("created.md"),
+                "# Created\nBioluminescence in deep sea creatures.\n",
+                Some(&fm),
+            )
+            .unwrap();
+
+        let tv = vault.tantivy().unwrap();
+        let results = tv.search("bioluminescence", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, PathBuf::from("created.md"));
+    }
+
+    #[tokio::test]
     async fn vault_search_text_tantivy_returns_scores() {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
@@ -1056,6 +1077,56 @@ mod tests {
             heading_only
                 .iter()
                 .any(|r| r.path == PathBuf::from("headingmatch.md"))
+        );
+    }
+
+    #[tokio::test]
+    async fn vault_search_text_tantivy_zero_context() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&tantivy_config(dir.path())).await.unwrap();
+
+        vault
+            .write_note(
+                Path::new("ctx.md"),
+                "# Context Test\nSearchable unique phrase here.\n",
+            )
+            .unwrap();
+
+        let results = vault.search_text("searchable", 0).unwrap();
+        assert!(!results.is_empty());
+        assert!(results[0].score.is_some());
+        assert!(
+            results[0].matches.is_empty(),
+            "context_length=0 should produce no match snippets"
+        );
+    }
+
+    #[tokio::test]
+    async fn vault_search_text_with_options_fallback_without_tantivy() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        vault
+            .write_note(
+                Path::new("fallback.md"),
+                "# Fallback\nFallback search content.\n",
+            )
+            .unwrap();
+
+        let results = vault
+            .search_text_with_options("fallback", 40, 10, true, None)
+            .unwrap();
+        assert!(
+            results
+                .iter()
+                .any(|r| r.path == PathBuf::from("fallback.md")),
+            "should still find results via regex fallback when tantivy is disabled"
+        );
+        assert!(
+            results[0].score.is_none(),
+            "regex fallback should not populate BM25 scores"
         );
     }
 }

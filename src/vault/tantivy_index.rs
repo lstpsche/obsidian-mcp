@@ -315,10 +315,9 @@ impl TantivyIndex {
             return Ok(Vec::new());
         }
 
-        let final_query: Box<dyn tantivy::query::Query> = if subqueries.len() == 1 {
-            subqueries.into_iter().next().unwrap().1
-        } else {
-            Box::new(BooleanQuery::new(subqueries))
+        let final_query: Box<dyn tantivy::query::Query> = match subqueries.len() {
+            1 => subqueries.pop().expect("len checked above").1,
+            _ => Box::new(BooleanQuery::new(subqueries)),
         };
 
         let top_docs = searcher.search(&*final_query, &TopDocs::with_limit(top_k))?;
