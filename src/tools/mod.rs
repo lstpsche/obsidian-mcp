@@ -189,6 +189,17 @@ impl ObsidianMcp {
         search::search_frontmatter(&self.vault, params).await
     }
 
+    #[tool(
+        name = "search_semantic",
+        description = "Semantic search using local embeddings. Finds conceptually related notes without requiring exact keyword matches. Requires OBSIDIAN_EMBEDDINGS=true and the embeddings build feature."
+    )]
+    async fn search_semantic(
+        &self,
+        Parameters(params): Parameters<search::SearchSemanticParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        search::search_semantic(&self.vault, params).await
+    }
+
     // ── Metadata ────────────────────────────────────────────────────
 
     #[tool(

@@ -174,6 +174,86 @@ pub async fn search_frontmatter(
     Ok(CallToolResult::success(vec![Content::text(json)]))
 }
 
+// ── search_semantic ──────────────────────────────────────────────────
+
+#[derive(Deserialize, JsonSchema, Default)]
+pub struct SearchSemanticParams {
+    /// Natural-language query for semantic search. Does not require exact
+    /// keyword matches — conceptually similar notes are returned.
+    pub query: String,
+    /// Number of results to return (default: 10).
+    #[serde(default)]
+    pub top_k: Option<usize>,
+    /// If true, include the full note content in each result. Default: false.
+    #[serde(default)]
+    pub include_content: Option<bool>,
+}
+
+#[cfg(feature = "embeddings")]
+#[derive(serde::Serialize, JsonSchema)]
+struct SemanticSearchResult {
+    path: std::path::PathBuf,
+    title: String,
+    score: f32,
+    tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+}
+
+#[cfg(feature = "embeddings")]
+pub async fn search_semantic(
+    vault: &Vault,
+    params: SearchSemanticParams,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    if !vault.has_embeddings() {
+        return Err(rmcp::ErrorData::new(
+            ErrorCode::INVALID_REQUEST,
+            "Embeddings are not enabled. Set OBSIDIAN_EMBEDDINGS=true and build with --features embeddings.",
+            None::<serde_json::Value>,
+        ));
+    }
+
+    let top_k = params.top_k.unwrap_or(10);
+    let include_content = params.include_content.unwrap_or(false);
+
+    let hits = vault.search_semantic(&params.query, top_k)?;
+
+    let mut results = Vec::with_capacity(hits.len());
+    for (path, score) in hits {
+        let meta = vault.get_note_metadata(&path).ok();
+        let title = meta.as_ref().map(|m| m.title.clone()).unwrap_or_default();
+        let tags = meta.as_ref().map(|m| m.tags.clone()).unwrap_or_default();
+        let content = if include_content {
+            vault.read_note(&path).ok()
+        } else {
+            None
+        };
+        results.push(SemanticSearchResult {
+            path,
+            title,
+            score,
+            tags,
+            content,
+        });
+    }
+
+    let json = serde_json::to_string_pretty(&results)
+        .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
+    Ok(CallToolResult::success(vec![Content::text(json)]))
+}
+
+#[cfg(not(feature = "embeddings"))]
+pub async fn search_semantic(
+    _vault: &Vault,
+    _params: SearchSemanticParams,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    Err(rmcp::ErrorData::new(
+        ErrorCode::INVALID_REQUEST,
+        "Semantic search is not available. This binary was compiled without the 'embeddings' feature. Rebuild with: cargo build --features embeddings",
+        None::<serde_json::Value>,
+    ))
+}
+
 // ── tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]

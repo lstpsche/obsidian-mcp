@@ -616,3 +616,113 @@ mod vault_periodic {
         assert!(content.is_empty() || content.contains("2026"));
     }
 }
+
+// ── Semantic search (embeddings feature) ────────────────────────────────
+
+#[cfg(feature = "embeddings")]
+mod vault_semantic_search {
+    use super::*;
+
+    /// Serialize model loading across tests to prevent concurrent fastembed
+    /// cache access races.
+    static MODEL_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    fn embeddings_config(vault_root: &Path) -> Config {
+        Config {
+            vault_path: vault_root.to_path_buf(),
+            watch: false,
+            log_level: "error".into(),
+            tantivy: false,
+            embeddings: true,
+            embeddings_model: "BAAI/bge-small-en-v1.5".into(),
+        }
+    }
+
+    async fn open_with_embeddings(vault_root: &Path) -> Vault {
+        let _guard = MODEL_LOCK.lock().await;
+        let config = embeddings_config(vault_root);
+        Vault::open(&config)
+            .await
+            .expect("open vault with embeddings")
+    }
+
+    #[tokio::test]
+    async fn search_semantic_returns_results() {
+        let (_tmp, _vault) = copy_fixture_to_temp().await;
+        let vault = open_with_embeddings(_tmp.path()).await;
+
+        let results = vault.search_semantic("programming languages", 5).unwrap();
+        assert!(
+            !results.is_empty(),
+            "semantic search should return results for the fixture vault"
+        );
+        if results.len() >= 2 {
+            assert!(
+                results[0].1 >= results[1].1,
+                "results should be sorted by descending score"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn search_semantic_empty_vault_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".obsidian")).unwrap();
+        let vault = open_with_embeddings(tmp.path()).await;
+
+        let results = vault.search_semantic("anything", 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_semantic_disabled_returns_error() {
+        let (_tmp, vault) = copy_fixture_to_temp().await;
+        let result = vault.search_semantic("test query", 5);
+        assert!(
+            result.is_err(),
+            "search_semantic should fail when embeddings are disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_semantic_syncs_on_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".obsidian")).unwrap();
+        let vault = open_with_embeddings(tmp.path()).await;
+
+        vault
+            .write_note(
+                Path::new("rust.md"),
+                "# Rust\nRust is a systems programming language known for memory safety.\n",
+            )
+            .unwrap();
+
+        let results = vault.search_semantic("memory safe programming", 5).unwrap();
+        assert!(
+            results.iter().any(|(p, _)| p == Path::new("rust.md")),
+            "newly written note should appear in semantic search"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_semantic_syncs_on_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".obsidian")).unwrap();
+        let vault = open_with_embeddings(tmp.path()).await;
+
+        vault
+            .write_note(
+                Path::new("gone.md"),
+                "# Ephemeral\nThis note will be deleted soon.\n",
+            )
+            .unwrap();
+        vault.delete_note(Path::new("gone.md")).unwrap();
+
+        let results = vault.search_semantic("ephemeral deleted", 5).unwrap();
+        assert!(
+            !results.iter().any(|(p, _)| p == Path::new("gone.md")),
+            "deleted note should not appear in semantic search"
+        );
+    }
+}

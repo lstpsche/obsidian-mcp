@@ -29,6 +29,64 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 ///
 /// Internally spawns a tokio task that receives debounced events, filters
 /// irrelevant paths, and calls the appropriate `VaultIndex` mutation.
+#[cfg(feature = "embeddings")]
+pub fn start_watcher(
+    vault_root: PathBuf,
+    index: Arc<RwLock<VaultIndex>>,
+    tantivy: Option<Arc<TantivyIndex>>,
+    embedding_model: Option<Arc<super::embeddings::EmbeddingModel>>,
+    embedding_store: Option<Arc<RwLock<super::embeddings::EmbeddingStore>>>,
+) -> VaultResult<Debouncer<notify::RecommendedWatcher>> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<DebounceEventResult>(EVENT_CHANNEL_CAPACITY);
+    let rt = Handle::current();
+
+    let mut debouncer = new_debouncer(DEBOUNCE_TIMEOUT, move |result: DebounceEventResult| {
+        let tx = tx.clone();
+        rt.spawn(async move {
+            if let Err(e) = tx.send(result).await {
+                tracing::error!("watcher channel closed: {e}");
+            }
+        });
+    })
+    .map_err(|e| VaultError::Watcher(e.to_string()))?;
+
+    debouncer
+        .watcher()
+        .watch(&vault_root, RecursiveMode::Recursive)
+        .map_err(|e| {
+            VaultError::Watcher(format!("failed to watch {}: {e}", vault_root.display()))
+        })?;
+
+    tracing::info!(path = %vault_root.display(), "filesystem watcher started");
+
+    tokio::spawn(async move {
+        while let Some(result) = rx.recv().await {
+            match result {
+                Ok(events) => {
+                    for event in events {
+                        process_event(
+                            &vault_root,
+                            &index,
+                            tantivy.as_deref(),
+                            embedding_model.as_deref(),
+                            embedding_store.as_ref(),
+                            &event.path,
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("watch error: {e}");
+                }
+            }
+        }
+        tracing::debug!("watcher event loop exited");
+    });
+
+    Ok(debouncer)
+}
+
+/// Start watching `vault_root` for filesystem changes.
+#[cfg(not(feature = "embeddings"))]
 pub fn start_watcher(
     vault_root: PathBuf,
     index: Arc<RwLock<VaultIndex>>,
@@ -127,6 +185,100 @@ fn is_obsidian_dir(relative: &Path) -> bool {
 }
 
 /// Process a single debounced event for a path that passed filtering.
+#[cfg(feature = "embeddings")]
+fn process_event(
+    vault_root: &Path,
+    index: &Arc<RwLock<VaultIndex>>,
+    tantivy: Option<&TantivyIndex>,
+    embedding_model: Option<&super::embeddings::EmbeddingModel>,
+    embedding_store: Option<&Arc<RwLock<super::embeddings::EmbeddingStore>>>,
+    absolute: &Path,
+) {
+    if !should_process_path(vault_root, absolute) {
+        return;
+    }
+
+    let relative = match absolute.strip_prefix(vault_root) {
+        Ok(r) => r.to_path_buf(),
+        Err(_) => return,
+    };
+
+    if absolute.exists() {
+        tracing::debug!(path = %relative.display(), "reindexing (create/modify)");
+        match index.write() {
+            Ok(mut idx) => {
+                if let Err(e) = idx.reindex_file(vault_root, &relative) {
+                    tracing::warn!(path = %relative.display(), error = %e, "reindex failed");
+                    return;
+                }
+                let meta = idx.get_note(&relative).cloned();
+                if let Some(tv) = tantivy
+                    && let Some(ref m) = meta
+                    && let Err(e) = tv.reindex_file(vault_root, &relative, m)
+                {
+                    tracing::warn!(path = %relative.display(), error = %e, "tantivy reindex failed");
+                }
+                if let (Some(model), Some(store), Some(m)) =
+                    (embedding_model, embedding_store, meta.as_ref())
+                {
+                    embed_and_insert(vault_root, &relative, m, model, store);
+                }
+            }
+            Err(e) => {
+                tracing::error!("index lock poisoned: {e}");
+            }
+        }
+    } else {
+        tracing::debug!(path = %relative.display(), "removing (delete)");
+        match index.write() {
+            Ok(mut idx) => {
+                idx.remove_file(&relative);
+                if let Some(tv) = tantivy
+                    && let Err(e) = tv.remove_file(&relative)
+                {
+                    tracing::warn!(path = %relative.display(), error = %e, "tantivy remove failed");
+                }
+                if let Some(store) = embedding_store
+                    && let Ok(mut s) = store.write()
+                {
+                    s.remove(&relative);
+                }
+            }
+            Err(e) => {
+                tracing::error!("index lock poisoned: {e}");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "embeddings")]
+fn embed_and_insert(
+    vault_root: &Path,
+    relative: &Path,
+    meta: &crate::models::NoteMetadata,
+    model: &super::embeddings::EmbeddingModel,
+    store: &Arc<RwLock<super::embeddings::EmbeddingStore>>,
+) {
+    let Ok(content) = super::fs::read_file(vault_root, relative) else {
+        return;
+    };
+    let body = super::frontmatter::get_body(&content);
+    let heading_texts: Vec<String> = meta.headings.iter().map(|h| h.text.clone()).collect();
+    let text = super::embeddings::prepare_embed_text(&meta.title, &heading_texts, body);
+    match model.embed_one(&text) {
+        Ok(vec) => {
+            if let Ok(mut s) = store.write() {
+                s.insert(relative.to_path_buf(), vec);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(path = %relative.display(), error = %e, "embedding failed in watcher");
+        }
+    }
+}
+
+/// Process a single debounced event for a path that passed filtering.
+#[cfg(not(feature = "embeddings"))]
 fn process_event(
     vault_root: &Path,
     index: &Arc<RwLock<VaultIndex>>,
@@ -240,13 +392,27 @@ mod tests {
         assert!(!is_obsidian_dir(Path::new("daily/2024-01-01.md")));
     }
 
+    fn call_start_watcher(
+        vault_root: PathBuf,
+        index: Arc<RwLock<VaultIndex>>,
+    ) -> VaultResult<Debouncer<notify::RecommendedWatcher>> {
+        #[cfg(feature = "embeddings")]
+        {
+            start_watcher(vault_root, index, None, None, None)
+        }
+        #[cfg(not(feature = "embeddings"))]
+        {
+            start_watcher(vault_root, index, None)
+        }
+    }
+
     #[tokio::test]
     async fn watcher_starts_and_stops() {
         let dir = tempfile::tempdir().unwrap();
         let vault_root = dir.path().to_path_buf();
         let index = Arc::new(RwLock::new(VaultIndex::empty()));
 
-        let debouncer = start_watcher(vault_root, index, None);
+        let debouncer = call_start_watcher(vault_root, index);
         assert!(debouncer.is_ok(), "watcher should start without error");
 
         drop(debouncer.unwrap());
@@ -259,7 +425,7 @@ mod tests {
         let vault_root = dir.path().to_path_buf();
         let index = Arc::new(RwLock::new(VaultIndex::empty()));
 
-        let _debouncer = start_watcher(vault_root.clone(), index, None).unwrap();
+        let _debouncer = call_start_watcher(vault_root.clone(), index).unwrap();
 
         // Create files the watcher should ignore.
         std::fs::write(vault_root.join("image.png"), b"fake png").unwrap();

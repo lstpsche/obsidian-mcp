@@ -39,6 +39,10 @@ struct VaultInner {
     root: PathBuf,
     index: Arc<RwLock<VaultIndex>>,
     tantivy: Option<Arc<TantivyIndex>>,
+    #[cfg(feature = "embeddings")]
+    embedding_model: Option<Arc<embeddings::EmbeddingModel>>,
+    #[cfg(feature = "embeddings")]
+    embedding_store: Option<Arc<RwLock<embeddings::EmbeddingStore>>>,
     /// Kept alive to sustain filesystem watching; never accessed after construction.
     /// Wrapped in `Mutex` to guarantee `Sync` (`Debouncer` contains a `mpsc::Sender`
     /// which is `Send` but not `Sync`).
@@ -84,12 +88,35 @@ impl Vault {
 
         let index = Arc::new(RwLock::new(vi));
 
+        #[cfg(feature = "embeddings")]
+        let (embedding_model, embedding_store) = if config.embeddings {
+            let model = embeddings::EmbeddingModel::load(&config.embeddings_model).await?;
+            let model = Arc::new(model);
+            let store = Self::build_or_load_embeddings(&root, &index, &model)?;
+            let store = Arc::new(RwLock::new(store));
+            tracing::info!(
+                notes = index.read().expect("index lock poisoned").notes().len(),
+                dim = model.dim(),
+                "embedding store ready"
+            );
+            (Some(model), Some(store))
+        } else {
+            (None, None)
+        };
+
         let watcher_handle = if config.watch {
-            Some(watcher::start_watcher(
+            #[cfg(feature = "embeddings")]
+            let debouncer = watcher::start_watcher(
                 root.clone(),
                 Arc::clone(&index),
                 tantivy.clone(),
-            )?)
+                embedding_model.clone(),
+                embedding_store.clone(),
+            )?;
+            #[cfg(not(feature = "embeddings"))]
+            let debouncer =
+                watcher::start_watcher(root.clone(), Arc::clone(&index), tantivy.clone())?;
+            Some(debouncer)
         } else {
             None
         };
@@ -99,6 +126,10 @@ impl Vault {
                 root,
                 index,
                 tantivy,
+                #[cfg(feature = "embeddings")]
+                embedding_model,
+                #[cfg(feature = "embeddings")]
+                embedding_store,
                 _watcher: Mutex::new(watcher_handle),
             }),
         })
@@ -182,6 +213,8 @@ impl Vault {
         if let Some(tv) = &self.inner.tantivy {
             tv.remove_file(path)?;
         }
+        #[cfg(feature = "embeddings")]
+        self.remove_embedding(path);
         Ok(())
     }
 
@@ -196,6 +229,11 @@ impl Vault {
                     tv.reindex_file(&self.inner.root, &new_path, meta)?;
                 }
             }
+        }
+        #[cfg(feature = "embeddings")]
+        {
+            self.remove_embedding(from);
+            self.reindex_embedding(&new_path);
         }
         Ok(new_path)
     }
@@ -294,6 +332,33 @@ impl Vault {
     ) -> VaultResult<Vec<SearchResult>> {
         self.read_index()
             .search_regex(&self.inner.root, pattern, context_len)
+    }
+
+    /// Semantic search via embedding cosine similarity (Layer 2).
+    ///
+    /// Embeds the query, then performs brute-force cosine similarity against
+    /// the embedding store. Returns `(path, score)` pairs sorted by descending
+    /// similarity.
+    #[cfg(feature = "embeddings")]
+    pub fn search_semantic(&self, query: &str, top_k: usize) -> VaultResult<Vec<(PathBuf, f32)>> {
+        let model = self.inner.embedding_model.as_ref().ok_or_else(|| {
+            VaultError::Embedding("embeddings not enabled (OBSIDIAN_EMBEDDINGS=false)".into())
+        })?;
+        let store = self
+            .inner
+            .embedding_store
+            .as_ref()
+            .ok_or_else(|| VaultError::Embedding("embedding store not initialized".into()))?;
+
+        let query_vec = model.embed_one(query)?;
+        let s = store.read().expect("embedding store lock poisoned");
+        Ok(s.query(&query_vec, top_k))
+    }
+
+    /// Returns `true` if embeddings are available for semantic search.
+    #[cfg(feature = "embeddings")]
+    pub fn has_embeddings(&self) -> bool {
+        self.inner.embedding_model.is_some() && self.inner.embedding_store.is_some()
     }
 
     pub fn search_by_tag(&self, tag: &str) -> VaultResult<Vec<NoteMetadata>> {
@@ -537,7 +602,138 @@ impl Vault {
         {
             tv.reindex_file(&self.inner.root, path, meta)?;
         }
+        drop(idx);
+        #[cfg(feature = "embeddings")]
+        self.reindex_embedding(path);
         Ok(())
+    }
+
+    // ── embedding helpers (feature-gated) ─────────────────────────────
+
+    #[cfg(feature = "embeddings")]
+    fn embedding_cache_path(vault_root: &Path) -> PathBuf {
+        vault_root
+            .join(".obsidian")
+            .join("obsidian-mcp")
+            .join("embeddings.bin")
+    }
+
+    /// Load cached embeddings or rebuild from scratch.
+    #[cfg(feature = "embeddings")]
+    fn build_or_load_embeddings(
+        vault_root: &Path,
+        index: &Arc<RwLock<VaultIndex>>,
+        model: &embeddings::EmbeddingModel,
+    ) -> VaultResult<embeddings::EmbeddingStore> {
+        let cache_path = Self::embedding_cache_path(vault_root);
+        let idx = index.read().expect("index lock poisoned");
+        let note_count = idx.notes().len();
+
+        if let Ok(store) = embeddings::EmbeddingStore::load(&cache_path) {
+            if store.dim() == model.dim() && store.len() == note_count {
+                tracing::info!(cached = store.len(), "loaded embedding cache");
+                return Ok(store);
+            }
+            tracing::info!(
+                cached = store.len(),
+                current = note_count,
+                "embedding cache stale, rebuilding"
+            );
+        }
+
+        let mut store = embeddings::EmbeddingStore::new(model.dim());
+
+        let entries: Vec<(PathBuf, String)> = idx
+            .notes()
+            .iter()
+            .filter_map(|(path, meta)| {
+                let content = fs::read_file(vault_root, path).ok()?;
+                let body = frontmatter::get_body(&content);
+                let heading_texts: Vec<String> =
+                    meta.headings.iter().map(|h| h.text.clone()).collect();
+                let text = embeddings::prepare_embed_text(&meta.title, &heading_texts, body);
+                Some((path.clone(), text))
+            })
+            .collect();
+
+        let batch_size = 64;
+        for chunk in entries.chunks(batch_size) {
+            let texts: Vec<&str> = chunk.iter().map(|(_, t)| t.as_str()).collect();
+            match model.embed_batch(&texts) {
+                Ok(vecs) => {
+                    for ((path, _), vec) in chunk.iter().zip(vecs) {
+                        store.insert(path.clone(), vec);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "embedding batch failed, skipping chunk");
+                }
+            }
+        }
+
+        if let Err(e) = store.save(&cache_path) {
+            tracing::warn!(error = %e, "failed to save embedding cache");
+        }
+
+        Ok(store)
+    }
+
+    /// Re-embed a single note and update the store. Non-fatal on error.
+    #[cfg(feature = "embeddings")]
+    fn reindex_embedding(&self, path: &Path) {
+        let (Some(model), Some(store)) = (&self.inner.embedding_model, &self.inner.embedding_store)
+        else {
+            return;
+        };
+
+        let Ok(content) = fs::read_file(&self.inner.root, path) else {
+            return;
+        };
+
+        let idx = self.read_index();
+        let Some(meta) = idx.get_note(path) else {
+            return;
+        };
+
+        let body = frontmatter::get_body(&content);
+        let heading_texts: Vec<String> = meta.headings.iter().map(|h| h.text.clone()).collect();
+        let text = embeddings::prepare_embed_text(&meta.title, &heading_texts, body);
+        drop(idx);
+
+        match model.embed_one(&text) {
+            Ok(vec) => {
+                let mut s = store.write().expect("embedding store lock poisoned");
+                s.insert(path.to_path_buf(), vec);
+                drop(s);
+                self.save_embedding_cache();
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "embedding failed");
+            }
+        }
+    }
+
+    /// Remove a note's embedding from the store.
+    #[cfg(feature = "embeddings")]
+    fn remove_embedding(&self, path: &Path) {
+        if let Some(store) = &self.inner.embedding_store {
+            let mut s = store.write().expect("embedding store lock poisoned");
+            s.remove(path);
+            drop(s);
+            self.save_embedding_cache();
+        }
+    }
+
+    /// Persist the embedding cache to disk. Non-fatal on error.
+    #[cfg(feature = "embeddings")]
+    fn save_embedding_cache(&self) {
+        if let Some(store) = &self.inner.embedding_store {
+            let s = store.read().expect("embedding store lock poisoned");
+            let cache_path = Self::embedding_cache_path(&self.inner.root);
+            if let Err(e) = s.save(&cache_path) {
+                tracing::warn!(error = %e, "failed to save embedding cache");
+            }
+        }
     }
 }
 
