@@ -13,6 +13,9 @@ pub mod tantivy_index;
 pub mod watcher;
 pub mod wikilink;
 
+#[cfg(feature = "embeddings")]
+pub mod embeddings;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 

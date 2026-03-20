@@ -271,7 +271,11 @@ npx @modelcontextprotocol/inspector cargo run
 - **Tantivy fuzzy search:** `search_text_with_options` supports `fuzzy: bool` which enables edit-distance-1 fuzzy matching via `QueryParser::set_field_fuzzy`. This tolerates single-character typos (insertions, deletions, substitutions, transpositions).
 - **Tantivy field filtering:** `search_text_with_options` supports `fields: Option<&[SearchField]>` to restrict search to specific note fields (title, headings, body, frontmatter, tags). Text fields use `QueryParser` with field-specific boosts. Tags use facet `TermQuery` since they're indexed as Tantivy facets, not text.
 - **Tantivy facet encoding:** `Facet::from_text("bare_word")` returns `Err(FacetParseError)` in tantivy 0.22 — it requires a leading `/`. Use `Facet::from_path(components)` instead, which constructs the facet directly from path components. Tags like `"nested/tag"` are split on `/` and passed as components: `Facet::from_path(["nested", "tag"])`.
-- **Embedding search (Layer 2):** Opt-in via `OBSIDIAN_EMBEDDINGS=true` + `--features embeddings` Cargo feature. Not yet implemented — error variant `VaultError::Embedding` is pre-wired.
+- **Embedding search (Layer 2):** Opt-in via `OBSIDIAN_EMBEDDINGS=true` + `--features embeddings` Cargo feature. Foundation (E1-E3) implemented: `EmbeddingStore` (cosine similarity, bincode persistence) and `EmbeddingModel` (fastembed wrapper). Not yet integrated into `Vault` or exposed as MCP tool (E4-E5 pending).
+- **fastembed `&mut self`:** `fastembed::TextEmbedding::embed()` takes `&mut self`, so `EmbeddingModel` wraps it in `std::sync::Mutex`. The Mutex is locked only during inference calls.
+- **bincode 2 serde compat:** Use `bincode::serde::encode_to_vec` / `decode_from_slice` with `bincode::config::standard()` for embedding cache persistence. The bincode dep requires `features = ["serde"]`.
+- **fastembed model resolution:** `fastembed::EmbeddingModel` implements `FromStr`. The config string (e.g. `"BAAI/bge-small-en-v1.5"`) is parsed via `.parse()`, falling back to `Default` (BGESmallENV15, dim=384) on failure. `get_model_info` requires importing `fastembed::ModelTrait`.
+- **Embedding cache format:** Binary file at `{vault}/.obsidian/obsidian-mcp/embeddings.bin`. Serialized via bincode serde compat with an `EmbeddingCacheData { dim, entries: Vec<(String, Vec<f32>)> }` struct. Not forward-compatible — cache version changes require rebuild.
 
 ## Task Tracking
 

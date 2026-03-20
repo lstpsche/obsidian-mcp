@@ -26,6 +26,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 tantivy = "0.22"
+fastembed = { version = "5", optional = true }
+bincode = { version = "2", optional = true, features = ["serde"] }
+
+[features]
+default = []
+embeddings = ["dep:fastembed", "dep:bincode"]
 
 [dev-dependencies]
 tempfile = "3"
