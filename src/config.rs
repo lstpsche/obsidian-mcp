@@ -30,7 +30,7 @@ impl Config {
         let vault_path = std::env::args()
             .nth(1)
             .or_else(|| std::env::var("OBSIDIAN_VAULT_PATH").ok())
-            .map(PathBuf::from)
+            .map(|raw| normalize_vault_path(&raw))
             .ok_or_else(|| {
                 "Vault path required: pass as first argument or set OBSIDIAN_VAULT_PATH".to_string()
             })?;
@@ -67,5 +67,65 @@ impl Config {
             embeddings_model,
             hybrid_alpha,
         })
+    }
+}
+
+fn normalize_vault_path(raw: &str) -> PathBuf {
+    let trimmed = raw.trim();
+    let normalized = strip_matching_outer_quotes(trimmed).trim();
+    let final_value = if normalized.is_empty() {
+        trimmed
+    } else {
+        normalized
+    };
+    PathBuf::from(final_value)
+}
+
+fn strip_matching_outer_quotes(mut value: &str) -> &str {
+    loop {
+        let is_double_quoted = value.starts_with('"') && value.ends_with('"');
+        let is_single_quoted = value.starts_with('\'') && value.ends_with('\'');
+        if (is_double_quoted || is_single_quoted) && value.len() >= 2 {
+            value = &value[1..value.len() - 1];
+            continue;
+        }
+        return value;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_vault_path_keeps_plain_value() {
+        assert_eq!(
+            normalize_vault_path("/tmp/my-vault"),
+            PathBuf::from("/tmp/my-vault")
+        );
+    }
+
+    #[test]
+    fn normalize_vault_path_strips_double_quotes() {
+        assert_eq!(
+            normalize_vault_path("\"/tmp/my-vault\""),
+            PathBuf::from("/tmp/my-vault")
+        );
+    }
+
+    #[test]
+    fn normalize_vault_path_strips_single_quotes_and_spaces() {
+        assert_eq!(
+            normalize_vault_path("  '/tmp/my-vault'  "),
+            PathBuf::from("/tmp/my-vault")
+        );
+    }
+
+    #[test]
+    fn normalize_vault_path_handles_multiple_quote_layers() {
+        assert_eq!(
+            normalize_vault_path(" \"'/tmp/my-vault'\" "),
+            PathBuf::from("/tmp/my-vault")
+        );
     }
 }
