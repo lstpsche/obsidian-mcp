@@ -1,3 +1,4 @@
+#[cfg(any(unix, test))]
 use std::path::PathBuf;
 
 use rmcp::ServiceExt;
@@ -10,6 +11,9 @@ use obsidian_mcp::daemon::server::IpcEndpoint;
 use obsidian_mcp::error::VaultError;
 use obsidian_mcp::tools::{ObsidianMcp, SemanticRuntime};
 use obsidian_mcp::vault::Vault;
+
+const DAEMON_DISABLED_BY_WATCH_REASON: &str =
+    "semantic daemon disabled because OBSIDIAN_WATCH is false";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -49,9 +53,6 @@ async fn init_semantic_runtime(
     config: &Config,
     runtime_cfg: &SemanticRuntimeConfig,
 ) -> SemanticRuntime {
-    #[cfg(not(feature = "embeddings"))]
-    let _ = config;
-
     let mut runtime = SemanticRuntime {
         mode: runtime_cfg.mode,
         daemon_client: None,
@@ -60,6 +61,11 @@ async fn init_semantic_runtime(
     };
 
     if runtime_cfg.mode == SemanticMode::Local {
+        return runtime;
+    }
+    if !config.watch {
+        runtime.daemon_unavailable_reason = Some(DAEMON_DISABLED_BY_WATCH_REASON.to_string());
+        tracing::info!("semantic daemon disabled because OBSIDIAN_WATCH=false");
         return runtime;
     }
 
@@ -170,5 +176,44 @@ fn endpoint_from_override(raw: &str) -> IpcEndpoint {
     #[cfg(windows)]
     {
         IpcEndpoint::NamedPipe(raw.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn runtime_config(mode: SemanticMode) -> SemanticRuntimeConfig {
+        SemanticRuntimeConfig {
+            mode,
+            semantic_home_override: None,
+            daemon_path_override: None,
+            daemon_endpoint_override: Some("/tmp/semanticd.sock".to_string()),
+            daemon_download_url: None,
+            model_name: "BAAI/bge-small-en-v1.5".to_string(),
+            connect_timeout_ms: 2_000,
+            connect_retries: 2,
+            retry_backoff_ms: 250,
+            prefetch_count: 50,
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_disabled_skips_daemon_initialization() {
+        let config = Config {
+            vault_path: PathBuf::from("/tmp/test-vault"),
+            watch: false,
+            log_level: "error".to_string(),
+            tantivy: true,
+            embeddings: false,
+            embeddings_model: "BAAI/bge-small-en-v1.5".to_string(),
+            hybrid_alpha: 0.25,
+        };
+        let runtime = init_semantic_runtime(&config, &runtime_config(SemanticMode::Daemon)).await;
+        assert!(runtime.daemon_client.is_none());
+        assert_eq!(
+            runtime.daemon_unavailable_reason.as_deref(),
+            Some(DAEMON_DISABLED_BY_WATCH_REASON)
+        );
     }
 }

@@ -1,6 +1,7 @@
 //! IPC server skeleton for `obsidian-semanticd`.
 
 use std::future::Future;
+#[cfg(unix)]
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -177,7 +178,7 @@ async fn run_named_pipe(
     tracing::info!(endpoint = %name, "semantic daemon IPC listening");
 
     loop {
-        let mut next = create_pipe_server(&name)?;
+        let next = create_pipe_server(&name)?;
         tokio::select! {
             _ = &mut shutdown => {
                 tracing::info!("semantic daemon shutdown requested");

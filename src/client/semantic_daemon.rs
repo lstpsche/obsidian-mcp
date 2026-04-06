@@ -265,7 +265,7 @@ impl SemanticDaemonClient {
                 )));
             }
 
-            parse_response(method, &line)
+            parse_response(method, request_id, &line)
         };
 
         match tokio::time::timeout(self.inner.policy.timeout, future).await {
@@ -303,7 +303,7 @@ impl SemanticDaemonClient {
     }
 }
 
-fn parse_response<R>(method: &str, line: &str) -> VaultResult<R>
+fn parse_response<R>(method: &str, request_id: u64, line: &str) -> VaultResult<R>
 where
     R: DeserializeOwned,
 {
@@ -313,13 +313,26 @@ where
         ))
     })?;
 
-    if response
-        .get("jsonrpc")
-        .and_then(Value::as_str)
-        .is_some_and(|version| version != protocol::JSONRPC_VERSION)
-    {
+    let Some(jsonrpc) = response.get("jsonrpc").and_then(Value::as_str) else {
+        return Err(VaultError::DaemonProtocol(format!(
+            "daemon response for '{method}' missing jsonrpc version"
+        )));
+    };
+    if jsonrpc != protocol::JSONRPC_VERSION {
         return Err(VaultError::DaemonProtocol(format!(
             "daemon response for '{method}' had invalid jsonrpc version"
+        )));
+    }
+
+    let expected_id = Value::from(request_id);
+    let Some(response_id) = response.get("id") else {
+        return Err(VaultError::DaemonProtocol(format!(
+            "daemon response for '{method}' missing id"
+        )));
+    };
+    if *response_id != expected_id {
+        return Err(VaultError::DaemonProtocol(format!(
+            "daemon response for '{method}' had mismatched id"
         )));
     }
 
@@ -518,6 +531,81 @@ mod tests {
                 assert!(data.is_some());
             }
             other => panic!("expected daemon RPC error, got: {other:?}"),
+        }
+
+        server.await.expect("server task should complete");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn response_with_mismatched_id_is_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("semanticd.sock");
+        let server = start_unix_server_once(socket_path.clone(), |_request| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": 999,
+                "result": {
+                    "daemon_version": "1.0.1",
+                    "daemon_api_version": 1,
+                    "status": "ok",
+                    "uptime_ms": 10,
+                    "model_name": "BAAI/bge-small-en-v1.5",
+                    "semantic_home": "/tmp/semantic"
+                }
+            })
+        })
+        .await;
+
+        let client = SemanticDaemonClient::new(
+            IpcEndpoint::UnixSocket(socket_path),
+            DaemonConnectPolicy::default(),
+        );
+        let result = client.health("obsidian-mcp-test", "1.0.1").await;
+        match result {
+            Err(VaultError::DaemonProtocol(message)) => {
+                assert!(message.contains("mismatched id"));
+            }
+            other => panic!("expected daemon protocol error, got: {other:?}"),
+        }
+
+        server.await.expect("server task should complete");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn response_missing_jsonrpc_is_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("semanticd.sock");
+        let server = start_unix_server_once(socket_path.clone(), |request| {
+            let id = request
+                .get("id")
+                .cloned()
+                .expect("request id should be present");
+            json!({
+                "id": id,
+                "result": {
+                    "daemon_version": "1.0.1",
+                    "daemon_api_version": 1,
+                    "status": "ok",
+                    "uptime_ms": 10,
+                    "model_name": "BAAI/bge-small-en-v1.5",
+                    "semantic_home": "/tmp/semantic"
+                }
+            })
+        })
+        .await;
+
+        let client = SemanticDaemonClient::new(
+            IpcEndpoint::UnixSocket(socket_path),
+            DaemonConnectPolicy::default(),
+        );
+        let result = client.health("obsidian-mcp-test", "1.0.1").await;
+        match result {
+            Err(VaultError::DaemonProtocol(message)) => {
+                assert!(message.contains("missing jsonrpc version"));
+            }
+            other => panic!("expected daemon protocol error, got: {other:?}"),
         }
 
         server.await.expect("server task should complete");

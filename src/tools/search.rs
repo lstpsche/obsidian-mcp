@@ -180,6 +180,7 @@ pub async fn search_frontmatter(
 
 // ── search_semantic ──────────────────────────────────────────────────
 
+#[cfg(feature = "embeddings")]
 const DEFAULT_PREFETCH_COUNT: usize = 50;
 #[cfg(feature = "embeddings")]
 const SNIPPET_CONTEXT_LEN: usize = 100;
@@ -307,7 +308,7 @@ async fn search_semantic_daemon(
     client.ensure_vault(vault.root(), true, None).await?;
 
     let daemon_result = if lexical_prefetch {
-        let prefetch_count = runtime.prefetch_count.max(DEFAULT_PREFETCH_COUNT);
+        let prefetch_count = runtime.prefetch_count;
         client
             .search_hybrid(
                 vault.root(),
@@ -495,9 +496,20 @@ fn to_semantic_tool_error(err: VaultError) -> rmcp::ErrorData {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    #[cfg(unix)]
+    use std::path::PathBuf;
 
     use super::*;
     use crate::config::Config;
+    #[cfg(unix)]
+    use crate::{
+        client::semantic_daemon::{DaemonConnectPolicy, SemanticDaemonClient},
+        daemon::server::IpcEndpoint,
+    };
+    #[cfg(unix)]
+    use serde_json::json;
+    #[cfg(unix)]
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     fn test_config(vault_root: &Path) -> Config {
         Config {
@@ -521,6 +533,78 @@ mod tests {
             .expect("expected text content")
             .text
             .as_str()
+    }
+
+    #[cfg(unix)]
+    fn start_prefetch_capture_server(socket_path: PathBuf) -> tokio::task::JoinHandle<usize> {
+        tokio::spawn(async move {
+            if socket_path.exists() {
+                let _ = std::fs::remove_file(&socket_path);
+            }
+            let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind unix socket");
+            let mut captured_prefetch = 0usize;
+
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept client");
+                let (reader, mut writer) = tokio::io::split(stream);
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.expect("read request");
+                let request: serde_json::Value =
+                    serde_json::from_str(&line).expect("request should be valid JSON");
+                let id = request
+                    .get("id")
+                    .cloned()
+                    .expect("request should include id");
+                let method = request
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("request should include method");
+
+                let response = match method {
+                    "ensure_vault" => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "vault_id": "test-vault",
+                            "ready": true,
+                            "watch_enabled": true,
+                            "model_name": "BAAI/bge-small-en-v1.5"
+                        }
+                    }),
+                    "search_hybrid" => {
+                        captured_prefetch = request
+                            .get("params")
+                            .and_then(|params| params.get("prefetch"))
+                            .and_then(serde_json::Value::as_u64)
+                            .expect("search_hybrid should include prefetch")
+                            as usize;
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "results": []
+                            }
+                        })
+                    }
+                    other => panic!("unexpected method in daemon test server: {other}"),
+                };
+
+                writer
+                    .write_all(
+                        format!(
+                            "{}\n",
+                            serde_json::to_string(&response).expect("serialize response")
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("write response");
+                writer.flush().await.expect("flush response");
+            }
+
+            captured_prefetch
+        })
     }
 
     async fn setup_search_vault() -> (tempfile::TempDir, Vault) {
@@ -1005,6 +1089,49 @@ mod tests {
                 .unwrap();
         assert!((params.alpha.unwrap() - 0.7).abs() < f32::EPSILON);
         assert_eq!(params.lexical_prefetch, Some(true));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_prefetch_uses_runtime_value_without_forcing_min_50() {
+        let (_dir, vault) = setup_search_vault().await;
+        let socket_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = socket_dir.path().join("semanticd.sock");
+        let server = start_prefetch_capture_server(socket_path.clone());
+
+        let runtime = SemanticRuntime {
+            mode: SemanticMode::Daemon,
+            daemon_client: Some(SemanticDaemonClient::new(
+                IpcEndpoint::UnixSocket(socket_path),
+                DaemonConnectPolicy::default(),
+            )),
+            daemon_unavailable_reason: None,
+            prefetch_count: 7,
+        };
+
+        let result = search_semantic(
+            &vault,
+            SearchSemanticParams {
+                query: "systems language".to_string(),
+                top_k: Some(5),
+                include_content: Some(false),
+                lexical_prefetch: Some(true),
+                alpha: Some(0.25),
+            },
+            0.25,
+            &runtime,
+        )
+        .await
+        .expect("daemon search should succeed");
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(extract_text(&result)).expect("parse result");
+        assert!(parsed.is_empty(), "mock daemon returns empty result set");
+
+        let captured_prefetch = server.await.expect("server join");
+        assert_eq!(
+            captured_prefetch, 7,
+            "runtime prefetch should be used as-is"
+        );
     }
 
     // ── body_preview ────────────────────────────────────────────────

@@ -62,11 +62,16 @@ Grab the latest from [GitHub Releases](https://github.com/lstpsche/obsidian-mcp/
 
 | Platform | Archive |
 |----------|---------|
-| Linux x86_64 | `obsidian-mcp-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux ARM64 | `obsidian-mcp-aarch64-unknown-linux-gnu.tar.gz` |
-| macOS Intel | `obsidian-mcp-x86_64-apple-darwin.tar.gz` |
-| macOS Apple Silicon | `obsidian-mcp-aarch64-apple-darwin.tar.gz` |
-| Windows x86_64 | `obsidian-mcp-x86_64-pc-windows-msvc.zip` |
+| Linux x86_64 | `obsidian-mcp-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux ARM64 | `obsidian-mcp-<version>-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS Intel | `obsidian-mcp-<version>-x86_64-apple-darwin.tar.gz` |
+| macOS Apple Silicon | `obsidian-mcp-<version>-aarch64-apple-darwin.tar.gz` |
+| Windows x86_64 | `obsidian-mcp-<version>-x86_64-pc-windows-msvc.zip` |
+
+Semantic daemon release assets are also published per target:
+
+- `obsidian-semanticd-<version>-<target>.tar.gz` (Unix)
+- `obsidian-semanticd-<version>-<target>.zip` (Windows)
 
 ## Client Setup
 
@@ -132,6 +137,11 @@ Semantic runtime modes:
 - `auto` (default): prefer daemon, fallback to local in-process embeddings when daemon is unavailable and local embeddings are enabled.
 - `daemon`: daemon-only path; semantic calls fail clearly if daemon is unavailable.
 - `local`: force legacy in-process embeddings path.
+
+Daemon startup policy:
+
+- MCP only initializes/starts the daemon when `OBSIDIAN_WATCH=true`.
+- When `OBSIDIAN_WATCH=false`, MCP skips daemon initialization and semantic search must use local mode (if enabled) or returns a clear error.
 
 - Finds notes by **meaning**, not keywords — "making money from software" surfaces notes about monetization
 - **Hybrid mode** — `lexical_prefetch: true` combines BM25 candidate retrieval with semantic re-ranking
@@ -237,7 +247,7 @@ Always available. Full regex syntax for pattern matching across all notes.
 | `OBSIDIAN_SEMANTIC_MODE` | No | `auto` | Semantic backend mode: `auto`, `daemon`, `local` |
 | `OBSIDIAN_SEMANTIC_HOME` | No | OS data-dir default | Shared semantic runtime home for daemon bin/model/cache state |
 | `OBSIDIAN_SEMANTIC_DAEMON_PATH` | No | unset | Override daemon binary path used by bootstrap |
-| `OBSIDIAN_SEMANTIC_DAEMON_DOWNLOAD_URL` | No | GitHub latest release asset URL | Override daemon download URL when binary is missing |
+| `OBSIDIAN_SEMANTIC_DAEMON_DOWNLOAD_URL` | No | `https://github.com/lstpsche/obsidian-mcp/releases/download/v<version>/obsidian-semanticd-<version>-<target>.<ext>` | Override daemon download URL when binary is missing |
 | `OBSIDIAN_SEMANTIC_MODEL` | No | `BAAI/bge-small-en-v1.5` | Default model used by semantic daemon runtime |
 | `OBSIDIAN_SEMANTIC_ENDPOINT` | No | `<semantic-home>/ipc/...` | Daemon-only endpoint override (internal/runtime use) |
 | `OBSIDIAN_SEMANTIC_CONNECT_TIMEOUT_MS` | No | `2000` | Per-call daemon timeout in milliseconds |

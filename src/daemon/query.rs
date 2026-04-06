@@ -141,7 +141,11 @@ pub async fn open_hint(
         ));
     }
 
-    let exists = context.read_note(relative).is_ok();
+    let exists = match context.read_note(relative) {
+        Ok(_) => true,
+        Err(VaultError::NoteNotFound(_)) => false,
+        Err(err) => return Err(map_vault_error(err)),
+    };
     Ok(OpenHintResult {
         path: path_part.to_string(),
         exists,

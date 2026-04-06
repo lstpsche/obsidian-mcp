@@ -55,6 +55,29 @@ mod daemon_integration_tests {
     }
 
     #[tokio::test]
+    async fn open_hint_rejects_path_traversal_with_invalid_params() {
+        let _guard = MODEL_LOCK.lock().await;
+        let server = DaemonTestServer::start(MODEL_NAME).await;
+
+        let vault = create_temp_vault();
+        write_note(vault.path(), "note.md", "# Note\nhello world");
+        server.ensure_vault(vault.path(), false).await;
+
+        let response = server
+            .request_value(
+                "open_hint",
+                json!({
+                    "vault_root": vault.path().display().to_string(),
+                    "path": "../outside.md"
+                }),
+            )
+            .await;
+        assert_eq!(response["error"]["code"], json!(-32602));
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn per_vault_isolation_with_same_note_name() {
         let _guard = MODEL_LOCK.lock().await;
         let server = DaemonTestServer::start(MODEL_NAME).await;

@@ -21,7 +21,7 @@ use super::protocol::{self, DAEMON_API_VERSION, ERR_INCOMPATIBLE_API_VERSION};
 use super::server::IpcEndpoint;
 
 const DEFAULT_DOWNLOAD_BASE_URL: &str =
-    "https://github.com/lstpsche/obsidian-mcp/releases/latest/download";
+    "https://github.com/lstpsche/obsidian-mcp/releases/download";
 
 #[derive(Debug, Clone)]
 pub struct BootstrapConfig {
@@ -195,13 +195,15 @@ fn resolve_download_url(config: &BootstrapConfig) -> VaultResult<String> {
         return Ok(url.trim().to_string());
     }
 
+    let version = env!("CARGO_PKG_VERSION");
+    let tag = format!("v{version}");
     let target = target_triple()?;
     let asset = if cfg!(windows) {
-        format!("obsidian-semanticd-{target}.zip")
+        format!("obsidian-semanticd-{version}-{target}.zip")
     } else {
-        format!("obsidian-semanticd-{target}.tar.gz")
+        format!("obsidian-semanticd-{version}-{target}.tar.gz")
     };
-    Ok(format!("{DEFAULT_DOWNLOAD_BASE_URL}/{asset}"))
+    Ok(format!("{DEFAULT_DOWNLOAD_BASE_URL}/{tag}/{asset}"))
 }
 
 fn target_triple() -> VaultResult<&'static str> {
@@ -351,11 +353,22 @@ fn start_daemon_process(
     endpoint: &IpcEndpoint,
     model_name: &str,
 ) -> VaultResult<tokio::process::Child> {
+    let stderr_log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&paths.daemon_stderr_log_path)
+        .map_err(|err| {
+            VaultError::DaemonBootstrap(format!(
+                "failed to open daemon stderr log file '{}': {err}",
+                paths.daemon_stderr_log_path.display()
+            ))
+        })?;
+
     let mut command = tokio::process::Command::new(binary_path);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(stderr_log))
         .env("OBSIDIAN_SEMANTIC_HOME", &paths.root)
         .env("OBSIDIAN_SEMANTIC_ENDPOINT", endpoint.endpoint_string())
         .env("OBSIDIAN_SEMANTIC_MODEL", model_name)
@@ -571,6 +584,25 @@ mod tests {
         };
         let url = resolve_download_url(&config).expect("download URL should resolve");
         assert_eq!(url, "https://example.com/custom.tar.gz");
+    }
+
+    #[test]
+    fn resolve_download_url_uses_versioned_semanticd_asset_name() {
+        let url = resolve_download_url(&BootstrapConfig::default()).expect("resolve default URL");
+        let version = env!("CARGO_PKG_VERSION");
+        assert!(
+            url.contains(&format!("/releases/download/v{version}/")),
+            "url should target release tag path, got: {url}"
+        );
+        assert!(
+            url.contains(&format!("obsidian-semanticd-{version}-")),
+            "url should include versioned semantic daemon asset, got: {url}"
+        );
+        if cfg!(windows) {
+            assert!(url.ends_with(".zip"), "windows URL should end with .zip");
+        } else {
+            assert!(url.ends_with(".tar.gz"), "unix URL should end with .tar.gz");
+        }
     }
 
     #[test]

@@ -17,6 +17,8 @@ pub struct SemanticHomePaths {
     pub manifest_path: PathBuf,
     pub lock_dir: PathBuf,
     pub install_lock_path: PathBuf,
+    pub logs_dir: PathBuf,
+    pub daemon_stderr_log_path: PathBuf,
     pub bin_dir: PathBuf,
     pub daemon_binary_path: PathBuf,
     pub model_dir: PathBuf,
@@ -28,17 +30,20 @@ pub struct SemanticHomePaths {
 impl SemanticHomePaths {
     pub fn new(root: PathBuf) -> Self {
         let lock_dir = root.join("lock");
+        let logs_dir = root.join("logs");
         let bin_dir = root.join("bin");
         let model_dir = root.join("model");
         Self {
             manifest_path: root.join("manifest.json"),
             install_lock_path: lock_dir.join("install.lock"),
+            daemon_stderr_log_path: logs_dir.join("obsidian-semanticd.stderr.log"),
             daemon_binary_path: bin_dir.join(daemon_binary_name()),
             fastembed_cache_dir: model_dir.join("fastembed-cache"),
             ipc_dir: root.join("ipc"),
             vaults_dir: root.join("vaults"),
             root,
             lock_dir,
+            logs_dir,
             bin_dir,
             model_dir,
         }
@@ -87,6 +92,7 @@ pub fn semantic_home_paths(semantic_home: &Path) -> SemanticHomePaths {
 pub fn ensure_home_layout(paths: &SemanticHomePaths) -> VaultResult<()> {
     std::fs::create_dir_all(&paths.root)?;
     std::fs::create_dir_all(&paths.lock_dir)?;
+    std::fs::create_dir_all(&paths.logs_dir)?;
     std::fs::create_dir_all(&paths.bin_dir)?;
     std::fs::create_dir_all(&paths.model_dir)?;
     std::fs::create_dir_all(&paths.fastembed_cache_dir)?;
@@ -154,12 +160,28 @@ impl InstallLock {
 
         match file.try_lock_exclusive() {
             Ok(()) => Ok(Some(Self { file })),
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(err) if is_lock_contention(&err) => Ok(None),
             Err(err) => Err(VaultError::DaemonBootstrap(format!(
                 "failed to acquire install lock '{}': {err}",
                 paths.install_lock_path.display()
             ))),
         }
+    }
+}
+
+fn is_lock_contention(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        // Windows can report lock conflicts as sharing/lock-violation OS codes.
+        matches!(err.raw_os_error(), Some(32 | 33))
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 

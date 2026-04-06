@@ -58,24 +58,28 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          ARCHIVE="obsidian-mcp-${VERSION}-${{ matrix.target }}.tar.gz"
-          tar -czf "$ARCHIVE" -C target/${{ matrix.target }}/release obsidian-mcp
-          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+          MCP_ARCHIVE="obsidian-mcp-${VERSION}-${{ matrix.target }}.tar.gz"
+          DAEMON_ARCHIVE="obsidian-semanticd-${VERSION}-${{ matrix.target }}.tar.gz"
+          tar -czf "$MCP_ARCHIVE" -C target/${{ matrix.target }}/release obsidian-mcp
+          tar -czf "$DAEMON_ARCHIVE" -C target/${{ matrix.target }}/release obsidian-semanticd
 
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $VERSION = "$env:GITHUB_REF_NAME" -replace '^v', ''
-          $ARCHIVE = "obsidian-mcp-${VERSION}-${{ matrix.target }}.zip"
-          Compress-Archive -Path "target/${{ matrix.target }}/release/obsidian-mcp.exe" -DestinationPath $ARCHIVE
-          echo "ARCHIVE=$ARCHIVE" >> $env:GITHUB_ENV
+          $MCP_ARCHIVE = "obsidian-mcp-${VERSION}-${{ matrix.target }}.zip"
+          $DAEMON_ARCHIVE = "obsidian-semanticd-${VERSION}-${{ matrix.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/obsidian-mcp.exe" -DestinationPath $MCP_ARCHIVE
+          Compress-Archive -Path "target/${{ matrix.target }}/release/obsidian-semanticd.exe" -DestinationPath $DAEMON_ARCHIVE
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
-          path: ${{ env.ARCHIVE }}
+          path: |
+            obsidian-mcp-*-${{ matrix.target }}.*
+            obsidian-semanticd-*-${{ matrix.target }}.*
 
   release:
     name: GitHub Release

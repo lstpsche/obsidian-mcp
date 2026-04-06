@@ -17,7 +17,7 @@ obsidian-mcp client -----------> obsidian-semanticd
                                  - model lifecycle (fastembed)
                                  - per-vault indexing state
                                  - semantic/hybrid query API
-                                 - watcher ownership (future tasks)
+                                 - watcher ownership (enabled)
 ```
 
 ## Shared Home Layout
@@ -37,6 +37,8 @@ Layout:
   manifest.json
   lock/
     install.lock
+  logs/
+    obsidian-semanticd.stderr.log
   bin/
     obsidian-semanticd[.exe]
   model/
@@ -95,6 +97,7 @@ Rules:
 - Never spawn duplicate daemon when a healthy daemon already exists.
 - Manifest is the authority for endpoint/binary metadata after successful handshake.
 - Model download remains daemon-owned and lazy at runtime; bootstrap only ensures daemon availability.
+- MCP initializes daemon runtime only when `OBSIDIAN_WATCH=true`; with watch disabled, daemon startup is skipped.
 
 ## Contract Documents
 
