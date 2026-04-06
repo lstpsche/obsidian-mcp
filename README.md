@@ -48,13 +48,13 @@ All indices (metadata, BM25, embeddings) update in real time via a filesystem wa
 cargo install obsidian-mcp
 ```
 
-For **semantic search** (local embeddings, hybrid re-ranking):
+For **semantic search local compatibility mode** (`OBSIDIAN_SEMANTIC_MODE=local`), build with embeddings:
 
 ```sh
 cargo install obsidian-mcp --features embeddings
 ```
 
-The `embeddings` feature adds ~60 MB to the binary (ONNX Runtime). The default model (`BAAI/bge-small-en-v1.5`, 384-dim) downloads automatically on first run and caches in `.fastembed_cache/`.
+The `embeddings` feature adds ~60 MB to the binary (ONNX Runtime). In daemon mode, model/runtime cache is shared under semantic home; local mode keeps in-process embedding support in the MCP binary.
 
 ### Pre-built binaries
 
@@ -125,12 +125,18 @@ On by default. Powered by [Tantivy](https://github.com/quickwit-oss/tantivy), re
 
 ### Semantic — `search_semantic`
 
-Opt-in (`--features embeddings` + `OBSIDIAN_EMBEDDINGS=true`). Uses a local ONNX model to embed notes and queries into vectors, then ranks by cosine similarity. No API calls — everything runs on your machine.
+Uses the shared local semantic daemon by default (`OBSIDIAN_SEMANTIC_MODE=auto`). Results keep the same MCP schema while backend execution can run through daemon or local compatibility mode.
+
+Semantic runtime modes:
+
+- `auto` (default): prefer daemon, fallback to local in-process embeddings when daemon is unavailable and local embeddings are enabled.
+- `daemon`: daemon-only path; semantic calls fail clearly if daemon is unavailable.
+- `local`: force legacy in-process embeddings path.
 
 - Finds notes by **meaning**, not keywords — "making money from software" surfaces notes about monetization
 - **Hybrid mode** — `lexical_prefetch: true` combines BM25 candidate retrieval with semantic re-ranking
 - **Tunable blending** — `alpha` controls the weight between lexical and semantic scores (default 0.25)
-- Embeddings cached to disk; incremental updates on note changes
+- Daemon cache migration is one-way and non-destructive: legacy `.obsidian/obsidian-mcp/embeddings.bin` is copied into daemon namespace store when available, and never deleted automatically
 
 ### Regex — `search_regex`
 
@@ -228,11 +234,18 @@ Always available. Full regex syntax for pattern matching across all notes.
 | `OBSIDIAN_TANTIVY` | No | `true` | BM25 full-text index |
 | `OBSIDIAN_EMBEDDINGS` | No | `false` | Semantic embedding search (requires `embeddings` feature) |
 | `OBSIDIAN_EMBEDDINGS_MODEL` | No | `BAAI/bge-small-en-v1.5` | HuggingFace model for embeddings |
+| `OBSIDIAN_SEMANTIC_MODE` | No | `auto` | Semantic backend mode: `auto`, `daemon`, `local` |
 | `OBSIDIAN_SEMANTIC_HOME` | No | OS data-dir default | Shared semantic runtime home for daemon bin/model/cache state |
 | `OBSIDIAN_SEMANTIC_DAEMON_PATH` | No | unset | Override daemon binary path used by bootstrap |
 | `OBSIDIAN_SEMANTIC_DAEMON_DOWNLOAD_URL` | No | GitHub latest release asset URL | Override daemon download URL when binary is missing |
 | `OBSIDIAN_SEMANTIC_MODEL` | No | `BAAI/bge-small-en-v1.5` | Default model used by semantic daemon runtime |
 | `OBSIDIAN_SEMANTIC_ENDPOINT` | No | `<semantic-home>/ipc/...` | Daemon-only endpoint override (internal/runtime use) |
+| `OBSIDIAN_SEMANTIC_CONNECT_TIMEOUT_MS` | No | `2000` | Per-call daemon timeout in milliseconds |
+| `OBSIDIAN_SEMANTIC_CONNECT_RETRIES` | No | `2` | Daemon retry attempts after the first failed call |
+| `OBSIDIAN_SEMANTIC_RETRY_BACKOFF_MS` | No | `250` | Base retry backoff in milliseconds |
+| `OBSIDIAN_SEMANTIC_PREFETCH` | No | `50` | Default lexical prefetch candidate count for hybrid daemon queries |
+| `OBSIDIAN_SEMANTIC_ALPHA` | No | `0.25` | Default hybrid blend weight (`alpha * BM25 + (1-alpha) * semantic`) |
+| `OBSIDIAN_HYBRID_ALPHA` | No | alias | Backward-compatible alias for `OBSIDIAN_SEMANTIC_ALPHA` |
 | `FASTEMBED_CACHE_DIR` | No | `<semantic-home>/model/fastembed-cache` | Daemon-internal shared fastembed cache root |
 
 \* Also accepted as the first CLI argument: `obsidian-mcp /path/to/vault`

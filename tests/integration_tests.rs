@@ -5,6 +5,9 @@ use obsidian_mcp::config::Config;
 use obsidian_mcp::models::{NotePeriod, PatchOperation, PatchRequest, PatchTargetType};
 use obsidian_mcp::vault::Vault;
 
+#[cfg(all(unix, feature = "embeddings"))]
+mod common;
+
 fn fixture_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -829,5 +832,180 @@ mod vault_semantic_search {
             results.iter().any(|(p, _)| p == Path::new("quantum.md")),
             "newly written note should appear in hybrid search"
         );
+    }
+}
+
+#[cfg(all(unix, feature = "embeddings"))]
+mod semantic_tool_runtime_modes {
+    use super::*;
+    use std::sync::LazyLock;
+
+    use obsidian_mcp::client::semantic_daemon::{DaemonConnectPolicy, SemanticDaemonClient};
+    use obsidian_mcp::config::SemanticMode;
+    use obsidian_mcp::daemon::server::IpcEndpoint;
+    use obsidian_mcp::tools::SemanticRuntime;
+    use obsidian_mcp::tools::search::{SearchSemanticParams, search_semantic};
+    use rmcp::model::ErrorCode;
+
+    use crate::common::daemon_test_utils::{DaemonTestServer, create_temp_vault, write_note};
+
+    static MODEL_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
+    const MODEL_NAME: &str = "BAAI/bge-small-en-v1.5";
+
+    fn semantic_tool_config(vault_root: &Path, embeddings: bool) -> Config {
+        Config {
+            vault_path: vault_root.to_path_buf(),
+            watch: false,
+            log_level: "error".into(),
+            tantivy: false,
+            embeddings,
+            embeddings_model: MODEL_NAME.to_string(),
+            hybrid_alpha: 0.25,
+        }
+    }
+
+    fn extract_text(result: &rmcp::model::CallToolResult) -> &str {
+        result.content[0]
+            .as_text()
+            .expect("expected text content")
+            .text
+            .as_str()
+    }
+
+    #[tokio::test]
+    async fn daemon_mode_preserves_semantic_result_schema() {
+        let _guard = MODEL_LOCK.lock().await;
+        let server = DaemonTestServer::start(MODEL_NAME).await;
+
+        let vault_dir = create_temp_vault();
+        write_note(
+            vault_dir.path(),
+            "semantic.md",
+            "# Semantic\nRust ownership and memory safety for systems programming.",
+        );
+        let vault = Vault::open(&semantic_tool_config(vault_dir.path(), false))
+            .await
+            .expect("open vault");
+
+        let runtime = SemanticRuntime {
+            mode: SemanticMode::Daemon,
+            daemon_client: Some(SemanticDaemonClient::new(
+                IpcEndpoint::UnixSocket(server.endpoint_path().to_path_buf()),
+                DaemonConnectPolicy::default(),
+            )),
+            daemon_unavailable_reason: None,
+            prefetch_count: 50,
+        };
+
+        let result = search_semantic(
+            &vault,
+            SearchSemanticParams {
+                query: "memory safe systems".to_string(),
+                top_k: Some(5),
+                include_content: Some(false),
+                lexical_prefetch: Some(false),
+                alpha: None,
+            },
+            0.25,
+            &runtime,
+        )
+        .await
+        .expect("daemon semantic search should succeed");
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(extract_text(&result)).expect("parse semantic result");
+
+        assert!(!parsed.is_empty());
+        let first = &parsed[0];
+        assert!(first.get("path").is_some(), "path field should exist");
+        assert!(first.get("title").is_some(), "title field should exist");
+        assert!(first.get("score").is_some(), "score field should exist");
+        assert!(first.get("tags").is_some(), "tags field should exist");
+        assert!(
+            first.get("subpath").is_none(),
+            "MCP response should keep legacy schema (no subpath field)"
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn auto_mode_falls_back_to_local_backend_when_daemon_unavailable() {
+        let _guard = MODEL_LOCK.lock().await;
+        let vault_dir = create_temp_vault();
+        let vault = Vault::open(&semantic_tool_config(vault_dir.path(), true))
+            .await
+            .expect("open vault");
+        vault
+            .write_note(
+                Path::new("local.md"),
+                "# Local\nOwnership and borrow checker for memory safety.",
+            )
+            .expect("write local note");
+
+        let runtime = SemanticRuntime {
+            mode: SemanticMode::Auto,
+            daemon_client: None,
+            daemon_unavailable_reason: Some("daemon socket unavailable".to_string()),
+            prefetch_count: 50,
+        };
+
+        let result = search_semantic(
+            &vault,
+            SearchSemanticParams {
+                query: "memory safety".to_string(),
+                top_k: Some(5),
+                include_content: Some(false),
+                lexical_prefetch: Some(false),
+                alpha: None,
+            },
+            0.25,
+            &runtime,
+        )
+        .await
+        .expect("auto mode should fall back to local backend");
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(extract_text(&result)).expect("parse semantic result");
+        assert!(!parsed.is_empty());
+        assert!(
+            parsed.iter().any(|entry| {
+                entry
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|path| path == "local.md")
+            }),
+            "local backend result should include local.md"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_mode_without_client_returns_invalid_request_error() {
+        let vault_dir = create_temp_vault();
+        let vault = Vault::open(&semantic_tool_config(vault_dir.path(), false))
+            .await
+            .expect("open vault");
+
+        let runtime = SemanticRuntime {
+            mode: SemanticMode::Daemon,
+            daemon_client: None,
+            daemon_unavailable_reason: Some("not connected".to_string()),
+            prefetch_count: 50,
+        };
+
+        let result = search_semantic(
+            &vault,
+            SearchSemanticParams {
+                query: "anything".to_string(),
+                top_k: Some(3),
+                include_content: Some(false),
+                lexical_prefetch: Some(false),
+                alpha: None,
+            },
+            0.25,
+            &runtime,
+        )
+        .await;
+        let err = result.expect_err("daemon mode should fail without daemon client");
+        assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
     }
 }

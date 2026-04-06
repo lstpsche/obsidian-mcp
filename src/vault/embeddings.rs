@@ -222,6 +222,41 @@ impl EmbeddingModel {
 
 const MAX_BODY_WORDS: usize = 400;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacyCacheMigration {
+    NotFound,
+    AlreadyPresent(PathBuf),
+    Migrated(PathBuf),
+}
+
+pub fn migrate_legacy_cache_to_daemon_store(
+    vault_root: &Path,
+    semantic_home: &Path,
+) -> VaultResult<LegacyCacheMigration> {
+    let source = vault_root
+        .join(".obsidian")
+        .join("obsidian-mcp")
+        .join("embeddings.bin");
+    if !source.is_file() {
+        return Ok(LegacyCacheMigration::NotFound);
+    }
+
+    let vault_id = crate::daemon::home::compute_vault_id(vault_root)?;
+    let target = semantic_home
+        .join("vaults")
+        .join(vault_id)
+        .join("embeddings.bin");
+    if target.exists() {
+        return Ok(LegacyCacheMigration::AlreadyPresent(target));
+    }
+
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(&source, &target)?;
+    Ok(LegacyCacheMigration::Migrated(target))
+}
+
 /// Prepare text for embedding from note components.
 ///
 /// Format: `"{title}\n{headings joined with " | "}\n{body truncated to 400 words}"`.
@@ -419,5 +454,49 @@ mod tests {
         let body = "Short body with a few words.";
         let result = prepare_embed_text("T", &[], body);
         assert!(result.contains(body));
+    }
+
+    #[test]
+    fn migrate_legacy_cache_copies_once_and_keeps_source() {
+        let vault_root = tempfile::tempdir().expect("temp vault root");
+        let semantic_home = tempfile::tempdir().expect("temp semantic home");
+        std::fs::create_dir_all(vault_root.path().join(".obsidian")).expect("create .obsidian");
+
+        let source = vault_root
+            .path()
+            .join(".obsidian")
+            .join("obsidian-mcp")
+            .join("embeddings.bin");
+        std::fs::create_dir_all(source.parent().expect("source parent"))
+            .expect("create source dir");
+        std::fs::write(&source, b"legacy-cache-bytes").expect("write legacy cache");
+
+        let first = migrate_legacy_cache_to_daemon_store(vault_root.path(), semantic_home.path())
+            .expect("first migration should succeed");
+        let migrated_path = match first {
+            LegacyCacheMigration::Migrated(path) => path,
+            other => panic!("expected migrated outcome, got: {other:?}"),
+        };
+        assert!(source.exists(), "source cache should not be deleted");
+        assert!(migrated_path.exists(), "target cache should be created");
+        assert_eq!(
+            std::fs::read(&source).expect("read source bytes"),
+            std::fs::read(&migrated_path).expect("read target bytes")
+        );
+
+        let second = migrate_legacy_cache_to_daemon_store(vault_root.path(), semantic_home.path())
+            .expect("second migration should succeed");
+        assert_eq!(second, LegacyCacheMigration::AlreadyPresent(migrated_path));
+    }
+
+    #[test]
+    fn migrate_legacy_cache_without_source_is_noop() {
+        let vault_root = tempfile::tempdir().expect("temp vault root");
+        let semantic_home = tempfile::tempdir().expect("temp semantic home");
+        std::fs::create_dir_all(vault_root.path().join(".obsidian")).expect("create .obsidian");
+
+        let outcome = migrate_legacy_cache_to_daemon_store(vault_root.path(), semantic_home.path())
+            .expect("migration should succeed");
+        assert_eq!(outcome, LegacyCacheMigration::NotFound);
     }
 }

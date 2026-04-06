@@ -13,21 +13,33 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ErrorData, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 
+use crate::client::semantic_daemon::SemanticDaemonClient;
+use crate::config::SemanticMode;
 use crate::vault::Vault;
+
+#[derive(Clone)]
+pub struct SemanticRuntime {
+    pub mode: SemanticMode,
+    pub daemon_client: Option<SemanticDaemonClient>,
+    pub daemon_unavailable_reason: Option<String>,
+    pub prefetch_count: usize,
+}
 
 pub struct ObsidianMcp {
     vault: Vault,
     hybrid_alpha: f32,
+    semantic_runtime: SemanticRuntime,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl ObsidianMcp {
-    pub fn new(vault: Vault, hybrid_alpha: f32) -> Self {
+    pub fn new(vault: Vault, hybrid_alpha: f32, semantic_runtime: SemanticRuntime) -> Self {
         Self {
             tool_router: Self::tool_router(),
             vault,
             hybrid_alpha,
+            semantic_runtime,
         }
     }
 
@@ -193,13 +205,19 @@ impl ObsidianMcp {
 
     #[tool(
         name = "search_semantic",
-        description = "Semantic search using local embeddings. Finds conceptually related notes without requiring exact keyword matches. Requires OBSIDIAN_EMBEDDINGS=true and the embeddings build feature."
+        description = "Semantic search using daemon-backed runtime (preferred) with local compatibility fallback based on OBSIDIAN_SEMANTIC_MODE. Finds conceptually related notes without requiring exact keyword matches."
     )]
     async fn search_semantic(
         &self,
         Parameters(params): Parameters<search::SearchSemanticParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        search::search_semantic(&self.vault, params, self.hybrid_alpha).await
+        search::search_semantic(
+            &self.vault,
+            params,
+            self.hybrid_alpha,
+            &self.semantic_runtime,
+        )
+        .await
     }
 
     // ── Metadata ────────────────────────────────────────────────────

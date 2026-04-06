@@ -4,9 +4,13 @@ use rmcp::model::{CallToolResult, Content, ErrorCode};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use crate::config::SemanticMode;
+use crate::daemon::protocol;
 use crate::error::VaultError;
 use crate::models::SearchField;
 use crate::vault::Vault;
+
+use super::SemanticRuntime;
 
 // ── search_text ─────────────────────────────────────────────────────
 
@@ -176,7 +180,6 @@ pub async fn search_frontmatter(
 
 // ── search_semantic ──────────────────────────────────────────────────
 
-#[cfg(feature = "embeddings")]
 const DEFAULT_PREFETCH_COUNT: usize = 50;
 #[cfg(feature = "embeddings")]
 const SNIPPET_CONTEXT_LEN: usize = 100;
@@ -207,7 +210,6 @@ pub struct SearchSemanticParams {
     pub alpha: Option<f32>,
 }
 
-#[cfg(feature = "embeddings")]
 #[derive(serde::Serialize, JsonSchema)]
 struct SemanticSearchResult {
     path: std::path::PathBuf,
@@ -220,43 +222,145 @@ struct SemanticSearchResult {
     content: Option<String>,
 }
 
-#[cfg(feature = "embeddings")]
 pub async fn search_semantic(
     vault: &Vault,
     params: SearchSemanticParams,
     default_alpha: f32,
+    runtime: &SemanticRuntime,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    if !vault.has_embeddings() {
-        return Err(rmcp::ErrorData::new(
-            ErrorCode::INVALID_REQUEST,
-            "Embeddings are not enabled. Set OBSIDIAN_EMBEDDINGS=true and build with --features embeddings.",
-            None::<serde_json::Value>,
-        ));
-    }
-
     let top_k = params.top_k.unwrap_or(10);
     let include_content = params.include_content.unwrap_or(false);
     let lexical_prefetch = params.lexical_prefetch.unwrap_or(false);
     let alpha = params.alpha.unwrap_or(default_alpha).clamp(0.0, 1.0);
 
-    let hits = if lexical_prefetch {
-        vault.search_hybrid(&params.query, top_k, DEFAULT_PREFETCH_COUNT, alpha)?
+    let results = match runtime.mode {
+        SemanticMode::Daemon => {
+            search_semantic_daemon(
+                vault,
+                &params,
+                top_k,
+                include_content,
+                lexical_prefetch,
+                alpha,
+                runtime,
+            )
+            .await
+        }
+        SemanticMode::Local => search_semantic_local(
+            vault,
+            &params.query,
+            top_k,
+            include_content,
+            lexical_prefetch,
+            alpha,
+        ),
+        SemanticMode::Auto => match search_semantic_daemon(
+            vault,
+            &params,
+            top_k,
+            include_content,
+            lexical_prefetch,
+            alpha,
+            runtime,
+        )
+        .await
+        {
+            Ok(results) => Ok(results),
+            Err(err) if local_backend_available(vault) && should_fallback_to_local(&err) => {
+                tracing::warn!(error = %err, "semantic daemon unavailable in auto mode; falling back to local embeddings backend");
+                search_semantic_local(
+                    vault,
+                    &params.query,
+                    top_k,
+                    include_content,
+                    lexical_prefetch,
+                    alpha,
+                )
+            }
+            Err(err) => Err(err),
+        },
+    }
+    .map_err(to_semantic_tool_error)?;
+
+    let json = serde_json::to_string_pretty(&results)
+        .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
+    Ok(CallToolResult::success(vec![Content::text(json)]))
+}
+
+async fn search_semantic_daemon(
+    vault: &Vault,
+    params: &SearchSemanticParams,
+    top_k: usize,
+    include_content: bool,
+    lexical_prefetch: bool,
+    alpha: f32,
+    runtime: &SemanticRuntime,
+) -> Result<Vec<SemanticSearchResult>, VaultError> {
+    let Some(client) = runtime.daemon_client.as_ref() else {
+        let reason = runtime
+            .daemon_unavailable_reason
+            .as_deref()
+            .unwrap_or("semantic daemon client is not initialized");
+        return Err(VaultError::DaemonUnavailable(reason.to_string()));
+    };
+
+    client.ensure_vault(vault.root(), true, None).await?;
+
+    let daemon_result = if lexical_prefetch {
+        let prefetch_count = runtime.prefetch_count.max(DEFAULT_PREFETCH_COUNT);
+        client
+            .search_hybrid(
+                vault.root(),
+                &params.query,
+                top_k,
+                prefetch_count,
+                alpha,
+                include_content,
+            )
+            .await?
     } else {
-        vault.search_semantic(&params.query, top_k)?
+        client
+            .search_semantic(vault.root(), &params.query, top_k, include_content)
+            .await?
+    };
+
+    Ok(daemon_result
+        .results
+        .into_iter()
+        .map(|hit| SemanticSearchResult {
+            path: std::path::PathBuf::from(hit.path),
+            title: hit.title,
+            score: hit.score,
+            tags: hit.tags,
+            snippet: hit.snippet,
+            content: hit.content,
+        })
+        .collect())
+}
+
+#[cfg(feature = "embeddings")]
+fn search_semantic_local(
+    vault: &Vault,
+    query: &str,
+    top_k: usize,
+    include_content: bool,
+    lexical_prefetch: bool,
+    alpha: f32,
+) -> Result<Vec<SemanticSearchResult>, VaultError> {
+    if !vault.has_embeddings() {
+        return Err(VaultError::Embedding(
+            "Embeddings are not enabled. Set OBSIDIAN_EMBEDDINGS=true and build with --features embeddings.".to_string(),
+        ));
+    }
+
+    let hits = if lexical_prefetch {
+        vault.search_hybrid(query, top_k, DEFAULT_PREFETCH_COUNT, alpha)?
+    } else {
+        vault.search_semantic(query, top_k)?
     };
 
     let word_re = if !include_content {
-        let pattern: String = params
-            .query
-            .split_whitespace()
-            .map(regex::escape)
-            .collect::<Vec<_>>()
-            .join("|");
-        if pattern.is_empty() {
-            None
-        } else {
-            regex::Regex::new(&format!("(?i){pattern}")).ok()
-        }
+        compile_query_word_regex(query)
     } else {
         None
     };
@@ -271,16 +375,16 @@ pub async fn search_semantic(
             (vault.read_note(&path).ok(), None)
         } else {
             let snip = vault.read_note(&path).ok().map(|text| {
-                if let Some(ref re) = word_re {
-                    if let Some(m) = re.find(&text) {
-                        let (ctx, _, _, _) = crate::vault::index::extract_match_context(
-                            &text,
-                            m.start(),
-                            m.end(),
-                            SNIPPET_CONTEXT_LEN,
-                        );
-                        return ctx;
-                    }
+                if let Some(ref re) = word_re
+                    && let Some(found) = re.find(&text)
+                {
+                    let (ctx, _, _, _) = crate::vault::index::extract_match_context(
+                        &text,
+                        found.start(),
+                        found.end(),
+                        SNIPPET_CONTEXT_LEN,
+                    );
+                    return ctx;
                 }
                 body_preview(&text, SNIPPET_FALLBACK_CHARS)
             });
@@ -297,9 +401,21 @@ pub async fn search_semantic(
         });
     }
 
-    let json = serde_json::to_string_pretty(&results)
-        .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
-    Ok(CallToolResult::success(vec![Content::text(json)]))
+    Ok(results)
+}
+
+#[cfg(not(feature = "embeddings"))]
+fn search_semantic_local(
+    _vault: &Vault,
+    _query: &str,
+    _top_k: usize,
+    _include_content: bool,
+    _lexical_prefetch: bool,
+    _alpha: f32,
+) -> Result<Vec<SemanticSearchResult>, VaultError> {
+    Err(VaultError::Embedding(
+        "Semantic search is not available. This binary was compiled without the 'embeddings' feature. Rebuild with: cargo build --features embeddings".to_string(),
+    ))
 }
 
 #[cfg(feature = "embeddings")]
@@ -319,17 +435,59 @@ fn body_preview(content: &str, max_chars: usize) -> String {
     body.chars().take(max_chars).collect()
 }
 
-#[cfg(not(feature = "embeddings"))]
-pub async fn search_semantic(
-    _vault: &Vault,
-    _params: SearchSemanticParams,
-    _default_alpha: f32,
-) -> Result<CallToolResult, rmcp::ErrorData> {
-    Err(rmcp::ErrorData::new(
-        ErrorCode::INVALID_REQUEST,
-        "Semantic search is not available. This binary was compiled without the 'embeddings' feature. Rebuild with: cargo build --features embeddings",
-        None::<serde_json::Value>,
-    ))
+#[cfg(feature = "embeddings")]
+fn compile_query_word_regex(query: &str) -> Option<regex::Regex> {
+    let pattern: String = query
+        .split_whitespace()
+        .map(regex::escape)
+        .collect::<Vec<_>>()
+        .join("|");
+    if pattern.is_empty() {
+        None
+    } else {
+        regex::Regex::new(&format!("(?i){pattern}")).ok()
+    }
+}
+
+fn local_backend_available(vault: &Vault) -> bool {
+    #[cfg(feature = "embeddings")]
+    {
+        vault.has_embeddings()
+    }
+    #[cfg(not(feature = "embeddings"))]
+    {
+        let _ = vault;
+        false
+    }
+}
+
+fn should_fallback_to_local(err: &VaultError) -> bool {
+    match err {
+        VaultError::DaemonUnavailable(_)
+        | VaultError::DaemonIpc(_)
+        | VaultError::DaemonTimeout { .. }
+        | VaultError::DaemonBootstrap(_) => true,
+        VaultError::DaemonRpc { code, .. } => matches!(
+            *code,
+            protocol::ERR_DAEMON_UNAVAILABLE
+                | protocol::ERR_BOOTSTRAP_REQUIRED
+                | protocol::ERR_VAULT_NOT_READY
+                | protocol::ERR_INCOMPATIBLE_API_VERSION
+        ),
+        _ => false,
+    }
+}
+
+fn to_semantic_tool_error(err: VaultError) -> rmcp::ErrorData {
+    if matches!(err, VaultError::Embedding(_)) {
+        rmcp::ErrorData::new(
+            ErrorCode::INVALID_REQUEST,
+            err.to_string(),
+            None::<serde_json::Value>,
+        )
+    } else {
+        err.into()
+    }
 }
 
 // ── tests ───────────────────────────────────────────────────────────

@@ -4,3 +4,4 @@ AGENTS.md
 target/
 .DS_Store
 .cursor/
+tmp/

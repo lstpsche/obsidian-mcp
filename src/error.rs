@@ -58,6 +58,19 @@ pub enum VaultError {
     #[error("Daemon protocol error: {0}")]
     DaemonProtocol(String),
 
+    #[error("Daemon unavailable: {0}")]
+    DaemonUnavailable(String),
+
+    #[error("Daemon RPC error ({code}): {message}")]
+    DaemonRpc {
+        code: i64,
+        message: String,
+        data: Option<serde_json::Value>,
+    },
+
+    #[error("Daemon request timed out after {timeout_ms}ms: {operation}")]
+    DaemonTimeout { operation: String, timeout_ms: u64 },
+
     #[error("Daemon bootstrap error: {0}")]
     DaemonBootstrap(String),
 
@@ -85,10 +98,21 @@ impl From<VaultError> for rmcp::ErrorData {
             | VaultError::Embedding(_)
             | VaultError::DaemonIpc(_)
             | VaultError::DaemonProtocol(_)
+            | VaultError::DaemonTimeout { .. }
             | VaultError::DaemonBootstrap(_)
             | VaultError::Other(_) => ErrorCode::INTERNAL_ERROR,
+            VaultError::DaemonUnavailable(_) => ErrorCode::INVALID_REQUEST,
+            VaultError::DaemonRpc { code, .. } => match *code {
+                -32700 => ErrorCode::PARSE_ERROR,
+                -32602 => ErrorCode::INVALID_PARAMS,
+                -32600 | -32601 | -32010 | -32020 | -32030 | -32040 => ErrorCode::INVALID_REQUEST,
+                _ => ErrorCode::INTERNAL_ERROR,
+            },
         };
-
-        rmcp::ErrorData::new(code, err.to_string(), None)
+        let data = match &err {
+            VaultError::DaemonRpc { data, .. } => data.clone(),
+            _ => None,
+        };
+        rmcp::ErrorData::new(code, err.to_string(), data)
     }
 }
