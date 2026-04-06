@@ -7,6 +7,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -19,11 +20,13 @@ use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use crate::error::{VaultError, VaultResult};
 
 use super::protocol::{
-    self, DAEMON_API_VERSION, ERR_BOOTSTRAP_REQUIRED, ERR_INCOMPATIBLE_API_VERSION,
-    ERR_INVALID_PARAMS, ERR_INVALID_REQUEST, ERR_METHOD_NOT_FOUND, ERR_PARSE, EnsureVaultParams,
-    HealthParams, HealthResult, JSONRPC_VERSION, OpenHintParams, RpcRequest, RpcResponse,
-    SearchHybridParams, SearchSemanticParams,
+    self, DAEMON_API_VERSION, ERR_INCOMPATIBLE_API_VERSION, ERR_INVALID_PARAMS,
+    ERR_INVALID_REQUEST, ERR_METHOD_NOT_FOUND, ERR_PARSE, EnsureVaultParams, HealthParams,
+    HealthResult, JSONRPC_VERSION, OpenHintParams, RpcRequest, RpcResponse, SearchHybridParams,
+    SearchSemanticParams,
 };
+use super::query;
+use super::vault_registry::VaultRegistry;
 
 type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -53,21 +56,22 @@ impl IpcEndpoint {
     }
 }
 
-#[derive(Debug)]
 struct ServerState {
     daemon_version: String,
     model_name: String,
     semantic_home: PathBuf,
     started_at: Instant,
+    registry: Arc<VaultRegistry>,
 }
 
 impl ServerState {
-    fn new(model_name: String, semantic_home: PathBuf) -> Self {
+    fn new(model_name: String, semantic_home: PathBuf, registry: Arc<VaultRegistry>) -> Self {
         Self {
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             model_name,
             semantic_home,
             started_at: Instant::now(),
+            registry,
         }
     }
 }
@@ -87,7 +91,15 @@ pub async fn run_with_shutdown<F>(config: DaemonServerConfig, shutdown: F) -> Va
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let state = Arc::new(ServerState::new(config.model_name, config.semantic_home));
+    let registry = Arc::new(VaultRegistry::new(
+        config.semantic_home.clone(),
+        config.model_name.clone(),
+    )?);
+    let state = Arc::new(ServerState::new(
+        config.model_name,
+        config.semantic_home,
+        registry,
+    ));
     let shutdown: ShutdownSignal = Box::pin(shutdown);
 
     match config.endpoint {
@@ -211,7 +223,7 @@ where
         }
 
         let response = match serde_json::from_str::<RpcRequest>(&line) {
-            Ok(request) => route_request(request, &state),
+            Ok(request) => route_request(request, Arc::clone(&state)).await,
             Err(err) => RpcResponse::error(None, ERR_PARSE, format!("parse error: {err}")),
         };
 
@@ -234,7 +246,7 @@ where
     Ok(())
 }
 
-fn route_request(request: RpcRequest, state: &ServerState) -> RpcResponse {
+async fn route_request(request: RpcRequest, state: Arc<ServerState>) -> RpcResponse {
     if request.jsonrpc != JSONRPC_VERSION {
         return RpcResponse::error(request.id, ERR_INVALID_REQUEST, "jsonrpc must be '2.0'");
     }
@@ -245,35 +257,49 @@ fn route_request(request: RpcRequest, state: &ServerState) -> RpcResponse {
                 Ok(params) => params,
                 Err(err) => return *err,
             };
-            route_health(request.id, params, state)
+            route_health(request.id, params, &state)
         }
         "ensure_vault" => {
-            if let Err(err) = parse_params::<EnsureVaultParams>(request.params, request.id.clone())
-            {
-                return *err;
+            let params: EnsureVaultParams = match parse_params(request.params, request.id.clone()) {
+                Ok(params) => params,
+                Err(err) => return *err,
+            };
+            match query::ensure_vault(&state.registry, params).await {
+                Ok(result) => response_from_result(request.id, &result),
+                Err(err) => response_from_query_error(request.id, err),
             }
-            not_implemented(request.id, "ensure_vault")
         }
         "search_semantic" => {
-            if let Err(err) =
-                parse_params::<SearchSemanticParams>(request.params, request.id.clone())
-            {
-                return *err;
+            let params: SearchSemanticParams =
+                match parse_params(request.params, request.id.clone()) {
+                    Ok(params) => params,
+                    Err(err) => return *err,
+                };
+            match query::search_semantic(&state.registry, params).await {
+                Ok(result) => response_from_result(request.id, &result),
+                Err(err) => response_from_query_error(request.id, err),
             }
-            not_implemented(request.id, "search_semantic")
         }
         "search_hybrid" => {
-            if let Err(err) = parse_params::<SearchHybridParams>(request.params, request.id.clone())
+            let params: SearchHybridParams = match parse_params(request.params, request.id.clone())
             {
-                return *err;
+                Ok(params) => params,
+                Err(err) => return *err,
+            };
+            match query::search_hybrid(&state.registry, params).await {
+                Ok(result) => response_from_result(request.id, &result),
+                Err(err) => response_from_query_error(request.id, err),
             }
-            not_implemented(request.id, "search_hybrid")
         }
         "open_hint" => {
-            if let Err(err) = parse_params::<OpenHintParams>(request.params, request.id.clone()) {
-                return *err;
+            let params: OpenHintParams = match parse_params(request.params, request.id.clone()) {
+                Ok(params) => params,
+                Err(err) => return *err,
+            };
+            match query::open_hint(&state.registry, params).await {
+                Ok(result) => response_from_result(request.id, &result),
+                Err(err) => response_from_query_error(request.id, err),
             }
-            not_implemented(request.id, "open_hint")
         }
         _ => RpcResponse::error(
             request.id,
@@ -344,21 +370,46 @@ fn route_health(
     }
 }
 
-fn not_implemented(id: Option<serde_json::Value>, method: &str) -> RpcResponse {
-    RpcResponse::error(
-        id,
-        ERR_BOOTSTRAP_REQUIRED,
-        format!("method '{method}' is routed but not implemented in this phase"),
-    )
+fn response_from_result<T: Serialize>(id: Option<serde_json::Value>, result: &T) -> RpcResponse {
+    match serde_json::to_value(result) {
+        Ok(value) => RpcResponse::success(id, value),
+        Err(err) => RpcResponse::error(
+            id,
+            protocol::ERR_INTERNAL,
+            format!("failed to serialize daemon result: {err}"),
+        ),
+    }
+}
+
+fn response_from_query_error(id: Option<serde_json::Value>, err: query::QueryError) -> RpcResponse {
+    match err.data {
+        Some(data) => RpcResponse::error_with_data(id, err.code, err.message, data),
+        None => RpcResponse::error(id, err.code, err.message),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
-    #[test]
-    fn route_health_rejects_incompatible_api() {
-        let state = ServerState::new("BAAI/bge-small-en-v1.5".to_string(), PathBuf::from("/tmp"));
+    fn make_state(semantic_home: &Path) -> Arc<ServerState> {
+        let model_name = "BAAI/bge-small-en-v1.5".to_string();
+        let registry = Arc::new(
+            VaultRegistry::new(semantic_home.to_path_buf(), model_name.clone())
+                .expect("registry should be created"),
+        );
+        Arc::new(ServerState::new(
+            model_name,
+            semantic_home.to_path_buf(),
+            registry,
+        ))
+    }
+
+    #[tokio::test]
+    async fn route_health_rejects_incompatible_api() {
+        let tmp = tempfile::tempdir().expect("tempdir should be created");
+        let state = make_state(tmp.path());
         let response = route_request(
             RpcRequest {
                 jsonrpc: JSONRPC_VERSION.to_string(),
@@ -369,8 +420,9 @@ mod tests {
                     "max_api_version": DAEMON_API_VERSION + 2
                 }),
             },
-            &state,
-        );
+            state,
+        )
+        .await;
 
         assert_eq!(
             response.error.expect("error expected").code,
@@ -453,30 +505,33 @@ mod tests {
         server.await.expect("server task should join");
     }
 
-    #[test]
-    fn route_known_but_unimplemented_method() {
-        let state = ServerState::new("BAAI/bge-small-en-v1.5".to_string(), PathBuf::from("/tmp"));
+    #[tokio::test]
+    async fn route_ensure_vault_rejects_relative_path() {
+        let tmp = tempfile::tempdir().expect("tempdir should be created");
+        let state = make_state(tmp.path());
         let response = route_request(
             RpcRequest {
                 jsonrpc: JSONRPC_VERSION.to_string(),
                 id: Some(json!(1)),
                 method: "ensure_vault".to_string(),
                 params: json!({
-                    "vault_root": "/tmp/vault",
+                    "vault_root": "relative/path",
                     "watch": true
                 }),
             },
-            &state,
-        );
+            state,
+        )
+        .await;
         assert_eq!(
             response.error.expect("error expected").code,
-            ERR_BOOTSTRAP_REQUIRED
+            ERR_INVALID_PARAMS
         );
     }
 
-    #[test]
-    fn route_unrecognized_method_returns_method_not_found() {
-        let state = ServerState::new("BAAI/bge-small-en-v1.5".to_string(), PathBuf::from("/tmp"));
+    #[tokio::test]
+    async fn route_unrecognized_method_returns_method_not_found() {
+        let tmp = tempfile::tempdir().expect("tempdir should be created");
+        let state = make_state(tmp.path());
         let response = route_request(
             RpcRequest {
                 jsonrpc: JSONRPC_VERSION.to_string(),
@@ -484,8 +539,9 @@ mod tests {
                 method: "does_not_exist".to_string(),
                 params: json!({}),
             },
-            &state,
-        );
+            state,
+        )
+        .await;
         assert_eq!(
             response.error.expect("error expected").code,
             ERR_METHOD_NOT_FOUND

@@ -299,6 +299,9 @@ The full development plan with task breakdown, dependencies, and parallelization
 - **`create_periodic_note` content override:** The method now accepts `content_override: Option<&str>` as the third parameter. When provided, it skips template expansion entirely. When `None`, missing template files are handled gracefully (`unwrap_or_default`) instead of erroring.
 - **Semantic daemon IPC framing:** `obsidian-semanticd` uses local JSON-RPC 2.0 over UDS (Unix) / named pipes (Windows) with newline-delimited JSON messages (one request/response per line). Keep this framing consistent in all clients/bootstrappers.
 - **Shared semantic bootstrap lock + defaults:** Bootstrap serializes install/manifest writes with `<semantic-home>/lock/install.lock` (fs2 exclusive lock). Home defaults are OS-specific (`~/Library/Application Support/obsidian-semantic`, `${XDG_DATA_HOME:-~/.local/share}/obsidian-semantic`, `%APPDATA%/obsidian-semantic`), and daemon auto-download defaults to GitHub latest release assets unless `OBSIDIAN_SEMANTIC_DAEMON_DOWNLOAD_URL` is set.
+- **Daemon vault context lifecycle:** `search_semantic`, `search_hybrid`, and `open_hint` now require a prior `ensure_vault` call for that `vault_root`; otherwise the daemon returns `ERR_VAULT_NOT_READY` (`-32030`). The daemon keeps per-vault runtime state in a registry keyed by `vault_id` (SHA-256 of canonical path).
+- **Daemon per-vault embedding cache path:** daemon-managed embedding caches live under `<semantic-home>/vaults/<vault_id>/embeddings.bin` (not inside `.obsidian/obsidian-mcp`). Watcher-driven updates persist to this path and keep non-fatal behavior on embedding failures (warn + continue).
+- **Daemon query parity rules:** `search_hybrid` keeps explicit empty-query short-circuit (`[]`), while pure `search_semantic` does not short-circuit empty queries. Snippet generation keeps the MCP parity behavior: query-word context first, then frontmatter-stripped body preview fallback.
 
 ## Links
 
