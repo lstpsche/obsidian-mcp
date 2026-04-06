@@ -129,7 +129,7 @@ Opt-in (`--features embeddings` + `OBSIDIAN_EMBEDDINGS=true`). Uses a local ONNX
 
 - Finds notes by **meaning**, not keywords — "making money from software" surfaces notes about monetization
 - **Hybrid mode** — `lexical_prefetch: true` combines BM25 candidate retrieval with semantic re-ranking
-- **Tunable blending** — `alpha` controls the weight between lexical and semantic scores (default 0.4)
+- **Tunable blending** — `alpha` controls the weight between lexical and semantic scores (default 0.25)
 - Embeddings cached to disk; incremental updates on note changes
 
 ### Regex — `search_regex`
@@ -228,6 +228,12 @@ Always available. Full regex syntax for pattern matching across all notes.
 | `OBSIDIAN_TANTIVY` | No | `true` | BM25 full-text index |
 | `OBSIDIAN_EMBEDDINGS` | No | `false` | Semantic embedding search (requires `embeddings` feature) |
 | `OBSIDIAN_EMBEDDINGS_MODEL` | No | `BAAI/bge-small-en-v1.5` | HuggingFace model for embeddings |
+| `OBSIDIAN_SEMANTIC_HOME` | No | OS data-dir default | Shared semantic runtime home for daemon bin/model/cache state |
+| `OBSIDIAN_SEMANTIC_DAEMON_PATH` | No | unset | Override daemon binary path used by bootstrap |
+| `OBSIDIAN_SEMANTIC_DAEMON_DOWNLOAD_URL` | No | GitHub latest release asset URL | Override daemon download URL when binary is missing |
+| `OBSIDIAN_SEMANTIC_MODEL` | No | `BAAI/bge-small-en-v1.5` | Default model used by semantic daemon runtime |
+| `OBSIDIAN_SEMANTIC_ENDPOINT` | No | `<semantic-home>/ipc/...` | Daemon-only endpoint override (internal/runtime use) |
+| `FASTEMBED_CACHE_DIR` | No | `<semantic-home>/model/fastembed-cache` | Daemon-internal shared fastembed cache root |
 
 \* Also accepted as the first CLI argument: `obsidian-mcp /path/to/vault`
 

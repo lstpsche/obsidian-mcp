@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 const DEFAULT_EMBEDDINGS_MODEL: &str = "BAAI/bge-small-en-v1.5";
+const DEFAULT_SEMANTIC_MODEL: &str = "BAAI/bge-small-en-v1.5";
 const DEFAULT_HYBRID_ALPHA: f32 = 0.25;
 
 #[derive(Debug, Clone)]
@@ -70,6 +71,36 @@ impl Config {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct SemanticRuntimeConfig {
+    /// Override shared semantic home path (`OBSIDIAN_SEMANTIC_HOME`).
+    pub semantic_home_override: Option<PathBuf>,
+    /// Override daemon binary path (`OBSIDIAN_SEMANTIC_DAEMON_PATH`).
+    pub daemon_path_override: Option<PathBuf>,
+    /// Override daemon binary download URL (`OBSIDIAN_SEMANTIC_DAEMON_DOWNLOAD_URL`).
+    pub daemon_download_url: Option<String>,
+    /// Shared semantic model name (`OBSIDIAN_SEMANTIC_MODEL`).
+    pub model_name: String,
+}
+
+impl SemanticRuntimeConfig {
+    pub fn load_from_env() -> Self {
+        Self {
+            semantic_home_override: normalize_optional_path_env("OBSIDIAN_SEMANTIC_HOME"),
+            daemon_path_override: normalize_optional_path_env("OBSIDIAN_SEMANTIC_DAEMON_PATH"),
+            daemon_download_url: std::env::var("OBSIDIAN_SEMANTIC_DAEMON_DOWNLOAD_URL")
+                .ok()
+                .map(|raw| raw.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            model_name: std::env::var("OBSIDIAN_SEMANTIC_MODEL")
+                .ok()
+                .map(|raw| raw.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| DEFAULT_SEMANTIC_MODEL.to_string()),
+        }
+    }
+}
+
 fn normalize_vault_path(raw: &str) -> PathBuf {
     let trimmed = raw.trim();
     let normalized = strip_matching_outer_quotes(trimmed).trim();
@@ -79,6 +110,13 @@ fn normalize_vault_path(raw: &str) -> PathBuf {
         normalized
     };
     PathBuf::from(final_value)
+}
+
+fn normalize_optional_path_env(var_name: &str) -> Option<PathBuf> {
+    std::env::var(var_name)
+        .ok()
+        .map(|raw| normalize_vault_path(&raw))
+        .filter(|path| !path.as_os_str().is_empty())
 }
 
 fn strip_matching_outer_quotes(mut value: &str) -> &str {
@@ -127,5 +165,11 @@ mod tests {
             normalize_vault_path(" \"'/tmp/my-vault'\" "),
             PathBuf::from("/tmp/my-vault")
         );
+    }
+
+    #[test]
+    fn semantic_runtime_config_defaults_model() {
+        let cfg = SemanticRuntimeConfig::load_from_env();
+        assert!(!cfg.model_name.is_empty());
     }
 }

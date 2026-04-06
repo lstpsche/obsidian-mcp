@@ -297,6 +297,8 @@ The full development plan with task breakdown, dependencies, and parallelization
 
 - **`CallToolResult::structured()` rejects null:** The Cursor MCP client validates `structuredContent` as a record (object). Passing `serde_json::Value::Null` via `CallToolResult::structured()` triggers a validation error. When a tool may return null, use `CallToolResult::success(vec![Content::text("null")])` for the null case and `CallToolResult::structured(value)` for real objects.
 - **`create_periodic_note` content override:** The method now accepts `content_override: Option<&str>` as the third parameter. When provided, it skips template expansion entirely. When `None`, missing template files are handled gracefully (`unwrap_or_default`) instead of erroring.
+- **Semantic daemon IPC framing:** `obsidian-semanticd` uses local JSON-RPC 2.0 over UDS (Unix) / named pipes (Windows) with newline-delimited JSON messages (one request/response per line). Keep this framing consistent in all clients/bootstrappers.
+- **Shared semantic bootstrap lock + defaults:** Bootstrap serializes install/manifest writes with `<semantic-home>/lock/install.lock` (fs2 exclusive lock). Home defaults are OS-specific (`~/Library/Application Support/obsidian-semantic`, `${XDG_DATA_HOME:-~/.local/share}/obsidian-semantic`, `%APPDATA%/obsidian-semantic`), and daemon auto-download defaults to GitHub latest release assets unless `OBSIDIAN_SEMANTIC_DAEMON_DOWNLOAD_URL` is set.
 
 ## Links
 

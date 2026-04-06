@@ -52,6 +52,15 @@ pub enum VaultError {
     #[error("Embedding error: {0}")]
     Embedding(String),
 
+    #[error("Daemon IPC error: {0}")]
+    DaemonIpc(String),
+
+    #[error("Daemon protocol error: {0}")]
+    DaemonProtocol(String),
+
+    #[error("Daemon bootstrap error: {0}")]
+    DaemonBootstrap(String),
+
     #[error("{0}")]
     Other(String),
 }
@@ -74,6 +83,9 @@ impl From<VaultError> for rmcp::ErrorData {
             | VaultError::Watcher(_)
             | VaultError::Tantivy(_)
             | VaultError::Embedding(_)
+            | VaultError::DaemonIpc(_)
+            | VaultError::DaemonProtocol(_)
+            | VaultError::DaemonBootstrap(_)
             | VaultError::Other(_) => ErrorCode::INTERNAL_ERROR,
         };
 
