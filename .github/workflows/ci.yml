@@ -43,3 +43,34 @@ jobs:
 
       - name: Tests
         run: cargo test
+
+  daemon-integration:
+    name: daemon integration (embeddings)
+    runs-on: ubuntu-latest
+    env:
+      FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-daemon-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ubuntu-daemon-cargo-
+
+      - name: Cache fastembed model artifacts
+        uses: actions/cache@v5
+        with:
+          path: .fastembed_cache
+          key: ubuntu-fastembed-cache-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ubuntu-fastembed-cache-v1-
+
+      - name: Daemon integration tests
+        run: cargo test --features embeddings --test daemon_integration_tests

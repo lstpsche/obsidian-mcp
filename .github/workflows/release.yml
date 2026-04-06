@@ -9,6 +9,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  DAEMON_API_VERSION: "1"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   build:
@@ -103,6 +105,12 @@ jobs:
         uses: softprops/action-gh-release@v2.6.1
         with:
           generate_release_notes: true
+          body: |
+            ## Semantic daemon compatibility
+
+            - Daemon API version: `${{ env.DAEMON_API_VERSION }}`
+            - `obsidian-mcp` and `obsidian-semantic-search-plugin` enforce runtime daemon API handshake checks at startup.
+            - Keep MCP and plugin releases aligned to avoid compatibility mismatch errors.
           files: release/*
 
   publish:
