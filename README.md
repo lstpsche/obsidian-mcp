@@ -73,6 +73,25 @@ Semantic daemon release assets are also published per target:
 - `obsidian-semanticd-<version>-<target>.tar.gz` (Unix)
 - `obsidian-semanticd-<version>-<target>.zip` (Windows)
 
+## Semantic Runtime Compatibility
+
+Current semantic daemon API version: `1` (`DAEMON_API_VERSION` in `src/daemon/protocol.rs`).
+
+| Component | Compatibility contract | Enforcement |
+|----------|-------------------------|-------------|
+| `obsidian-mcp` | Daemon API version must match exactly | MCP daemon `health` handshake validates `min_api_version`/`max_api_version` against current API version and fails fast on mismatch |
+| `obsidian-semantic-search-plugin` | Daemon API version must match exactly | Plugin bootstrap performs daemon `health` handshake and surfaces explicit incompatibility notices |
+
+Release asset compatibility expectations:
+
+- Daemon auto-install clients expect release assets named `obsidian-semanticd-<version>-<target>.{tar.gz|zip}` plus `checksums.sha256`.
+- Plugin releases should publish `main.js`, `manifest.json`, and optional `styles.css` as GitHub release assets.
+
+Upgrade guidance:
+
+- Prefer upgrading `obsidian-mcp`, `obsidian-semanticd`, and `obsidian-semantic-search-plugin` together.
+- If versions are skewed, startup/handshake fails with explicit API incompatibility errors rather than silent fallback.
+
 ## Client Setup
 
 ### Cursor
