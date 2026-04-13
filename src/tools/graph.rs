@@ -1,5 +1,6 @@
 //! Backlink, outgoing-link, and graph traversal tools.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rmcp::model::{CallToolResult, Content};
@@ -76,12 +77,40 @@ pub struct BrokenLink {
     pub target: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OrphanStatus {
+    /// Note has no inbound links and no outbound wikilinks at all.
+    NoLinks,
+    /// Note has no inbound links and no resolvable outbound links,
+    /// but it does contain outgoing wikilinks that are broken.
+    BrokenOutgoingOnly,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct OrphanNoteEntry {
+    /// Path of the disconnected note.
+    pub path: PathBuf,
+    /// Why this note is disconnected from the resolvable graph.
+    pub status: OrphanStatus,
+    /// Broken outgoing targets found in this note (empty for `no_links`).
+    pub broken_targets: Vec<String>,
+}
+
 // ── handler functions ───────────────────────────────────────────────
 
 fn to_json_text(value: &impl Serialize) -> Result<CallToolResult, rmcp::ErrorData> {
     let json = serde_json::to_string_pretty(value)
         .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
     Ok(CallToolResult::success(vec![Content::text(json)]))
+}
+
+fn has_resolved_target(vault: &Vault, target: &str) -> bool {
+    !target.is_empty() && vault.resolve_link(target).is_some()
+}
+
+fn is_broken_target(vault: &Vault, target: &str) -> bool {
+    !target.is_empty() && vault.resolve_link(target).is_none()
 }
 
 /// Find all notes linking TO a given note, with the specific wikilinks used.
@@ -162,9 +191,7 @@ pub async fn links_broken(
 
             links
                 .into_iter()
-                .filter(|link| {
-                    !link.target.is_empty() && vault.resolve_link(&link.target).is_none()
-                })
+                .filter(|link| is_broken_target(vault, &link.target))
                 .map(|link| BrokenLink {
                     source_path: path.to_path_buf(),
                     link_raw: link.raw,
@@ -187,14 +214,62 @@ pub async fn links_broken(
     to_json_text(&result)
 }
 
-/// Find notes with no inbound and no outbound links.
+/// Find notes disconnected from the resolvable graph.
 pub async fn links_orphans(
     vault: &Vault,
     _params: LinksOrphansParams,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    let orphans = vault.orphan_notes()?;
-    let paths: Vec<PathBuf> = orphans.into_iter().map(|n| n.path).collect();
-    to_json_text(&paths)
+    let mut disconnected: Vec<OrphanNoteEntry> = vault
+        .orphan_notes()?
+        .into_iter()
+        .map(|note| OrphanNoteEntry {
+            path: note.path,
+            status: OrphanStatus::NoLinks,
+            broken_targets: Vec::new(),
+        })
+        .collect();
+
+    let mut seen_paths: HashSet<PathBuf> = disconnected.iter().map(|e| e.path.clone()).collect();
+
+    let mut broken_by_source: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    for (source_path, link) in vault.broken_links()? {
+        broken_by_source
+            .entry(source_path)
+            .or_default()
+            .insert(link.target);
+    }
+
+    for (source_path, broken_targets) in broken_by_source {
+        if seen_paths.contains(&source_path) {
+            continue;
+        }
+
+        let has_incoming = !vault.backlinks(&source_path)?.is_empty();
+        if has_incoming {
+            continue;
+        }
+
+        let has_resolved_outgoing = vault
+            .outgoing_links(&source_path)?
+            .into_iter()
+            .any(|link| has_resolved_target(vault, &link.target));
+        if has_resolved_outgoing {
+            continue;
+        }
+
+        let mut broken_targets: Vec<String> = broken_targets.into_iter().collect();
+        broken_targets.sort();
+
+        disconnected.push(OrphanNoteEntry {
+            path: source_path.clone(),
+            status: OrphanStatus::BrokenOutgoingOnly,
+            broken_targets,
+        });
+        seen_paths.insert(source_path);
+    }
+
+    disconnected.sort_by(|a, b| a.path.cmp(&b.path));
+    to_json_text(&disconnected)
 }
 
 #[cfg(test)]
@@ -224,6 +299,11 @@ mod tests {
         std::fs::write(
             dir.join("d.md"),
             "# D\n\nLinks to [[nonexistent]] and [[a]].\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("broken_only.md"),
+            "# Broken Only\n\nLinks to [[still_missing]].\n",
         )
         .unwrap();
         std::fs::write(dir.join("orphan.md"), "# Orphan\n\nNo links here.\n").unwrap();
@@ -479,12 +559,41 @@ mod tests {
 
         let result = links_orphans(&vault, LinksOrphansParams {}).await.unwrap();
         let text = extract_text(&result);
-        let orphans: Vec<String> = serde_json::from_str(text).unwrap();
+        let orphans: Vec<OrphanNoteEntry> = serde_json::from_str(text).unwrap();
 
-        assert!(orphans.contains(&"orphan.md".to_string()));
-        assert!(!orphans.contains(&"a.md".to_string()));
-        assert!(!orphans.contains(&"b.md".to_string()));
-        assert!(!orphans.contains(&"c.md".to_string()));
+        let orphan_entry = orphans
+            .iter()
+            .find(|entry| entry.path == PathBuf::from("orphan.md"))
+            .expect("expected orphan.md in orphans");
+        assert_eq!(orphan_entry.status, OrphanStatus::NoLinks);
+
+        let broken_only_entry = orphans
+            .iter()
+            .find(|entry| entry.path == PathBuf::from("broken_only.md"))
+            .expect("expected broken_only.md in orphans");
+        assert_eq!(broken_only_entry.status, OrphanStatus::BrokenOutgoingOnly);
+        assert!(
+            broken_only_entry
+                .broken_targets
+                .iter()
+                .any(|target| target == "still_missing")
+        );
+
+        assert!(
+            !orphans
+                .iter()
+                .any(|entry| entry.path == PathBuf::from("a.md"))
+        );
+        assert!(
+            !orphans
+                .iter()
+                .any(|entry| entry.path == PathBuf::from("b.md"))
+        );
+        assert!(
+            !orphans
+                .iter()
+                .any(|entry| entry.path == PathBuf::from("c.md"))
+        );
     }
 
     #[tokio::test]
@@ -495,7 +604,11 @@ mod tests {
 
         let result = links_orphans(&vault, LinksOrphansParams {}).await.unwrap();
         let text = extract_text(&result);
-        let orphans: Vec<String> = serde_json::from_str(text).unwrap();
-        assert!(!orphans.contains(&"d.md".to_string()));
+        let orphans: Vec<OrphanNoteEntry> = serde_json::from_str(text).unwrap();
+        assert!(
+            !orphans
+                .iter()
+                .any(|entry| entry.path == PathBuf::from("d.md"))
+        );
     }
 }

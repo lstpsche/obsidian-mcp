@@ -314,7 +314,7 @@ impl ObsidianMcp {
 
     #[tool(
         name = "links_orphans",
-        description = "Find notes with no inbound and no outbound wikilinks — completely disconnected from the vault graph."
+        description = "Find notes disconnected from the resolvable vault graph. Includes true orphans (no links) and notes with only broken outgoing links."
     )]
     async fn links_orphans(
         &self,

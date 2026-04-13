@@ -216,7 +216,7 @@ Always available. Full regex syntax for pattern matching across all notes.
 | `links_backlinks` | `path` | Notes linking to this note |
 | `links_outgoing` | `path` | Outgoing wikilinks with resolution status |
 | `links_broken` | `path?` | Broken wikilinks (vault-wide or single note) |
-| `links_orphans` | — | Notes with no inbound or outbound links |
+| `links_orphans` | — | Notes disconnected from the resolvable graph (no links, or only broken outgoing links) |
 
 ### Periodic Notes
 
