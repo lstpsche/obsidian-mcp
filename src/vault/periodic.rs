@@ -395,7 +395,7 @@ pub fn list_recent_periodic_notes(
         }
     }
 
-    dated_paths.sort_by(|a, b| b.0.cmp(&a.0));
+    dated_paths.sort_by_key(|x| std::cmp::Reverse(x.0));
     dated_paths.truncate(limit);
 
     Ok(dated_paths.into_iter().map(|(_, p)| p).collect())

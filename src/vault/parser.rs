@@ -153,16 +153,14 @@ fn extract_headings_with_offsets(content: &str) -> Vec<HeadingPos> {
             Event::SoftBreak if in_heading => {
                 current_text.push(' ');
             }
-            Event::End(TagEnd::Heading(_)) => {
-                if in_heading {
-                    headings.push(HeadingPos {
-                        level: current_level,
-                        text: current_text.clone(),
-                        line: byte_offset_to_line(content, current_offset),
-                        offset: current_offset,
-                    });
-                    in_heading = false;
-                }
+            Event::End(TagEnd::Heading(_)) if in_heading => {
+                headings.push(HeadingPos {
+                    level: current_level,
+                    text: current_text.clone(),
+                    line: byte_offset_to_line(content, current_offset),
+                    offset: current_offset,
+                });
+                in_heading = false;
             }
             _ => {}
         }
