@@ -269,6 +269,9 @@ pub async fn search_semantic(
             Ok(results) => Ok(results),
             Err(err) if local_backend_available(vault) && should_fallback_to_local(&err) => {
                 tracing::warn!(error = %err, "semantic daemon unavailable in auto mode; falling back to local embeddings backend");
+                runtime
+                    .vault_ensured
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 search_semantic_local(
                     vault,
                     &params.query,
@@ -305,7 +308,19 @@ async fn search_semantic_daemon(
         return Err(VaultError::DaemonUnavailable(reason.to_string()));
     };
 
-    client.ensure_vault(vault.root(), true, None).await?;
+    if !runtime
+        .vault_ensured
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        match client.ensure_vault(vault.root(), true, None).await {
+            Ok(_) => {
+                runtime
+                    .vault_ensured
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(err) => return Err(err),
+        }
+    }
 
     let daemon_result = if lexical_prefetch {
         let prefetch_count = runtime.prefetch_count;
@@ -1043,6 +1058,7 @@ mod tests {
             )),
             daemon_unavailable_reason: None,
             prefetch_count: 7,
+            vault_ensured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let result = search_semantic(

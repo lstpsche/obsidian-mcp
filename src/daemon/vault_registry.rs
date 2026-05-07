@@ -21,6 +21,7 @@ pub struct VaultRegistry {
     paths: SemanticHomePaths,
     model_name: String,
     contexts: RwLock<HashMap<String, Arc<VaultContext>>>,
+    init_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     #[cfg(feature = "embeddings")]
     embedding_model: OnceCell<Arc<EmbeddingModel>>,
 }
@@ -34,6 +35,7 @@ impl VaultRegistry {
             paths,
             model_name,
             contexts: RwLock::new(HashMap::new()),
+            init_locks: tokio::sync::Mutex::new(HashMap::new()),
             #[cfg(feature = "embeddings")]
             embedding_model: OnceCell::new(),
         })
@@ -66,6 +68,19 @@ impl VaultRegistry {
             return Ok(existing);
         }
 
+        let init_lock = {
+            let mut locks = self.init_locks.lock().await;
+            Arc::clone(locks.entry(vault_id.clone()).or_default())
+        };
+        let _init_guard = init_lock.lock().await;
+
+        if let Some(existing) = self.get_by_id(&vault_id).await {
+            if watch_enabled {
+                existing.ensure_watcher()?;
+            }
+            return Ok(existing);
+        }
+
         #[cfg(feature = "embeddings")]
         let embedding_model = self.embedding_model().await?;
 
@@ -83,16 +98,13 @@ impl VaultRegistry {
         let context = Arc::new(context);
 
         let mut guard = self.contexts.write().await;
-        let existing = guard
-            .entry(vault_id)
-            .or_insert_with(|| Arc::clone(&context))
-            .clone();
+        guard.insert(vault_id, Arc::clone(&context));
         drop(guard);
 
         if watch_enabled {
-            existing.ensure_watcher()?;
+            context.ensure_watcher()?;
         }
-        Ok(existing)
+        Ok(context)
     }
 
     pub async fn get_context_by_root(

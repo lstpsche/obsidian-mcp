@@ -37,29 +37,36 @@ pub(crate) fn compile_query_word_regex(query: &str) -> Option<regex::Regex> {
 /// Min-max normalize BM25 scores to `[0, 1]`.
 ///
 /// When all scores are identical, each normalized score is `1.0`.
+/// Non-finite scores (NaN, infinity) are silently filtered out.
 pub(crate) fn normalize_bm25_scores(hits: &[(PathBuf, f32)]) -> Vec<(PathBuf, f32)> {
     if hits.is_empty() {
         return Vec::new();
     }
 
-    let min = hits
+    let finite_hits: Vec<_> = hits.iter().filter(|(_, s)| s.is_finite()).collect();
+    if finite_hits.is_empty() {
+        return Vec::new();
+    }
+
+    let min = finite_hits
         .iter()
         .map(|(_, score)| *score)
         .fold(f32::INFINITY, f32::min);
-    let max = hits
+    let max = finite_hits
         .iter()
         .map(|(_, score)| *score)
         .fold(f32::NEG_INFINITY, f32::max);
     let range = max - min;
 
-    hits.iter()
+    finite_hits
+        .iter()
         .map(|(path, score)| {
             let normalized = if range == 0.0 {
                 1.0
             } else {
                 (score - min) / range
             };
-            (path.clone(), normalized)
+            ((*path).clone(), normalized)
         })
         .collect()
 }
@@ -180,5 +187,29 @@ mod tests {
         let norm = normalize_bm25_scores(&hits);
         assert!(norm[0].1 > norm[1].1);
         assert!(norm[1].1 > norm[2].1);
+    }
+
+    #[test]
+    fn normalize_filters_non_finite_scores() {
+        let hits = vec![
+            (PathBuf::from("valid.md"), 10.0),
+            (PathBuf::from("nan.md"), f32::NAN),
+            (PathBuf::from("inf.md"), f32::INFINITY),
+            (PathBuf::from("neginf.md"), f32::NEG_INFINITY),
+            (PathBuf::from("low.md"), 0.0),
+        ];
+        let norm = normalize_bm25_scores(&hits);
+        assert_eq!(norm.len(), 2);
+        assert!(norm.iter().any(|(p, _)| p == Path::new("valid.md")));
+        assert!(norm.iter().any(|(p, _)| p == Path::new("low.md")));
+    }
+
+    #[test]
+    fn normalize_all_non_finite_returns_empty() {
+        let hits = vec![
+            (PathBuf::from("nan.md"), f32::NAN),
+            (PathBuf::from("inf.md"), f32::INFINITY),
+        ];
+        assert!(normalize_bm25_scores(&hits).is_empty());
     }
 }

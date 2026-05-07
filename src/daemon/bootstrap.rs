@@ -135,8 +135,25 @@ pub async fn ensure_daemon(config: &BootstrapConfig) -> VaultResult<BootstrapRes
         binary_sha256 = Some(checksum);
     }
 
-    let child = start_daemon_process(&daemon_binary_path, &paths, &endpoint, &config.model_name)?;
+    let mut child =
+        start_daemon_process(&daemon_binary_path, &paths, &endpoint, &config.model_name)?;
     let pid = child.id().unwrap_or_default();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            return Err(VaultError::DaemonBootstrap(format!(
+                "daemon process exited immediately with {status} \
+                 (binary: '{}', check {})",
+                daemon_binary_path.display(),
+                paths.daemon_stderr_log_path.display()
+            )));
+        }
+        Ok(None) => {}
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to check daemon process status after spawn");
+        }
+    }
     drop(child);
 
     let health = wait_for_health(&endpoint, Duration::from_secs(10)).await?;
@@ -448,7 +465,11 @@ async fn probe_health(endpoint: &IpcEndpoint) -> VaultResult<HealthProbeOutcome>
     let IpcEndpoint::NamedPipe(name) = endpoint;
     let stream = match ClientOptions::new().open(name) {
         Ok(stream) => stream,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+        Err(err)
+            if err.kind() == std::io::ErrorKind::NotFound
+                || err.kind() == std::io::ErrorKind::ConnectionRefused
+                || err.raw_os_error() == Some(231) =>
+        {
             return Ok(HealthProbeOutcome::Unreachable);
         }
         Err(err) => {

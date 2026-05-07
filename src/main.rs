@@ -58,6 +58,7 @@ async fn init_semantic_runtime(
         daemon_client: None,
         daemon_unavailable_reason: None,
         prefetch_count: runtime_cfg.prefetch_count,
+        vault_ensured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     if runtime_cfg.mode == SemanticMode::Local {

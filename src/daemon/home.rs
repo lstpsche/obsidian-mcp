@@ -132,6 +132,8 @@ pub struct InstallLock {
 
 impl InstallLock {
     pub fn acquire(paths: &SemanticHomePaths) -> VaultResult<Self> {
+        use std::time::{Duration, Instant};
+
         std::fs::create_dir_all(&paths.lock_dir)?;
         let file = OpenOptions::new()
             .create(true)
@@ -140,13 +142,40 @@ impl InstallLock {
             .truncate(false)
             .open(&paths.install_lock_path)?;
 
-        file.lock_exclusive().map_err(|err| {
-            VaultError::DaemonBootstrap(format!(
-                "failed to acquire install lock '{}': {err}",
-                paths.install_lock_path.display()
-            ))
-        })?;
-        Ok(Self { file })
+        let timeout = Duration::from_secs(30);
+        let retry_interval = Duration::from_millis(200);
+        let start = Instant::now();
+        let mut warned = false;
+
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(Self { file }),
+                Err(err) if is_lock_contention(&err) => {
+                    let elapsed = start.elapsed();
+                    if elapsed >= timeout {
+                        return Err(VaultError::DaemonBootstrap(format!(
+                            "timed out ({}s) waiting for install lock '{}'",
+                            timeout.as_secs(),
+                            paths.install_lock_path.display()
+                        )));
+                    }
+                    if !warned && elapsed >= Duration::from_secs(5) {
+                        tracing::warn!(
+                            "waiting for install lock '{}' (held by another process)...",
+                            paths.install_lock_path.display()
+                        );
+                        warned = true;
+                    }
+                    std::thread::sleep(retry_interval);
+                }
+                Err(err) => {
+                    return Err(VaultError::DaemonBootstrap(format!(
+                        "failed to acquire install lock '{}': {err}",
+                        paths.install_lock_path.display()
+                    )));
+                }
+            }
+        }
     }
 
     pub fn try_acquire(paths: &SemanticHomePaths) -> VaultResult<Option<Self>> {

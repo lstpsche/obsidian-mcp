@@ -8,6 +8,9 @@ pub mod periodic;
 pub mod search;
 pub mod utility;
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ErrorData, Implementation, ServerCapabilities, ServerInfo};
@@ -23,6 +26,7 @@ pub struct SemanticRuntime {
     pub daemon_client: Option<SemanticDaemonClient>,
     pub daemon_unavailable_reason: Option<String>,
     pub prefetch_count: usize,
+    pub vault_ensured: Arc<AtomicBool>,
 }
 
 pub struct ObsidianMcp {
