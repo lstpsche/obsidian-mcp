@@ -8,7 +8,8 @@ pub(crate) fn body_preview(content: &str, max_chars: usize) -> String {
         stripped
             .find("\n---")
             .map(|idx| {
-                let end = idx + 7;
+                // 3 (stripped "---" prefix) + 4 ("\n---" closing delimiter)
+                let end = idx + 3 + 4;
                 content[end..].find('\n').map_or(end, |nl| end + nl + 1)
             })
             .unwrap_or(0)

@@ -1,0 +1,23 @@
+[advisories]
+ignore = [
+    # lru 0.12.5 IterMut unsoundness — transitive dep of tantivy 0.25.
+    # tantivy's internal usage is safe; we never use lru directly.
+    "RUSTSEC-2026-0002",
+
+    # rand unsoundness with custom logger using rand::rng() — transitive
+    # dep of tantivy-stacker and fastembed. Not exploitable: we don't
+    # install custom global loggers.
+    "RUSTSEC-2026-0097",
+
+    # rustls-webpki 0.103.x CRL/name-constraint issues — transitive via
+    # reqwest/hf-hub. Fix requires rustls-webpki >=0.103.10 which upstream
+    # (reqwest 0.12) hasn't adopted yet. Low risk: we only make HTTPS
+    # calls to trusted endpoints (GitHub releases, HuggingFace Hub).
+    "RUSTSEC-2026-0104",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0049",
+]
+
+[yanked]
+enabled = false

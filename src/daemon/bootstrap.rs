@@ -77,7 +77,7 @@ pub async fn ensure_daemon(config: &BootstrapConfig) -> VaultResult<BootstrapRes
     let paths = home::semantic_home_paths(&semantic_home);
     home::ensure_home_layout(&paths)?;
 
-    let _install_lock = InstallLock::acquire(&paths)?;
+    let _install_lock = InstallLock::acquire_async(&paths).await?;
     let mut existing_manifest = manifest::load(&paths.manifest_path)?;
     let default_endpoint = home::default_ipc_endpoint(&paths);
 

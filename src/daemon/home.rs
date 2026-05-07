@@ -131,6 +131,8 @@ pub struct InstallLock {
 }
 
 impl InstallLock {
+    /// Blocking acquire with retry loop. Suitable for synchronous contexts
+    /// or when already inside `spawn_blocking`.
     pub fn acquire(paths: &SemanticHomePaths) -> VaultResult<Self> {
         use std::time::{Duration, Instant};
 
@@ -176,6 +178,15 @@ impl InstallLock {
                 }
             }
         }
+    }
+
+    /// Async-friendly acquire that offloads the blocking retry loop to a
+    /// dedicated thread, avoiding stalling the tokio worker pool.
+    pub async fn acquire_async(paths: &SemanticHomePaths) -> VaultResult<Self> {
+        let paths = paths.clone();
+        tokio::task::spawn_blocking(move || Self::acquire(&paths))
+            .await
+            .map_err(|e| VaultError::DaemonBootstrap(format!("install lock task panicked: {e}")))?
     }
 
     pub fn try_acquire(paths: &SemanticHomePaths) -> VaultResult<Option<Self>> {
