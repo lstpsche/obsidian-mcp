@@ -295,6 +295,13 @@ fn extract_tar_gz_binary(archive_bytes: &[u8], destination: &Path) -> VaultResul
             continue;
         };
         if file_name == wanted_name {
+            if !entry.header().entry_type().is_file() {
+                return Err(VaultError::DaemonBootstrap(format!(
+                    "tar entry '{}' is not a regular file (type: {:?}); refusing to extract",
+                    file_name,
+                    entry.header().entry_type()
+                )));
+            }
             entry.unpack(destination).map_err(|err| {
                 VaultError::DaemonBootstrap(format!(
                     "failed to unpack daemon binary to '{}': {err}",
@@ -333,6 +340,18 @@ fn extract_zip_binary(archive_bytes: &[u8], destination: &Path) -> VaultResult<(
             continue;
         };
         if file_name == wanted_name {
+            if file.is_dir() {
+                return Err(VaultError::DaemonBootstrap(format!(
+                    "zip entry '{}' is a directory; refusing to extract",
+                    file.name()
+                )));
+            }
+            if file.name().contains("..") {
+                return Err(VaultError::DaemonBootstrap(format!(
+                    "zip entry '{}' contains path traversal sequence; refusing to extract",
+                    file.name()
+                )));
+            }
             let mut out = std::fs::File::create(destination)?;
             std::io::copy(&mut file, &mut out).map_err(|err| {
                 VaultError::DaemonBootstrap(format!(

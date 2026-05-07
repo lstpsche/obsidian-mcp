@@ -12,6 +12,9 @@ use crate::vault::Vault;
 
 use super::SemanticRuntime;
 
+const MAX_RESULTS_CAP: usize = 200;
+const MAX_CONTEXT_LEN_CAP: usize = 2000;
+
 // ── search_text ─────────────────────────────────────────────────────
 
 #[derive(Deserialize, JsonSchema, Default)]
@@ -38,8 +41,11 @@ pub async fn search_text(
     vault: &Vault,
     params: SearchTextParams,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    let context_length = params.context_length.unwrap_or(100);
-    let max_results = params.max_results.unwrap_or(20);
+    let context_length = params
+        .context_length
+        .unwrap_or(100)
+        .min(MAX_CONTEXT_LEN_CAP);
+    let max_results = params.max_results.unwrap_or(20).min(MAX_RESULTS_CAP);
     let fuzzy = params.fuzzy.unwrap_or(false);
 
     let results = if fuzzy || params.fields.is_some() {
@@ -79,8 +85,11 @@ pub async fn search_regex(
     vault: &Vault,
     params: SearchRegexParams,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    let context_length = params.context_length.unwrap_or(100);
-    let max_results = params.max_results.unwrap_or(20);
+    let context_length = params
+        .context_length
+        .unwrap_or(100)
+        .min(MAX_CONTEXT_LEN_CAP);
+    let max_results = params.max_results.unwrap_or(20).min(MAX_RESULTS_CAP);
 
     let results = vault.search_regex(&params.pattern, context_length)?;
     let limited: Vec<_> = results.into_iter().take(max_results).collect();

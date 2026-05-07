@@ -94,7 +94,11 @@ impl Vault {
             let store = Self::build_or_load_embeddings(&root, &index, &model)?;
             let store = Arc::new(RwLock::new(store));
             tracing::info!(
-                notes = index.read().expect("index lock poisoned").notes().len(),
+                notes = index
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .notes()
+                    .len(),
                 dim = model.dim(),
                 "embedding store ready"
             );
@@ -350,7 +354,7 @@ impl Vault {
             .ok_or_else(|| VaultError::Embedding("embedding store not initialized".into()))?;
 
         let query_vec = model.embed_one(query)?;
-        let s = store.read().expect("embedding store lock poisoned");
+        let s = store.read().unwrap_or_else(|e| e.into_inner());
         Ok(s.query(&query_vec, top_k))
     }
 
@@ -398,7 +402,7 @@ impl Vault {
         }
 
         let query_vec = model.embed_one(query)?;
-        let store_guard = store.read().expect("embedding store lock poisoned");
+        let store_guard = store.read().unwrap_or_else(|e| e.into_inner());
 
         let norm_bm25 = search_utils::normalize_bm25_scores(&bm25_hits);
 
@@ -636,11 +640,11 @@ impl Vault {
     }
 
     fn read_index(&self) -> std::sync::RwLockReadGuard<'_, VaultIndex> {
-        self.inner.index.read().expect("index lock poisoned")
+        self.inner.index.read().unwrap_or_else(|e| e.into_inner())
     }
 
     fn write_index(&self) -> std::sync::RwLockWriteGuard<'_, VaultIndex> {
-        self.inner.index.write().expect("index lock poisoned")
+        self.inner.index.write().unwrap_or_else(|e| e.into_inner())
     }
 
     fn reindex(&self, path: &Path) -> VaultResult<()> {
@@ -674,7 +678,7 @@ impl Vault {
         model: &embeddings::EmbeddingModel,
     ) -> VaultResult<embeddings::EmbeddingStore> {
         let cache_path = Self::embedding_cache_path(vault_root);
-        let idx = index.read().expect("index lock poisoned");
+        let idx = index.read().unwrap_or_else(|e| e.into_inner());
         let note_entries: Vec<_> = idx
             .notes()
             .iter()
@@ -708,7 +712,7 @@ impl Vault {
 
         match model.embed_one(&text) {
             Ok(vec) => {
-                let mut s = store.write().expect("embedding store lock poisoned");
+                let mut s = store.write().unwrap_or_else(|e| e.into_inner());
                 s.insert(path.to_path_buf(), vec);
                 drop(s);
                 self.save_embedding_cache();
@@ -723,7 +727,7 @@ impl Vault {
     #[cfg(feature = "embeddings")]
     fn remove_embedding(&self, path: &Path) {
         if let Some(store) = &self.inner.embedding_store {
-            let mut s = store.write().expect("embedding store lock poisoned");
+            let mut s = store.write().unwrap_or_else(|e| e.into_inner());
             s.remove(path);
             drop(s);
             self.save_embedding_cache();
@@ -734,7 +738,7 @@ impl Vault {
     #[cfg(feature = "embeddings")]
     fn save_embedding_cache(&self) {
         if let Some(store) = &self.inner.embedding_store {
-            let s = store.read().expect("embedding store lock poisoned");
+            let s = store.read().unwrap_or_else(|e| e.into_inner());
             let cache_path = Self::embedding_cache_path(&self.inner.root);
             if let Err(e) = s.save(&cache_path) {
                 tracing::warn!(error = %e, "failed to save embedding cache");

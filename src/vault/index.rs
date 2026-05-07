@@ -306,6 +306,9 @@ impl VaultIndex {
         self.search_with_regex(vault_root, &re, context_len, 0)
     }
 
+    const MAX_REGEX_PATTERN_LEN: usize = 1000;
+    const REGEX_SIZE_LIMIT: usize = 1 << 20; // 1 MiB NFA size cap
+
     /// Regex search across all indexed notes.
     pub fn search_regex(
         &self,
@@ -314,10 +317,22 @@ impl VaultIndex {
         context_len: usize,
         max_results: usize,
     ) -> VaultResult<Vec<SearchResult>> {
-        let re = Regex::new(pattern).map_err(|e| VaultError::InvalidRegex {
-            pattern: pattern.to_string(),
-            source: e,
-        })?;
+        if pattern.len() > Self::MAX_REGEX_PATTERN_LEN {
+            return Err(VaultError::InvalidRegex {
+                pattern: pattern.to_string(),
+                source: regex::Error::Syntax(format!(
+                    "pattern exceeds maximum length of {} characters",
+                    Self::MAX_REGEX_PATTERN_LEN
+                )),
+            });
+        }
+        let re = regex::RegexBuilder::new(pattern)
+            .size_limit(Self::REGEX_SIZE_LIMIT)
+            .build()
+            .map_err(|e| VaultError::InvalidRegex {
+                pattern: pattern.to_string(),
+                source: e,
+            })?;
         self.search_with_regex(vault_root, &re, context_len, max_results)
     }
 

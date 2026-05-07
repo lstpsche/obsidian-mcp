@@ -129,6 +129,13 @@ async fn run_unix_socket(
     }
 
     let listener = UnixListener::bind(&path).map_err(VaultError::Io)?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        if let Err(err) = std::fs::set_permissions(&path, perms) {
+            tracing::warn!(error = %err, "failed to restrict socket permissions to 0600");
+        }
+    }
     tracing::info!(endpoint = %path.display(), "semantic daemon IPC listening");
 
     loop {
