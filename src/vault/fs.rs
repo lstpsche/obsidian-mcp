@@ -186,8 +186,7 @@ pub fn list_files(
     let mut results = Vec::new();
 
     let mut try_add = |entry_path: &Path| -> VaultResult<()> {
-        let canonical = entry_path.canonicalize()?;
-        if let Ok(rel) = canonical.strip_prefix(&canonical_root) {
+        if let Ok(rel) = entry_path.strip_prefix(&canonical_root) {
             let rel = rel.to_path_buf();
             if let Some(ref matcher) = glob_matcher
                 && !matcher.is_match(&rel)

@@ -140,7 +140,15 @@ impl VaultIndex {
     }
 
     /// Re-index a single file (on create or modify).
+    ///
+    /// Uses incremental backlink update for content-only changes (file already
+    /// in the index). Falls back to full rebuild when a new file is added
+    /// (because the `LinkResolver` path set changes, potentially altering
+    /// ambiguity for other notes' wikilinks).
     pub fn reindex_file(&mut self, vault_root: &Path, path: &Path) -> VaultResult<()> {
+        let was_existing = self.notes.contains_key(path);
+        let old_links = self.notes.get(path).map(|n| n.links.clone());
+
         self.remove_note_contributions(path);
         self.link_resolver.remove_path(path);
 
@@ -154,7 +162,11 @@ impl VaultIndex {
         self.link_resolver.add_path(path.to_path_buf());
         self.notes.insert(path.to_path_buf(), metadata);
 
-        self.rebuild_backlinks();
+        if was_existing {
+            self.update_backlinks_for_file(path, old_links.as_deref());
+        } else {
+            self.rebuild_backlinks();
+        }
         self.recompute_stats();
         Ok(())
     }
@@ -291,7 +303,7 @@ impl VaultIndex {
             pattern: query.to_string(),
             source: e,
         })?;
-        self.search_with_regex(vault_root, &re, context_len)
+        self.search_with_regex(vault_root, &re, context_len, 0)
     }
 
     /// Regex search across all indexed notes.
@@ -300,12 +312,13 @@ impl VaultIndex {
         vault_root: &Path,
         pattern: &str,
         context_len: usize,
+        max_results: usize,
     ) -> VaultResult<Vec<SearchResult>> {
         let re = Regex::new(pattern).map_err(|e| VaultError::InvalidRegex {
             pattern: pattern.to_string(),
             source: e,
         })?;
-        self.search_with_regex(vault_root, &re, context_len)
+        self.search_with_regex(vault_root, &re, context_len, max_results)
     }
 
     /// Search notes by frontmatter field values.
@@ -369,6 +382,42 @@ impl VaultIndex {
         }
     }
 
+    /// Incrementally update backlinks for a single file whose content changed.
+    ///
+    /// Safe only when the `LinkResolver` path set hasn't changed (i.e. the file
+    /// was already in the index before the update).
+    fn update_backlinks_for_file(&mut self, path: &Path, old_links: Option<&[WikiLink]>) {
+        if let Some(old) = old_links {
+            for link in old {
+                if link.target.is_empty() {
+                    continue;
+                }
+                if let Some(resolved) = self.link_resolver.resolve(&link.target)
+                    && let Some(sources) = self.backlinks.get_mut(&resolved)
+                {
+                    sources.remove(path);
+                    if sources.is_empty() {
+                        self.backlinks.remove(&resolved);
+                    }
+                }
+            }
+        }
+
+        if let Some(note) = self.notes.get(path) {
+            for link in &note.links {
+                if link.target.is_empty() {
+                    continue;
+                }
+                if let Some(resolved) = self.link_resolver.resolve(&link.target) {
+                    self.backlinks
+                        .entry(resolved)
+                        .or_default()
+                        .insert(path.to_path_buf());
+                }
+            }
+        }
+    }
+
     fn rebuild_backlinks(&mut self) {
         self.backlinks.clear();
         for (source, note) in &self.notes {
@@ -402,10 +451,15 @@ impl VaultIndex {
         vault_root: &Path,
         re: &Regex,
         context_len: usize,
+        max_results: usize,
     ) -> VaultResult<Vec<SearchResult>> {
         let mut results = Vec::new();
 
         for path in self.notes.keys() {
+            if max_results > 0 && results.len() >= max_results {
+                break;
+            }
+
             let content = match fs::read_file(vault_root, path) {
                 Ok(c) => c,
                 Err(_) => continue,
@@ -945,7 +999,7 @@ mod tests {
         let index = VaultIndex::build(vault.path()).await.unwrap();
 
         let results = index
-            .search_regex(vault.path(), r"\[\[alpha\]\]", 10)
+            .search_regex(vault.path(), r"\[\[alpha\]\]", 10, 0)
             .unwrap();
         assert!(!results.is_empty());
 
@@ -959,7 +1013,7 @@ mod tests {
         let vault = setup_vault();
         let index = VaultIndex::build(vault.path()).await.unwrap();
 
-        let result = index.search_regex(vault.path(), "[invalid", 10);
+        let result = index.search_regex(vault.path(), "[invalid", 10, 0);
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),

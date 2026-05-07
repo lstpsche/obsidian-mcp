@@ -23,8 +23,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use chrono::{Local, NaiveDate};
 use notify_debouncer_mini::Debouncer;
 
-use regex::Regex;
-
 use crate::config::Config;
 use crate::error::{VaultError, VaultResult};
 use crate::models::{
@@ -332,7 +330,7 @@ impl Vault {
         context_len: usize,
     ) -> VaultResult<Vec<SearchResult>> {
         self.read_index()
-            .search_regex(&self.inner.root, pattern, context_len)
+            .search_regex(&self.inner.root, pattern, context_len, 0)
     }
 
     /// Semantic search via embedding cosine similarity (Layer 2).
@@ -606,17 +604,7 @@ impl Vault {
             tv.search(query, max_results)?
         };
 
-        let word_pattern: String = query
-            .split_whitespace()
-            .map(regex::escape)
-            .collect::<Vec<_>>()
-            .join("|");
-
-        let word_re = if word_pattern.is_empty() {
-            None
-        } else {
-            Regex::new(&format!("(?i){word_pattern}")).ok()
-        };
+        let word_re = search_utils::compile_query_word_regex(query);
 
         let mut results = Vec::with_capacity(hits.len());
         for (path, score) in hits {

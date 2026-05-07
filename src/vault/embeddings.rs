@@ -99,8 +99,17 @@ impl EmbeddingStore {
             .map(|(path, vec)| (path.clone(), cosine_similarity(query_vec, vec)))
             .collect();
 
-        scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(top_k);
+        let cmp = |a: &(PathBuf, f32), b: &(PathBuf, f32)| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        };
+
+        if top_k < scored.len() {
+            scored.select_nth_unstable_by(top_k, cmp);
+            scored.truncate(top_k);
+            scored.sort_unstable_by(cmp);
+        } else {
+            scored.sort_unstable_by(cmp);
+        }
         scored
     }
 

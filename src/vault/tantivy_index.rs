@@ -144,11 +144,20 @@ impl TantivyIndex {
         })
     }
 
-    /// Re-index a single file after create or modify.
-    ///
-    /// Deletes any existing document with the same path, reads the current
-    /// file content, adds the new document, and commits.
+    /// Re-index a single file after create or modify (commits immediately).
     pub fn reindex_file(
+        &self,
+        vault_root: &Path,
+        path: &Path,
+        meta: &NoteMetadata,
+    ) -> VaultResult<()> {
+        self.reindex_file_batch(vault_root, path, meta)?;
+        self.flush()
+    }
+
+    /// Re-index a single file without committing.
+    /// Call [`flush`] after processing a batch of updates.
+    pub fn reindex_file_batch(
         &self,
         vault_root: &Path,
         path: &Path,
@@ -157,7 +166,7 @@ impl TantivyIndex {
         let content = fs::read_file(vault_root, path)?;
         let path_str = path.to_string_lossy();
 
-        let mut writer = self
+        let writer = self
             .writer
             .lock()
             .map_err(|e| VaultError::Other(format!("tantivy writer lock poisoned: {e}")))?;
@@ -165,27 +174,40 @@ impl TantivyIndex {
         writer.delete_term(Term::from_field_text(self.ts.f_path, &path_str));
         let doc = build_document(&self.ts, path, meta, &content);
         writer.add_document(doc)?;
-        writer.commit()?;
-        drop(writer);
-        self.reader.reload()?;
 
         Ok(())
     }
 
-    /// Remove a file from the index after deletion.
+    /// Remove a file from the index (commits immediately).
     pub fn remove_file(&self, path: &Path) -> VaultResult<()> {
+        self.remove_file_batch(path)?;
+        self.flush()
+    }
+
+    /// Remove a file from the index without committing.
+    /// Call [`flush`] after processing a batch of updates.
+    pub fn remove_file_batch(&self, path: &Path) -> VaultResult<()> {
         let path_str = path.to_string_lossy();
 
-        let mut writer = self
+        let writer = self
             .writer
             .lock()
             .map_err(|e| VaultError::Other(format!("tantivy writer lock poisoned: {e}")))?;
 
         writer.delete_term(Term::from_field_text(self.ts.f_path, &path_str));
+
+        Ok(())
+    }
+
+    /// Commit pending writes and reload the reader.
+    pub fn flush(&self) -> VaultResult<()> {
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|e| VaultError::Other(format!("tantivy writer lock poisoned: {e}")))?;
         writer.commit()?;
         drop(writer);
         self.reader.reload()?;
-
         Ok(())
     }
 

@@ -316,6 +316,11 @@ The full development plan with task breakdown, dependencies, and parallelization
 - **VaultRegistry per-vault init lock:** `ensure_vault` uses a per-vault_id `tokio::sync::Mutex<()>` to prevent duplicate `VaultContext` construction under concurrent calls. The pattern is: acquire per-key lock → double-check registry → build if still missing → insert → release.
 - **InstallLock timeout:** `InstallLock::acquire` retries `try_lock_exclusive` in a loop with 200ms sleep and 30s timeout instead of blocking indefinitely. Warns after 5s of contention.
 - **Daemon early-exit detection:** After spawning the daemon process, bootstrap waits 50ms and calls `try_wait()` to detect immediate crashes before entering the health probe loop.
+- **Incremental backlinks:** `VaultIndex::reindex_file` uses incremental backlink updates (O(links_in_file)) for content-only changes (file already in index). Falls back to full `rebuild_backlinks()` (O(total_links)) only when the path set changes (new file, remove, rename) because `LinkResolver` ambiguity may shift.
+- **TantivyIndex batch API:** `reindex_file_batch` / `remove_file_batch` skip commit+reload; call `flush()` once after a batch. The watcher uses these to amortize a single commit per debounced event batch. Direct (non-watcher) mutations still use the committing `reindex_file` / `remove_file` methods.
+- **Watcher lock discipline:** The watcher releases the `VaultIndex` write lock before calling Tantivy batch ops or embedding inference. This minimizes read contention on the index lock.
+- **list_files skips canonicalize:** Since `WalkDir` defaults to `follow_links(false)` and the walk root is already canonical, per-entry `canonicalize()` is unnecessary. Entries are stripped against the canonical root directly.
+- **EmbeddingStore partial sort:** `query()` uses `select_nth_unstable_by` + sort of the top-k partition instead of sorting the entire store. Significant for vaults with >1k notes.
 
 ## Links
 
