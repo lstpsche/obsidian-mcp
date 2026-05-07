@@ -4,18 +4,16 @@ use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use regex::Regex;
 use serde_json::Value;
 
-use crate::error::VaultError;
-
-use super::indexer::normalize_bm25_scores;
 use super::protocol::{
     self, EnsureVaultParams, EnsureVaultResult, OpenHintParams, OpenHintResult, SearchHybridParams,
     SearchResult, SearchSemanticParams, SemanticHit,
 };
 use super::vault_context::VaultContext;
 use super::vault_registry::VaultRegistry;
+use crate::error::VaultError;
+use crate::vault::search_utils::{body_preview, compile_query_word_regex, normalize_bm25_scores};
 
 const DEFAULT_TOP_K: usize = 10;
 const DEFAULT_PREFETCH_COUNT: usize = 50;
@@ -226,34 +224,6 @@ fn build_hits(
     }
 
     Ok(SearchResult { results })
-}
-
-fn compile_query_word_regex(query: &str) -> Option<Regex> {
-    let pattern: String = query
-        .split_whitespace()
-        .map(regex::escape)
-        .collect::<Vec<_>>()
-        .join("|");
-    if pattern.is_empty() {
-        return None;
-    }
-    Regex::new(&format!("(?i){pattern}")).ok()
-}
-
-fn body_preview(content: &str, max_chars: usize) -> String {
-    let start = if let Some(stripped) = content.strip_prefix("---") {
-        stripped
-            .find("\n---")
-            .map(|idx| {
-                let end = idx + 7;
-                content[end..].find('\n').map_or(end, |nl| end + nl + 1)
-            })
-            .unwrap_or(0)
-    } else {
-        0
-    };
-    let body = content[start..].trim_start();
-    body.chars().take(max_chars).collect()
 }
 
 fn split_subpath(path: &str) -> (&str, Option<String>) {

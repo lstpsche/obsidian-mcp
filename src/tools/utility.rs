@@ -116,23 +116,7 @@ fn launch_uri(uri: &str) -> Result<(), VaultError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
-
-    fn test_config(vault_root: &Path) -> Config {
-        Config {
-            vault_path: vault_root.to_path_buf(),
-            watch: false,
-            log_level: "error".into(),
-            tantivy: false,
-            embeddings: false,
-            embeddings_model: String::new(),
-            hybrid_alpha: 0.25,
-        }
-    }
-
-    fn create_test_vault(dir: &Path) {
-        std::fs::create_dir_all(dir.join(".obsidian")).unwrap();
-    }
+    use crate::test_helpers::{create_test_vault, test_config};
 
     #[tokio::test]
     async fn vault_info_returns_stats() {

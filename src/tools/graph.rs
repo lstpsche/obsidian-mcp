@@ -276,22 +276,10 @@ pub async fn links_orphans(
 mod tests {
     use super::*;
 
-    use crate::config::Config;
-
-    fn test_config(vault_root: &Path) -> Config {
-        Config {
-            vault_path: vault_root.to_path_buf(),
-            watch: false,
-            log_level: "error".into(),
-            tantivy: false,
-            embeddings: false,
-            embeddings_model: String::new(),
-            hybrid_alpha: 0.25,
-        }
-    }
+    use crate::test_helpers::{extract_text, test_config};
 
     fn create_test_vault(dir: &Path) {
-        std::fs::create_dir_all(dir.join(".obsidian")).unwrap();
+        crate::test_helpers::create_test_vault(dir);
 
         std::fs::write(dir.join("a.md"), "# A\n\nLinks to [[b]] and [[c]].\n").unwrap();
         std::fs::write(dir.join("b.md"), "# B\n\nLinks back to [[a]].\n").unwrap();
@@ -307,14 +295,6 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.join("orphan.md"), "# Orphan\n\nNo links here.\n").unwrap();
-    }
-
-    fn extract_text(result: &CallToolResult) -> &str {
-        result.content[0]
-            .as_text()
-            .expect("expected text content")
-            .text
-            .as_str()
     }
 
     #[tokio::test]

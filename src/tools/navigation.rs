@@ -125,22 +125,10 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::config::Config;
-
-    fn test_config(vault_root: &Path) -> Config {
-        Config {
-            vault_path: vault_root.to_path_buf(),
-            watch: false,
-            log_level: "error".into(),
-            tantivy: false,
-            embeddings: false,
-            embeddings_model: String::new(),
-            hybrid_alpha: 0.25,
-        }
-    }
+    use crate::test_helpers::{extract_text, test_config};
 
     fn create_test_vault(dir: &Path) {
-        fs::create_dir_all(dir.join(".obsidian")).unwrap();
+        crate::test_helpers::create_test_vault(dir);
         fs::write(dir.join("readme.md"), "# Readme").unwrap();
         fs::write(dir.join("notes.md"), "# Notes").unwrap();
         fs::create_dir_all(dir.join("journal")).unwrap();
@@ -148,14 +136,6 @@ mod tests {
         fs::write(dir.join("journal/2024-01-02.md"), "# Jan 2").unwrap();
         fs::create_dir_all(dir.join("projects/alpha")).unwrap();
         fs::write(dir.join("projects/alpha/spec.md"), "# Spec").unwrap();
-    }
-
-    fn extract_text(result: &CallToolResult) -> &str {
-        result.content[0]
-            .as_text()
-            .expect("expected text content")
-            .text
-            .as_str()
     }
 
     // ── vault_list ──

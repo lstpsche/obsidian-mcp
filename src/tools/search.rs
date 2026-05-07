@@ -420,35 +420,7 @@ fn search_semantic_local(
 }
 
 #[cfg(feature = "embeddings")]
-fn body_preview(content: &str, max_chars: usize) -> String {
-    let start = if content.starts_with("---") {
-        content[3..]
-            .find("\n---")
-            .map(|i| {
-                let end = i + 7; // skip initial "---" (3) + "\n---" (4)
-                content[end..].find('\n').map_or(end, |nl| end + nl + 1)
-            })
-            .unwrap_or(0)
-    } else {
-        0
-    };
-    let body = content[start..].trim_start();
-    body.chars().take(max_chars).collect()
-}
-
-#[cfg(feature = "embeddings")]
-fn compile_query_word_regex(query: &str) -> Option<regex::Regex> {
-    let pattern: String = query
-        .split_whitespace()
-        .map(regex::escape)
-        .collect::<Vec<_>>()
-        .join("|");
-    if pattern.is_empty() {
-        None
-    } else {
-        regex::Regex::new(&format!("(?i){pattern}")).ok()
-    }
-}
+use crate::vault::search_utils::{body_preview, compile_query_word_regex};
 
 fn local_backend_available(vault: &Vault) -> bool {
     #[cfg(feature = "embeddings")]
@@ -500,7 +472,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::config::Config;
+    use crate::test_helpers::{create_test_vault, extract_text, tantivy_config, test_config};
     #[cfg(unix)]
     use crate::{
         client::semantic_daemon::{DaemonConnectPolicy, SemanticDaemonClient},
@@ -510,30 +482,6 @@ mod tests {
     use serde_json::json;
     #[cfg(unix)]
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-    fn test_config(vault_root: &Path) -> Config {
-        Config {
-            vault_path: vault_root.to_path_buf(),
-            watch: false,
-            log_level: "error".into(),
-            tantivy: false,
-            embeddings: false,
-            embeddings_model: String::new(),
-            hybrid_alpha: 0.25,
-        }
-    }
-
-    fn create_test_vault(dir: &Path) {
-        std::fs::create_dir_all(dir.join(".obsidian")).unwrap();
-    }
-
-    fn extract_text(result: &CallToolResult) -> &str {
-        result.content[0]
-            .as_text()
-            .expect("expected text content")
-            .text
-            .as_str()
-    }
 
     #[cfg(unix)]
     fn start_prefetch_capture_server(socket_path: PathBuf) -> tokio::task::JoinHandle<usize> {
@@ -923,18 +871,6 @@ mod tests {
 
     // ── search_text with Tantivy BM25 ──────────────────────────────
 
-    fn tantivy_config(vault_root: &Path) -> Config {
-        Config {
-            vault_path: vault_root.to_path_buf(),
-            watch: false,
-            log_level: "error".into(),
-            tantivy: true,
-            embeddings: false,
-            embeddings_model: String::new(),
-            hybrid_alpha: 0.25,
-        }
-    }
-
     async fn setup_tantivy_vault() -> (tempfile::TempDir, Vault) {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
@@ -1132,46 +1068,5 @@ mod tests {
             captured_prefetch, 7,
             "runtime prefetch should be used as-is"
         );
-    }
-
-    // ── body_preview ────────────────────────────────────────────────
-
-    #[cfg(feature = "embeddings")]
-    #[test]
-    fn body_preview_strips_frontmatter() {
-        let content = "---\ntags: [a]\n---\nHello world";
-        let preview = super::body_preview(content, 100);
-        assert_eq!(preview, "Hello world");
-    }
-
-    #[cfg(feature = "embeddings")]
-    #[test]
-    fn body_preview_no_frontmatter() {
-        let content = "# Title\nSome body text";
-        let preview = super::body_preview(content, 100);
-        assert_eq!(preview, "# Title\nSome body text");
-    }
-
-    #[cfg(feature = "embeddings")]
-    #[test]
-    fn body_preview_truncates() {
-        let content = "---\nk: v\n---\nABCDEFGHIJ";
-        let preview = super::body_preview(content, 5);
-        assert_eq!(preview, "ABCDE");
-    }
-
-    #[cfg(feature = "embeddings")]
-    #[test]
-    fn body_preview_empty_content() {
-        let preview = super::body_preview("", 100);
-        assert_eq!(preview, "");
-    }
-
-    #[cfg(feature = "embeddings")]
-    #[test]
-    fn body_preview_unclosed_frontmatter() {
-        let content = "---\ntags: [a]\nNo closing delimiter here";
-        let preview = super::body_preview(content, 200);
-        assert!(preview.contains("tags:"));
     }
 }

@@ -309,6 +309,9 @@ The full development plan with task breakdown, dependencies, and parallelization
 - **MCP daemon connect policy knobs:** `OBSIDIAN_SEMANTIC_CONNECT_TIMEOUT_MS` (clamped `100..=60000`), `OBSIDIAN_SEMANTIC_CONNECT_RETRIES` (`0..=10`), and `OBSIDIAN_SEMANTIC_RETRY_BACKOFF_MS` (`50..=60000`) drive MCP daemon call retry behavior; retries only apply to transport/timeouts, not protocol errors.
 - **Legacy embedding cache migration path:** On daemon initialization with embeddings feature, MCP best-effort copies legacy per-vault cache from `<vault>/.obsidian/obsidian-mcp/embeddings.bin` into `<semantic-home>/vaults/<vault_id>/embeddings.bin`. The copy is idempotent and never deletes the source cache.
 - **Daemon stderr logging:** Daemon bootstrap writes daemon stderr to `<semantic-home>/logs/obsidian-semanticd.stderr.log` (append mode) instead of discarding it, while stdout remains null to protect JSON-RPC channels.
+- **Shared search utilities:** `src/vault/search_utils.rs` contains `body_preview`, `compile_query_word_regex`, and `normalize_bm25_scores`. These are **not** feature-gated — callers maintain their own `#[cfg(feature = "embeddings")]` on imports. Do not duplicate these functions in tool or daemon modules.
+- **Shared test helpers:** `src/test_helpers.rs` is a `#[cfg(test)] pub(crate) mod` at crate root providing `test_config`, `tantivy_config`, `create_test_vault`, and `extract_text`. Tool test modules import from here and extend with domain-specific setup (e.g. writing fixture notes). Do not duplicate base helpers.
+- **Single model name constant:** `config::DEFAULT_MODEL_NAME` is the single source of truth for the default embedding model name (`BAAI/bge-small-en-v1.5`). Both the MCP server and the semantic daemon binary import from `obsidian_mcp::config`. Do not define local model name constants.
 
 ## Links
 

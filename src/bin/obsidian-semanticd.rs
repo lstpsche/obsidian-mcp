@@ -1,9 +1,8 @@
 use tracing_subscriber::EnvFilter;
 
+use obsidian_mcp::config::DEFAULT_MODEL_NAME;
 use obsidian_mcp::daemon::home::{self, semantic_home_paths};
 use obsidian_mcp::daemon::server::{self, DaemonServerConfig, IpcEndpoint};
-
-const DEFAULT_SEMANTIC_MODEL: &str = "BAAI/bge-small-en-v1.5";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,8 +18,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let endpoint =
         resolve_endpoint_from_env().unwrap_or_else(|| home::default_ipc_endpoint(&paths));
-    let model_name = std::env::var("OBSIDIAN_SEMANTIC_MODEL")
-        .unwrap_or_else(|_| DEFAULT_SEMANTIC_MODEL.to_string());
+    let model_name =
+        std::env::var("OBSIDIAN_SEMANTIC_MODEL").unwrap_or_else(|_| DEFAULT_MODEL_NAME.to_string());
 
     tracing::info!(
         endpoint = %endpoint.endpoint_string(),

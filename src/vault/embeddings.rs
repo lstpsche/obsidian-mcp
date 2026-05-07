@@ -218,6 +218,71 @@ impl EmbeddingModel {
     }
 }
 
+// ── Shared embedding index builder ────────────────────────────────────
+
+const BATCH_SIZE: usize = 64;
+
+/// Load cached embeddings or rebuild from note entries.
+///
+/// The caller is responsible for lock acquisition on the index — this
+/// function receives pre-extracted note entries to stay decoupled from
+/// any particular lock strategy.
+pub(crate) fn build_or_load_embedding_store(
+    cache_path: &Path,
+    vault_root: &Path,
+    note_entries: &[(PathBuf, crate::models::NoteMetadata)],
+    model: &EmbeddingModel,
+) -> VaultResult<EmbeddingStore> {
+    if let Ok(store) = EmbeddingStore::load(cache_path) {
+        if store.dim() == model.dim() && store.len() == note_entries.len() {
+            tracing::info!(
+                cache = %cache_path.display(),
+                cached = store.len(),
+                "loaded embedding cache"
+            );
+            return Ok(store);
+        }
+        tracing::info!(
+            cache = %cache_path.display(),
+            cached = store.len(),
+            current = note_entries.len(),
+            "embedding cache stale, rebuilding"
+        );
+    }
+
+    let entries: Vec<(PathBuf, String)> = note_entries
+        .iter()
+        .filter_map(|(path, meta)| {
+            let content = super::fs::read_file(vault_root, path).ok()?;
+            let body = super::frontmatter::get_body(&content);
+            let heading_texts: Vec<String> = meta.headings.iter().map(|h| h.text.clone()).collect();
+            let text = prepare_embed_text(&meta.title, &heading_texts, body);
+            Some((path.clone(), text))
+        })
+        .collect();
+
+    let mut store = EmbeddingStore::new(model.dim());
+    for chunk in entries.chunks(BATCH_SIZE) {
+        let texts: Vec<&str> = chunk.iter().map(|(_, text)| text.as_str()).collect();
+        match model.embed_batch(&texts) {
+            Ok(vectors) => {
+                for ((path, _), vector) in chunk.iter().zip(vectors) {
+                    store.insert(path.clone(), vector);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "embedding batch failed, skipping chunk");
+            }
+        }
+    }
+
+    if let Err(err) = store.save(cache_path) {
+        tracing::warn!(error = %err, "failed to save embedding cache");
+    }
+
+    Ok(store)
+}
+
 // ── Text preparation ───────────────────────────────────────────────────
 
 const MAX_BODY_WORDS: usize = 400;

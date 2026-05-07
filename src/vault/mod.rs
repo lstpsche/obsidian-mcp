@@ -9,6 +9,7 @@ pub mod index;
 pub mod parser;
 pub mod patch;
 pub mod periodic;
+pub mod search_utils;
 pub mod tantivy_index;
 pub mod watcher;
 pub mod wikilink;
@@ -401,7 +402,7 @@ impl Vault {
         let query_vec = model.embed_one(query)?;
         let store_guard = store.read().expect("embedding store lock poisoned");
 
-        let norm_bm25 = normalize_bm25_scores(&bm25_hits);
+        let norm_bm25 = search_utils::normalize_bm25_scores(&bm25_hits);
 
         let mut combined: Vec<(PathBuf, f32)> = norm_bm25
             .into_iter()
@@ -678,7 +679,6 @@ impl Vault {
             .join("embeddings.bin")
     }
 
-    /// Load cached embeddings or rebuild from scratch.
     #[cfg(feature = "embeddings")]
     fn build_or_load_embeddings(
         vault_root: &Path,
@@ -687,55 +687,13 @@ impl Vault {
     ) -> VaultResult<embeddings::EmbeddingStore> {
         let cache_path = Self::embedding_cache_path(vault_root);
         let idx = index.read().expect("index lock poisoned");
-        let note_count = idx.notes().len();
-
-        if let Ok(store) = embeddings::EmbeddingStore::load(&cache_path) {
-            if store.dim() == model.dim() && store.len() == note_count {
-                tracing::info!(cached = store.len(), "loaded embedding cache");
-                return Ok(store);
-            }
-            tracing::info!(
-                cached = store.len(),
-                current = note_count,
-                "embedding cache stale, rebuilding"
-            );
-        }
-
-        let mut store = embeddings::EmbeddingStore::new(model.dim());
-
-        let entries: Vec<(PathBuf, String)> = idx
+        let note_entries: Vec<_> = idx
             .notes()
             .iter()
-            .filter_map(|(path, meta)| {
-                let content = fs::read_file(vault_root, path).ok()?;
-                let body = frontmatter::get_body(&content);
-                let heading_texts: Vec<String> =
-                    meta.headings.iter().map(|h| h.text.clone()).collect();
-                let text = embeddings::prepare_embed_text(&meta.title, &heading_texts, body);
-                Some((path.clone(), text))
-            })
+            .map(|(path, meta)| (path.clone(), meta.clone()))
             .collect();
-
-        let batch_size = 64;
-        for chunk in entries.chunks(batch_size) {
-            let texts: Vec<&str> = chunk.iter().map(|(_, t)| t.as_str()).collect();
-            match model.embed_batch(&texts) {
-                Ok(vecs) => {
-                    for ((path, _), vec) in chunk.iter().zip(vecs) {
-                        store.insert(path.clone(), vec);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "embedding batch failed, skipping chunk");
-                }
-            }
-        }
-
-        if let Err(e) = store.save(&cache_path) {
-            tracing::warn!(error = %e, "failed to save embedding cache");
-        }
-
-        Ok(store)
+        drop(idx);
+        embeddings::build_or_load_embedding_store(&cache_path, vault_root, &note_entries, model)
     }
 
     /// Re-embed a single note and update the store. Non-fatal on error.
@@ -797,59 +755,13 @@ impl Vault {
     }
 }
 
-// ── Hybrid search helpers ──────────────────────────────────────────────
-
-/// Min-max normalize BM25 scores to [0, 1].
-///
-/// When all scores are identical (max == min), all normalized values are 1.0.
-#[cfg(feature = "embeddings")]
-fn normalize_bm25_scores(hits: &[(PathBuf, f32)]) -> Vec<(PathBuf, f32)> {
-    if hits.is_empty() {
-        return Vec::new();
-    }
-
-    let min = hits.iter().map(|(_, s)| *s).fold(f32::INFINITY, f32::min);
-    let max = hits
-        .iter()
-        .map(|(_, s)| *s)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let range = max - min;
-
-    hits.iter()
-        .map(|(path, score)| {
-            let normalized = if range == 0.0 {
-                1.0
-            } else {
-                (score - min) / range
-            };
-            (path.clone(), normalized)
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::config::Config;
     use crate::models::{PatchOperation, PatchTargetType};
-
-    fn test_config(vault_root: &Path) -> Config {
-        Config {
-            vault_path: vault_root.to_path_buf(),
-            watch: false,
-            log_level: "error".into(),
-            tantivy: false,
-            embeddings: false,
-            embeddings_model: String::new(),
-            hybrid_alpha: 0.25,
-        }
-    }
-
-    fn create_test_vault(dir: &Path) {
-        std::fs::create_dir_all(dir.join(".obsidian")).unwrap();
-    }
+    use crate::test_helpers::{create_test_vault, tantivy_config, test_config};
 
     #[tokio::test]
     async fn vault_open_succeeds() {
@@ -1184,18 +1096,6 @@ mod tests {
         assert_send_sync_clone::<Vault>();
     }
 
-    fn tantivy_config(vault_root: &Path) -> Config {
-        Config {
-            vault_path: vault_root.to_path_buf(),
-            watch: false,
-            log_level: "error".into(),
-            tantivy: true,
-            embeddings: false,
-            embeddings_model: String::new(),
-            hybrid_alpha: 0.25,
-        }
-    }
-
     #[tokio::test]
     async fn vault_open_with_tantivy() {
         let dir = tempfile::tempdir().unwrap();
@@ -1420,86 +1320,5 @@ mod tests {
             results[0].score.is_none(),
             "regex fallback should not populate BM25 scores"
         );
-    }
-
-    // ── normalize_bm25_scores ────────────────────────────────────────
-
-    #[cfg(feature = "embeddings")]
-    mod normalize_tests {
-        use super::*;
-
-        #[test]
-        fn normalize_empty() {
-            assert!(normalize_bm25_scores(&[]).is_empty());
-        }
-
-        #[test]
-        fn normalize_single_score() {
-            let hits = vec![(PathBuf::from("a.md"), 5.0)];
-            let norm = normalize_bm25_scores(&hits);
-            assert_eq!(norm.len(), 1);
-            assert!(
-                (norm[0].1 - 1.0).abs() < 1e-6,
-                "single item normalizes to 1.0"
-            );
-        }
-
-        #[test]
-        fn normalize_identical_scores() {
-            let hits = vec![
-                (PathBuf::from("a.md"), 3.0),
-                (PathBuf::from("b.md"), 3.0),
-                (PathBuf::from("c.md"), 3.0),
-            ];
-            let norm = normalize_bm25_scores(&hits);
-            for (_, score) in &norm {
-                assert!(
-                    (score - 1.0).abs() < 1e-6,
-                    "identical scores should all normalize to 1.0"
-                );
-            }
-        }
-
-        #[test]
-        fn normalize_min_max_range() {
-            let hits = vec![
-                (PathBuf::from("high.md"), 10.0),
-                (PathBuf::from("mid.md"), 5.0),
-                (PathBuf::from("low.md"), 0.0),
-            ];
-            let norm = normalize_bm25_scores(&hits);
-
-            let high = norm
-                .iter()
-                .find(|(p, _)| p == Path::new("high.md"))
-                .unwrap()
-                .1;
-            let mid = norm
-                .iter()
-                .find(|(p, _)| p == Path::new("mid.md"))
-                .unwrap()
-                .1;
-            let low = norm
-                .iter()
-                .find(|(p, _)| p == Path::new("low.md"))
-                .unwrap()
-                .1;
-
-            assert!((high - 1.0).abs() < 1e-6);
-            assert!((mid - 0.5).abs() < 1e-6);
-            assert!(low.abs() < 1e-6);
-        }
-
-        #[test]
-        fn normalize_preserves_order() {
-            let hits = vec![
-                (PathBuf::from("first.md"), 8.0),
-                (PathBuf::from("second.md"), 4.0),
-                (PathBuf::from("third.md"), 2.0),
-            ];
-            let norm = normalize_bm25_scores(&hits);
-            assert!(norm[0].1 > norm[1].1);
-            assert!(norm[1].1 > norm[2].1);
-        }
     }
 }

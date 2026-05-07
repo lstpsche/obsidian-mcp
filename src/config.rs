@@ -3,8 +3,7 @@
 
 use std::path::PathBuf;
 
-const DEFAULT_EMBEDDINGS_MODEL: &str = "BAAI/bge-small-en-v1.5";
-const DEFAULT_SEMANTIC_MODEL: &str = "BAAI/bge-small-en-v1.5";
+pub const DEFAULT_MODEL_NAME: &str = "BAAI/bge-small-en-v1.5";
 const DEFAULT_HYBRID_ALPHA: f32 = 0.25;
 const DEFAULT_SEMANTIC_CONNECT_TIMEOUT_MS: u64 = 2_000;
 const DEFAULT_SEMANTIC_CONNECT_RETRIES: u32 = 2;
@@ -55,7 +54,7 @@ impl Config {
             .eq_ignore_ascii_case("true");
 
         let embeddings_model = std::env::var("OBSIDIAN_EMBEDDINGS_MODEL")
-            .unwrap_or_else(|_| DEFAULT_EMBEDDINGS_MODEL.into());
+            .unwrap_or_else(|_| DEFAULT_MODEL_NAME.into());
 
         let hybrid_alpha = std::env::var("OBSIDIAN_SEMANTIC_ALPHA")
             .ok()
@@ -150,7 +149,7 @@ impl SemanticRuntimeConfig {
                 .ok()
                 .map(|raw| raw.trim().to_string())
                 .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| DEFAULT_SEMANTIC_MODEL.to_string()),
+                .unwrap_or_else(|| DEFAULT_MODEL_NAME.to_string()),
             connect_timeout_ms: parse_u64_env("OBSIDIAN_SEMANTIC_CONNECT_TIMEOUT_MS")
                 .unwrap_or(DEFAULT_SEMANTIC_CONNECT_TIMEOUT_MS)
                 .clamp(100, 60_000),
