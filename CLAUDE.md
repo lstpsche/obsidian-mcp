@@ -312,6 +312,10 @@ The full development plan with task breakdown, dependencies, and parallelization
 - **Shared search utilities:** `src/vault/search_utils.rs` contains `body_preview`, `compile_query_word_regex`, and `normalize_bm25_scores`. These are **not** feature-gated — callers maintain their own `#[cfg(feature = "embeddings")]` on imports. Do not duplicate these functions in tool or daemon modules.
 - **Shared test helpers:** `src/test_helpers.rs` is a `#[cfg(test)] pub(crate) mod` at crate root providing `test_config`, `tantivy_config`, `create_test_vault`, and `extract_text`. Tool test modules import from here and extend with domain-specific setup (e.g. writing fixture notes). Do not duplicate base helpers.
 - **Single model name constant:** `config::DEFAULT_MODEL_NAME` is the single source of truth for the default embedding model name (`BAAI/bge-small-en-v1.5`). Both the MCP server and the semantic daemon binary import from `obsidian_mcp::config`. Do not define local model name constants.
+- **SemanticRuntime `vault_ensured` flag:** `SemanticRuntime` has a `vault_ensured: Arc<AtomicBool>` field that caches whether `ensure_vault` has been called for the current daemon session. The flag is reset to `false` when the daemon becomes unavailable (fallback path). Always initialize this field when constructing `SemanticRuntime` in new code or tests.
+- **VaultRegistry per-vault init lock:** `ensure_vault` uses a per-vault_id `tokio::sync::Mutex<()>` to prevent duplicate `VaultContext` construction under concurrent calls. The pattern is: acquire per-key lock → double-check registry → build if still missing → insert → release.
+- **InstallLock timeout:** `InstallLock::acquire` retries `try_lock_exclusive` in a loop with 200ms sleep and 30s timeout instead of blocking indefinitely. Warns after 5s of contention.
+- **Daemon early-exit detection:** After spawning the daemon process, bootstrap waits 50ms and calls `try_wait()` to detect immediate crashes before entering the health probe loop.
 
 ## Links
 
