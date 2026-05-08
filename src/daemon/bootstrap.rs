@@ -116,7 +116,7 @@ pub async fn ensure_daemon(config: &BootstrapConfig) -> VaultResult<BootstrapRes
         .and_then(endpoint_from_manifest)
         .unwrap_or(default_endpoint);
 
-    let daemon_binary_path =
+    let mut daemon_binary_path =
         resolve_daemon_binary_path(config, &paths, existing_manifest.as_ref())?;
     let mut binary_sha256 = existing_manifest
         .as_ref()
@@ -129,10 +129,15 @@ pub async fn ensure_daemon(config: &BootstrapConfig) -> VaultResult<BootstrapRes
                 daemon_binary_path.display()
             )));
         }
-        let download_url = resolve_download_url(config)?;
-        tracing::info!(url = %download_url, "downloading semantic daemon binary");
-        let checksum = download_and_install(&download_url, &daemon_binary_path).await?;
-        binary_sha256 = Some(checksum);
+        if let Some(path_binary) = find_daemon_on_path() {
+            tracing::info!(path = %path_binary.display(), "using daemon binary found on $PATH");
+            daemon_binary_path = path_binary;
+        } else {
+            let download_url = resolve_download_url(config)?;
+            tracing::info!(url = %download_url, "downloading semantic daemon binary");
+            let checksum = download_and_install(&download_url, &daemon_binary_path).await?;
+            binary_sha256 = Some(checksum);
+        }
     }
 
     let mut child =
@@ -203,6 +208,14 @@ fn resolve_daemon_binary_path(
     }
 
     Ok(paths.daemon_binary_path.clone())
+}
+
+fn find_daemon_on_path() -> Option<PathBuf> {
+    let binary_name = home::daemon_binary_name();
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(binary_name))
+        .find(|candidate| candidate.is_file())
 }
 
 fn resolve_download_url(config: &BootstrapConfig) -> VaultResult<String> {
@@ -664,6 +677,46 @@ mod tests {
             bootstrap_client_version: "1.0.1".to_string(),
         });
         assert!(endpoint_from_manifest(&manifest).is_none());
+    }
+
+    #[test]
+    fn find_daemon_on_path_discovers_binary_in_temp_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binary_name = home::daemon_binary_name();
+        let fake_binary = dir.path().join(binary_name);
+        std::fs::write(&fake_binary, b"fake").expect("write fake binary");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_binary).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_binary, perms).unwrap();
+        }
+
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut new_path = std::env::split_paths(&original_path).collect::<Vec<_>>();
+        new_path.insert(0, dir.path().to_path_buf());
+        let joined = std::env::join_paths(&new_path).expect("join paths");
+        // SAFETY: test-only; mutating env is acceptable in single-threaded test context
+        unsafe { std::env::set_var("PATH", &joined) };
+
+        let result = find_daemon_on_path();
+        unsafe { std::env::set_var("PATH", &original_path) };
+
+        assert_eq!(result, Some(fake_binary));
+    }
+
+    #[test]
+    fn find_daemon_on_path_returns_none_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        // SAFETY: test-only; mutating env is acceptable in single-threaded test context
+        unsafe { std::env::set_var("PATH", dir.path()) };
+
+        let result = find_daemon_on_path();
+        unsafe { std::env::set_var("PATH", &original_path) };
+
+        assert!(result.is_none());
     }
 
     #[cfg(unix)]
