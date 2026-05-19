@@ -10,10 +10,10 @@ use crate::models::NoteMetadata;
 use crate::vault::index::VaultIndex;
 use crate::vault::tantivy_index::TantivyIndex;
 
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 use crate::vault::embeddings::{EmbeddingModel, EmbeddingStore};
 
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 use super::indexer;
 use super::watcher;
 
@@ -23,11 +23,11 @@ pub struct VaultContext {
     model_name: String,
     index: Arc<RwLock<VaultIndex>>,
     tantivy: Arc<TantivyIndex>,
-    #[cfg(feature = "embeddings")]
+    #[cfg(has_embeddings)]
     embedding_model: Arc<EmbeddingModel>,
-    #[cfg(feature = "embeddings")]
+    #[cfg(has_embeddings)]
     embedding_store: Arc<RwLock<EmbeddingStore>>,
-    #[cfg(feature = "embeddings")]
+    #[cfg(has_embeddings)]
     embedding_cache_path: PathBuf,
     watcher: Mutex<Option<Debouncer<notify::RecommendedWatcher>>>,
 }
@@ -39,7 +39,7 @@ impl VaultContext {
         model_name: String,
         state_dir: PathBuf,
         watch_enabled: bool,
-        #[cfg(feature = "embeddings")] embedding_model: Arc<EmbeddingModel>,
+        #[cfg(has_embeddings)] embedding_model: Arc<EmbeddingModel>,
     ) -> VaultResult<Self> {
         std::fs::create_dir_all(&state_dir)?;
 
@@ -52,7 +52,7 @@ impl VaultContext {
         };
         let tantivy = Arc::new(tantivy);
 
-        #[cfg(feature = "embeddings")]
+        #[cfg(has_embeddings)]
         let (embedding_store, embedding_cache_path) = {
             let embedding_cache_path = state_dir.join("embeddings.bin");
             let store = indexer::build_or_load_embeddings(
@@ -71,11 +71,11 @@ impl VaultContext {
             model_name,
             index,
             tantivy,
-            #[cfg(feature = "embeddings")]
+            #[cfg(has_embeddings)]
             embedding_model,
-            #[cfg(feature = "embeddings")]
+            #[cfg(has_embeddings)]
             embedding_store,
-            #[cfg(feature = "embeddings")]
+            #[cfg(has_embeddings)]
             embedding_cache_path,
             watcher: Mutex::new(None),
         };
@@ -117,7 +117,7 @@ impl VaultContext {
             return Ok(true);
         }
 
-        #[cfg(feature = "embeddings")]
+        #[cfg(has_embeddings)]
         let debouncer = watcher::start_watcher(
             self.vault_root.clone(),
             Arc::clone(&self.index),
@@ -127,7 +127,7 @@ impl VaultContext {
             self.embedding_cache_path.clone(),
         )?;
 
-        #[cfg(not(feature = "embeddings"))]
+        #[cfg(not(has_embeddings))]
         let debouncer = watcher::start_watcher(
             self.vault_root.clone(),
             Arc::clone(&self.index),
@@ -154,7 +154,7 @@ impl VaultContext {
         self.tantivy.search(query, top_k)
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(has_embeddings)]
     pub fn search_semantic_scores(
         &self,
         query: &str,
@@ -167,12 +167,12 @@ impl VaultContext {
         Ok(guard.query(&query_vec, top_k))
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(has_embeddings)]
     pub fn query_embedding(&self, query: &str) -> VaultResult<Vec<f32>> {
         self.embedding_model.embed_one(query)
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(has_embeddings)]
     pub fn semantic_score_for(&self, path: &Path, query_embedding: &[f32]) -> VaultResult<f32> {
         let guard = self.embedding_store.read().map_err(|err| {
             VaultError::Other(format!("daemon embedding store lock poisoned: {err}"))
@@ -185,7 +185,7 @@ impl VaultContext {
             .unwrap_or(0.0))
     }
 
-    #[cfg(not(feature = "embeddings"))]
+    #[cfg(not(has_embeddings))]
     pub fn search_semantic_scores(
         &self,
         _query: &str,
@@ -196,14 +196,14 @@ impl VaultContext {
         ))
     }
 
-    #[cfg(not(feature = "embeddings"))]
+    #[cfg(not(has_embeddings))]
     pub fn query_embedding(&self, _query: &str) -> VaultResult<Vec<f32>> {
         Err(VaultError::Embedding(
             "daemon binary compiled without embeddings feature".to_string(),
         ))
     }
 
-    #[cfg(not(feature = "embeddings"))]
+    #[cfg(not(has_embeddings))]
     pub fn semantic_score_for(&self, _path: &Path, _query_embedding: &[f32]) -> VaultResult<f32> {
         Err(VaultError::Embedding(
             "daemon binary compiled without embeddings feature".to_string(),

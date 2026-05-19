@@ -12,16 +12,16 @@ use crate::error::{VaultError, VaultResult};
 use crate::vault::index::VaultIndex;
 use crate::vault::tantivy_index::TantivyIndex;
 
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 use crate::vault::embeddings::{EmbeddingModel, EmbeddingStore};
 
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 use super::indexer;
 
 const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(500);
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 pub fn start_watcher(
     vault_root: PathBuf,
     index: Arc<RwLock<VaultIndex>>,
@@ -94,7 +94,7 @@ pub fn start_watcher(
     Ok(debouncer)
 }
 
-#[cfg(not(feature = "embeddings"))]
+#[cfg(not(has_embeddings))]
 pub fn start_watcher(
     vault_root: PathBuf,
     index: Arc<RwLock<VaultIndex>>,
@@ -180,7 +180,7 @@ fn is_obsidian_dir(relative: &Path) -> bool {
 }
 
 /// Returns `(tantivy_touched, embedding_touched)`.
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 fn process_event(
     vault_root: &Path,
     index: &Arc<RwLock<VaultIndex>>,
@@ -255,7 +255,7 @@ fn process_event(
 }
 
 /// Returns whether Tantivy was touched.
-#[cfg(not(feature = "embeddings"))]
+#[cfg(not(has_embeddings))]
 fn process_event(
     vault_root: &Path,
     index: &Arc<RwLock<VaultIndex>>,

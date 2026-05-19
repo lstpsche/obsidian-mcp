@@ -22,6 +22,32 @@ pub enum Transport {
     Http,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingProvider {
+    Local,
+    Api,
+}
+
+impl EmbeddingProvider {
+    pub fn parse(raw: &str) -> Option<Self> {
+        let normalized = raw.trim();
+        if normalized.eq_ignore_ascii_case("local") {
+            Some(Self::Local)
+        } else if normalized.eq_ignore_ascii_case("api") {
+            Some(Self::Api)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Api => "api",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub vault_path: PathBuf,
@@ -39,6 +65,9 @@ pub struct Config {
     /// Hybrid search alpha: `alpha * BM25 + (1-alpha) * semantic` (`OBSIDIAN_HYBRID_ALPHA`, default `0.25`).
     /// Clamped to `[0.0, 1.0]`. Lower values give more weight to semantic similarity.
     pub hybrid_alpha: f32,
+    /// Embedding backend selection (`OBSIDIAN_EMBEDDING_PROVIDER`).
+    /// `None` = infer from compiled features (local if `embeddings`, api if `embeddings-api`).
+    pub embedding_provider: Option<EmbeddingProvider>,
     /// Tool filter configuration (`OBSIDIAN_TOOLS`): profile name, allow-list, or deny-list.
     pub tool_filter: ToolFilter,
 }
@@ -306,6 +335,25 @@ impl Config {
             .unwrap_or(DEFAULT_HYBRID_ALPHA)
             .clamp(0.0, 1.0);
 
+        let embedding_provider = std::env::var("OBSIDIAN_EMBEDDING_PROVIDER")
+            .ok()
+            .and_then(|v| {
+                let trimmed = v.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                match EmbeddingProvider::parse(trimmed) {
+                    Some(p) => Some(p),
+                    None => {
+                        tracing::warn!(
+                            value = trimmed,
+                            "unknown OBSIDIAN_EMBEDDING_PROVIDER, ignoring"
+                        );
+                        None
+                    }
+                }
+            });
+
         let tool_filter = match std::env::var("OBSIDIAN_TOOLS").ok() {
             Some(raw) if !raw.trim().is_empty() => ToolFilter::parse(raw.trim())?,
             _ => ToolFilter::Full,
@@ -322,6 +370,7 @@ impl Config {
             embeddings,
             embeddings_model,
             hybrid_alpha,
+            embedding_provider,
             tool_filter,
         })
     }
@@ -648,5 +697,56 @@ mod tests {
         let disabled = filter.disabled_tools();
         assert!(disabled.contains("fake_tool"));
         assert!(disabled.contains("note_read"));
+    }
+
+    // ── EmbeddingProvider ─────────────────────────────────────────
+
+    #[test]
+    fn embedding_provider_parse_known_values() {
+        assert_eq!(
+            EmbeddingProvider::parse("local"),
+            Some(EmbeddingProvider::Local)
+        );
+        assert_eq!(
+            EmbeddingProvider::parse("api"),
+            Some(EmbeddingProvider::Api)
+        );
+    }
+
+    #[test]
+    fn embedding_provider_parse_case_insensitive() {
+        assert_eq!(
+            EmbeddingProvider::parse("LOCAL"),
+            Some(EmbeddingProvider::Local)
+        );
+        assert_eq!(
+            EmbeddingProvider::parse("Api"),
+            Some(EmbeddingProvider::Api)
+        );
+        assert_eq!(
+            EmbeddingProvider::parse("API"),
+            Some(EmbeddingProvider::Api)
+        );
+    }
+
+    #[test]
+    fn embedding_provider_parse_unknown_returns_none() {
+        assert_eq!(EmbeddingProvider::parse("unknown"), None);
+        assert_eq!(EmbeddingProvider::parse(""), None);
+        assert_eq!(EmbeddingProvider::parse("  "), None);
+    }
+
+    #[test]
+    fn embedding_provider_as_str_roundtrip() {
+        assert_eq!(EmbeddingProvider::Local.as_str(), "local");
+        assert_eq!(EmbeddingProvider::Api.as_str(), "api");
+        assert_eq!(
+            EmbeddingProvider::parse(EmbeddingProvider::Local.as_str()),
+            Some(EmbeddingProvider::Local)
+        );
+        assert_eq!(
+            EmbeddingProvider::parse(EmbeddingProvider::Api.as_str()),
+            Some(EmbeddingProvider::Api)
+        );
     }
 }

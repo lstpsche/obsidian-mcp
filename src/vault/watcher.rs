@@ -29,7 +29,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 ///
 /// Internally spawns a tokio task that receives debounced events, filters
 /// irrelevant paths, and calls the appropriate `VaultIndex` mutation.
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 pub fn start_watcher(
     vault_root: PathBuf,
     index: Arc<RwLock<VaultIndex>>,
@@ -102,7 +102,7 @@ pub fn start_watcher(
 }
 
 /// Start watching `vault_root` for filesystem changes.
-#[cfg(not(feature = "embeddings"))]
+#[cfg(not(has_embeddings))]
 pub fn start_watcher(
     vault_root: PathBuf,
     index: Arc<RwLock<VaultIndex>>,
@@ -209,7 +209,7 @@ fn is_obsidian_dir(relative: &Path) -> bool {
 }
 
 /// Process a single debounced event. Returns `(tantivy_touched, embedding_touched)`.
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 fn process_event(
     vault_root: &Path,
     index: &Arc<RwLock<VaultIndex>>,
@@ -286,7 +286,7 @@ fn process_event(
     (tv_touched, emb_touched)
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 fn embed_and_insert(
     vault_root: &Path,
     relative: &Path,
@@ -316,7 +316,7 @@ fn embed_and_insert(
     }
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 fn save_embedding_cache(vault_root: &Path, store: &super::embeddings::EmbeddingStore) {
     let cache_path = vault_root
         .join(".obsidian")
@@ -328,7 +328,7 @@ fn save_embedding_cache(vault_root: &Path, store: &super::embeddings::EmbeddingS
 }
 
 /// Process a single debounced event. Returns whether Tantivy was touched.
-#[cfg(not(feature = "embeddings"))]
+#[cfg(not(has_embeddings))]
 fn process_event(
     vault_root: &Path,
     index: &Arc<RwLock<VaultIndex>>,
@@ -462,11 +462,11 @@ mod tests {
         vault_root: PathBuf,
         index: Arc<RwLock<VaultIndex>>,
     ) -> VaultResult<Debouncer<notify::RecommendedWatcher>> {
-        #[cfg(feature = "embeddings")]
+        #[cfg(has_embeddings)]
         {
             start_watcher(vault_root, index, None, None, None)
         }
-        #[cfg(not(feature = "embeddings"))]
+        #[cfg(not(has_embeddings))]
         {
             start_watcher(vault_root, index, None)
         }

@@ -6,12 +6,12 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 use tokio::sync::OnceCell;
 
 use crate::error::{VaultError, VaultResult};
 
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 use crate::vault::embeddings::EmbeddingModel;
 
 use super::home::{self, SemanticHomePaths};
@@ -22,7 +22,7 @@ pub struct VaultRegistry {
     model_name: String,
     contexts: RwLock<HashMap<String, Arc<VaultContext>>>,
     init_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    #[cfg(feature = "embeddings")]
+    #[cfg(has_embeddings)]
     embedding_model: OnceCell<Arc<EmbeddingModel>>,
 }
 
@@ -36,7 +36,7 @@ impl VaultRegistry {
             model_name,
             contexts: RwLock::new(HashMap::new()),
             init_locks: tokio::sync::Mutex::new(HashMap::new()),
-            #[cfg(feature = "embeddings")]
+            #[cfg(has_embeddings)]
             embedding_model: OnceCell::new(),
         })
     }
@@ -81,7 +81,7 @@ impl VaultRegistry {
             return Ok(existing);
         }
 
-        #[cfg(feature = "embeddings")]
+        #[cfg(has_embeddings)]
         let embedding_model = self.embedding_model().await?;
 
         let state_dir = self.paths.vaults_dir.join(&vault_id);
@@ -91,7 +91,7 @@ impl VaultRegistry {
             self.model_name.clone(),
             state_dir,
             watch_enabled,
-            #[cfg(feature = "embeddings")]
+            #[cfg(has_embeddings)]
             embedding_model,
         )
         .await?;
@@ -121,12 +121,12 @@ impl VaultRegistry {
         guard.get(vault_id).cloned()
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(has_embeddings)]
     async fn embedding_model(&self) -> VaultResult<Arc<EmbeddingModel>> {
         let model = self
             .embedding_model
             .get_or_try_init(|| async {
-                let loaded = EmbeddingModel::load(&self.model_name).await?;
+                let loaded = EmbeddingModel::load(&self.model_name, None).await?;
                 Ok::<Arc<EmbeddingModel>, VaultError>(Arc::new(loaded))
             })
             .await?;

@@ -1,20 +1,20 @@
 //! Daemon-side indexing helpers shared by per-vault contexts and watcher updates.
 
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 use crate::error::{VaultError, VaultResult};
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 use crate::models::NoteMetadata;
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 use crate::vault::{frontmatter, fs, index::VaultIndex};
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 use std::path::Path;
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 use std::sync::{Arc, RwLock};
 
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 use crate::vault::embeddings::{self, EmbeddingModel, EmbeddingStore};
 
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 pub(crate) fn build_or_load_embeddings(
     vault_root: &Path,
     index: &Arc<RwLock<VaultIndex>>,
@@ -33,7 +33,7 @@ pub(crate) fn build_or_load_embeddings(
     embeddings::build_or_load_embedding_store(cache_path, vault_root, &note_entries, model)
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 pub(crate) fn embed_note(
     vault_root: &Path,
     relative: &Path,
@@ -71,7 +71,7 @@ pub(crate) fn embed_note(
     }
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 pub(crate) fn remove_note_embedding(relative: &Path, store: &Arc<RwLock<EmbeddingStore>>) -> bool {
     match store.write() {
         Ok(mut store_guard) => {
@@ -85,7 +85,7 @@ pub(crate) fn remove_note_embedding(relative: &Path, store: &Arc<RwLock<Embeddin
     }
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 pub(crate) fn save_embedding_cache(cache_path: &Path, store: &EmbeddingStore) {
     if let Err(err) = store.save(cache_path) {
         tracing::warn!(

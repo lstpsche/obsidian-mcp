@@ -14,7 +14,7 @@ pub mod tantivy_index;
 pub mod watcher;
 pub mod wikilink;
 
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 pub mod embeddings;
 
 use std::path::{Path, PathBuf};
@@ -38,14 +38,17 @@ struct VaultInner {
     root: PathBuf,
     index: Arc<RwLock<VaultIndex>>,
     tantivy: Option<Arc<TantivyIndex>>,
-    #[cfg(feature = "embeddings")]
+    #[cfg(has_embeddings)]
     embedding_model: Option<Arc<embeddings::EmbeddingModel>>,
-    #[cfg(feature = "embeddings")]
+    #[cfg(has_embeddings)]
     embedding_store: Option<Arc<RwLock<embeddings::EmbeddingStore>>>,
     /// Kept alive to sustain filesystem watching; never accessed after construction.
     /// Wrapped in `Mutex` to guarantee `Sync` (`Debouncer` contains a `mpsc::Sender`
     /// which is `Send` but not `Sync`).
     _watcher: Mutex<Option<Debouncer<notify::RecommendedWatcher>>>,
+    /// Stores the error message when embedding model loading fails at startup.
+    /// Not feature-gated to avoid struct literal drift across feature combinations.
+    embedding_load_error: Option<String>,
 }
 
 /// High-level facade over the vault filesystem, index, and watcher.
@@ -87,28 +90,40 @@ impl Vault {
 
         let index = Arc::new(RwLock::new(vi));
 
-        #[cfg(feature = "embeddings")]
-        let (embedding_model, embedding_store) = if config.embeddings {
-            let model = embeddings::EmbeddingModel::load(&config.embeddings_model).await?;
-            let model = Arc::new(model);
-            let store = Self::build_or_load_embeddings(&root, &index, &model)?;
-            let store = Arc::new(RwLock::new(store));
-            tracing::info!(
-                notes = index
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .notes()
-                    .len(),
-                dim = model.dim(),
-                "embedding store ready"
-            );
-            (Some(model), Some(store))
+        #[cfg(has_embeddings)]
+        let (embedding_model, embedding_store, embedding_load_error) = if config.embeddings {
+            match embeddings::EmbeddingModel::load(
+                &config.embeddings_model,
+                config.embedding_provider,
+            )
+            .await
+            {
+                Ok(model) => {
+                    let model = Arc::new(model);
+                    let store = Self::build_or_load_embeddings(&root, &index, &model)?;
+                    let store = Arc::new(RwLock::new(store));
+                    tracing::info!(
+                        notes = index
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .notes()
+                            .len(),
+                        dim = model.dim(),
+                        "embedding store ready"
+                    );
+                    (Some(model), Some(store), None)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to load embedding model — semantic search will be unavailable");
+                    (None, None, Some(e.to_string()))
+                }
+            }
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         let watcher_handle = if config.watch {
-            #[cfg(feature = "embeddings")]
+            #[cfg(has_embeddings)]
             let debouncer = watcher::start_watcher(
                 root.clone(),
                 Arc::clone(&index),
@@ -116,7 +131,7 @@ impl Vault {
                 embedding_model.clone(),
                 embedding_store.clone(),
             )?;
-            #[cfg(not(feature = "embeddings"))]
+            #[cfg(not(has_embeddings))]
             let debouncer =
                 watcher::start_watcher(root.clone(), Arc::clone(&index), tantivy.clone())?;
             Some(debouncer)
@@ -124,16 +139,22 @@ impl Vault {
             None
         };
 
+        #[cfg(has_embeddings)]
+        let embed_err = embedding_load_error;
+        #[cfg(not(has_embeddings))]
+        let embed_err: Option<String> = None;
+
         Ok(Self {
             inner: Arc::new(VaultInner {
                 root,
                 index,
                 tantivy,
-                #[cfg(feature = "embeddings")]
+                #[cfg(has_embeddings)]
                 embedding_model,
-                #[cfg(feature = "embeddings")]
+                #[cfg(has_embeddings)]
                 embedding_store,
                 _watcher: Mutex::new(watcher_handle),
+                embedding_load_error: embed_err,
             }),
         })
     }
@@ -216,7 +237,7 @@ impl Vault {
         if let Some(tv) = &self.inner.tantivy {
             tv.remove_file(path)?;
         }
-        #[cfg(feature = "embeddings")]
+        #[cfg(has_embeddings)]
         self.remove_embedding(path);
         Ok(())
     }
@@ -233,7 +254,7 @@ impl Vault {
                 }
             }
         }
-        #[cfg(feature = "embeddings")]
+        #[cfg(has_embeddings)]
         {
             self.remove_embedding(from);
             self.reindex_embedding(&new_path);
@@ -342,7 +363,7 @@ impl Vault {
     /// Embeds the query, then performs brute-force cosine similarity against
     /// the embedding store. Returns `(path, score)` pairs sorted by descending
     /// similarity.
-    #[cfg(feature = "embeddings")]
+    #[cfg(has_embeddings)]
     pub fn search_semantic(&self, query: &str, top_k: usize) -> VaultResult<Vec<(PathBuf, f32)>> {
         let model = self.inner.embedding_model.as_ref().ok_or_else(|| {
             VaultError::Embedding("embeddings not enabled (OBSIDIAN_EMBEDDINGS=false)".into())
@@ -359,9 +380,14 @@ impl Vault {
     }
 
     /// Returns `true` if embeddings are available for semantic search.
-    #[cfg(feature = "embeddings")]
+    #[cfg(has_embeddings)]
     pub fn has_embeddings(&self) -> bool {
         self.inner.embedding_model.is_some() && self.inner.embedding_store.is_some()
+    }
+
+    /// Returns the error message from a failed embedding model load, if any.
+    pub fn embedding_load_error(&self) -> Option<&str> {
+        self.inner.embedding_load_error.as_deref()
     }
 
     /// Hybrid search: BM25 prefetch via Tantivy, then re-rank by combining
@@ -371,7 +397,7 @@ impl Vault {
     ///
     /// `alpha` controls the balance: `final = alpha * norm_bm25 + (1-alpha) * cosine_sim`.
     /// Lower alpha = more weight to semantic meaning.
-    #[cfg(feature = "embeddings")]
+    #[cfg(has_embeddings)]
     pub fn search_hybrid(
         &self,
         query: &str,
@@ -656,14 +682,14 @@ impl Vault {
             tv.reindex_file(&self.inner.root, path, meta)?;
         }
         drop(idx);
-        #[cfg(feature = "embeddings")]
+        #[cfg(has_embeddings)]
         self.reindex_embedding(path);
         Ok(())
     }
 
     // ── embedding helpers (feature-gated) ─────────────────────────────
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(has_embeddings)]
     fn embedding_cache_path(vault_root: &Path) -> PathBuf {
         vault_root
             .join(".obsidian")
@@ -671,7 +697,7 @@ impl Vault {
             .join("embeddings.bin")
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(has_embeddings)]
     fn build_or_load_embeddings(
         vault_root: &Path,
         index: &Arc<RwLock<VaultIndex>>,
@@ -689,7 +715,7 @@ impl Vault {
     }
 
     /// Re-embed a single note and update the store. Non-fatal on error.
-    #[cfg(feature = "embeddings")]
+    #[cfg(has_embeddings)]
     fn reindex_embedding(&self, path: &Path) {
         let (Some(model), Some(store)) = (&self.inner.embedding_model, &self.inner.embedding_store)
         else {
@@ -724,7 +750,7 @@ impl Vault {
     }
 
     /// Remove a note's embedding from the store.
-    #[cfg(feature = "embeddings")]
+    #[cfg(has_embeddings)]
     fn remove_embedding(&self, path: &Path) {
         if let Some(store) = &self.inner.embedding_store {
             let mut s = store.write().unwrap_or_else(|e| e.into_inner());
@@ -735,7 +761,7 @@ impl Vault {
     }
 
     /// Persist the embedding cache to disk. Non-fatal on error.
-    #[cfg(feature = "embeddings")]
+    #[cfg(has_embeddings)]
     fn save_embedding_cache(&self) {
         if let Some(store) = &self.inner.embedding_store {
             let s = store.read().unwrap_or_else(|e| e.into_inner());
@@ -787,6 +813,7 @@ mod tests {
             embeddings: false,
             embeddings_model: String::new(),
             hybrid_alpha: 0.25,
+            embedding_provider: None,
             tool_filter: crate::config::ToolFilter::Full,
         };
 
@@ -1316,5 +1343,41 @@ mod tests {
             results[0].score.is_none(),
             "regex fallback should not populate BM25 scores"
         );
+    }
+
+    #[cfg(has_embeddings)]
+    #[tokio::test]
+    async fn graceful_degradation_captures_embedding_load_error() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+
+        let config = Config {
+            vault_path: dir.path().to_path_buf(),
+            watch: false,
+            log_level: "error".into(),
+            transport: crate::config::Transport::Stdio,
+            http_host: crate::config::DEFAULT_HTTP_HOST,
+            http_port: crate::config::DEFAULT_HTTP_PORT,
+            tantivy: false,
+            embeddings: true,
+            embeddings_model: "nonexistent-model-that-will-fail".into(),
+            hybrid_alpha: 0.25,
+            embedding_provider: Some(crate::config::EmbeddingProvider::Api),
+            tool_filter: crate::config::ToolFilter::Full,
+        };
+
+        let vault = Vault::open(&config)
+            .await
+            .expect("vault should open despite embedding failure");
+        assert!(
+            !vault.has_embeddings(),
+            "embeddings should not be available after load failure"
+        );
+        assert!(
+            vault.embedding_load_error().is_some(),
+            "embedding_load_error should capture the failure reason"
+        );
+        let err = vault.embedding_load_error().unwrap();
+        assert!(!err.is_empty(), "error message should be descriptive");
     }
 }

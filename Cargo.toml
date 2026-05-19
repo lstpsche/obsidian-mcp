@@ -39,6 +39,7 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 [features]
 default = []
 embeddings = ["dep:fastembed", "dep:bincode"]
+embeddings-api = ["dep:bincode", "reqwest/blocking", "reqwest/json"]
 
 [dev-dependencies]
 tempfile = "3"

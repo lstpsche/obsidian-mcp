@@ -1,16 +1,19 @@
 //! Embedding store and model wrapper for semantic search (Layer 2).
 //!
-//! Gated behind the `embeddings` Cargo feature. Provides:
+//! Gated behind `#[cfg(has_embeddings)]` (either `embeddings` or `embeddings-api`
+//! Cargo feature). Provides:
 //! - `EmbeddingStore`: in-memory HashMap of note embeddings with brute-force
 //!   cosine similarity search and bincode persistence.
-//! - `EmbeddingModel`: wrapper around `fastembed::TextEmbedding` with async
-//!   model loading and batch/single embedding generation.
+//! - `EmbeddingModel`: backend-agnostic wrapper supporting local fastembed
+//!   (`--features embeddings`) and OpenAI-compatible API (`--features embeddings-api`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "embeddings")]
 use fastembed::ModelTrait;
 
+use crate::config::EmbeddingProvider;
 use crate::error::{VaultError, VaultResult};
 
 // ── Cosine similarity ──────────────────────────────────────────────────
@@ -57,14 +60,20 @@ impl EmbeddingStore {
     }
 
     /// Insert or replace the embedding for a note.
+    ///
+    /// Vectors with a dimension mismatch are rejected (logged + skipped)
+    /// to prevent garbage cosine-similarity results from a misconfigured
+    /// API backend.
     pub fn insert(&mut self, path: PathBuf, vec: Vec<f32>) {
-        debug_assert_eq!(
-            vec.len(),
-            self.dim,
-            "embedding dimension mismatch: expected {}, got {}",
-            self.dim,
-            vec.len()
-        );
+        if vec.len() != self.dim {
+            tracing::warn!(
+                path = %path.display(),
+                expected = self.dim,
+                got = vec.len(),
+                "embedding dimension mismatch — skipping insert"
+            );
+            return;
+        }
         self.embeddings.insert(path, vec);
     }
 
@@ -161,23 +170,81 @@ impl EmbeddingStore {
     }
 }
 
+// ── EmbeddingBackend ───────────────────────────────────────────────────
+
+enum EmbeddingBackend {
+    #[cfg(feature = "embeddings")]
+    Local(Box<std::sync::Mutex<fastembed::TextEmbedding>>),
+
+    #[cfg(feature = "embeddings-api")]
+    Api {
+        client: reqwest::blocking::Client,
+        base_url: String,
+        model: String,
+        api_key: String,
+    },
+}
+
 // ── EmbeddingModel ─────────────────────────────────────────────────────
 
-/// Wrapper around `fastembed::TextEmbedding` providing thread-safe embedding.
-///
-/// `TextEmbedding::embed()` takes `&mut self`, so access is serialized via
-/// a `Mutex`. The lock is held only during inference calls.
+/// Backend-agnostic embedding model supporting local fastembed and
+/// OpenAI-compatible API backends.
 pub struct EmbeddingModel {
-    inner: std::sync::Mutex<fastembed::TextEmbedding>,
+    backend: EmbeddingBackend,
     dim: usize,
 }
 
 impl EmbeddingModel {
-    /// Load an embedding model by HuggingFace name (e.g. "BAAI/bge-small-en-v1.5").
+    /// Load an embedding model using the specified (or inferred) backend.
     ///
-    /// Model initialization downloads weights on first use and loads the ONNX
-    /// runtime, both of which are blocking — runs inside `spawn_blocking`.
-    pub async fn load(model_name: &str) -> VaultResult<Self> {
+    /// `provider` selects the backend explicitly; `None` infers from compiled
+    /// features (local preferred when both are available).
+    pub async fn load(model_name: &str, provider: Option<EmbeddingProvider>) -> VaultResult<Self> {
+        match resolve_provider(provider) {
+            EmbeddingProvider::Local => Self::load_local(model_name).await,
+            EmbeddingProvider::Api => Self::load_api(model_name).await,
+        }
+    }
+
+    /// Embed a batch of texts. Returns one vector per input text.
+    pub fn embed_batch(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>> {
+        match &self.backend {
+            #[cfg(feature = "embeddings")]
+            EmbeddingBackend::Local(inner) => {
+                let mut model = inner
+                    .lock()
+                    .map_err(|e| VaultError::Embedding(format!("model lock poisoned: {e}")))?;
+                model
+                    .embed(texts, Some(64))
+                    .map_err(|e| VaultError::Embedding(format!("embed failed: {e}")))
+            }
+            #[cfg(feature = "embeddings-api")]
+            EmbeddingBackend::Api {
+                client,
+                base_url,
+                model,
+                api_key,
+            } => embed_batch_api(client, base_url, model, api_key, texts),
+        }
+    }
+
+    /// Embed a single text. Convenience wrapper over `embed_batch`.
+    pub fn embed_one(&self, text: &str) -> VaultResult<Vec<f32>> {
+        let mut results = self.embed_batch(&[text])?;
+        results
+            .pop()
+            .ok_or_else(|| VaultError::Embedding("embed returned empty result".into()))
+    }
+
+    /// Embedding dimensionality for the loaded model.
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    // ── Local backend (fastembed) ──────────────────────────────────────
+
+    #[cfg(feature = "embeddings")]
+    async fn load_local(model_name: &str) -> VaultResult<Self> {
         let model_name = model_name.to_owned();
 
         tokio::task::spawn_blocking(move || {
@@ -193,7 +260,7 @@ impl EmbeddingModel {
                 .map_err(|e| VaultError::Embedding(format!("model load failed: {e}")))?;
 
             Ok(Self {
-                inner: std::sync::Mutex::new(inner),
+                backend: EmbeddingBackend::Local(Box::new(std::sync::Mutex::new(inner))),
                 dim,
             })
         })
@@ -201,30 +268,237 @@ impl EmbeddingModel {
         .map_err(|e| VaultError::Embedding(format!("spawn_blocking join error: {e}")))?
     }
 
-    /// Embed a batch of texts. Returns one vector per input text.
-    pub fn embed_batch(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>> {
-        let mut model = self
-            .inner
-            .lock()
-            .map_err(|e| VaultError::Embedding(format!("model lock poisoned: {e}")))?;
-
-        model
-            .embed(texts, Some(64))
-            .map_err(|e| VaultError::Embedding(format!("embed failed: {e}")))
+    #[cfg(not(feature = "embeddings"))]
+    async fn load_local(_model_name: &str) -> VaultResult<Self> {
+        Err(VaultError::Embedding(
+            "local embedding backend not compiled (needs --features embeddings)".into(),
+        ))
     }
 
-    /// Embed a single text. Convenience wrapper over `embed_batch`.
-    pub fn embed_one(&self, text: &str) -> VaultResult<Vec<f32>> {
-        let mut results = self.embed_batch(&[text])?;
-        results
-            .pop()
-            .ok_or_else(|| VaultError::Embedding("embed returned empty result".into()))
+    // ── API backend (OpenAI-compatible) ────────────────────────────────
+
+    #[cfg(feature = "embeddings-api")]
+    async fn load_api(model_name: &str) -> VaultResult<Self> {
+        let model_name = model_name.to_owned();
+
+        tokio::task::spawn_blocking(move || {
+            let api_key = read_env_with_fallback("OBSIDIAN_EMBEDDING_API_KEY", "OPENAI_API_KEY")
+                .ok_or_else(|| {
+                    VaultError::Embedding(
+                        "API key required: set OBSIDIAN_EMBEDDING_API_KEY or OPENAI_API_KEY".into(),
+                    )
+                })?;
+
+            let base_url = read_env_with_fallback("OBSIDIAN_EMBEDDING_API_BASE", "OPENAI_BASE_URL")
+                .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+
+            let model = read_env_with_fallback("OBSIDIAN_EMBEDDING_API_MODEL", "OPENAI_MODEL")
+                .unwrap_or(model_name);
+
+            let client = build_api_client()?;
+
+            let dim = match parse_usize_env("OBSIDIAN_EMBEDDING_DIM") {
+                Some(d) => {
+                    tracing::info!(dim = d, "using explicit embedding dimension");
+                    d
+                }
+                None => {
+                    tracing::info!("probing embedding API for dimension…");
+                    probe_api_dimension(&client, &base_url, &model, &api_key)?
+                }
+            };
+
+            tracing::info!(
+                base_url = %base_url,
+                model = %model,
+                dim,
+                "API embedding backend ready"
+            );
+
+            Ok(Self {
+                backend: EmbeddingBackend::Api {
+                    client,
+                    base_url,
+                    model,
+                    api_key,
+                },
+                dim,
+            })
+        })
+        .await
+        .map_err(|e| VaultError::Embedding(format!("spawn_blocking join error: {e}")))?
     }
 
-    /// Embedding dimensionality for the loaded model.
-    pub fn dim(&self) -> usize {
-        self.dim
+    #[cfg(not(feature = "embeddings-api"))]
+    async fn load_api(_model_name: &str) -> VaultResult<Self> {
+        Err(VaultError::Embedding(
+            "API embedding backend not compiled (needs --features embeddings-api)".into(),
+        ))
     }
+}
+
+// ── Provider resolution ────────────────────────────────────────────────
+
+fn resolve_provider(explicit: Option<EmbeddingProvider>) -> EmbeddingProvider {
+    if let Some(p) = explicit {
+        return p;
+    }
+
+    let has_local = cfg!(feature = "embeddings");
+    let has_api = cfg!(feature = "embeddings-api");
+
+    match (has_local, has_api) {
+        (true, _) => EmbeddingProvider::Local,
+        (false, true) => EmbeddingProvider::Api,
+        (false, false) => unreachable!("embeddings module compiled without any backend"),
+    }
+}
+
+// ── API client helpers ─────────────────────────────────────────────────
+
+#[cfg(feature = "embeddings-api")]
+fn build_api_client() -> Result<reqwest::blocking::Client, VaultError> {
+    let mut builder =
+        reqwest::blocking::ClientBuilder::new().timeout(std::time::Duration::from_secs(30));
+
+    if let Ok(cert_path) = std::env::var("OBSIDIAN_EMBEDDING_CA_CERT") {
+        let cert_pem = std::fs::read(&cert_path).map_err(|e| {
+            VaultError::Embedding(format!("failed to read CA cert {cert_path}: {e}"))
+        })?;
+        let cert = reqwest::Certificate::from_pem(&cert_pem)
+            .map_err(|e| VaultError::Embedding(format!("invalid CA cert: {e}")))?;
+        builder = builder.add_root_certificate(cert);
+    }
+
+    if std::env::var("OBSIDIAN_EMBEDDING_TLS_VERIFY")
+        .map(|v| v.eq_ignore_ascii_case("false") || v == "0")
+        .unwrap_or(false)
+    {
+        tracing::warn!(
+            "TLS verification disabled for embedding API — NOT recommended for production"
+        );
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+
+    builder
+        .build()
+        .map_err(|e| VaultError::Embedding(format!("failed to build HTTP client: {e}")))
+}
+
+#[cfg(feature = "embeddings-api")]
+fn probe_api_dimension(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+) -> Result<usize, VaultError> {
+    let vecs = embed_batch_api(client, base_url, model, api_key, &["dim"])?;
+    let first = vecs
+        .first()
+        .ok_or_else(|| VaultError::Embedding("dimension probe returned empty result".into()))?;
+    if first.is_empty() {
+        return Err(VaultError::Embedding(
+            "dimension probe returned zero-length vector".into(),
+        ));
+    }
+    Ok(first.len())
+}
+
+#[cfg(feature = "embeddings-api")]
+fn embed_batch_api(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+    texts: &[&str],
+) -> Result<Vec<Vec<f32>>, VaultError> {
+    let url = format!("{}/embeddings", base_url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "model": model,
+        "input": texts,
+    });
+
+    let mut attempt = 0u8;
+    loop {
+        let response = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .json(&body)
+            .send()
+            .map_err(|e| VaultError::Embedding(format!("embedding API request failed: {e}")))?;
+
+        let status = response.status();
+        if status.as_u16() == 429 && attempt == 0 {
+            let wait = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(1)
+                .min(30);
+            tracing::warn!(
+                retry_after_secs = wait,
+                "embedding API rate limited, retrying"
+            );
+            std::thread::sleep(std::time::Duration::from_secs(wait));
+            attempt += 1;
+            continue;
+        }
+
+        if !status.is_success() {
+            let body_text = response.text().unwrap_or_default();
+            return Err(VaultError::Embedding(format!(
+                "embedding API error {status}: {body_text}"
+            )));
+        }
+
+        let resp: serde_json::Value = response
+            .json()
+            .map_err(|e| VaultError::Embedding(format!("embedding API parse error: {e}")))?;
+
+        let data = resp["data"]
+            .as_array()
+            .ok_or_else(|| VaultError::Embedding("missing 'data' array in API response".into()))?;
+
+        let mut embeddings = Vec::with_capacity(data.len());
+        for item in data {
+            let vec = item["embedding"]
+                .as_array()
+                .ok_or_else(|| {
+                    VaultError::Embedding("missing 'embedding' array in response item".into())
+                })?
+                .iter()
+                .map(|v| {
+                    v.as_f64()
+                        .ok_or_else(|| {
+                            VaultError::Embedding("non-numeric value in embedding vector".into())
+                        })
+                        .map(|f| f as f32)
+                })
+                .collect::<Result<Vec<f32>, _>>()?;
+            embeddings.push(vec);
+        }
+
+        return Ok(embeddings);
+    }
+}
+
+// ── Env var helpers (API backend) ──────────────────────────────────────
+
+#[cfg(feature = "embeddings-api")]
+fn read_env_with_fallback(primary: &str, fallback: &str) -> Option<String> {
+    let read_trimmed = |var: &str| {
+        std::env::var(var)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    read_trimmed(primary).or_else(|| read_trimmed(fallback))
+}
+
+#[cfg(feature = "embeddings-api")]
+fn parse_usize_env(var_name: &str) -> Option<usize> {
+    std::env::var(var_name).ok()?.trim().parse::<usize>().ok()
 }
 
 // ── Shared embedding index builder ────────────────────────────────────
@@ -572,5 +846,212 @@ mod tests {
         let outcome = migrate_legacy_cache_to_daemon_store(vault_root.path(), semantic_home.path())
             .expect("migration should succeed");
         assert_eq!(outcome, LegacyCacheMigration::NotFound);
+    }
+
+    // ── resolve_provider ──────────────────────────────────────────
+
+    #[test]
+    fn resolve_provider_explicit_local() {
+        let result = resolve_provider(Some(EmbeddingProvider::Local));
+        assert_eq!(result, EmbeddingProvider::Local);
+    }
+
+    #[test]
+    fn resolve_provider_explicit_api() {
+        let result = resolve_provider(Some(EmbeddingProvider::Api));
+        assert_eq!(result, EmbeddingProvider::Api);
+    }
+
+    #[test]
+    fn resolve_provider_none_infers_from_features() {
+        let result = resolve_provider(None);
+        if cfg!(feature = "embeddings") {
+            assert_eq!(result, EmbeddingProvider::Local);
+        } else if cfg!(feature = "embeddings-api") {
+            assert_eq!(result, EmbeddingProvider::Api);
+        }
+    }
+
+    // ── API response parsing ──────────────────────────────────────
+
+    #[cfg(feature = "embeddings-api")]
+    mod api_response_tests {
+        use super::*;
+
+        fn parse_embedding_response(resp: &serde_json::Value) -> Result<Vec<Vec<f32>>, VaultError> {
+            let data = resp["data"].as_array().ok_or_else(|| {
+                VaultError::Embedding("missing 'data' array in API response".into())
+            })?;
+
+            let mut embeddings = Vec::with_capacity(data.len());
+            for item in data {
+                let vec = item["embedding"]
+                    .as_array()
+                    .ok_or_else(|| {
+                        VaultError::Embedding("missing 'embedding' array in response item".into())
+                    })?
+                    .iter()
+                    .map(|v| {
+                        v.as_f64()
+                            .ok_or_else(|| {
+                                VaultError::Embedding(
+                                    "non-numeric value in embedding vector".into(),
+                                )
+                            })
+                            .map(|f| f as f32)
+                    })
+                    .collect::<Result<Vec<f32>, _>>()?;
+                embeddings.push(vec);
+            }
+            Ok(embeddings)
+        }
+
+        #[test]
+        fn parse_valid_single_embedding() {
+            let resp = serde_json::json!({
+                "data": [{"embedding": [0.1, 0.2, 0.3]}]
+            });
+            let result = parse_embedding_response(&resp).unwrap();
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].len(), 3);
+            assert!((result[0][0] - 0.1).abs() < 1e-6);
+        }
+
+        #[test]
+        fn parse_valid_multiple_embeddings() {
+            let resp = serde_json::json!({
+                "data": [
+                    {"embedding": [0.1, 0.2]},
+                    {"embedding": [0.3, 0.4]}
+                ]
+            });
+            let result = parse_embedding_response(&resp).unwrap();
+            assert_eq!(result.len(), 2);
+            assert_eq!(result[0], vec![0.1f32, 0.2]);
+            assert_eq!(result[1], vec![0.3f32, 0.4]);
+        }
+
+        #[test]
+        fn parse_missing_data_field() {
+            let resp = serde_json::json!({"object": "list"});
+            let err = parse_embedding_response(&resp).unwrap_err();
+            assert!(err.to_string().contains("missing 'data' array"));
+        }
+
+        #[test]
+        fn parse_missing_embedding_in_item() {
+            let resp = serde_json::json!({
+                "data": [{"index": 0}]
+            });
+            let err = parse_embedding_response(&resp).unwrap_err();
+            assert!(err.to_string().contains("missing 'embedding' array"));
+        }
+
+        #[test]
+        fn parse_non_numeric_value_in_vector() {
+            let resp = serde_json::json!({
+                "data": [{"embedding": [0.1, "bad", 0.3]}]
+            });
+            let err = parse_embedding_response(&resp).unwrap_err();
+            assert!(err.to_string().contains("non-numeric value"));
+        }
+
+        #[test]
+        fn parse_empty_data_array() {
+            let resp = serde_json::json!({"data": []});
+            let result = parse_embedding_response(&resp).unwrap();
+            assert!(result.is_empty());
+        }
+
+        #[test]
+        fn parse_empty_embedding_vector() {
+            let resp = serde_json::json!({
+                "data": [{"embedding": []}]
+            });
+            let result = parse_embedding_response(&resp).unwrap();
+            assert_eq!(result.len(), 1);
+            assert!(result[0].is_empty());
+        }
+
+        #[test]
+        fn read_env_with_fallback_primary_wins() {
+            unsafe {
+                std::env::set_var("TEST_PRIMARY_KEY_A", "primary_value");
+                std::env::set_var("TEST_FALLBACK_KEY_A", "fallback_value");
+            }
+            let result = read_env_with_fallback("TEST_PRIMARY_KEY_A", "TEST_FALLBACK_KEY_A");
+            assert_eq!(result, Some("primary_value".to_string()));
+            unsafe {
+                std::env::remove_var("TEST_PRIMARY_KEY_A");
+                std::env::remove_var("TEST_FALLBACK_KEY_A");
+            }
+        }
+
+        #[test]
+        fn read_env_with_fallback_uses_fallback() {
+            unsafe {
+                std::env::remove_var("TEST_PRIMARY_KEY_B");
+                std::env::set_var("TEST_FALLBACK_KEY_B", "fallback_value");
+            }
+            let result = read_env_with_fallback("TEST_PRIMARY_KEY_B", "TEST_FALLBACK_KEY_B");
+            assert_eq!(result, Some("fallback_value".to_string()));
+            unsafe {
+                std::env::remove_var("TEST_FALLBACK_KEY_B");
+            }
+        }
+
+        #[test]
+        fn read_env_with_fallback_returns_none_when_both_missing() {
+            unsafe {
+                std::env::remove_var("TEST_PRIMARY_KEY_C");
+                std::env::remove_var("TEST_FALLBACK_KEY_C");
+            }
+            let result = read_env_with_fallback("TEST_PRIMARY_KEY_C", "TEST_FALLBACK_KEY_C");
+            assert_eq!(result, None);
+        }
+
+        #[test]
+        fn read_env_with_fallback_ignores_empty_primary() {
+            unsafe {
+                std::env::set_var("TEST_PRIMARY_KEY_D", "  ");
+                std::env::set_var("TEST_FALLBACK_KEY_D", "valid");
+            }
+            let result = read_env_with_fallback("TEST_PRIMARY_KEY_D", "TEST_FALLBACK_KEY_D");
+            assert_eq!(result, Some("valid".to_string()));
+            unsafe {
+                std::env::remove_var("TEST_PRIMARY_KEY_D");
+                std::env::remove_var("TEST_FALLBACK_KEY_D");
+            }
+        }
+
+        #[test]
+        fn parse_usize_env_valid() {
+            unsafe {
+                std::env::set_var("TEST_DIM_VALID", "384");
+            }
+            assert_eq!(parse_usize_env("TEST_DIM_VALID"), Some(384));
+            unsafe {
+                std::env::remove_var("TEST_DIM_VALID");
+            }
+        }
+
+        #[test]
+        fn parse_usize_env_invalid() {
+            unsafe {
+                std::env::set_var("TEST_DIM_INVALID", "not_a_number");
+            }
+            assert_eq!(parse_usize_env("TEST_DIM_INVALID"), None);
+            unsafe {
+                std::env::remove_var("TEST_DIM_INVALID");
+            }
+        }
+
+        #[test]
+        fn parse_usize_env_missing() {
+            unsafe {
+                std::env::remove_var("TEST_DIM_MISSING");
+            }
+            assert_eq!(parse_usize_env("TEST_DIM_MISSING"), None);
+        }
     }
 }

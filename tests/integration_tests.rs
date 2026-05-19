@@ -27,6 +27,7 @@ fn fixture_config() -> Config {
         embeddings: false,
         embeddings_model: String::new(),
         hybrid_alpha: 0.25,
+        embedding_provider: None,
         tool_filter: ToolFilter::Full,
     }
 }
@@ -52,6 +53,7 @@ async fn copy_fixture_to_temp() -> (tempfile::TempDir, Vault) {
         embeddings: false,
         embeddings_model: String::new(),
         hybrid_alpha: 0.25,
+        embedding_provider: None,
         tool_filter: ToolFilter::Full,
     };
     let vault = Vault::open(&config)
@@ -332,6 +334,7 @@ mod vault_tantivy_search {
             embeddings: false,
             embeddings_model: String::new(),
             hybrid_alpha: 0.25,
+            embedding_provider: None,
             tool_filter: ToolFilter::Full,
         };
         let vault = Vault::open(&config)
@@ -669,6 +672,7 @@ mod tool_filtering {
             embeddings: false,
             embeddings_model: String::new(),
             hybrid_alpha: 0.25,
+            embedding_provider: None,
             tool_filter: filter,
         }
     }
@@ -824,6 +828,7 @@ mod vault_semantic_search {
             embeddings: true,
             embeddings_model: "BAAI/bge-small-en-v1.5".into(),
             hybrid_alpha: 0.25,
+            embedding_provider: None,
             tool_filter: ToolFilter::Full,
         }
     }
@@ -1020,7 +1025,8 @@ mod vault_semantic_search {
 #[cfg(all(unix, feature = "embeddings"))]
 mod semantic_tool_runtime_modes {
     use super::*;
-    use std::sync::LazyLock;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, LazyLock};
 
     use obsidian_mcp::client::semantic_daemon::{DaemonConnectPolicy, SemanticDaemonClient};
     use obsidian_mcp::config::SemanticMode;
@@ -1047,6 +1053,7 @@ mod semantic_tool_runtime_modes {
             embeddings,
             embeddings_model: MODEL_NAME.to_string(),
             hybrid_alpha: 0.25,
+            embedding_provider: None,
             tool_filter: ToolFilter::Full,
         }
     }
@@ -1081,6 +1088,7 @@ mod semantic_tool_runtime_modes {
                 DaemonConnectPolicy::default(),
             )),
             daemon_unavailable_reason: None,
+            vault_ensured: Arc::new(AtomicBool::new(false)),
             prefetch_count: 50,
         };
 
@@ -1133,6 +1141,7 @@ mod semantic_tool_runtime_modes {
             mode: SemanticMode::Auto,
             daemon_client: None,
             daemon_unavailable_reason: Some("daemon socket unavailable".to_string()),
+            vault_ensured: Arc::new(AtomicBool::new(false)),
             prefetch_count: 50,
         };
 
@@ -1175,6 +1184,7 @@ mod semantic_tool_runtime_modes {
             mode: SemanticMode::Daemon,
             daemon_client: None,
             daemon_unavailable_reason: Some("not connected".to_string()),
+            vault_ensured: Arc::new(AtomicBool::new(false)),
             prefetch_count: 50,
         };
 

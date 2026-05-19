@@ -189,7 +189,7 @@ async fn shutdown_signal() {
 
 struct InitializedDaemonClient {
     client: SemanticDaemonClient,
-    #[cfg(feature = "embeddings")]
+    #[cfg(has_embeddings)]
     semantic_home: Option<PathBuf>,
 }
 
@@ -216,7 +216,7 @@ async fn init_semantic_runtime(
 
     match initialize_daemon_client(runtime_cfg).await {
         Ok(initialized) => {
-            #[cfg(feature = "embeddings")]
+            #[cfg(has_embeddings)]
             if let Some(semantic_home) = initialized.semantic_home.as_deref() {
                 match obsidian_mcp::vault::embeddings::migrate_legacy_cache_to_daemon_store(
                     &config.vault_path,
@@ -279,7 +279,7 @@ async fn initialize_daemon_client(
     let initialized = if let Some(raw_endpoint) = runtime_cfg.daemon_endpoint_override.as_deref() {
         InitializedDaemonClient {
             client: SemanticDaemonClient::new(endpoint_from_override(raw_endpoint), policy),
-            #[cfg(feature = "embeddings")]
+            #[cfg(has_embeddings)]
             semantic_home: None,
         }
     } else {
@@ -294,7 +294,7 @@ async fn initialize_daemon_client(
         .await?;
         InitializedDaemonClient {
             client: SemanticDaemonClient::new(bootstrap_result.endpoint, policy),
-            #[cfg(feature = "embeddings")]
+            #[cfg(has_embeddings)]
             semantic_home: Some(bootstrap_result.semantic_home),
         }
     };
@@ -374,7 +374,15 @@ fn print_help() {
              OBSIDIAN_LOG_LEVEL      Tracing log level              [default: info]\n    \
              OBSIDIAN_TANTIVY        Enable BM25 full-text index    [default: true]\n    \
              OBSIDIAN_EMBEDDINGS     Enable semantic embeddings     [default: false]\n    \
+             OBSIDIAN_EMBEDDINGS_MODEL  HuggingFace model name      [default: BAAI/bge-small-en-v1.5]\n    \
              OBSIDIAN_HYBRID_ALPHA   BM25/semantic blend weight     [default: 0.25]\n    \
+             OBSIDIAN_EMBEDDING_PROVIDER  Backend: local | api      [default: infer from features]\n    \
+             OBSIDIAN_EMBEDDING_API_KEY   API auth key              (or OPENAI_API_KEY)\n    \
+             OBSIDIAN_EMBEDDING_API_BASE  API base URL              [default: https://api.openai.com/v1]\n    \
+             OBSIDIAN_EMBEDDING_API_MODEL API model name            (or OPENAI_MODEL)\n    \
+             OBSIDIAN_EMBEDDING_DIM  Override embedding dimension   [default: probed from API]\n    \
+             OBSIDIAN_EMBEDDING_CA_CERT   PEM CA cert path for API TLS\n    \
+             OBSIDIAN_EMBEDDING_TLS_VERIFY  Verify API TLS certs    [default: true]\n    \
              OBSIDIAN_TOOLS          Tool filter: profile (full/core/read/minimal),\n    \
                                      comma-separated allow-list, or !-prefixed deny-list",
         name = env!("CARGO_PKG_NAME"),
@@ -661,6 +669,7 @@ mod tests {
             embeddings: false,
             embeddings_model: "BAAI/bge-small-en-v1.5".to_string(),
             hybrid_alpha: 0.25,
+            embedding_provider: None,
             tool_filter: obsidian_mcp::config::ToolFilter::Full,
         };
         let runtime = init_semantic_runtime(&config, &runtime_config(SemanticMode::Daemon)).await;

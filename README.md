@@ -59,6 +59,45 @@ cargo install obsidian-mcp --features embeddings
 
 The `embeddings` feature adds ~60 MB to the binary (ONNX Runtime). In daemon mode, model/runtime cache is shared under semantic home; local mode keeps in-process embedding support in the MCP binary.
 
+For **API embedding backend** (OpenAI, Ollama, vLLM, LM Studio, or any `/v1/embeddings`-compatible endpoint):
+
+```sh
+cargo install obsidian-mcp --features embeddings-api
+```
+
+This adds no model weight to the binary — embeddings are computed by an external server. Both features can be compiled simultaneously; `OBSIDIAN_EMBEDDING_PROVIDER` selects which runs.
+
+#### API backend examples
+
+```sh
+# OpenAI
+OBSIDIAN_EMBEDDINGS=true
+OBSIDIAN_EMBEDDING_PROVIDER=api
+OBSIDIAN_EMBEDDING_API_KEY=sk-...
+OBSIDIAN_EMBEDDING_API_MODEL=text-embedding-3-small
+
+# Ollama (local, no auth)
+OBSIDIAN_EMBEDDINGS=true
+OBSIDIAN_EMBEDDING_PROVIDER=api
+OBSIDIAN_EMBEDDING_API_BASE=http://localhost:11434/v1
+OBSIDIAN_EMBEDDING_API_MODEL=nomic-embed-text
+OBSIDIAN_EMBEDDING_API_KEY=unused
+
+# vLLM / LM Studio
+OBSIDIAN_EMBEDDINGS=true
+OBSIDIAN_EMBEDDING_PROVIDER=api
+OBSIDIAN_EMBEDDING_API_BASE=http://localhost:8000/v1
+OBSIDIAN_EMBEDDING_API_MODEL=BAAI/bge-small-en-v1.5
+OBSIDIAN_EMBEDDING_API_KEY=unused
+
+# OpenRouter (25+ embedding models from multiple providers)
+OBSIDIAN_EMBEDDINGS=true
+OBSIDIAN_EMBEDDING_PROVIDER=api
+OBSIDIAN_EMBEDDING_API_BASE=https://openrouter.ai/api/v1
+OBSIDIAN_EMBEDDING_API_MODEL=openai/text-embedding-3-small
+OBSIDIAN_EMBEDDING_API_KEY=sk-or-v1-...
+```
+
 ### Pre-built binaries
 
 Grab the latest from [GitHub Releases](https://github.com/lstpsche/obsidian-mcp/releases/latest):
@@ -353,8 +392,15 @@ Control which tools are exposed via the `OBSIDIAN_TOOLS` environment variable or
 | `OBSIDIAN_LOG_LEVEL` | No | `info` | `trace`, `debug`, `info`, `warn`, `error` |
 | `OBSIDIAN_TANTIVY` | No | `true` | BM25 full-text index |
 | `OBSIDIAN_TOOLS` | No | `full` | Tool filtering: profile name, comma-separated allow-list, or `!`-prefixed deny-list |
-| `OBSIDIAN_EMBEDDINGS` | No | `false` | Semantic embedding search (requires `embeddings` feature) |
+| `OBSIDIAN_EMBEDDINGS` | No | `false` | Semantic embedding search (requires `embeddings` or `embeddings-api` feature) |
 | `OBSIDIAN_EMBEDDINGS_MODEL` | No | `BAAI/bge-small-en-v1.5` | HuggingFace model for embeddings |
+| `OBSIDIAN_EMBEDDING_PROVIDER` | No | *(infer)* | Embedding backend: `local` (fastembed) or `api` (OpenAI-compatible) |
+| `OBSIDIAN_EMBEDDING_API_KEY` | When api | Fallback: `OPENAI_API_KEY` | API authentication key |
+| `OBSIDIAN_EMBEDDING_API_BASE` | No | `https://api.openai.com/v1` | Embedding API base URL (fallback: `OPENAI_BASE_URL`) |
+| `OBSIDIAN_EMBEDDING_API_MODEL` | When api | Fallback: `OPENAI_MODEL` | Model name for embedding API |
+| `OBSIDIAN_EMBEDDING_DIM` | No | *(probed)* | Override embedding dimension (skips API probe) |
+| `OBSIDIAN_EMBEDDING_CA_CERT` | No | — | Path to PEM CA certificate for API TLS |
+| `OBSIDIAN_EMBEDDING_TLS_VERIFY` | No | `true` | Set to `false` to skip TLS verification |
 | `OBSIDIAN_SEMANTIC_MODE` | No | `auto` | Semantic backend mode: `auto`, `daemon`, `local` |
 | `OBSIDIAN_SEMANTIC_HOME` | No | OS data-dir default | Shared semantic runtime home for daemon bin/model/cache state |
 | `OBSIDIAN_SEMANTIC_DAEMON_PATH` | No | unset | Override daemon binary path used by bootstrap |
@@ -403,7 +449,8 @@ In HTTP mode, each MCP session gets its own handler instance, but all sessions s
 
 ```sh
 cargo build                          # default build
-cargo build --features embeddings    # with semantic search
+cargo build --features embeddings    # with local semantic search (fastembed)
+cargo build --features embeddings-api  # with API semantic search (OpenAI-compatible)
 
 # stdio mode (default)
 OBSIDIAN_VAULT_PATH=~/vault cargo run
