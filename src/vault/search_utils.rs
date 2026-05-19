@@ -2,21 +2,18 @@
 
 use std::path::PathBuf;
 
-/// Strip YAML frontmatter and return a character-limited body preview.
+/// Strip YAML frontmatter and title heading, return a character-limited body preview.
+///
+/// Skips the first `# Heading` line since it duplicates the `title` field in search results.
 pub(crate) fn body_preview(content: &str, max_chars: usize) -> String {
-    let start = if let Some(stripped) = content.strip_prefix("---") {
-        stripped
-            .find("\n---")
-            .map(|idx| {
-                // 3 (stripped "---" prefix) + 4 ("\n---" closing delimiter)
-                let end = idx + 3 + 4;
-                content[end..].find('\n').map_or(end, |nl| end + nl + 1)
-            })
-            .unwrap_or(0)
+    let body = super::frontmatter::get_body(content).trim_start();
+    let body = if body.starts_with("# ") {
+        body.find('\n')
+            .map_or("", |nl| &body[nl + 1..])
+            .trim_start()
     } else {
-        0
+        body
     };
-    let body = content[start..].trim_start();
     body.chars().take(max_chars).collect()
 }
 
@@ -91,7 +88,7 @@ mod tests {
     fn body_preview_no_frontmatter() {
         let content = "# Title\nSome body text";
         let preview = body_preview(content, 100);
-        assert_eq!(preview, "# Title\nSome body text");
+        assert_eq!(preview, "Some body text");
     }
 
     #[test]
@@ -112,6 +109,34 @@ mod tests {
         let content = "---\ntags: [a]\nNo closing delimiter here";
         let preview = body_preview(content, 200);
         assert!(preview.contains("tags:"));
+    }
+
+    #[test]
+    fn body_preview_skips_title_heading() {
+        let content = "---\ntags: [a]\n---\n# My Title\n\nActual content here";
+        let preview = body_preview(content, 100);
+        assert_eq!(preview, "Actual content here");
+    }
+
+    #[test]
+    fn body_preview_preserves_h2_start() {
+        let content = "## Section Header\n\nBody text follows";
+        let preview = body_preview(content, 100);
+        assert_eq!(preview, "## Section Header\n\nBody text follows");
+    }
+
+    #[test]
+    fn body_preview_skips_title_without_frontmatter() {
+        let content = "# Title Only\n\nThe real content starts here";
+        let preview = body_preview(content, 100);
+        assert_eq!(preview, "The real content starts here");
+    }
+
+    #[test]
+    fn body_preview_title_with_no_body_after() {
+        let content = "# Just a Title";
+        let preview = body_preview(content, 100);
+        assert_eq!(preview, "");
     }
 
     // ── normalize_bm25_scores ───────────────────────────────────────

@@ -18,8 +18,8 @@ use crate::vault::search_utils::{body_preview, compile_query_word_regex, normali
 const DEFAULT_TOP_K: usize = 10;
 const DEFAULT_PREFETCH_COUNT: usize = 50;
 const DEFAULT_ALPHA: f32 = 0.25;
-const SNIPPET_CONTEXT_LEN: usize = 100;
-const SNIPPET_FALLBACK_CHARS: usize = 200;
+const SNIPPET_CONTEXT_LEN: usize = 150;
+const SNIPPET_FALLBACK_CHARS: usize = 300;
 
 #[derive(Debug)]
 pub struct QueryError {
@@ -196,11 +196,12 @@ fn build_hits(
             (context.read_note(&path).ok(), None)
         } else {
             let snippet = context.read_note(&path).ok().map(|text| {
+                let body = crate::vault::frontmatter::get_body(&text);
                 if let Some(re) = word_re.as_ref()
-                    && let Some(matched) = re.find(&text)
+                    && let Some(matched) = re.find(body)
                 {
                     let (context_text, _, _, _) = crate::vault::index::extract_match_context(
-                        &text,
+                        body,
                         matched.start(),
                         matched.end(),
                         SNIPPET_CONTEXT_LEN,

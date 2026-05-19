@@ -223,12 +223,12 @@ fn search_metadata_frontmatter(
 
 // ── search_semantic ──────────────────────────────────────────────────
 
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 const DEFAULT_PREFETCH_COUNT: usize = 50;
-#[cfg(feature = "embeddings")]
-const SNIPPET_CONTEXT_LEN: usize = 100;
-#[cfg(feature = "embeddings")]
-const SNIPPET_FALLBACK_CHARS: usize = 200;
+#[cfg(has_embeddings)]
+const SNIPPET_CONTEXT_LEN: usize = 150;
+#[cfg(has_embeddings)]
+const SNIPPET_FALLBACK_CHARS: usize = 300;
 
 #[derive(Deserialize, JsonSchema, Default)]
 pub struct SearchSemanticParams {
@@ -397,7 +397,7 @@ async fn search_semantic_daemon(
         .collect())
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 fn search_semantic_local(
     vault: &Vault,
     query: &str,
@@ -407,9 +407,13 @@ fn search_semantic_local(
     alpha: f32,
 ) -> Result<Vec<SemanticSearchResult>, VaultError> {
     if !vault.has_embeddings() {
-        return Err(VaultError::Embedding(
-            "Embeddings are not enabled. Set OBSIDIAN_EMBEDDINGS=true and build with --features embeddings.".to_string(),
-        ));
+        let detail = vault
+            .embedding_load_error()
+            .map(|e| format!("Embedding model failed to load: {e}"))
+            .unwrap_or_else(|| {
+                "Embeddings not enabled (compile with --features embeddings or embeddings-api, and set OBSIDIAN_EMBEDDINGS=true)".to_string()
+            });
+        return Err(VaultError::Embedding(detail));
     }
 
     let hits = if lexical_prefetch {
@@ -434,11 +438,12 @@ fn search_semantic_local(
             (vault.read_note(&path).ok(), None)
         } else {
             let snip = vault.read_note(&path).ok().map(|text| {
+                let body = crate::vault::frontmatter::get_body(&text);
                 if let Some(ref re) = word_re
-                    && let Some(found) = re.find(&text)
+                    && let Some(found) = re.find(body)
                 {
                     let (ctx, _, _, _) = crate::vault::index::extract_match_context(
-                        &text,
+                        body,
                         found.start(),
                         found.end(),
                         SNIPPET_CONTEXT_LEN,
@@ -463,7 +468,7 @@ fn search_semantic_local(
     Ok(results)
 }
 
-#[cfg(not(feature = "embeddings"))]
+#[cfg(not(has_embeddings))]
 fn search_semantic_local(
     _vault: &Vault,
     _query: &str,
@@ -473,19 +478,19 @@ fn search_semantic_local(
     _alpha: f32,
 ) -> Result<Vec<SemanticSearchResult>, VaultError> {
     Err(VaultError::Embedding(
-        "Semantic search is not available. This binary was compiled without the 'embeddings' feature. Rebuild with: cargo build --features embeddings".to_string(),
+        "Semantic search is not available. Rebuild with --features embeddings or --features embeddings-api".to_string(),
     ))
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(has_embeddings)]
 use crate::vault::search_utils::{body_preview, compile_query_word_regex};
 
 fn local_backend_available(vault: &Vault) -> bool {
-    #[cfg(feature = "embeddings")]
+    #[cfg(has_embeddings)]
     {
         vault.has_embeddings()
     }
-    #[cfg(not(feature = "embeddings"))]
+    #[cfg(not(has_embeddings))]
     {
         let _ = vault;
         false
