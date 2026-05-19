@@ -181,7 +181,7 @@ enum EmbeddingBackend {
         client: reqwest::blocking::Client,
         base_url: String,
         model: String,
-        api_key: String,
+        api_key: zeroize::Zeroizing<String>,
     },
 }
 
@@ -282,12 +282,16 @@ impl EmbeddingModel {
         let model_name = model_name.to_owned();
 
         tokio::task::spawn_blocking(move || {
-            let api_key = read_env_with_fallback("OBSIDIAN_EMBEDDING_API_KEY", "OPENAI_API_KEY")
-                .ok_or_else(|| {
-                    VaultError::Embedding(
-                        "API key required: set OBSIDIAN_EMBEDDING_API_KEY or OPENAI_API_KEY".into(),
-                    )
-                })?;
+            let api_key = zeroize::Zeroizing::new(
+                read_env_with_fallback("OBSIDIAN_EMBEDDING_API_KEY", "OPENAI_API_KEY").ok_or_else(
+                    || {
+                        VaultError::Embedding(
+                            "API key required: set OBSIDIAN_EMBEDDING_API_KEY or OPENAI_API_KEY"
+                                .into(),
+                        )
+                    },
+                )?,
+            );
 
             let base_url = read_env_with_fallback("OBSIDIAN_EMBEDDING_API_BASE", "OPENAI_BASE_URL")
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
@@ -418,6 +422,7 @@ fn embed_batch_api(
         "input": texts,
     });
 
+    const MAX_RETRIES: u8 = 3;
     let mut attempt = 0u8;
     loop {
         let response = client
@@ -428,20 +433,22 @@ fn embed_batch_api(
             .map_err(|e| VaultError::Embedding(format!("embedding API request failed: {e}")))?;
 
         let status = response.status();
-        if status.as_u16() == 429 && attempt == 0 {
+        if status.as_u16() == 429 && attempt < MAX_RETRIES {
             let wait = response
                 .headers()
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(1)
+                .unwrap_or(1u64 << attempt)
                 .min(30);
+            attempt += 1;
             tracing::warn!(
                 retry_after_secs = wait,
-                "embedding API rate limited, retrying"
+                attempt = attempt,
+                max_retries = MAX_RETRIES,
+                "embedding API rate limited (attempt {attempt}/{MAX_RETRIES})"
             );
             std::thread::sleep(std::time::Duration::from_secs(wait));
-            attempt += 1;
             continue;
         }
 
@@ -456,31 +463,37 @@ fn embed_batch_api(
             .json()
             .map_err(|e| VaultError::Embedding(format!("embedding API parse error: {e}")))?;
 
-        let data = resp["data"]
-            .as_array()
-            .ok_or_else(|| VaultError::Embedding("missing 'data' array in API response".into()))?;
-
-        let mut embeddings = Vec::with_capacity(data.len());
-        for item in data {
-            let vec = item["embedding"]
-                .as_array()
-                .ok_or_else(|| {
-                    VaultError::Embedding("missing 'embedding' array in response item".into())
-                })?
-                .iter()
-                .map(|v| {
-                    v.as_f64()
-                        .ok_or_else(|| {
-                            VaultError::Embedding("non-numeric value in embedding vector".into())
-                        })
-                        .map(|f| f as f32)
-                })
-                .collect::<Result<Vec<f32>, _>>()?;
-            embeddings.push(vec);
-        }
-
-        return Ok(embeddings);
+        return parse_embedding_response(&resp);
     }
+}
+
+/// Parse an OpenAI-compatible embedding API response into embedding vectors.
+#[cfg(feature = "embeddings-api")]
+fn parse_embedding_response(resp: &serde_json::Value) -> Result<Vec<Vec<f32>>, VaultError> {
+    let data = resp["data"]
+        .as_array()
+        .ok_or_else(|| VaultError::Embedding("missing 'data' array in API response".into()))?;
+
+    let mut embeddings = Vec::with_capacity(data.len());
+    for item in data {
+        let vec = item["embedding"]
+            .as_array()
+            .ok_or_else(|| {
+                VaultError::Embedding("missing 'embedding' array in response item".into())
+            })?
+            .iter()
+            .map(|v| {
+                v.as_f64()
+                    .ok_or_else(|| {
+                        VaultError::Embedding("non-numeric value in embedding vector".into())
+                    })
+                    .map(|f| f as f32)
+            })
+            .collect::<Result<Vec<f32>, _>>()?;
+        embeddings.push(vec);
+    }
+
+    Ok(embeddings)
 }
 
 // ── Env var helpers (API backend) ──────────────────────────────────────
@@ -877,34 +890,6 @@ mod tests {
     #[cfg(feature = "embeddings-api")]
     mod api_response_tests {
         use super::*;
-
-        fn parse_embedding_response(resp: &serde_json::Value) -> Result<Vec<Vec<f32>>, VaultError> {
-            let data = resp["data"].as_array().ok_or_else(|| {
-                VaultError::Embedding("missing 'data' array in API response".into())
-            })?;
-
-            let mut embeddings = Vec::with_capacity(data.len());
-            for item in data {
-                let vec = item["embedding"]
-                    .as_array()
-                    .ok_or_else(|| {
-                        VaultError::Embedding("missing 'embedding' array in response item".into())
-                    })?
-                    .iter()
-                    .map(|v| {
-                        v.as_f64()
-                            .ok_or_else(|| {
-                                VaultError::Embedding(
-                                    "non-numeric value in embedding vector".into(),
-                                )
-                            })
-                            .map(|f| f as f32)
-                    })
-                    .collect::<Result<Vec<f32>, _>>()?;
-                embeddings.push(vec);
-            }
-            Ok(embeddings)
-        }
 
         #[test]
         fn parse_valid_single_embedding() {

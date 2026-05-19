@@ -2317,6 +2317,7 @@ dependencies = [
  "tracing-subscriber",
  "walkdir",
  "yaml_serde",
+ "zeroize",
  "zip",
 ]
 

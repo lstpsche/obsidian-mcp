@@ -715,6 +715,11 @@ impl Vault {
     }
 
     /// Re-embed a single note and update the store. Non-fatal on error.
+    ///
+    /// When a tokio runtime is available, the blocking embed+store+save work
+    /// is offloaded via `spawn_blocking` so that tokio worker threads remain
+    /// free for concurrent reads. Falls back to synchronous execution when no
+    /// runtime is present (e.g. unit tests).
     #[cfg(has_embeddings)]
     fn reindex_embedding(&self, path: &Path) {
         let (Some(model), Some(store)) = (&self.inner.embedding_model, &self.inner.embedding_store)
@@ -736,16 +741,31 @@ impl Vault {
         let text = embeddings::prepare_embed_text(&meta.title, &heading_texts, body);
         drop(idx);
 
-        match model.embed_one(&text) {
+        let model = Arc::clone(model);
+        let store = Arc::clone(store);
+        let root = self.inner.root.clone();
+        let path_owned = path.to_path_buf();
+
+        let do_embed = move || match model.embed_one(&text) {
             Ok(vec) => {
                 let mut s = store.write().unwrap_or_else(|e| e.into_inner());
-                s.insert(path.to_path_buf(), vec);
+                s.insert(path_owned.clone(), vec);
                 drop(s);
-                self.save_embedding_cache();
+                let cache_path = Self::embedding_cache_path(&root);
+                let s = store.read().unwrap_or_else(|e| e.into_inner());
+                if let Err(e) = s.save(&cache_path) {
+                    tracing::warn!(error = %e, "failed to save embedding cache");
+                }
             }
             Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "embedding failed");
+                tracing::warn!(path = %path_owned.display(), error = %e, "embedding failed");
             }
+        };
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            drop(handle.spawn_blocking(do_embed));
+        } else {
+            do_embed();
         }
     }
 
