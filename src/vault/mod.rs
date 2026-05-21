@@ -17,6 +17,8 @@ pub mod wikilink;
 #[cfg(has_embeddings)]
 pub mod embeddings;
 
+#[cfg(has_embeddings)]
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -42,6 +44,8 @@ struct VaultInner {
     embedding_model: Option<Arc<embeddings::EmbeddingModel>>,
     #[cfg(has_embeddings)]
     embedding_store: Option<Arc<RwLock<embeddings::EmbeddingStore>>>,
+    #[cfg(has_embeddings)]
+    embedding_task_generation: Mutex<HashMap<PathBuf, u64>>,
     /// Kept alive to sustain filesystem watching; never accessed after construction.
     /// Wrapped in `Mutex` to guarantee `Sync` (`Debouncer` contains a `mpsc::Sender`
     /// which is `Send` but not `Sync`).
@@ -153,6 +157,8 @@ impl Vault {
                 embedding_model,
                 #[cfg(has_embeddings)]
                 embedding_store,
+                #[cfg(has_embeddings)]
+                embedding_task_generation: Mutex::new(HashMap::new()),
                 _watcher: Mutex::new(watcher_handle),
                 embedding_load_error: embed_err,
             }),
@@ -238,7 +244,11 @@ impl Vault {
             tv.remove_file(path)?;
         }
         #[cfg(has_embeddings)]
-        self.remove_embedding(path);
+        {
+            self.next_embedding_generation(path);
+            self.remove_embedding(path);
+            self.clear_embedding_generation(path);
+        }
         Ok(())
     }
 
@@ -256,7 +266,9 @@ impl Vault {
         }
         #[cfg(has_embeddings)]
         {
+            self.next_embedding_generation(from);
             self.remove_embedding(from);
+            self.clear_embedding_generation(from);
             self.reindex_embedding(&new_path);
         }
         Ok(new_path)
@@ -714,6 +726,46 @@ impl Vault {
         embeddings::build_or_load_embedding_store(&cache_path, vault_root, &note_entries, model)
     }
 
+    #[cfg(has_embeddings)]
+    fn next_embedding_generation(&self, path: &Path) -> u64 {
+        let mut generations = self
+            .inner
+            .embedding_task_generation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = generations.entry(path.to_path_buf()).or_insert(0);
+        *entry = entry.wrapping_add(1);
+        *entry
+    }
+
+    #[cfg(has_embeddings)]
+    fn current_embedding_generation(&self, path: &Path) -> Option<u64> {
+        let generations = self
+            .inner
+            .embedding_task_generation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        generations.get(path).copied()
+    }
+
+    #[cfg(has_embeddings)]
+    fn clear_embedding_generation(&self, path: &Path) {
+        let mut generations = self
+            .inner
+            .embedding_task_generation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        generations.remove(path);
+    }
+
+    #[cfg(has_embeddings)]
+    fn should_commit_embedding_task(&self, path: &Path, generation: u64) -> bool {
+        if self.current_embedding_generation(path) != Some(generation) {
+            return false;
+        }
+        self.read_index().get_note(path).is_some()
+    }
+
     /// Re-embed a single note and update the store. Non-fatal on error.
     ///
     /// When a tokio runtime is available, the blocking embed+store+save work
@@ -726,6 +778,8 @@ impl Vault {
         else {
             return;
         };
+
+        let generation = self.next_embedding_generation(path);
 
         let Ok(content) = fs::read_file(&self.inner.root, path) else {
             return;
@@ -744,10 +798,22 @@ impl Vault {
         let model = Arc::clone(model);
         let store = Arc::clone(store);
         let root = self.inner.root.clone();
+        let vault = self.clone();
         let path_owned = path.to_path_buf();
 
         let do_embed = move || match model.embed_one(&text) {
             Ok(vec) => {
+                if !vault.should_commit_embedding_task(&path_owned, generation) {
+                    let current_generation = vault.current_embedding_generation(&path_owned);
+                    tracing::debug!(
+                        path = %path_owned.display(),
+                        expected_generation = generation,
+                        actual_generation = ?current_generation,
+                        "skipping embedding insert for stale or missing note"
+                    );
+                    return;
+                }
+
                 let mut s = store.write().unwrap_or_else(|e| e.into_inner());
                 s.insert(path_owned.clone(), vec);
                 drop(s);
@@ -1399,5 +1465,73 @@ mod tests {
         );
         let err = vault.embedding_load_error().unwrap();
         assert!(!err.is_empty(), "error message should be descriptive");
+    }
+
+    #[cfg(has_embeddings)]
+    #[tokio::test]
+    async fn embedding_generation_rejects_stale_tasks_same_path() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        let path = Path::new("race.md");
+        vault.write_note(path, "# Race").unwrap();
+
+        let first = vault.next_embedding_generation(path);
+        let second = vault.next_embedding_generation(path);
+
+        assert!(
+            !vault.should_commit_embedding_task(path, first),
+            "older generation must be rejected after a newer schedule"
+        );
+        assert!(
+            vault.should_commit_embedding_task(path, second),
+            "latest generation for an existing note should be accepted"
+        );
+    }
+
+    #[cfg(has_embeddings)]
+    #[tokio::test]
+    async fn embedding_generation_rejects_deleted_note_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        let path = Path::new("deleted.md");
+        vault.write_note(path, "# Deleted").unwrap();
+        let scheduled_generation = vault.next_embedding_generation(path);
+
+        vault.delete_note(path).unwrap();
+
+        assert!(
+            !vault.should_commit_embedding_task(path, scheduled_generation),
+            "deleted notes must reject previously scheduled embedding tasks"
+        );
+    }
+
+    #[cfg(has_embeddings)]
+    #[tokio::test]
+    async fn embedding_generation_rejects_moved_old_path_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        let from = Path::new("moved-from.md");
+        let to = Path::new("nested/moved-to.md");
+        vault.write_note(from, "# Move").unwrap();
+        let old_generation = vault.next_embedding_generation(from);
+
+        vault.move_note(from, to).unwrap();
+
+        assert!(
+            !vault.should_commit_embedding_task(from, old_generation),
+            "old path tasks must be rejected after move"
+        );
+
+        let new_generation = vault.next_embedding_generation(to);
+        assert!(
+            vault.should_commit_embedding_task(to, new_generation),
+            "new path generation should be valid for existing moved note"
+        );
     }
 }

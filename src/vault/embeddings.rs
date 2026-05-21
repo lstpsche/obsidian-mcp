@@ -890,6 +890,14 @@ mod tests {
     #[cfg(feature = "embeddings-api")]
     mod api_response_tests {
         use super::*;
+        use std::sync::{LazyLock, Mutex};
+
+        static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+        fn with_env_lock<F: FnOnce()>(f: F) {
+            let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            f();
+        }
 
         #[test]
         fn parse_valid_single_embedding() {
@@ -960,83 +968,97 @@ mod tests {
 
         #[test]
         fn read_env_with_fallback_primary_wins() {
-            unsafe {
-                std::env::set_var("TEST_PRIMARY_KEY_A", "primary_value");
-                std::env::set_var("TEST_FALLBACK_KEY_A", "fallback_value");
-            }
-            let result = read_env_with_fallback("TEST_PRIMARY_KEY_A", "TEST_FALLBACK_KEY_A");
-            assert_eq!(result, Some("primary_value".to_string()));
-            unsafe {
-                std::env::remove_var("TEST_PRIMARY_KEY_A");
-                std::env::remove_var("TEST_FALLBACK_KEY_A");
-            }
+            with_env_lock(|| {
+                unsafe {
+                    std::env::set_var("TEST_PRIMARY_KEY_A", "primary_value");
+                    std::env::set_var("TEST_FALLBACK_KEY_A", "fallback_value");
+                }
+                let result = read_env_with_fallback("TEST_PRIMARY_KEY_A", "TEST_FALLBACK_KEY_A");
+                assert_eq!(result, Some("primary_value".to_string()));
+                unsafe {
+                    std::env::remove_var("TEST_PRIMARY_KEY_A");
+                    std::env::remove_var("TEST_FALLBACK_KEY_A");
+                }
+            });
         }
 
         #[test]
         fn read_env_with_fallback_uses_fallback() {
-            unsafe {
-                std::env::remove_var("TEST_PRIMARY_KEY_B");
-                std::env::set_var("TEST_FALLBACK_KEY_B", "fallback_value");
-            }
-            let result = read_env_with_fallback("TEST_PRIMARY_KEY_B", "TEST_FALLBACK_KEY_B");
-            assert_eq!(result, Some("fallback_value".to_string()));
-            unsafe {
-                std::env::remove_var("TEST_FALLBACK_KEY_B");
-            }
+            with_env_lock(|| {
+                unsafe {
+                    std::env::remove_var("TEST_PRIMARY_KEY_B");
+                    std::env::set_var("TEST_FALLBACK_KEY_B", "fallback_value");
+                }
+                let result = read_env_with_fallback("TEST_PRIMARY_KEY_B", "TEST_FALLBACK_KEY_B");
+                assert_eq!(result, Some("fallback_value".to_string()));
+                unsafe {
+                    std::env::remove_var("TEST_FALLBACK_KEY_B");
+                }
+            });
         }
 
         #[test]
         fn read_env_with_fallback_returns_none_when_both_missing() {
-            unsafe {
-                std::env::remove_var("TEST_PRIMARY_KEY_C");
-                std::env::remove_var("TEST_FALLBACK_KEY_C");
-            }
-            let result = read_env_with_fallback("TEST_PRIMARY_KEY_C", "TEST_FALLBACK_KEY_C");
-            assert_eq!(result, None);
+            with_env_lock(|| {
+                unsafe {
+                    std::env::remove_var("TEST_PRIMARY_KEY_C");
+                    std::env::remove_var("TEST_FALLBACK_KEY_C");
+                }
+                let result = read_env_with_fallback("TEST_PRIMARY_KEY_C", "TEST_FALLBACK_KEY_C");
+                assert_eq!(result, None);
+            });
         }
 
         #[test]
         fn read_env_with_fallback_ignores_empty_primary() {
-            unsafe {
-                std::env::set_var("TEST_PRIMARY_KEY_D", "  ");
-                std::env::set_var("TEST_FALLBACK_KEY_D", "valid");
-            }
-            let result = read_env_with_fallback("TEST_PRIMARY_KEY_D", "TEST_FALLBACK_KEY_D");
-            assert_eq!(result, Some("valid".to_string()));
-            unsafe {
-                std::env::remove_var("TEST_PRIMARY_KEY_D");
-                std::env::remove_var("TEST_FALLBACK_KEY_D");
-            }
+            with_env_lock(|| {
+                unsafe {
+                    std::env::set_var("TEST_PRIMARY_KEY_D", "  ");
+                    std::env::set_var("TEST_FALLBACK_KEY_D", "valid");
+                }
+                let result = read_env_with_fallback("TEST_PRIMARY_KEY_D", "TEST_FALLBACK_KEY_D");
+                assert_eq!(result, Some("valid".to_string()));
+                unsafe {
+                    std::env::remove_var("TEST_PRIMARY_KEY_D");
+                    std::env::remove_var("TEST_FALLBACK_KEY_D");
+                }
+            });
         }
 
         #[test]
         fn parse_usize_env_valid() {
-            unsafe {
-                std::env::set_var("TEST_DIM_VALID", "384");
-            }
-            assert_eq!(parse_usize_env("TEST_DIM_VALID"), Some(384));
-            unsafe {
-                std::env::remove_var("TEST_DIM_VALID");
-            }
+            with_env_lock(|| {
+                unsafe {
+                    std::env::set_var("TEST_DIM_VALID", "384");
+                }
+                assert_eq!(parse_usize_env("TEST_DIM_VALID"), Some(384));
+                unsafe {
+                    std::env::remove_var("TEST_DIM_VALID");
+                }
+            });
         }
 
         #[test]
         fn parse_usize_env_invalid() {
-            unsafe {
-                std::env::set_var("TEST_DIM_INVALID", "not_a_number");
-            }
-            assert_eq!(parse_usize_env("TEST_DIM_INVALID"), None);
-            unsafe {
-                std::env::remove_var("TEST_DIM_INVALID");
-            }
+            with_env_lock(|| {
+                unsafe {
+                    std::env::set_var("TEST_DIM_INVALID", "not_a_number");
+                }
+                assert_eq!(parse_usize_env("TEST_DIM_INVALID"), None);
+                unsafe {
+                    std::env::remove_var("TEST_DIM_INVALID");
+                }
+            });
         }
 
         #[test]
         fn parse_usize_env_missing() {
-            unsafe {
-                std::env::remove_var("TEST_DIM_MISSING");
-            }
-            assert_eq!(parse_usize_env("TEST_DIM_MISSING"), None);
+            with_env_lock(|| {
+                unsafe {
+                    std::env::remove_var("TEST_DIM_MISSING");
+                }
+                assert_eq!(parse_usize_env("TEST_DIM_MISSING"), None);
+            });
         }
     }
 }
