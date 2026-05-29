@@ -420,6 +420,7 @@ fn embed_batch_api(
     let body = serde_json::json!({
         "model": model,
         "input": texts,
+        "encoding_format": "float",
     });
 
     const MAX_RETRIES: u8 = 3;
@@ -468,14 +469,22 @@ fn embed_batch_api(
 }
 
 /// Parse an OpenAI-compatible embedding API response into embedding vectors.
+///
+/// Items are sorted by the `index` field when present, falling back to array
+/// position for providers that omit it. This ensures correct input→output
+/// alignment even when providers return items out of order.
 #[cfg(feature = "embeddings-api")]
 fn parse_embedding_response(resp: &serde_json::Value) -> Result<Vec<Vec<f32>>, VaultError> {
     let data = resp["data"]
         .as_array()
         .ok_or_else(|| VaultError::Embedding("missing 'data' array in API response".into()))?;
 
-    let mut embeddings = Vec::with_capacity(data.len());
-    for item in data {
+    let mut indexed: Vec<(usize, Vec<f32>)> = Vec::with_capacity(data.len());
+    for (array_pos, item) in data.iter().enumerate() {
+        let idx = item["index"]
+            .as_u64()
+            .map(|i| i as usize)
+            .unwrap_or(array_pos);
         let vec = item["embedding"]
             .as_array()
             .ok_or_else(|| {
@@ -490,10 +499,11 @@ fn parse_embedding_response(resp: &serde_json::Value) -> Result<Vec<Vec<f32>>, V
                     .map(|f| f as f32)
             })
             .collect::<Result<Vec<f32>, _>>()?;
-        embeddings.push(vec);
+        indexed.push((idx, vec));
     }
 
-    Ok(embeddings)
+    indexed.sort_by_key(|(idx, _)| *idx);
+    Ok(indexed.into_iter().map(|(_, vec)| vec).collect())
 }
 
 // ── Env var helpers (API backend) ──────────────────────────────────────
@@ -947,6 +957,33 @@ mod tests {
             });
             let err = parse_embedding_response(&resp).unwrap_err();
             assert!(err.to_string().contains("non-numeric value"));
+        }
+
+        #[test]
+        fn parse_reorders_by_index_field() {
+            let resp = serde_json::json!({
+                "data": [
+                    {"index": 1, "embedding": [0.3, 0.4]},
+                    {"index": 0, "embedding": [0.1, 0.2]}
+                ]
+            });
+            let result = parse_embedding_response(&resp).unwrap();
+            assert_eq!(result.len(), 2);
+            assert_eq!(result[0], vec![0.1f32, 0.2]);
+            assert_eq!(result[1], vec![0.3f32, 0.4]);
+        }
+
+        #[test]
+        fn parse_falls_back_to_array_order_without_index() {
+            let resp = serde_json::json!({
+                "data": [
+                    {"embedding": [0.1, 0.2]},
+                    {"embedding": [0.3, 0.4]}
+                ]
+            });
+            let result = parse_embedding_response(&resp).unwrap();
+            assert_eq!(result[0], vec![0.1f32, 0.2]);
+            assert_eq!(result[1], vec![0.3f32, 0.4]);
         }
 
         #[test]
