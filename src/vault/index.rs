@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use regex::Regex;
 use walkdir::WalkDir;
@@ -11,6 +12,8 @@ use crate::models::{NoteMetadata, SearchMatch, SearchResult, VaultStats, WikiLin
 use crate::vault::wikilink::{LinkResolver, build_link_resolver};
 use crate::vault::{frontmatter, fs, parser};
 
+use super::exclude::ExcludeSet;
+
 pub struct VaultIndex {
     notes: HashMap<PathBuf, NoteMetadata>,
     tags: HashMap<String, HashSet<PathBuf>>,
@@ -19,6 +22,7 @@ pub struct VaultIndex {
     stats: VaultStats,
     non_md_file_count: usize,
     non_md_bytes: u64,
+    excluded_note_paths: HashSet<PathBuf>,
 }
 
 impl VaultIndex {
@@ -35,25 +39,28 @@ impl VaultIndex {
                 total_tags: 0,
                 total_links: 0,
                 vault_size_bytes: 0,
+                excluded_notes: 0,
             },
             non_md_file_count: 0,
             non_md_bytes: 0,
+            excluded_note_paths: HashSet::new(),
         }
     }
 
     /// Build the index by walking the entire vault directory.
-    pub async fn build(vault_root: &Path) -> VaultResult<Self> {
+    pub async fn build(vault_root: &Path, exclude: Arc<ExcludeSet>) -> VaultResult<Self> {
         let root = vault_root.to_path_buf();
-        tokio::task::spawn_blocking(move || Self::build_sync(&root))
+        tokio::task::spawn_blocking(move || Self::build_sync(&root, &exclude))
             .await
             .map_err(|e| VaultError::Other(format!("index build task panicked: {e}")))?
     }
 
-    fn build_sync(vault_root: &Path) -> VaultResult<Self> {
+    fn build_sync(vault_root: &Path, exclude: &ExcludeSet) -> VaultResult<Self> {
         let mut notes = HashMap::new();
         let mut tags: HashMap<String, HashSet<PathBuf>> = HashMap::new();
         let mut non_md_file_count: usize = 0;
         let mut non_md_bytes: u64 = 0;
+        let mut excluded_note_paths: HashSet<PathBuf> = HashSet::new();
 
         let walker = WalkDir::new(vault_root)
             .min_depth(1)
@@ -89,6 +96,10 @@ impl VaultIndex {
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
 
             if is_md {
+                if exclude.is_excluded(&rel_path) {
+                    excluded_note_paths.insert(rel_path);
+                    continue;
+                }
                 match parse_note_metadata(vault_root, &rel_path) {
                     Ok(metadata) => {
                         for tag in &metadata.tags {
@@ -128,9 +139,11 @@ impl VaultIndex {
                 total_tags: 0,
                 total_links: 0,
                 vault_size_bytes: 0,
+                excluded_notes: 0,
             },
             non_md_file_count,
             non_md_bytes,
+            excluded_note_paths,
         };
 
         index.rebuild_backlinks();
@@ -148,6 +161,7 @@ impl VaultIndex {
     pub fn reindex_file(&mut self, vault_root: &Path, path: &Path) -> VaultResult<()> {
         let was_existing = self.notes.contains_key(path);
         let old_links = self.notes.get(path).map(|n| n.links.clone());
+        self.excluded_note_paths.remove(path);
 
         self.remove_note_contributions(path);
         self.link_resolver.remove_path(path);
@@ -173,6 +187,7 @@ impl VaultIndex {
 
     /// Remove a file from the index (on delete).
     pub fn remove_file(&mut self, path: &Path) {
+        self.excluded_note_paths.remove(path);
         self.remove_note_contributions(path);
         self.link_resolver.remove_path(path);
         self.backlinks.remove(path);
@@ -183,6 +198,7 @@ impl VaultIndex {
 
     /// Handle a file rename/move.
     pub fn rename_file(&mut self, vault_root: &Path, old: &Path, new: &Path) -> VaultResult<()> {
+        self.excluded_note_paths.remove(old);
         self.remove_note_contributions(old);
         self.link_resolver.rename_path(old, new.to_path_buf());
         self.backlinks.remove(old);
@@ -284,6 +300,20 @@ impl VaultIndex {
 
     pub fn stats(&self) -> &VaultStats {
         &self.stats
+    }
+
+    pub fn excluded_notes(&self) -> usize {
+        self.excluded_note_paths.len()
+    }
+
+    /// Track a markdown file that exists on disk but is excluded from the index.
+    pub fn add_excluded_file(&mut self, path: &Path) {
+        self.remove_note_contributions(path);
+        self.link_resolver.remove_path(path);
+        self.backlinks.remove(path);
+        self.excluded_note_paths.insert(path.to_path_buf());
+        self.rebuild_backlinks();
+        self.recompute_stats();
     }
 
     // ── search methods ──────────────────────────────────────────────
@@ -458,6 +488,7 @@ impl VaultIndex {
             total_tags: self.tags.len(),
             total_links: self.notes.values().map(|n| n.links.len()).sum(),
             vault_size_bytes: md_bytes + self.non_md_bytes,
+            excluded_notes: self.excluded_note_paths.len(),
         };
     }
 
@@ -623,7 +654,12 @@ fn frontmatter_field_contains(
 mod tests {
     use super::*;
     use std::fs as stdfs;
+    use std::sync::Arc;
     use tempfile::TempDir;
+
+    fn empty_exclude() -> Arc<ExcludeSet> {
+        Arc::new(ExcludeSet::build(vec![]).unwrap())
+    }
 
     fn setup_vault() -> TempDir {
         let dir = TempDir::new().unwrap();
@@ -676,7 +712,9 @@ mod tests {
     #[tokio::test]
     async fn build_indexes_all_notes() {
         let vault = setup_vault();
-        let index = VaultIndex::build(vault.path()).await.unwrap();
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         assert_eq!(index.notes.len(), 5);
         assert!(index.get_note(Path::new("daily.md")).is_some());
@@ -689,7 +727,9 @@ mod tests {
     #[tokio::test]
     async fn build_computes_correct_backlinks() {
         let vault = setup_vault();
-        let index = VaultIndex::build(vault.path()).await.unwrap();
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         let alpha_bl = index.backlinks_to(Path::new("notes/alpha.md"));
         let bl_paths: HashSet<PathBuf> = alpha_bl.iter().map(|n| n.path.clone()).collect();
@@ -707,7 +747,9 @@ mod tests {
     #[tokio::test]
     async fn build_indexes_both_frontmatter_and_inline_tags() {
         let vault = setup_vault();
-        let index = VaultIndex::build(vault.path()).await.unwrap();
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         let alpha = index.get_note(Path::new("notes/alpha.md")).unwrap();
         assert!(alpha.tags.contains(&"rust".to_string()));
@@ -726,7 +768,9 @@ mod tests {
     #[tokio::test]
     async fn build_detects_broken_links() {
         let vault = setup_vault();
-        let index = VaultIndex::build(vault.path()).await.unwrap();
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         let broken = index.broken_links();
         let broken_targets: Vec<&str> = broken.iter().map(|(_, l)| l.target.as_str()).collect();
@@ -736,7 +780,9 @@ mod tests {
     #[tokio::test]
     async fn build_detects_orphan_notes() {
         let vault = setup_vault();
-        let index = VaultIndex::build(vault.path()).await.unwrap();
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         let orphans = index.orphan_notes();
         let orphan_paths: HashSet<&PathBuf> = orphans.iter().map(|n| &n.path).collect();
@@ -749,7 +795,9 @@ mod tests {
     #[tokio::test]
     async fn build_computes_stats() {
         let vault = setup_vault();
-        let index = VaultIndex::build(vault.path()).await.unwrap();
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         let stats = index.stats();
         assert_eq!(stats.total_notes, 5);
@@ -762,7 +810,9 @@ mod tests {
     #[tokio::test]
     async fn build_skips_hidden_and_obsidian() {
         let vault = setup_vault();
-        let index = VaultIndex::build(vault.path()).await.unwrap();
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         for path in index.notes.keys() {
             let s = path.display().to_string();
@@ -774,7 +824,9 @@ mod tests {
     #[tokio::test]
     async fn outgoing_links_correct() {
         let vault = setup_vault();
-        let index = VaultIndex::build(vault.path()).await.unwrap();
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         let links = index.outgoing_links(Path::new("notes/alpha.md"));
         let targets: Vec<&str> = links.iter().map(|l| l.target.as_str()).collect();
@@ -784,7 +836,9 @@ mod tests {
     #[tokio::test]
     async fn get_note_missing_returns_none() {
         let vault = setup_vault();
-        let index = VaultIndex::build(vault.path()).await.unwrap();
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         assert!(index.get_note(Path::new("nonexistent.md")).is_none());
     }
@@ -792,7 +846,9 @@ mod tests {
     #[tokio::test]
     async fn notes_with_nonexistent_tag_returns_empty() {
         let vault = setup_vault();
-        let index = VaultIndex::build(vault.path()).await.unwrap();
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         assert!(index.notes_with_tag("nonexistent").is_empty());
     }
@@ -800,7 +856,9 @@ mod tests {
     #[tokio::test]
     async fn note_title_is_file_stem() {
         let vault = setup_vault();
-        let index = VaultIndex::build(vault.path()).await.unwrap();
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         assert_eq!(
             index.get_note(Path::new("notes/alpha.md")).unwrap().title,
@@ -815,7 +873,9 @@ mod tests {
     #[tokio::test]
     async fn block_refs_indexed() {
         let vault = setup_vault();
-        let index = VaultIndex::build(vault.path()).await.unwrap();
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         let beta = index.get_note(Path::new("notes/beta.md")).unwrap();
         assert!(beta.block_refs.contains(&"block1".to_string()));
@@ -826,7 +886,9 @@ mod tests {
     #[tokio::test]
     async fn reindex_file_updates_tags_and_links() {
         let vault = setup_vault();
-        let mut index = VaultIndex::build(vault.path()).await.unwrap();
+        let mut index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         stdfs::write(
             vault.path().join("notes/gamma.md"),
@@ -856,7 +918,9 @@ mod tests {
     #[tokio::test]
     async fn reindex_file_handles_new_file() {
         let vault = setup_vault();
-        let mut index = VaultIndex::build(vault.path()).await.unwrap();
+        let mut index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
         let old_count = index.notes.len();
 
         stdfs::write(
@@ -877,7 +941,9 @@ mod tests {
     #[tokio::test]
     async fn reindex_removes_old_tag_contributions() {
         let vault = setup_vault();
-        let mut index = VaultIndex::build(vault.path()).await.unwrap();
+        let mut index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         assert_eq!(index.notes_with_tag("rust").len(), 1);
 
@@ -899,7 +965,9 @@ mod tests {
     #[tokio::test]
     async fn remove_file_cleans_up_everything() {
         let vault = setup_vault();
-        let mut index = VaultIndex::build(vault.path()).await.unwrap();
+        let mut index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         assert!(index.get_note(Path::new("notes/alpha.md")).is_some());
         assert!(!index.notes_with_tag("rust").is_empty());
@@ -921,7 +989,9 @@ mod tests {
     #[tokio::test]
     async fn remove_file_updates_stats() {
         let vault = setup_vault();
-        let mut index = VaultIndex::build(vault.path()).await.unwrap();
+        let mut index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
         let old_notes = index.stats().total_notes;
 
         index.remove_file(Path::new("notes/gamma.md"));
@@ -932,7 +1002,9 @@ mod tests {
     #[tokio::test]
     async fn rename_file_updates_index() {
         let vault = setup_vault();
-        let mut index = VaultIndex::build(vault.path()).await.unwrap();
+        let mut index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         stdfs::rename(
             vault.path().join("notes/gamma.md"),
@@ -958,7 +1030,9 @@ mod tests {
     #[tokio::test]
     async fn search_text_finds_matches() {
         let vault = setup_vault();
-        let index = VaultIndex::build(vault.path()).await.unwrap();
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         let results = index.search_text(vault.path(), "alpha", 20).unwrap();
         assert!(!results.is_empty());
@@ -970,7 +1044,9 @@ mod tests {
     #[tokio::test]
     async fn search_text_case_insensitive() {
         let vault = setup_vault();
-        let index = VaultIndex::build(vault.path()).await.unwrap();
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         let lower = index.search_text(vault.path(), "gamma", 10).unwrap();
         let upper = index.search_text(vault.path(), "GAMMA", 10).unwrap();
@@ -982,7 +1058,9 @@ mod tests {
     #[tokio::test]
     async fn search_text_empty_query_returns_empty() {
         let vault = setup_vault();
-        let index = VaultIndex::build(vault.path()).await.unwrap();
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         assert!(index.search_text(vault.path(), "", 10).unwrap().is_empty());
     }
@@ -990,7 +1068,9 @@ mod tests {
     #[tokio::test]
     async fn search_text_context_offsets_are_correct() {
         let vault = setup_vault();
-        let index = VaultIndex::build(vault.path()).await.unwrap();
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         let results = index.search_text(vault.path(), "isolated", 50).unwrap();
         assert!(!results.is_empty());
@@ -1011,7 +1091,9 @@ mod tests {
     #[tokio::test]
     async fn search_regex_works() {
         let vault = setup_vault();
-        let index = VaultIndex::build(vault.path()).await.unwrap();
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         let results = index
             .search_regex(vault.path(), r"\[\[alpha\]\]", 10, 0)
@@ -1026,7 +1108,9 @@ mod tests {
     #[tokio::test]
     async fn search_regex_invalid_pattern_returns_error() {
         let vault = setup_vault();
-        let index = VaultIndex::build(vault.path()).await.unwrap();
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         let result = index.search_regex(vault.path(), "[invalid", 10, 0);
         assert!(result.is_err());
@@ -1039,7 +1123,9 @@ mod tests {
     #[tokio::test]
     async fn search_frontmatter_exact_match() {
         let vault = setup_vault();
-        let index = VaultIndex::build(vault.path()).await.unwrap();
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         let results = index.search_frontmatter("tags", &serde_json::json!(["journal"]));
         assert_eq!(results.len(), 1);
@@ -1049,7 +1135,9 @@ mod tests {
     #[tokio::test]
     async fn search_frontmatter_array_contains() {
         let vault = setup_vault();
-        let index = VaultIndex::build(vault.path()).await.unwrap();
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         let results = index.search_frontmatter("tags", &serde_json::json!("rust"));
         assert_eq!(results.len(), 1);
@@ -1059,7 +1147,9 @@ mod tests {
     #[tokio::test]
     async fn search_frontmatter_no_match() {
         let vault = setup_vault();
-        let index = VaultIndex::build(vault.path()).await.unwrap();
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         assert!(
             index
@@ -1071,7 +1161,9 @@ mod tests {
     #[tokio::test]
     async fn search_frontmatter_missing_field() {
         let vault = setup_vault();
-        let index = VaultIndex::build(vault.path()).await.unwrap();
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         assert!(
             index
@@ -1090,7 +1182,9 @@ mod tests {
         stdfs::write(dir.path().join("c.md"), "# C\n\n#inbox/todo\n").unwrap();
         stdfs::write(dir.path().join("d.md"), "---\ntags: [other]\n---\n# D\n").unwrap();
 
-        let index = VaultIndex::build(dir.path()).await.unwrap();
+        let index = VaultIndex::build(dir.path(), empty_exclude())
+            .await
+            .unwrap();
         let results = index.notes_with_tag_prefix("inbox");
         assert_eq!(results.len(), 3);
     }
@@ -1101,7 +1195,9 @@ mod tests {
         stdfs::write(dir.path().join("a.md"), "# A\n\n#inbox\n").unwrap();
         stdfs::write(dir.path().join("b.md"), "# B\n\n#inboxes\n").unwrap();
 
-        let index = VaultIndex::build(dir.path()).await.unwrap();
+        let index = VaultIndex::build(dir.path(), empty_exclude())
+            .await
+            .unwrap();
         let results = index.notes_with_tag_prefix("inbox");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, PathBuf::from("a.md"));
@@ -1112,7 +1208,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         stdfs::write(dir.path().join("a.md"), "# A\n\n#inbox #inbox/read\n").unwrap();
 
-        let index = VaultIndex::build(dir.path()).await.unwrap();
+        let index = VaultIndex::build(dir.path(), empty_exclude())
+            .await
+            .unwrap();
         let results = index.notes_with_tag_prefix("inbox");
         assert_eq!(results.len(), 1);
     }
@@ -1122,7 +1220,9 @@ mod tests {
     #[tokio::test]
     async fn search_frontmatter_exists_finds_field() {
         let vault = setup_vault();
-        let index = VaultIndex::build(vault.path()).await.unwrap();
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         let results = index.search_frontmatter_exists("tags");
         assert_eq!(results.len(), 2); // daily.md + notes/alpha.md
@@ -1131,7 +1231,9 @@ mod tests {
     #[tokio::test]
     async fn search_frontmatter_exists_missing_field_empty() {
         let vault = setup_vault();
-        let index = VaultIndex::build(vault.path()).await.unwrap();
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         assert!(index.search_frontmatter_exists("nonexistent").is_empty());
     }
@@ -1146,7 +1248,9 @@ mod tests {
         .unwrap();
         stdfs::write(dir.path().join("b.md"), "---\nstatus: done\n---\n# B\n").unwrap();
 
-        let index = VaultIndex::build(dir.path()).await.unwrap();
+        let index = VaultIndex::build(dir.path(), empty_exclude())
+            .await
+            .unwrap();
         let results = index.search_frontmatter_contains("status", &serde_json::json!("progress"));
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, PathBuf::from("a.md"));
@@ -1155,10 +1259,78 @@ mod tests {
     #[tokio::test]
     async fn search_frontmatter_contains_array_element() {
         let vault = setup_vault();
-        let index = VaultIndex::build(vault.path()).await.unwrap();
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
 
         let results = index.search_frontmatter_contains("tags", &serde_json::json!("rust"));
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, PathBuf::from("notes/alpha.md"));
+    }
+
+    // ── exclusion filtering tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn build_excludes_matching_notes() {
+        let dir = TempDir::new().unwrap();
+        stdfs::create_dir_all(dir.path().join("Archive")).unwrap();
+        stdfs::write(dir.path().join("Archive/old.md"), "# Old\n").unwrap();
+        stdfs::create_dir_all(dir.path().join("Active")).unwrap();
+        stdfs::write(dir.path().join("Active/note.md"), "# Note\n").unwrap();
+
+        let exclude = Arc::new(ExcludeSet::build(vec!["Archive/".into()]).unwrap());
+        let index = VaultIndex::build(dir.path(), exclude).await.unwrap();
+
+        assert!(index.get_note(Path::new("Active/note.md")).is_some());
+        assert!(index.get_note(Path::new("Archive/old.md")).is_none());
+        assert_eq!(index.excluded_notes(), 1);
+        assert_eq!(index.stats().total_notes, 1);
+    }
+
+    #[tokio::test]
+    async fn build_excludes_deeply_nested() {
+        let dir = TempDir::new().unwrap();
+        stdfs::create_dir_all(dir.path().join("Archive/sub")).unwrap();
+        stdfs::write(dir.path().join("Archive/sub/deep.md"), "# Deep\n").unwrap();
+        stdfs::write(dir.path().join("top.md"), "# Top\n").unwrap();
+
+        let exclude = Arc::new(ExcludeSet::build(vec!["Archive/".into()]).unwrap());
+        let index = VaultIndex::build(dir.path(), exclude).await.unwrap();
+
+        assert!(index.get_note(Path::new("Archive/sub/deep.md")).is_none());
+        assert!(index.get_note(Path::new("top.md")).is_some());
+        assert_eq!(index.excluded_notes(), 1);
+    }
+
+    #[tokio::test]
+    async fn build_empty_exclude_includes_all() {
+        let dir = TempDir::new().unwrap();
+        stdfs::create_dir_all(dir.path().join("Archive")).unwrap();
+        stdfs::write(dir.path().join("Archive/old.md"), "# Old\n").unwrap();
+        stdfs::write(dir.path().join("note.md"), "# Note\n").unwrap();
+
+        let index = VaultIndex::build(dir.path(), empty_exclude())
+            .await
+            .unwrap();
+
+        assert_eq!(index.notes().len(), 2);
+        assert_eq!(index.excluded_notes(), 0);
+    }
+
+    #[tokio::test]
+    async fn build_exclude_does_not_affect_non_md() {
+        let dir = TempDir::new().unwrap();
+        stdfs::create_dir_all(dir.path().join("Archive")).unwrap();
+        stdfs::write(dir.path().join("Archive/note.md"), "# Note\n").unwrap();
+        stdfs::write(dir.path().join("Archive/data.json"), r#"{"k":"v"}"#).unwrap();
+        stdfs::write(dir.path().join("keep.md"), "# Keep\n").unwrap();
+
+        let exclude = Arc::new(ExcludeSet::build(vec!["Archive/".into()]).unwrap());
+        let index = VaultIndex::build(dir.path(), exclude).await.unwrap();
+
+        assert_eq!(index.stats().total_notes, 1);
+        assert_eq!(index.excluded_notes(), 1);
+        // Non-md file still counted: 1 md (keep.md) + 1 non-md (data.json)
+        assert_eq!(index.stats().total_files, 2);
     }
 }

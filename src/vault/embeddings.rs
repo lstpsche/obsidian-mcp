@@ -604,14 +604,6 @@ pub fn migrate_legacy_cache_to_daemon_store(
     vault_root: &Path,
     semantic_home: &Path,
 ) -> VaultResult<LegacyCacheMigration> {
-    let source = vault_root
-        .join(".obsidian")
-        .join("obsidian-mcp")
-        .join("embeddings.bin");
-    if !source.is_file() {
-        return Ok(LegacyCacheMigration::NotFound);
-    }
-
     let vault_id = crate::daemon::home::compute_vault_id(vault_root)?;
     let target = semantic_home
         .join("vaults")
@@ -620,6 +612,23 @@ pub fn migrate_legacy_cache_to_daemon_store(
     if target.exists() {
         return Ok(LegacyCacheMigration::AlreadyPresent(target));
     }
+
+    let legacy_source = vault_root
+        .join(".obsidian")
+        .join("obsidian-mcp")
+        .join("embeddings.bin");
+    let new_source = vault_root
+        .join(".obsidian-mcp")
+        .join("embeddings")
+        .join("embeddings.bin");
+
+    let source = if legacy_source.is_file() {
+        legacy_source
+    } else if new_source.is_file() {
+        new_source
+    } else {
+        return Ok(LegacyCacheMigration::NotFound);
+    };
 
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
@@ -869,6 +878,87 @@ mod tests {
         let outcome = migrate_legacy_cache_to_daemon_store(vault_root.path(), semantic_home.path())
             .expect("migration should succeed");
         assert_eq!(outcome, LegacyCacheMigration::NotFound);
+    }
+
+    #[test]
+    fn migrate_legacy_cache_checks_daemon_store_first() {
+        let vault_root = tempfile::tempdir().expect("temp vault root");
+        let semantic_home = tempfile::tempdir().expect("temp semantic home");
+        let vault_id = crate::daemon::home::compute_vault_id(vault_root.path()).unwrap();
+        let target = semantic_home
+            .path()
+            .join("vaults")
+            .join(vault_id)
+            .join("embeddings.bin");
+        std::fs::create_dir_all(target.parent().expect("target parent"))
+            .expect("create target dir");
+        std::fs::write(&target, b"daemon-cache-bytes").expect("write target cache");
+
+        let outcome = migrate_legacy_cache_to_daemon_store(vault_root.path(), semantic_home.path())
+            .expect("migration should succeed");
+
+        assert_eq!(outcome, LegacyCacheMigration::AlreadyPresent(target));
+    }
+
+    #[test]
+    fn migrate_legacy_cache_uses_new_source_as_fallback() {
+        let vault_root = tempfile::tempdir().expect("temp vault root");
+        let semantic_home = tempfile::tempdir().expect("temp semantic home");
+
+        let new_source = vault_root
+            .path()
+            .join(".obsidian-mcp")
+            .join("embeddings")
+            .join("embeddings.bin");
+        std::fs::create_dir_all(new_source.parent().expect("parent")).expect("create new dir");
+        std::fs::write(&new_source, b"new-cache-bytes").expect("write new cache");
+
+        let result = migrate_legacy_cache_to_daemon_store(vault_root.path(), semantic_home.path())
+            .expect("migration should succeed");
+        let migrated_path = match result {
+            LegacyCacheMigration::Migrated(path) => path,
+            other => panic!("expected Migrated, got: {other:?}"),
+        };
+        assert!(new_source.exists(), "new source should not be deleted");
+        assert_eq!(
+            std::fs::read(&new_source).expect("read new source"),
+            std::fs::read(&migrated_path).expect("read target"),
+        );
+    }
+
+    #[test]
+    fn migrate_legacy_cache_prefers_legacy_over_new() {
+        let vault_root = tempfile::tempdir().expect("temp vault root");
+        let semantic_home = tempfile::tempdir().expect("temp semantic home");
+
+        let legacy_source = vault_root
+            .path()
+            .join(".obsidian")
+            .join("obsidian-mcp")
+            .join("embeddings.bin");
+        std::fs::create_dir_all(legacy_source.parent().expect("parent"))
+            .expect("create legacy dir");
+        std::fs::write(&legacy_source, b"legacy-bytes").expect("write legacy");
+
+        let new_source = vault_root
+            .path()
+            .join(".obsidian-mcp")
+            .join("embeddings")
+            .join("embeddings.bin");
+        std::fs::create_dir_all(new_source.parent().expect("parent")).expect("create new dir");
+        std::fs::write(&new_source, b"new-bytes").expect("write new");
+
+        let result = migrate_legacy_cache_to_daemon_store(vault_root.path(), semantic_home.path())
+            .expect("migration should succeed");
+        let migrated_path = match result {
+            LegacyCacheMigration::Migrated(path) => path,
+            other => panic!("expected Migrated, got: {other:?}"),
+        };
+        assert_eq!(
+            std::fs::read(&migrated_path).expect("read target"),
+            b"legacy-bytes",
+            "legacy source should be preferred over new"
+        );
     }
 
     // ── resolve_provider ──────────────────────────────────────────

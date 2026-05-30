@@ -9,6 +9,7 @@ use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer};
 use tokio::runtime::Handle;
 
 use crate::error::{VaultError, VaultResult};
+use crate::vault::exclude::ExcludeSet;
 use crate::vault::index::VaultIndex;
 use crate::vault::tantivy_index::TantivyIndex;
 
@@ -29,6 +30,7 @@ pub fn start_watcher(
     embedding_model: Arc<EmbeddingModel>,
     embedding_store: Arc<RwLock<EmbeddingStore>>,
     embedding_cache_path: PathBuf,
+    exclude: Arc<ExcludeSet>,
 ) -> VaultResult<Debouncer<notify::RecommendedWatcher>> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<DebounceEventResult>(EVENT_CHANNEL_CAPACITY);
     let rt = Handle::current();
@@ -69,6 +71,7 @@ pub fn start_watcher(
                             &embedding_model,
                             &embedding_store,
                             &event.path,
+                            &exclude,
                         );
                         tantivy_dirty |= tv;
                         embedding_dirty |= emb;
@@ -99,6 +102,7 @@ pub fn start_watcher(
     vault_root: PathBuf,
     index: Arc<RwLock<VaultIndex>>,
     tantivy: Option<Arc<TantivyIndex>>,
+    exclude: Arc<ExcludeSet>,
 ) -> VaultResult<Debouncer<notify::RecommendedWatcher>> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<DebounceEventResult>(EVENT_CHANNEL_CAPACITY);
     let rt = Handle::current();
@@ -131,8 +135,13 @@ pub fn start_watcher(
                 Ok(events) => {
                     let mut tantivy_dirty = false;
                     for event in events {
-                        tantivy_dirty |=
-                            process_event(&vault_root, &index, tantivy.as_deref(), &event.path);
+                        tantivy_dirty |= process_event(
+                            &vault_root,
+                            &index,
+                            tantivy.as_deref(),
+                            &event.path,
+                            &exclude,
+                        );
                     }
                     if tantivy_dirty
                         && let Some(ref tv) = tantivy
@@ -152,13 +161,18 @@ pub fn start_watcher(
     Ok(debouncer)
 }
 
-fn should_process_path(vault_root: &Path, absolute: &Path) -> bool {
+fn should_process_path(vault_root: &Path, absolute: &Path, exclude: &ExcludeSet) -> bool {
     let relative = match absolute.strip_prefix(vault_root) {
         Ok(relative) => relative,
         Err(_) => return false,
     };
 
     if is_obsidian_dir(relative) {
+        return false;
+    }
+
+    let rel_str = relative.to_string_lossy().replace('\\', "/");
+    if exclude.is_excluded(Path::new(&rel_str)) {
         return false;
     }
 
@@ -173,10 +187,10 @@ fn should_process_path(vault_root: &Path, absolute: &Path) -> bool {
 }
 
 fn is_obsidian_dir(relative: &Path) -> bool {
-    relative
-        .components()
-        .next()
-        .is_some_and(|component| component.as_os_str() == ".obsidian")
+    relative.components().next().is_some_and(|c| {
+        let name = c.as_os_str();
+        name == ".obsidian" || name == ".obsidian-mcp"
+    })
 }
 
 /// Returns `(tantivy_touched, embedding_touched)`.
@@ -188,8 +202,9 @@ fn process_event(
     embedding_model: &EmbeddingModel,
     embedding_store: &Arc<RwLock<EmbeddingStore>>,
     absolute: &Path,
+    exclude: &ExcludeSet,
 ) -> (bool, bool) {
-    if !should_process_path(vault_root, absolute) {
+    if !should_process_path(vault_root, absolute, exclude) {
         return (false, false);
     }
 
@@ -261,8 +276,9 @@ fn process_event(
     index: &Arc<RwLock<VaultIndex>>,
     tantivy: Option<&TantivyIndex>,
     absolute: &Path,
+    exclude: &ExcludeSet,
 ) -> bool {
-    if !should_process_path(vault_root, absolute) {
+    if !should_process_path(vault_root, absolute, exclude) {
         return false;
     }
 

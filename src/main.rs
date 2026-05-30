@@ -422,7 +422,9 @@ fn print_help() {
              OBSIDIAN_EMBEDDING_CA_CERT   PEM CA cert path for API TLS\n    \
              OBSIDIAN_EMBEDDING_TLS_VERIFY  Verify API TLS certs    [default: true]\n    \
              OBSIDIAN_TOOLS          Tool filter: profile (full/core/read/minimal),\n    \
-                                     comma-separated allow-list, or !-prefixed deny-list",
+                                     comma-separated allow-list, or !-prefixed deny-list\n    \
+             OBSIDIAN_MCP_DATA       External data dir for embeddings  [default: {{vault}}/.obsidian-mcp]\n    \
+             OBSIDIAN_EXCLUDE_PATHS  Comma-separated exclusion globs   [default: none]",
         name = env!("CARGO_PKG_NAME"),
         version = env!("CARGO_PKG_VERSION"),
         description = env!("CARGO_PKG_DESCRIPTION"),
@@ -773,6 +775,8 @@ mod tests {
             hybrid_alpha: 0.25,
             embedding_provider: None,
             tool_filter: obsidian_mcp::config::ToolFilter::Full,
+            mcp_data_dir: None,
+            exclude_patterns: vec![],
         };
         let runtime = init_semantic_runtime(&config, &runtime_config(SemanticMode::Daemon)).await;
         assert!(runtime.daemon_client.is_none());

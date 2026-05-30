@@ -2,8 +2,11 @@
 //! transport selection, and optional search features (Tantivy BM25, embeddings).
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 pub const DEFAULT_MODEL_NAME: &str = "BAAI/bge-small-en-v1.5";
 pub const DEFAULT_HTTP_PORT: u16 = 37842;
@@ -70,6 +73,11 @@ pub struct Config {
     pub embedding_provider: Option<EmbeddingProvider>,
     /// Tool filter configuration (`OBSIDIAN_TOOLS`): profile name, allow-list, or deny-list.
     pub tool_filter: ToolFilter,
+    /// External data directory (`OBSIDIAN_MCP_DATA`).
+    /// When set, embeddings and machine-specific config are stored under `{value}/vaults/{vault_slug}/`.
+    pub mcp_data_dir: Option<PathBuf>,
+    /// Raw exclusion patterns from `OBSIDIAN_EXCLUDE_PATHS` env var (comma-separated).
+    pub exclude_patterns: Vec<String>,
 }
 
 // ── Tool Filtering ─────────────────────────────────────────────────
@@ -359,6 +367,15 @@ impl Config {
             _ => ToolFilter::Full,
         };
 
+        let mcp_data_dir = normalize_optional_path_env("OBSIDIAN_MCP_DATA");
+
+        let exclude_patterns: Vec<String> = std::env::var("OBSIDIAN_EXCLUDE_PATHS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
         Ok(Self {
             vault_path,
             watch,
@@ -372,8 +389,82 @@ impl Config {
             hybrid_alpha,
             embedding_provider,
             tool_filter,
+            mcp_data_dir,
+            exclude_patterns,
         })
     }
+}
+
+const SLUG_MAX_LEN: usize = 200;
+const SLUG_HASH_SUFFIX_LEN: usize = 8;
+
+/// Convert a canonical vault path to a human-readable kebab-case slug.
+///
+/// Used for per-vault namespacing under `OBSIDIAN_MCP_DATA`. The caller must
+/// provide a canonical (absolute, resolved) path.
+pub fn vault_slug(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let raw = raw
+        .strip_prefix(r"\\?\")
+        .or_else(|| raw.strip_prefix("//?/"))
+        .unwrap_or(&raw);
+
+    // Strip platform prefix: leading `/` (Unix) or `C:\`/`C:/` (Windows).
+    // Windows drive prefix keeps the letter: `C:\Users` → `C` + separator-replaced tail.
+    let stripped: std::borrow::Cow<'_, str> = if let Some(rest) = raw.strip_prefix('/') {
+        rest.into()
+    } else {
+        let bytes = raw.as_bytes();
+        if bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'\\' || bytes[2] == b'/')
+        {
+            // `C:\Users\...` → `C-Users-...` (drive letter + separator-replaced tail)
+            let drive = raw.as_bytes()[0] as char;
+            format!("{drive}-{}", &raw[3..]).into()
+        } else {
+            raw.into()
+        }
+    };
+
+    let slug: String = stripped
+        .chars()
+        .map(|c| {
+            if c == '/'
+                || c == '\\'
+                || c == '<'
+                || c == '>'
+                || c == ':'
+                || c == '"'
+                || c == '|'
+                || c == '?'
+                || c == '*'
+                || c.is_control()
+            {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+
+    match slug.char_indices().nth(SLUG_MAX_LEN) {
+        Some((byte_pos, _)) => {
+            let suffix = slug_hash_suffix(&slug);
+            format!("{}-{suffix}", &slug[..byte_pos])
+        }
+        None => slug,
+    }
+}
+
+fn slug_hash_suffix(full_slug: &str) -> String {
+    let digest = Sha256::digest(full_slug.as_bytes());
+    let mut out = String::with_capacity(SLUG_HASH_SUFFIX_LEN);
+    for byte in &digest[..SLUG_HASH_SUFFIX_LEN / 2] {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -748,5 +839,91 @@ mod tests {
             EmbeddingProvider::parse(EmbeddingProvider::Api.as_str()),
             Some(EmbeddingProvider::Api)
         );
+    }
+
+    // ── vault_slug ────────────────────────────────────────────────
+
+    #[test]
+    fn vault_slug_unix_path() {
+        let path = Path::new("/Users/me/Dropbox/MyVault");
+        assert_eq!(vault_slug(path), "Users-me-Dropbox-MyVault");
+    }
+
+    #[test]
+    fn vault_slug_windows_style_path() {
+        let path = Path::new("C:\\Users\\me\\Vault");
+        assert_eq!(vault_slug(path), "C-Users-me-Vault");
+    }
+
+    #[test]
+    fn vault_slug_windows_extended_path() {
+        let path = Path::new(r"\\?\C:\Users\me\Vault");
+        assert_eq!(vault_slug(path), "C-Users-me-Vault");
+    }
+
+    #[test]
+    fn vault_slug_replaces_filename_invalid_chars() {
+        let path = Path::new(r"/Users/me/Bad:Name?*");
+        assert_eq!(vault_slug(path), "Users-me-Bad-Name--");
+    }
+
+    #[test]
+    fn vault_slug_strips_leading_slash() {
+        let path = Path::new("/a/b/c");
+        assert_eq!(vault_slug(path), "a-b-c");
+    }
+
+    #[test]
+    fn vault_slug_root_path() {
+        let path = Path::new("/");
+        assert_eq!(vault_slug(path), "");
+    }
+
+    #[test]
+    fn vault_slug_no_truncation_under_limit() {
+        // 50-char segment x2 + 1 separator = 101 chars, well under 200
+        let segment = "a".repeat(50);
+        let raw = format!("/{segment}/{segment}");
+        let path = Path::new(&raw);
+        let slug = vault_slug(path);
+        assert_eq!(slug.len(), 101);
+        assert!(slug.len() < SLUG_MAX_LEN);
+    }
+
+    #[test]
+    fn vault_slug_exactly_200_chars() {
+        // `/` + 200 chars → strip leading `/` → 200-char slug
+        let segment = "x".repeat(SLUG_MAX_LEN);
+        let raw = format!("/{segment}");
+        let path = Path::new(&raw);
+        let slug = vault_slug(path);
+        assert_eq!(slug.len(), SLUG_MAX_LEN);
+        assert!(!slug.contains('-'), "no hash suffix for exactly 200 chars");
+    }
+
+    #[test]
+    fn vault_slug_long_path_truncation() {
+        let segment = "a".repeat(250);
+        let raw = format!("/{segment}");
+        let path = Path::new(&raw);
+        let slug = vault_slug(path);
+        // 200 truncated + '-' + 8-char hash = 209
+        assert_eq!(slug.len(), SLUG_MAX_LEN + 1 + SLUG_HASH_SUFFIX_LEN);
+        assert!(slug[SLUG_MAX_LEN..].starts_with('-'));
+    }
+
+    #[test]
+    fn vault_slug_long_path_deterministic() {
+        let segment = "a".repeat(250);
+        let raw = format!("/{segment}");
+        let path = Path::new(&raw);
+        assert_eq!(vault_slug(path), vault_slug(path));
+    }
+
+    #[test]
+    fn vault_slug_special_chars_preserved() {
+        let path = Path::new("/Users/me/My Vault (2)");
+        let slug = vault_slug(path);
+        assert_eq!(slug, "Users-me-My Vault (2)");
     }
 }

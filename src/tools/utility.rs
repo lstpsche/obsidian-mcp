@@ -22,6 +22,10 @@ pub struct VaultInfo {
     pub stats: VaultStats,
     pub vault_name: String,
     pub vault_path: String,
+    /// Active exclusion glob patterns (merged from all sources).
+    pub exclude_patterns: Vec<String>,
+    /// Resolved external data directory, or `null` when using default (vault-root `.obsidian-mcp/`).
+    pub mcp_data_dir: Option<String>,
 }
 
 /// Return aggregate vault statistics.
@@ -30,6 +34,11 @@ pub async fn vault_info(
     _params: VaultInfoParams,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     let stats = vault.vault_stats()?;
+    let mcp_data_dir = if vault.mcp_data() != vault.mcp_home() {
+        Some(vault.mcp_data().display().to_string())
+    } else {
+        None
+    };
     let info = VaultInfo {
         stats,
         vault_name: vault
@@ -38,6 +47,8 @@ pub async fn vault_info(
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default(),
         vault_path: vault.root().display().to_string(),
+        exclude_patterns: vault.exclude().patterns().to_vec(),
+        mcp_data_dir,
     };
     let json = serde_json::to_string_pretty(&info).map_err(|e| VaultError::Other(e.to_string()))?;
     Ok(CallToolResult::success(vec![Content::text(json)]))
@@ -141,6 +152,9 @@ mod tests {
             .as_str();
         let info: VaultInfo = serde_json::from_str(json_str).unwrap();
         assert_eq!(info.stats.total_notes, 1);
+        assert_eq!(info.stats.excluded_notes, 0);
+        assert!(info.exclude_patterns.is_empty());
+        assert!(info.mcp_data_dir.is_none());
         assert!(!info.vault_path.is_empty());
     }
 

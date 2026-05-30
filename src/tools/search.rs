@@ -386,13 +386,19 @@ async fn search_semantic_daemon(
     Ok(daemon_result
         .results
         .into_iter()
-        .map(|hit| SemanticSearchResult {
-            path: std::path::PathBuf::from(hit.path),
-            title: hit.title,
-            score: hit.score,
-            tags: hit.tags,
-            snippet: hit.snippet,
-            content: hit.content,
+        .filter_map(|hit| {
+            let path = std::path::PathBuf::from(hit.path);
+            if vault.get_note_metadata(&path).is_err() {
+                return None;
+            }
+            Some(SemanticSearchResult {
+                path,
+                title: hit.title,
+                score: hit.score,
+                tags: hit.tags,
+                snippet: hit.snippet,
+                content: hit.content,
+            })
         })
         .collect())
 }
@@ -430,9 +436,12 @@ fn search_semantic_local(
 
     let mut results = Vec::with_capacity(hits.len());
     for (path, score) in hits {
-        let meta = vault.get_note_metadata(&path).ok();
-        let title = meta.as_ref().map(|m| m.title.clone()).unwrap_or_default();
-        let tags = meta.as_ref().map(|m| m.tags.clone()).unwrap_or_default();
+        let meta = match vault.get_note_metadata(&path) {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+        let title = meta.title.clone();
+        let tags = meta.tags.clone();
 
         let (content, snippet) = if include_content {
             (vault.read_note(&path).ok(), None)

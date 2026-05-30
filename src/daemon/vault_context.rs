@@ -7,6 +7,7 @@ use notify_debouncer_mini::Debouncer;
 
 use crate::error::{VaultError, VaultResult};
 use crate::models::NoteMetadata;
+use crate::vault::exclude::ExcludeSet;
 use crate::vault::index::VaultIndex;
 use crate::vault::tantivy_index::TantivyIndex;
 
@@ -43,7 +44,9 @@ impl VaultContext {
     ) -> VaultResult<Self> {
         std::fs::create_dir_all(&state_dir)?;
 
-        let index = Arc::new(RwLock::new(VaultIndex::build(&vault_root).await?));
+        let index = Arc::new(RwLock::new(
+            VaultIndex::build(&vault_root, Arc::new(ExcludeSet::build(vec![])?)).await?,
+        ));
         let tantivy = {
             let index_guard = index
                 .read()
@@ -125,6 +128,7 @@ impl VaultContext {
             Arc::clone(&self.embedding_model),
             Arc::clone(&self.embedding_store),
             self.embedding_cache_path.clone(),
+            Arc::new(ExcludeSet::build(vec![])?),
         )?;
 
         #[cfg(not(has_embeddings))]
@@ -132,6 +136,7 @@ impl VaultContext {
             self.vault_root.clone(),
             Arc::clone(&self.index),
             Some(Arc::clone(&self.tantivy)),
+            Arc::new(ExcludeSet::build(vec![])?),
         )?;
 
         *guard = Some(debouncer);

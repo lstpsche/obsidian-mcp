@@ -29,6 +29,8 @@ fn fixture_config() -> Config {
         hybrid_alpha: 0.25,
         embedding_provider: None,
         tool_filter: ToolFilter::Full,
+        mcp_data_dir: None,
+        exclude_patterns: vec![],
     }
 }
 
@@ -55,6 +57,8 @@ async fn copy_fixture_to_temp() -> (tempfile::TempDir, Vault) {
         hybrid_alpha: 0.25,
         embedding_provider: None,
         tool_filter: ToolFilter::Full,
+        mcp_data_dir: None,
+        exclude_patterns: vec![],
     };
     let vault = Vault::open(&config)
         .await
@@ -336,6 +340,8 @@ mod vault_tantivy_search {
             hybrid_alpha: 0.25,
             embedding_provider: None,
             tool_filter: ToolFilter::Full,
+            mcp_data_dir: None,
+            exclude_patterns: vec![],
         };
         let vault = Vault::open(&config)
             .await
@@ -674,6 +680,8 @@ mod tool_filtering {
             hybrid_alpha: 0.25,
             embedding_provider: None,
             tool_filter: filter,
+            mcp_data_dir: None,
+            exclude_patterns: vec![],
         }
     }
 
@@ -805,6 +813,358 @@ mod tool_filtering {
     }
 }
 
+// ── Exclusion & metadata folder ─────────────────────────────────────────
+
+mod vault_exclusion {
+    use super::*;
+
+    fn config_with_exclusions(vault_root: &Path, patterns: Vec<String>) -> Config {
+        Config {
+            vault_path: vault_root.to_path_buf(),
+            watch: false,
+            log_level: "error".into(),
+            transport: obsidian_mcp::config::Transport::Stdio,
+            http_host: obsidian_mcp::config::DEFAULT_HTTP_HOST,
+            http_port: obsidian_mcp::config::DEFAULT_HTTP_PORT,
+            tantivy: false,
+            embeddings: false,
+            embeddings_model: String::new(),
+            hybrid_alpha: 0.25,
+            embedding_provider: None,
+            tool_filter: ToolFilter::Full,
+            mcp_data_dir: None,
+            exclude_patterns: patterns,
+        }
+    }
+
+    fn tantivy_config_with_exclusions(vault_root: &Path, patterns: Vec<String>) -> Config {
+        Config {
+            tantivy: true,
+            ..config_with_exclusions(vault_root, patterns)
+        }
+    }
+
+    #[tokio::test]
+    async fn exclusion_filters_index() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".obsidian")).unwrap();
+        std::fs::create_dir_all(dir.path().join("Active")).unwrap();
+        std::fs::create_dir_all(dir.path().join("Archive")).unwrap();
+        std::fs::write(dir.path().join("Active/note.md"), "# Active Note\n").unwrap();
+        std::fs::write(dir.path().join("Archive/old.md"), "# Old Note\n").unwrap();
+
+        let config = config_with_exclusions(dir.path(), vec!["Archive/".into()]);
+        let vault = Vault::open(&config).await.unwrap();
+
+        assert!(
+            vault.get_note_metadata(Path::new("Active/note.md")).is_ok(),
+            "non-excluded note should be in index"
+        );
+        assert!(
+            vault
+                .get_note_metadata(Path::new("Archive/old.md"))
+                .is_err(),
+            "excluded note should not be in index"
+        );
+
+        let stats = vault.vault_stats().unwrap();
+        assert_eq!(stats.total_notes, 1, "only non-excluded notes counted");
+
+        let content = vault.read_note(Path::new("Archive/old.md")).unwrap();
+        assert!(
+            content.contains("Old Note"),
+            "direct read of excluded note should still work"
+        );
+    }
+
+    #[tokio::test]
+    async fn exclusion_via_ignore_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".obsidian")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".obsidian-mcp")).unwrap();
+        std::fs::create_dir_all(dir.path().join("Active")).unwrap();
+        std::fs::create_dir_all(dir.path().join("Archive")).unwrap();
+        std::fs::write(dir.path().join("Active/note.md"), "# Active\n").unwrap();
+        std::fs::write(dir.path().join("Archive/old.md"), "# Old\n").unwrap();
+        std::fs::write(dir.path().join(".obsidian-mcp/ignore"), "Archive/\n").unwrap();
+
+        let config = config_with_exclusions(dir.path(), vec![]);
+        let vault = Vault::open(&config).await.unwrap();
+
+        assert!(
+            vault.get_note_metadata(Path::new("Active/note.md")).is_ok(),
+            "non-excluded note should be in index"
+        );
+        assert!(
+            vault
+                .get_note_metadata(Path::new("Archive/old.md"))
+                .is_err(),
+            "note excluded via ignore file should not be in index"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_home_created_on_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".obsidian")).unwrap();
+
+        assert!(
+            !dir.path().join(".obsidian-mcp").exists(),
+            "precondition: .obsidian-mcp should not exist yet"
+        );
+
+        let config = config_with_exclusions(dir.path(), vec![]);
+        let _vault = Vault::open(&config).await.unwrap();
+
+        assert!(
+            dir.path().join(".obsidian-mcp").is_dir(),
+            ".obsidian-mcp directory should be created on startup"
+        );
+
+        let ignore_path = dir.path().join(".obsidian-mcp/ignore");
+        assert!(ignore_path.exists(), "ignore file should be auto-created");
+        let content = std::fs::read_to_string(&ignore_path).unwrap();
+        assert!(
+            content.is_empty(),
+            "auto-created ignore file should be empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_data_external_path() {
+        let vault_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(vault_dir.path().join(".obsidian")).unwrap();
+
+        let config = Config {
+            mcp_data_dir: Some(data_dir.path().to_path_buf()),
+            ..config_with_exclusions(vault_dir.path(), vec![])
+        };
+        let vault = Vault::open(&config).await.unwrap();
+
+        let slug = obsidian_mcp::config::vault_slug(vault.root());
+        let expected = data_dir.path().join("vaults").join(&slug);
+        assert!(
+            expected.is_dir(),
+            "external data dir should contain vaults/{slug}/ structure"
+        );
+        assert_eq!(vault.mcp_data(), expected);
+    }
+
+    #[tokio::test]
+    async fn obsidian_mcp_dir_not_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".obsidian")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".obsidian-mcp")).unwrap();
+        std::fs::write(
+            dir.path().join(".obsidian-mcp/test.md"),
+            "# Should not be indexed\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("visible.md"), "# Visible\n").unwrap();
+
+        let config = config_with_exclusions(dir.path(), vec![]);
+        let vault = Vault::open(&config).await.unwrap();
+
+        assert!(
+            vault.get_note_metadata(Path::new("visible.md")).is_ok(),
+            "regular note should be indexed"
+        );
+        assert!(
+            vault
+                .get_note_metadata(Path::new(".obsidian-mcp/test.md"))
+                .is_err(),
+            ".obsidian-mcp/ contents should never be indexed"
+        );
+
+        let stats = vault.vault_stats().unwrap();
+        assert_eq!(stats.total_notes, 1);
+    }
+
+    #[tokio::test]
+    async fn tantivy_respects_exclusion() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".obsidian")).unwrap();
+        std::fs::create_dir_all(dir.path().join("Active")).unwrap();
+        std::fs::create_dir_all(dir.path().join("Archive")).unwrap();
+        std::fs::write(
+            dir.path().join("Active/visible.md"),
+            "# Visible\nxylophone-unique-test-word content\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("Archive/hidden.md"),
+            "# Hidden\nxylophone-unique-test-word content\n",
+        )
+        .unwrap();
+
+        let config = tantivy_config_with_exclusions(dir.path(), vec!["Archive/".into()]);
+        let vault = Vault::open(&config).await.unwrap();
+
+        let results = vault.search_text("xylophone-unique-test-word", 40).unwrap();
+        assert_eq!(results.len(), 1, "only the non-excluded note should appear");
+        assert_eq!(results[0].path, PathBuf::from("Active/visible.md"));
+    }
+
+    #[tokio::test]
+    async fn vault_info_reports_exclusion_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".obsidian")).unwrap();
+        std::fs::create_dir_all(dir.path().join("Active")).unwrap();
+        std::fs::create_dir_all(dir.path().join("Archive")).unwrap();
+        std::fs::write(dir.path().join("Active/note.md"), "# Active Note\n").unwrap();
+        std::fs::write(dir.path().join("Archive/old.md"), "# Old Note\n").unwrap();
+
+        let config = config_with_exclusions(dir.path(), vec!["Archive/".into()]);
+        let vault = Vault::open(&config).await.unwrap();
+
+        let stats = vault.vault_stats().unwrap();
+        assert_eq!(
+            stats.excluded_notes, 1,
+            "one .md file in Archive/ should be excluded"
+        );
+        assert_eq!(stats.total_notes, 1, "only non-excluded notes counted");
+
+        let patterns = vault.exclude().patterns();
+        assert!(
+            patterns.iter().any(|p| p.contains("Archive")),
+            "exclude_patterns should contain the Archive pattern, got: {patterns:?}"
+        );
+
+        assert_eq!(
+            vault.mcp_data(),
+            vault.mcp_home(),
+            "mcp_data_dir should equal mcp_home when OBSIDIAN_MCP_DATA is not set"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_into_excluded_dir_removes_from_index() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".obsidian")).unwrap();
+        std::fs::create_dir_all(dir.path().join("Archive")).unwrap();
+        std::fs::write(dir.path().join("note.md"), "# Movable Note\n").unwrap();
+
+        let config = config_with_exclusions(dir.path(), vec!["Archive/".into()]);
+        let vault = Vault::open(&config).await.unwrap();
+
+        assert!(
+            vault.get_note_metadata(Path::new("note.md")).is_ok(),
+            "note should be in index before move"
+        );
+
+        let new_path = vault
+            .move_note(Path::new("note.md"), Path::new("Archive/moved.md"))
+            .unwrap();
+        assert_eq!(new_path, PathBuf::from("Archive/moved.md"));
+
+        assert!(
+            vault
+                .get_note_metadata(Path::new("Archive/moved.md"))
+                .is_err(),
+            "note should NOT be in index after moving to excluded dir"
+        );
+        assert!(
+            vault.get_note_metadata(Path::new("note.md")).is_err(),
+            "old path should be gone from index"
+        );
+
+        let content = vault.read_note(Path::new("Archive/moved.md")).unwrap();
+        assert!(
+            content.contains("Movable Note"),
+            "file should still be readable on disk via direct access"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_out_of_excluded_dir_adds_to_index() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".obsidian")).unwrap();
+        std::fs::create_dir_all(dir.path().join("Archive")).unwrap();
+        std::fs::write(dir.path().join("Archive/hidden.md"), "# Hidden Note\n").unwrap();
+
+        let config = config_with_exclusions(dir.path(), vec!["Archive/".into()]);
+        let vault = Vault::open(&config).await.unwrap();
+
+        assert!(
+            vault
+                .get_note_metadata(Path::new("Archive/hidden.md"))
+                .is_err(),
+            "excluded note should NOT be in index"
+        );
+
+        let new_path = vault
+            .move_note(Path::new("Archive/hidden.md"), Path::new("visible.md"))
+            .unwrap();
+        assert_eq!(new_path, PathBuf::from("visible.md"));
+
+        assert!(
+            vault.get_note_metadata(Path::new("visible.md")).is_ok(),
+            "note should be in index after moving out of excluded dir"
+        );
+        assert!(
+            vault
+                .get_note_metadata(Path::new("Archive/hidden.md"))
+                .is_err(),
+            "old excluded path should not be in index"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_text_excludes_excluded_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".obsidian")).unwrap();
+        std::fs::create_dir_all(dir.path().join("Active")).unwrap();
+        std::fs::create_dir_all(dir.path().join("Archive")).unwrap();
+        std::fs::write(
+            dir.path().join("Active/visible.md"),
+            "# Visible\nzebra-platypus-unique-search-term here\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("Archive/hidden.md"),
+            "# Hidden\nzebra-platypus-unique-search-term here\n",
+        )
+        .unwrap();
+
+        let config = config_with_exclusions(dir.path(), vec!["Archive/".into()]);
+        let vault = Vault::open(&config).await.unwrap();
+
+        let results = vault
+            .search_text("zebra-platypus-unique-search-term", 40)
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "only the non-excluded note should appear in regex search"
+        );
+        assert_eq!(results[0].path, PathBuf::from("Active/visible.md"));
+    }
+
+    #[tokio::test]
+    async fn vault_list_includes_excluded_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".obsidian")).unwrap();
+        std::fs::create_dir_all(dir.path().join("Active")).unwrap();
+        std::fs::create_dir_all(dir.path().join("Archive")).unwrap();
+        std::fs::write(dir.path().join("Active/note.md"), "# Active\n").unwrap();
+        std::fs::write(dir.path().join("Archive/old.md"), "# Old\n").unwrap();
+
+        let config = config_with_exclusions(dir.path(), vec!["Archive/".into()]);
+        let vault = Vault::open(&config).await.unwrap();
+
+        let files = vault.list_files(Path::new(""), true, None).unwrap();
+        assert!(
+            files.iter().any(|f| f == Path::new("Active/note.md")),
+            "non-excluded file should appear in listing, got: {files:?}"
+        );
+        assert!(
+            files.iter().any(|f| f == Path::new("Archive/old.md")),
+            "excluded file should ALSO appear in listing (vault_list is unfiltered), got: {files:?}"
+        );
+    }
+}
+
 // ── Semantic search (embeddings feature) ────────────────────────────────
 
 #[cfg(feature = "embeddings")]
@@ -830,6 +1190,8 @@ mod vault_semantic_search {
             hybrid_alpha: 0.25,
             embedding_provider: None,
             tool_filter: ToolFilter::Full,
+            mcp_data_dir: None,
+            exclude_patterns: vec![],
         }
     }
 
@@ -1055,6 +1417,8 @@ mod semantic_tool_runtime_modes {
             hybrid_alpha: 0.25,
             embedding_provider: None,
             tool_filter: ToolFilter::Full,
+            mcp_data_dir: None,
+            exclude_patterns: vec![],
         }
     }
 

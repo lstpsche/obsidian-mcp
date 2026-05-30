@@ -3,6 +3,7 @@
 //! Knows nothing about MCP; provides the data model and I/O primitives
 //! that tool handlers delegate to.
 
+pub mod exclude;
 pub mod frontmatter;
 pub mod fs;
 pub mod index;
@@ -32,12 +33,16 @@ use crate::models::{
     VaultStats, WikiLink,
 };
 
+use self::exclude::ExcludeSet;
 use self::index::VaultIndex;
 use self::tantivy_index::TantivyIndex;
 
 /// Internal shared state wrapped in `Arc` for cheap cloning.
 struct VaultInner {
     root: PathBuf,
+    mcp_home: PathBuf,
+    mcp_data: PathBuf,
+    exclude: Arc<ExcludeSet>,
     index: Arc<RwLock<VaultIndex>>,
     tantivy: Option<Arc<TantivyIndex>>,
     #[cfg(has_embeddings)]
@@ -82,7 +87,100 @@ impl Vault {
             );
         }
 
-        let vi = VaultIndex::build(&root).await?;
+        let ensure_dir = |p: &Path| -> VaultResult<()> {
+            std::fs::create_dir_all(p).map_err(|e| {
+                VaultError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("failed to create {}: {e}", p.display()),
+                ))
+            })
+        };
+
+        // ── metadata folder setup ──
+        let mcp_home = root.join(".obsidian-mcp");
+        ensure_dir(&mcp_home)?;
+
+        let mcp_home_canonical = mcp_home.canonicalize().ok();
+        let mcp_data = if let Some(ref data_dir) = config.mcp_data_dir {
+            let data_dir_canonical = data_dir.canonicalize().ok();
+            if data_dir == &mcp_home || data_dir_canonical.as_ref() == mcp_home_canonical.as_ref() {
+                tracing::debug!("OBSIDIAN_MCP_DATA resolves to .obsidian-mcp, treating as unset");
+                mcp_home.clone()
+            } else {
+                let slug = crate::config::vault_slug(&root);
+                let candidate = data_dir.join("vaults").join(&slug);
+                if candidate.starts_with(&root) {
+                    tracing::warn!(
+                        path = %candidate.display(),
+                        "OBSIDIAN_MCP_DATA resolves to inside the vault — \
+                         consider a path outside the vault for cloud sync benefits"
+                    );
+                }
+                candidate
+            }
+        } else {
+            mcp_home.clone()
+        };
+
+        let ignore_path = mcp_home.join("ignore");
+        if !ignore_path.exists()
+            && let Err(e) = std::fs::write(&ignore_path, "")
+        {
+            tracing::warn!(path = %ignore_path.display(), error = %e,
+                "failed to create default ignore file");
+        }
+
+        if mcp_data != mcp_home {
+            ensure_dir(&mcp_data)?;
+        }
+
+        ensure_dir(&mcp_data.join("embeddings"))?;
+
+        #[cfg(has_embeddings)]
+        {
+            let legacy_cache = root
+                .join(".obsidian")
+                .join("obsidian-mcp")
+                .join("embeddings.bin");
+            let new_cache = Self::embedding_cache_path(&mcp_data);
+            if legacy_cache.is_file() && !new_cache.exists() {
+                match std::fs::copy(&legacy_cache, &new_cache) {
+                    Ok(bytes) => {
+                        tracing::info!(
+                            from = %legacy_cache.display(),
+                            to = %new_cache.display(),
+                            bytes,
+                            "migrated legacy embedding cache to new location"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            from = %legacy_cache.display(),
+                            to = %new_cache.display(),
+                            error = %e,
+                            "failed to migrate legacy embedding cache (non-fatal)"
+                        );
+                    }
+                }
+            }
+        }
+
+        // ── exclusion patterns ──
+        let mut patterns = exclude::load_ignore_patterns(&mcp_home, &mcp_data);
+        patterns.extend(config.exclude_patterns.iter().cloned());
+        patterns.sort();
+        patterns.dedup();
+
+        let exclude = Arc::new(exclude::ExcludeSet::build(patterns)?);
+
+        if !exclude.is_empty() {
+            tracing::info!(
+                patterns = ?exclude.patterns(),
+                "path exclusion active"
+            );
+        }
+
+        let vi = VaultIndex::build(&root, Arc::clone(&exclude)).await?;
 
         let tantivy = if config.tantivy {
             let tv = TantivyIndex::build(&root, vi.notes())?;
@@ -104,7 +202,7 @@ impl Vault {
             {
                 Ok(model) => {
                     let model = Arc::new(model);
-                    let store = Self::build_or_load_embeddings(&root, &index, &model)?;
+                    let store = Self::build_or_load_embeddings(&mcp_data, &root, &index, &model)?;
                     let store = Arc::new(RwLock::new(store));
                     tracing::info!(
                         notes = index
@@ -134,10 +232,16 @@ impl Vault {
                 tantivy.clone(),
                 embedding_model.clone(),
                 embedding_store.clone(),
+                Arc::clone(&exclude),
+                mcp_data.clone(),
             )?;
             #[cfg(not(has_embeddings))]
-            let debouncer =
-                watcher::start_watcher(root.clone(), Arc::clone(&index), tantivy.clone())?;
+            let debouncer = watcher::start_watcher(
+                root.clone(),
+                Arc::clone(&index),
+                tantivy.clone(),
+                Arc::clone(&exclude),
+            )?;
             Some(debouncer)
         } else {
             None
@@ -151,6 +255,9 @@ impl Vault {
         Ok(Self {
             inner: Arc::new(VaultInner {
                 root,
+                mcp_home,
+                mcp_data,
+                exclude,
                 index,
                 tantivy,
                 #[cfg(has_embeddings)]
@@ -168,6 +275,21 @@ impl Vault {
     /// Vault root path (canonicalized).
     pub fn root(&self) -> &Path {
         &self.inner.root
+    }
+
+    /// Always `{vault_root}/.obsidian-mcp`. Auto-created on startup.
+    pub fn mcp_home(&self) -> &Path {
+        &self.inner.mcp_home
+    }
+
+    /// Resolved data location. Equals `mcp_home` unless `OBSIDIAN_MCP_DATA` is set.
+    pub fn mcp_data(&self) -> &Path {
+        &self.inner.mcp_data
+    }
+
+    /// Active path exclusion set.
+    pub fn exclude(&self) -> &ExcludeSet {
+        &self.inner.exclude
     }
 
     /// Access the Tantivy BM25 index (if enabled via `Config::tantivy`).
@@ -254,23 +376,42 @@ impl Vault {
 
     pub fn move_note(&self, from: &Path, to: &Path) -> VaultResult<PathBuf> {
         let new_path = fs::move_file(&self.inner.root, from, to)?;
-        {
-            let mut idx = self.write_index();
-            idx.rename_file(&self.inner.root, from, &new_path)?;
-            if let Some(tv) = &self.inner.tantivy {
-                tv.remove_file(from)?;
-                if let Some(meta) = idx.get_note(&new_path) {
-                    tv.reindex_file(&self.inner.root, &new_path, meta)?;
+
+        if self.inner.exclude.is_excluded(&new_path) {
+            {
+                let mut idx = self.write_index();
+                idx.remove_file(from);
+                idx.add_excluded_file(&new_path);
+                if let Some(tv) = &self.inner.tantivy {
+                    tv.remove_file(from)?;
                 }
             }
+            #[cfg(has_embeddings)]
+            {
+                self.next_embedding_generation(from);
+                self.remove_embedding(from);
+                self.clear_embedding_generation(from);
+            }
+        } else {
+            {
+                let mut idx = self.write_index();
+                idx.rename_file(&self.inner.root, from, &new_path)?;
+                if let Some(tv) = &self.inner.tantivy {
+                    tv.remove_file(from)?;
+                    if let Some(meta) = idx.get_note(&new_path) {
+                        tv.reindex_file(&self.inner.root, &new_path, meta)?;
+                    }
+                }
+            }
+            #[cfg(has_embeddings)]
+            {
+                self.next_embedding_generation(from);
+                self.remove_embedding(from);
+                self.clear_embedding_generation(from);
+                self.reindex_embedding(&new_path);
+            }
         }
-        #[cfg(has_embeddings)]
-        {
-            self.next_embedding_generation(from);
-            self.remove_embedding(from);
-            self.clear_embedding_generation(from);
-            self.reindex_embedding(&new_path);
-        }
+
         Ok(new_path)
     }
 
@@ -686,6 +827,20 @@ impl Vault {
     }
 
     fn reindex(&self, path: &Path) -> VaultResult<()> {
+        if self.inner.exclude.is_excluded(path) {
+            self.write_index().add_excluded_file(path);
+            if let Some(tv) = &self.inner.tantivy {
+                tv.remove_file(path)?;
+            }
+            #[cfg(has_embeddings)]
+            {
+                self.next_embedding_generation(path);
+                self.remove_embedding(path);
+                self.clear_embedding_generation(path);
+            }
+            return Ok(());
+        }
+
         let mut idx = self.write_index();
         idx.reindex_file(&self.inner.root, path)?;
         if let Some(tv) = &self.inner.tantivy
@@ -702,20 +857,18 @@ impl Vault {
     // ── embedding helpers (feature-gated) ─────────────────────────────
 
     #[cfg(has_embeddings)]
-    fn embedding_cache_path(vault_root: &Path) -> PathBuf {
-        vault_root
-            .join(".obsidian")
-            .join("obsidian-mcp")
-            .join("embeddings.bin")
+    fn embedding_cache_path(mcp_data: &Path) -> PathBuf {
+        mcp_data.join("embeddings").join("embeddings.bin")
     }
 
     #[cfg(has_embeddings)]
     fn build_or_load_embeddings(
+        mcp_data: &Path,
         vault_root: &Path,
         index: &Arc<RwLock<VaultIndex>>,
         model: &embeddings::EmbeddingModel,
     ) -> VaultResult<embeddings::EmbeddingStore> {
-        let cache_path = Self::embedding_cache_path(vault_root);
+        let cache_path = Self::embedding_cache_path(mcp_data);
         let idx = index.read().unwrap_or_else(|e| e.into_inner());
         let note_entries: Vec<_> = idx
             .notes()
@@ -797,7 +950,7 @@ impl Vault {
 
         let model = Arc::clone(model);
         let store = Arc::clone(store);
-        let root = self.inner.root.clone();
+        let mcp_data = self.inner.mcp_data.clone();
         let vault = self.clone();
         let path_owned = path.to_path_buf();
 
@@ -817,7 +970,7 @@ impl Vault {
                 let mut s = store.write().unwrap_or_else(|e| e.into_inner());
                 s.insert(path_owned.clone(), vec);
                 drop(s);
-                let cache_path = Self::embedding_cache_path(&root);
+                let cache_path = Self::embedding_cache_path(&mcp_data);
                 let s = store.read().unwrap_or_else(|e| e.into_inner());
                 if let Err(e) = s.save(&cache_path) {
                     tracing::warn!(error = %e, "failed to save embedding cache");
@@ -851,7 +1004,7 @@ impl Vault {
     fn save_embedding_cache(&self) {
         if let Some(store) = &self.inner.embedding_store {
             let s = store.read().unwrap_or_else(|e| e.into_inner());
-            let cache_path = Self::embedding_cache_path(&self.inner.root);
+            let cache_path = Self::embedding_cache_path(&self.inner.mcp_data);
             if let Err(e) = s.save(&cache_path) {
                 tracing::warn!(error = %e, "failed to save embedding cache");
             }
@@ -901,6 +1054,8 @@ mod tests {
             hybrid_alpha: 0.25,
             embedding_provider: None,
             tool_filter: crate::config::ToolFilter::Full,
+            mcp_data_dir: None,
+            exclude_patterns: vec![],
         };
 
         let result = Vault::open(&config).await;
@@ -1448,8 +1603,10 @@ mod tests {
             embeddings: true,
             embeddings_model: "nonexistent-model-that-will-fail".into(),
             hybrid_alpha: 0.25,
-            embedding_provider: Some(crate::config::EmbeddingProvider::Api),
+            embedding_provider: Some(crate::config::EmbeddingProvider::Local),
             tool_filter: crate::config::ToolFilter::Full,
+            mcp_data_dir: None,
+            exclude_patterns: vec![],
         };
 
         let vault = Vault::open(&config)
@@ -1532,6 +1689,267 @@ mod tests {
         assert!(
             vault.should_commit_embedding_task(to, new_generation),
             "new path generation should be valid for existing moved note"
+        );
+    }
+
+    #[cfg(has_embeddings)]
+    #[tokio::test]
+    async fn legacy_embedding_cache_migrated_to_new_location() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+
+        let legacy_dir = dir.path().join(".obsidian").join("obsidian-mcp");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_path = legacy_dir.join("embeddings.bin");
+        let test_bytes: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4];
+        std::fs::write(&legacy_path, &test_bytes).unwrap();
+
+        let _vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        let new_path = dir
+            .path()
+            .join(".obsidian-mcp")
+            .join("embeddings")
+            .join("embeddings.bin");
+        assert!(
+            new_path.exists(),
+            "migration should copy cache to new location"
+        );
+        assert_eq!(
+            std::fs::read(&new_path).unwrap(),
+            test_bytes,
+            "migrated file should have identical content"
+        );
+        assert!(
+            legacy_path.exists(),
+            "legacy file must not be deleted by migration"
+        );
+    }
+
+    #[cfg(has_embeddings)]
+    #[tokio::test]
+    async fn legacy_embedding_migration_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+
+        let legacy_dir = dir.path().join(".obsidian").join("obsidian-mcp");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(legacy_dir.join("embeddings.bin"), b"old-legacy-data").unwrap();
+
+        let new_dir = dir.path().join(".obsidian-mcp").join("embeddings");
+        std::fs::create_dir_all(&new_dir).unwrap();
+        let new_bytes = b"already-migrated-data";
+        std::fs::write(new_dir.join("embeddings.bin"), new_bytes).unwrap();
+
+        let _vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(new_dir.join("embeddings.bin")).unwrap(),
+            new_bytes,
+            "existing new cache must not be overwritten by legacy"
+        );
+        assert!(
+            legacy_dir.join("embeddings.bin").exists(),
+            "legacy file must not be deleted"
+        );
+    }
+
+    #[cfg(has_embeddings)]
+    #[tokio::test]
+    async fn no_legacy_cache_no_migration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+
+        let vault = Vault::open(&test_config(dir.path())).await;
+        assert!(vault.is_ok(), "vault should open without legacy cache");
+
+        let new_cache = dir
+            .path()
+            .join(".obsidian-mcp")
+            .join("embeddings")
+            .join("embeddings.bin");
+        assert!(
+            !new_cache.exists(),
+            "no cache file should be created when no legacy exists"
+        );
+    }
+
+    fn test_config_with_exclusions(vault_root: &Path, patterns: Vec<String>) -> Config {
+        Config {
+            exclude_patterns: patterns,
+            ..test_config(vault_root)
+        }
+    }
+
+    #[tokio::test]
+    async fn move_into_excluded_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let config = test_config_with_exclusions(dir.path(), vec!["Archive/**".into()]);
+        let vault = Vault::open(&config).await.unwrap();
+
+        vault
+            .write_note(Path::new("active.md"), "# Active")
+            .unwrap();
+        assert!(vault.get_note_metadata(Path::new("active.md")).is_ok());
+
+        let new_path = vault
+            .move_note(Path::new("active.md"), Path::new("Archive/archived.md"))
+            .unwrap();
+        assert_eq!(new_path, PathBuf::from("Archive/archived.md"));
+
+        assert!(vault.get_note_metadata(Path::new("active.md")).is_err());
+        assert!(
+            vault
+                .get_note_metadata(Path::new("Archive/archived.md"))
+                .is_err()
+        );
+        assert_eq!(vault.vault_stats().unwrap().excluded_notes, 1);
+
+        let content = vault.read_note(Path::new("Archive/archived.md")).unwrap();
+        assert_eq!(content, "# Active");
+    }
+
+    #[tokio::test]
+    async fn move_out_of_excluded_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        std::fs::create_dir_all(dir.path().join("Archive")).unwrap();
+        std::fs::write(dir.path().join("Archive/hidden.md"), "# Hidden").unwrap();
+
+        let config = test_config_with_exclusions(dir.path(), vec!["Archive/**".into()]);
+        let vault = Vault::open(&config).await.unwrap();
+
+        assert!(
+            vault
+                .get_note_metadata(Path::new("Archive/hidden.md"))
+                .is_err()
+        );
+
+        let new_path = vault
+            .move_note(Path::new("Archive/hidden.md"), Path::new("visible.md"))
+            .unwrap();
+        assert_eq!(new_path, PathBuf::from("visible.md"));
+
+        assert!(vault.get_note_metadata(Path::new("visible.md")).is_ok());
+        assert!(
+            vault
+                .get_note_metadata(Path::new("Archive/hidden.md"))
+                .is_err()
+        );
+        assert_eq!(vault.vault_stats().unwrap().excluded_notes, 0);
+    }
+
+    #[tokio::test]
+    async fn move_between_excluded_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        std::fs::create_dir_all(dir.path().join("Archive")).unwrap();
+        std::fs::write(dir.path().join("Archive/old.md"), "# Old").unwrap();
+
+        let config =
+            test_config_with_exclusions(dir.path(), vec!["Archive/**".into(), "Trash/**".into()]);
+        let vault = Vault::open(&config).await.unwrap();
+
+        assert!(
+            vault
+                .get_note_metadata(Path::new("Archive/old.md"))
+                .is_err()
+        );
+
+        let new_path = vault
+            .move_note(Path::new("Archive/old.md"), Path::new("Trash/old.md"))
+            .unwrap();
+        assert_eq!(new_path, PathBuf::from("Trash/old.md"));
+
+        assert!(
+            vault
+                .get_note_metadata(Path::new("Archive/old.md"))
+                .is_err()
+        );
+        assert!(vault.get_note_metadata(Path::new("Trash/old.md")).is_err());
+
+        let content = vault.read_note(Path::new("Trash/old.md")).unwrap();
+        assert_eq!(content, "# Old");
+    }
+
+    #[tokio::test]
+    async fn move_into_excluded_dir_with_tantivy() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let config = Config {
+            tantivy: true,
+            exclude_patterns: vec!["Archive/**".into()],
+            ..test_config(dir.path())
+        };
+        let vault = Vault::open(&config).await.unwrap();
+
+        vault
+            .write_note(Path::new("indexed.md"), "# Indexed note with content")
+            .unwrap();
+        assert!(vault.get_note_metadata(Path::new("indexed.md")).is_ok());
+
+        vault
+            .move_note(Path::new("indexed.md"), Path::new("Archive/gone.md"))
+            .unwrap();
+
+        assert!(vault.get_note_metadata(Path::new("indexed.md")).is_err());
+        assert!(
+            vault
+                .get_note_metadata(Path::new("Archive/gone.md"))
+                .is_err()
+        );
+
+        let results = vault.search_text("Indexed note", 100).unwrap();
+        assert!(
+            results.is_empty(),
+            "moved-to-excluded note should not appear in search"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_note_to_excluded_path_does_not_index() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let config = test_config_with_exclusions(dir.path(), vec!["Archive/**".into()]);
+        let vault = Vault::open(&config).await.unwrap();
+
+        vault
+            .write_note(Path::new("Archive/direct.md"), "# Direct excluded")
+            .unwrap();
+
+        assert!(
+            vault
+                .get_note_metadata(Path::new("Archive/direct.md"))
+                .is_err()
+        );
+        assert_eq!(vault.vault_stats().unwrap().excluded_notes, 1);
+        assert_eq!(
+            vault.read_note(Path::new("Archive/direct.md")).unwrap(),
+            "# Direct excluded"
+        );
+
+        vault.delete_note(Path::new("Archive/direct.md")).unwrap();
+        assert_eq!(vault.vault_stats().unwrap().excluded_notes, 0);
+    }
+
+    #[tokio::test]
+    async fn mcp_data_equal_to_mcp_home_uses_default_location() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let mcp_home = dir.path().join(".obsidian-mcp");
+        let config = Config {
+            mcp_data_dir: Some(mcp_home.clone()),
+            ..test_config(dir.path())
+        };
+
+        let vault = Vault::open(&config).await.unwrap();
+
+        assert_eq!(vault.mcp_home(), vault.root().join(".obsidian-mcp"));
+        assert_eq!(vault.mcp_data(), vault.mcp_home());
+        assert!(
+            !vault.mcp_home().join("vaults").exists(),
+            "default mcp home must not be namespaced under itself"
         );
     }
 }

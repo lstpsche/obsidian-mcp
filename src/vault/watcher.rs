@@ -15,6 +15,7 @@ use notify::RecursiveMode;
 use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer};
 use tokio::runtime::Handle;
 
+use super::exclude::ExcludeSet;
 use super::index::VaultIndex;
 use super::tantivy_index::TantivyIndex;
 use crate::error::{VaultError, VaultResult};
@@ -36,6 +37,8 @@ pub fn start_watcher(
     tantivy: Option<Arc<TantivyIndex>>,
     embedding_model: Option<Arc<super::embeddings::EmbeddingModel>>,
     embedding_store: Option<Arc<RwLock<super::embeddings::EmbeddingStore>>>,
+    exclude: Arc<ExcludeSet>,
+    mcp_data: PathBuf,
 ) -> VaultResult<Debouncer<notify::RecommendedWatcher>> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<DebounceEventResult>(EVENT_CHANNEL_CAPACITY);
     let rt = Handle::current();
@@ -73,6 +76,7 @@ pub fn start_watcher(
                             embedding_model.as_deref(),
                             embedding_store.as_ref(),
                             &event.path,
+                            &exclude,
                         );
                         tantivy_dirty |= tv_touched;
                         embedding_dirty |= emb_touched;
@@ -87,7 +91,7 @@ pub fn start_watcher(
                         && let Some(ref store) = embedding_store
                         && let Ok(s) = store.read()
                     {
-                        save_embedding_cache(&vault_root, &s);
+                        save_embedding_cache(&mcp_data, &s);
                     }
                 }
                 Err(e) => {
@@ -107,6 +111,7 @@ pub fn start_watcher(
     vault_root: PathBuf,
     index: Arc<RwLock<VaultIndex>>,
     tantivy: Option<Arc<TantivyIndex>>,
+    exclude: Arc<ExcludeSet>,
 ) -> VaultResult<Debouncer<notify::RecommendedWatcher>> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<DebounceEventResult>(EVENT_CHANNEL_CAPACITY);
     let rt = Handle::current();
@@ -136,8 +141,13 @@ pub fn start_watcher(
                 Ok(events) => {
                     let mut tantivy_dirty = false;
                     for event in events {
-                        tantivy_dirty |=
-                            process_event(&vault_root, &index, tantivy.as_deref(), &event.path);
+                        tantivy_dirty |= process_event(
+                            &vault_root,
+                            &index,
+                            tantivy.as_deref(),
+                            &event.path,
+                            &exclude,
+                        );
                     }
                     if tantivy_dirty
                         && let Some(ref tv) = tantivy
@@ -160,9 +170,10 @@ pub fn start_watcher(
 /// Decide whether a filesystem event should trigger an index update.
 ///
 /// Returns `false` for:
-/// - Paths inside `.obsidian/`
+/// - Paths inside `.obsidian/` or `.obsidian-mcp/`
+/// - Paths matching user-defined exclusion patterns
 /// - Non-`.md` files
-fn should_process_path(vault_root: &Path, absolute: &Path) -> bool {
+fn should_process_path(vault_root: &Path, absolute: &Path, exclude: &ExcludeSet) -> bool {
     let relative = match absolute.strip_prefix(vault_root) {
         Ok(r) => r,
         Err(_) => {
@@ -172,6 +183,11 @@ fn should_process_path(vault_root: &Path, absolute: &Path) -> bool {
     };
 
     if is_obsidian_dir(relative) {
+        return false;
+    }
+
+    let rel_str = relative.to_string_lossy().replace('\\', "/");
+    if exclude.is_excluded(Path::new(&rel_str)) {
         return false;
     }
 
@@ -200,12 +216,12 @@ fn should_process_path(vault_root: &Path, absolute: &Path) -> bool {
     }
 }
 
-/// Check if a vault-relative path is inside the `.obsidian/` config directory.
+/// Check if a vault-relative path is inside `.obsidian/` or `.obsidian-mcp/`.
 fn is_obsidian_dir(relative: &Path) -> bool {
-    relative
-        .components()
-        .next()
-        .is_some_and(|c| c.as_os_str() == ".obsidian")
+    relative.components().next().is_some_and(|c| {
+        let name = c.as_os_str();
+        name == ".obsidian" || name == ".obsidian-mcp"
+    })
 }
 
 /// Process a single debounced event. Returns `(tantivy_touched, embedding_touched)`.
@@ -217,8 +233,9 @@ fn process_event(
     embedding_model: Option<&super::embeddings::EmbeddingModel>,
     embedding_store: Option<&Arc<RwLock<super::embeddings::EmbeddingStore>>>,
     absolute: &Path,
+    exclude: &ExcludeSet,
 ) -> (bool, bool) {
-    if !should_process_path(vault_root, absolute) {
+    if !should_process_path(vault_root, absolute, exclude) {
         return (false, false);
     }
 
@@ -317,11 +334,8 @@ fn embed_and_insert(
 }
 
 #[cfg(has_embeddings)]
-fn save_embedding_cache(vault_root: &Path, store: &super::embeddings::EmbeddingStore) {
-    let cache_path = vault_root
-        .join(".obsidian")
-        .join("obsidian-mcp")
-        .join("embeddings.bin");
+fn save_embedding_cache(mcp_data: &Path, store: &super::embeddings::EmbeddingStore) {
+    let cache_path = mcp_data.join("embeddings").join("embeddings.bin");
     if let Err(e) = store.save(&cache_path) {
         tracing::warn!(error = %e, "failed to save embedding cache from watcher");
     }
@@ -334,8 +348,9 @@ fn process_event(
     index: &Arc<RwLock<VaultIndex>>,
     tantivy: Option<&TantivyIndex>,
     absolute: &Path,
+    exclude: &ExcludeSet,
 ) -> bool {
-    if !should_process_path(vault_root, absolute) {
+    if !should_process_path(vault_root, absolute, exclude) {
         return false;
     }
 
@@ -398,55 +413,96 @@ mod tests {
         PathBuf::from("/tmp/test-vault")
     }
 
+    fn empty_exclude() -> ExcludeSet {
+        ExcludeSet::build(vec![]).unwrap()
+    }
+
     #[test]
     fn filters_obsidian_directory() {
         let root = vault();
+        let exclude = empty_exclude();
         assert!(!should_process_path(
             &root,
-            &root.join(".obsidian/plugins/foo.json")
+            &root.join(".obsidian/plugins/foo.json"),
+            &exclude,
         ));
         assert!(!should_process_path(
             &root,
-            &root.join(".obsidian/workspace.json")
+            &root.join(".obsidian/workspace.json"),
+            &exclude,
+        ));
+    }
+
+    #[test]
+    fn filters_obsidian_mcp_directory() {
+        let root = vault();
+        let exclude = empty_exclude();
+        assert!(!should_process_path(
+            &root,
+            &root.join(".obsidian-mcp/config.json"),
+            &exclude,
+        ));
+        assert!(!should_process_path(
+            &root,
+            &root.join(".obsidian-mcp/ignore"),
+            &exclude,
         ));
     }
 
     #[test]
     fn filters_non_markdown_files() {
         let root = vault();
-        assert!(!should_process_path(&root, &root.join("image.png")));
-        assert!(!should_process_path(&root, &root.join("data.json")));
+        let exclude = empty_exclude();
         assert!(!should_process_path(
             &root,
-            &root.join("subfolder/script.js")
+            &root.join("image.png"),
+            &exclude
+        ));
+        assert!(!should_process_path(
+            &root,
+            &root.join("data.json"),
+            &exclude
+        ));
+        assert!(!should_process_path(
+            &root,
+            &root.join("subfolder/script.js"),
+            &exclude,
         ));
     }
 
     #[test]
     fn accepts_markdown_files() {
         let root = vault();
-        // should_process_path checks extension; the file needn't exist for that check.
-        assert!(should_process_path(&root, &root.join("note.md")));
+        let exclude = empty_exclude();
+        assert!(should_process_path(&root, &root.join("note.md"), &exclude));
         assert!(should_process_path(
             &root,
-            &root.join("subfolder/deep/note.md")
+            &root.join("subfolder/deep/note.md"),
+            &exclude,
         ));
     }
 
     #[test]
     fn accepts_uppercase_markdown_extension() {
         let root = vault();
-        assert!(should_process_path(&root, &root.join("NOTE.MD")));
-        assert!(should_process_path(&root, &root.join("Mixed.Md")));
-        assert!(should_process_path(&root, &root.join("subfolder/CAPS.MD")));
+        let exclude = empty_exclude();
+        assert!(should_process_path(&root, &root.join("NOTE.MD"), &exclude));
+        assert!(should_process_path(&root, &root.join("Mixed.Md"), &exclude));
+        assert!(should_process_path(
+            &root,
+            &root.join("subfolder/CAPS.MD"),
+            &exclude,
+        ));
     }
 
     #[test]
     fn filters_paths_outside_vault() {
         let root = vault();
+        let exclude = empty_exclude();
         assert!(!should_process_path(
             &root,
-            Path::new("/other/place/note.md")
+            Path::new("/other/place/note.md"),
+            &exclude,
         ));
     }
 
@@ -458,17 +514,61 @@ mod tests {
         assert!(!is_obsidian_dir(Path::new("daily/2024-01-01.md")));
     }
 
+    #[test]
+    fn obsidian_mcp_dir_detection() {
+        assert!(is_obsidian_dir(Path::new(".obsidian-mcp/ignore")));
+        assert!(is_obsidian_dir(Path::new(".obsidian-mcp")));
+        assert!(is_obsidian_dir(Path::new(
+            ".obsidian-mcp/embeddings/embeddings.bin"
+        )));
+        assert!(!is_obsidian_dir(Path::new("notes/.obsidian-mcp/foo")));
+    }
+
+    #[test]
+    fn filters_excluded_paths() {
+        let root = vault();
+        let exclude = ExcludeSet::build(vec!["Archive/".into()]).unwrap();
+        assert!(!should_process_path(
+            &root,
+            &root.join("Archive/note.md"),
+            &exclude,
+        ));
+        assert!(!should_process_path(
+            &root,
+            &root.join("Archive/sub/deep.md"),
+            &exclude,
+        ));
+    }
+
+    #[test]
+    fn accepts_non_excluded_paths() {
+        let root = vault();
+        let exclude = ExcludeSet::build(vec!["Archive/".into()]).unwrap();
+        assert!(should_process_path(
+            &root,
+            &root.join("Active/note.md"),
+            &exclude,
+        ));
+        assert!(should_process_path(
+            &root,
+            &root.join("Daily/2024-01-01.md"),
+            &exclude,
+        ));
+    }
+
     fn call_start_watcher(
         vault_root: PathBuf,
         index: Arc<RwLock<VaultIndex>>,
     ) -> VaultResult<Debouncer<notify::RecommendedWatcher>> {
+        let exclude = Arc::new(ExcludeSet::build(vec![]).unwrap());
         #[cfg(has_embeddings)]
         {
-            start_watcher(vault_root, index, None, None, None)
+            let mcp_data = vault_root.join(".obsidian-mcp");
+            start_watcher(vault_root, index, None, None, None, exclude, mcp_data)
         }
         #[cfg(not(has_embeddings))]
         {
-            start_watcher(vault_root, index, None)
+            start_watcher(vault_root, index, None, exclude)
         }
     }
 

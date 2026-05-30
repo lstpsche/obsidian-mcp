@@ -20,6 +20,8 @@ pub fn test_config(vault_root: &Path) -> Config {
         hybrid_alpha: 0.25,
         embedding_provider: None,
         tool_filter: ToolFilter::Full,
+        mcp_data_dir: None,
+        exclude_patterns: vec![],
     }
 }
 
@@ -37,6 +39,8 @@ pub fn tantivy_config(vault_root: &Path) -> Config {
         hybrid_alpha: 0.25,
         embedding_provider: None,
         tool_filter: ToolFilter::Full,
+        mcp_data_dir: None,
+        exclude_patterns: vec![],
     }
 }
 

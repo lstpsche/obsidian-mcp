@@ -6,3 +6,4 @@ target/
 .cursor/
 tmp/
 .fastembed_cache/
+tests/fixtures/test_vault/.obsidian-mcp/

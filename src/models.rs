@@ -85,6 +85,8 @@ pub struct VaultStats {
     pub total_tags: usize,
     pub total_links: usize,
     pub vault_size_bytes: u64,
+    /// Number of `.md` files skipped by exclusion patterns.
+    pub excluded_notes: usize,
 }
 
 /// Available PATCH targets in a note.
