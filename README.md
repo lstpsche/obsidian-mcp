@@ -59,6 +59,8 @@ cargo install obsidian-mcp --features embeddings
 
 The `embeddings` feature adds ~60 MB to the binary (ONNX Runtime). In daemon mode, model/runtime cache is shared under semantic home; local mode keeps in-process embedding support in the MCP binary.
 
+On Windows, local embeddings builds require a recent MSVC Build Tools toolset for ONNX Runtime. MSVC 14.44+ is known to work; older VS 2019-era 14.2x toolsets may fail to link with `__std_find_trivial_8`. Use `--features embeddings-api` instead if you want semantic search through an external `/v1/embeddings` server without bundling ONNX Runtime.
+
 For **API embedding backend** (OpenAI, Ollama, vLLM, LM Studio, or any `/v1/embeddings`-compatible endpoint):
 
 ```sh

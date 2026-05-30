@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-#[cfg(any(unix, test))]
+#[cfg(any(unix, test, has_embeddings))]
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
