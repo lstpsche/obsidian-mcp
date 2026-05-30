@@ -1603,7 +1603,7 @@ mod tests {
             embeddings: true,
             embeddings_model: "nonexistent-model-that-will-fail".into(),
             hybrid_alpha: 0.25,
-            embedding_provider: Some(crate::config::EmbeddingProvider::Local),
+            embedding_provider: Some(crate::config::EmbeddingProvider::Api),
             tool_filter: crate::config::ToolFilter::Full,
             mcp_data_dir: None,
             exclude_patterns: vec![],

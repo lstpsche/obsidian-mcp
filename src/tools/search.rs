@@ -14,6 +14,8 @@ use super::SemanticRuntime;
 
 const MAX_RESULTS_CAP: usize = 200;
 const MAX_CONTEXT_LEN_CAP: usize = 2000;
+const SEMANTIC_FILTER_OVERFETCH_FACTOR: usize = 4;
+const SEMANTIC_FILTER_OVERFETCH_MIN_EXTRA: usize = 20;
 
 // ── search_text ─────────────────────────────────────────────────────
 
@@ -272,7 +274,7 @@ pub async fn search_semantic(
     default_alpha: f32,
     runtime: &SemanticRuntime,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    let top_k = params.top_k.unwrap_or(10);
+    let top_k = params.top_k.unwrap_or(10).min(MAX_RESULTS_CAP);
     let include_content = params.include_content.unwrap_or(false);
     let lexical_prefetch = params.lexical_prefetch.unwrap_or(false);
     let alpha = params.alpha.unwrap_or(default_alpha).clamp(0.0, 1.0);
@@ -334,6 +336,17 @@ pub async fn search_semantic(
     Ok(CallToolResult::success(vec![Content::text(json)]))
 }
 
+fn semantic_candidate_limit(top_k: usize) -> usize {
+    if top_k == 0 {
+        0
+    } else {
+        top_k
+            .saturating_mul(SEMANTIC_FILTER_OVERFETCH_FACTOR)
+            .max(top_k.saturating_add(SEMANTIC_FILTER_OVERFETCH_MIN_EXTRA))
+            .min(MAX_RESULTS_CAP)
+    }
+}
+
 async fn search_semantic_daemon(
     vault: &Vault,
     params: &SearchSemanticParams,
@@ -365,13 +378,14 @@ async fn search_semantic_daemon(
         }
     }
 
+    let candidate_limit = semantic_candidate_limit(top_k);
     let daemon_result = if lexical_prefetch {
-        let prefetch_count = runtime.prefetch_count;
+        let prefetch_count = runtime.prefetch_count.max(candidate_limit);
         client
             .search_hybrid(
                 vault.root(),
                 &params.query,
-                top_k,
+                candidate_limit,
                 prefetch_count,
                 alpha,
                 include_content,
@@ -379,7 +393,12 @@ async fn search_semantic_daemon(
             .await?
     } else {
         client
-            .search_semantic(vault.root(), &params.query, top_k, include_content)
+            .search_semantic(
+                vault.root(),
+                &params.query,
+                candidate_limit,
+                include_content,
+            )
             .await?
     };
 
@@ -400,6 +419,7 @@ async fn search_semantic_daemon(
                 content: hit.content,
             })
         })
+        .take(top_k)
         .collect())
 }
 
@@ -422,10 +442,16 @@ fn search_semantic_local(
         return Err(VaultError::Embedding(detail));
     }
 
+    let candidate_limit = semantic_candidate_limit(top_k);
     let hits = if lexical_prefetch {
-        vault.search_hybrid(query, top_k, DEFAULT_PREFETCH_COUNT, alpha)?
+        vault.search_hybrid(
+            query,
+            candidate_limit,
+            DEFAULT_PREFETCH_COUNT.max(candidate_limit),
+            alpha,
+        )?
     } else {
-        vault.search_semantic(query, top_k)?
+        vault.search_semantic(query, candidate_limit)?
     };
 
     let word_re = if !include_content {
@@ -472,6 +498,9 @@ fn search_semantic_local(
             snippet,
             content,
         });
+        if results.len() == top_k {
+            break;
+        }
     }
 
     Ok(results)
@@ -627,6 +656,100 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
+    fn start_semantic_filter_server(
+        socket_path: PathBuf,
+        filtered_path: &'static str,
+    ) -> tokio::task::JoinHandle<usize> {
+        tokio::spawn(async move {
+            if socket_path.exists() {
+                let _ = std::fs::remove_file(&socket_path);
+            }
+            let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind unix socket");
+            let mut captured_top_k = 0usize;
+
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept client");
+                let (reader, mut writer) = tokio::io::split(stream);
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.expect("read request");
+                let request: serde_json::Value =
+                    serde_json::from_str(&line).expect("request should be valid JSON");
+                let id = request
+                    .get("id")
+                    .cloned()
+                    .expect("request should include id");
+                let method = request
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("request should include method");
+
+                let response = match method {
+                    "ensure_vault" => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "vault_id": "test-vault",
+                            "ready": true,
+                            "watch_enabled": true,
+                            "model_name": "BAAI/bge-small-en-v1.5"
+                        }
+                    }),
+                    "search_semantic" => {
+                        captured_top_k = request
+                            .get("params")
+                            .and_then(|params| params.get("top_k"))
+                            .and_then(serde_json::Value::as_u64)
+                            .expect("search_semantic should include top_k")
+                            as usize;
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "results": [
+                                    {
+                                        "path": filtered_path,
+                                        "title": "Filtered",
+                                        "score": 1.0,
+                                        "tags": [],
+                                        "snippet": "filtered",
+                                        "content": null,
+                                        "subpath": null
+                                    },
+                                    {
+                                        "path": "rust.md",
+                                        "title": "Rust",
+                                        "score": 0.9,
+                                        "tags": ["lang", "systems"],
+                                        "snippet": "Rust is a systems language.",
+                                        "content": null,
+                                        "subpath": null
+                                    }
+                                ]
+                            }
+                        })
+                    }
+                    other => panic!("unexpected method in daemon test server: {other}"),
+                };
+
+                writer
+                    .write_all(
+                        format!(
+                            "{}\n",
+                            serde_json::to_string(&response).expect("serialize response")
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("write response");
+                writer.flush().await.expect("flush response");
+            }
+
+            captured_top_k
+        })
+    }
+
     async fn setup_search_vault() -> (tempfile::TempDir, Vault) {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
@@ -657,6 +780,28 @@ mod tests {
                 "# Empty\nNothing interesting here.\n",
             )
             .unwrap();
+
+        (dir, vault)
+    }
+
+    async fn setup_excluded_search_vault() -> (tempfile::TempDir, Vault) {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        std::fs::create_dir_all(dir.path().join("Archive")).unwrap();
+        std::fs::write(
+            dir.path().join("Archive/hidden.md"),
+            "# Hidden\nThis excluded note should not be visible.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("rust.md"),
+            "---\ntags: [lang, systems]\n---\n# Rust\nRust is a systems language.\n",
+        )
+        .unwrap();
+
+        let mut config = test_config(dir.path());
+        config.exclude_patterns = vec!["Archive/".into()];
+        let vault = Vault::open(&config).await.unwrap();
 
         (dir, vault)
     }
@@ -1162,7 +1307,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn daemon_prefetch_uses_runtime_value_without_forcing_min_50() {
+    async fn daemon_prefetch_overfetches_without_forcing_min_50() {
         let (_dir, vault) = setup_search_vault().await;
         let socket_dir = tempfile::tempdir().expect("tempdir");
         let socket_path = socket_dir.path().join("semanticd.sock");
@@ -1199,8 +1344,97 @@ mod tests {
 
         let captured_prefetch = server.await.expect("server join");
         assert_eq!(
-            captured_prefetch, 7,
-            "runtime prefetch should be used as-is"
+            captured_prefetch,
+            semantic_candidate_limit(5),
+            "runtime prefetch may grow to cover the filtered candidate window"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_semantic_overfetches_before_filtering_hidden_results() {
+        let (_dir, vault) = setup_search_vault().await;
+        let socket_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = socket_dir.path().join("semanticd.sock");
+        let server = start_semantic_filter_server(socket_path.clone(), "missing-hidden.md");
+
+        let runtime = SemanticRuntime {
+            mode: SemanticMode::Daemon,
+            daemon_client: Some(SemanticDaemonClient::new(
+                IpcEndpoint::UnixSocket(socket_path),
+                DaemonConnectPolicy::default(),
+            )),
+            daemon_unavailable_reason: None,
+            prefetch_count: 50,
+            vault_ensured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        let result = search_semantic(
+            &vault,
+            SearchSemanticParams {
+                query: "systems language".to_string(),
+                top_k: Some(1),
+                include_content: Some(false),
+                lexical_prefetch: Some(false),
+                alpha: None,
+            },
+            0.25,
+            &runtime,
+        )
+        .await
+        .expect("daemon search should succeed");
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(extract_text(&result)).expect("parse result");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["path"], "rust.md");
+
+        let captured_top_k = server.await.expect("server join");
+        assert_eq!(captured_top_k, semantic_candidate_limit(1));
+        assert!(
+            captured_top_k > 1,
+            "daemon request should over-fetch before MCP-side visibility filtering"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_semantic_filters_excluded_hits_after_overfetching() {
+        let (_dir, vault) = setup_excluded_search_vault().await;
+        let socket_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = socket_dir.path().join("semanticd.sock");
+        let server = start_semantic_filter_server(socket_path.clone(), "Archive/hidden.md");
+
+        let runtime = SemanticRuntime {
+            mode: SemanticMode::Daemon,
+            daemon_client: Some(SemanticDaemonClient::new(
+                IpcEndpoint::UnixSocket(socket_path),
+                DaemonConnectPolicy::default(),
+            )),
+            daemon_unavailable_reason: None,
+            prefetch_count: 50,
+            vault_ensured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        let result = search_semantic(
+            &vault,
+            SearchSemanticParams {
+                query: "systems language".to_string(),
+                top_k: Some(1),
+                include_content: Some(false),
+                lexical_prefetch: Some(false),
+                alpha: None,
+            },
+            0.25,
+            &runtime,
+        )
+        .await
+        .expect("daemon search should succeed");
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(extract_text(&result)).expect("parse result");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["path"], "rust.md");
+
+        let captured_top_k = server.await.expect("server join");
+        assert_eq!(captured_top_k, semantic_candidate_limit(1));
     }
 }

@@ -171,9 +171,8 @@ pub fn start_watcher(
 ///
 /// Returns `false` for:
 /// - Paths inside `.obsidian/` or `.obsidian-mcp/`
-/// - Paths matching user-defined exclusion patterns
 /// - Non-`.md` files
-fn should_process_path(vault_root: &Path, absolute: &Path, exclude: &ExcludeSet) -> bool {
+fn should_process_path(vault_root: &Path, absolute: &Path) -> bool {
     let relative = match absolute.strip_prefix(vault_root) {
         Ok(r) => r,
         Err(_) => {
@@ -183,11 +182,6 @@ fn should_process_path(vault_root: &Path, absolute: &Path, exclude: &ExcludeSet)
     };
 
     if is_obsidian_dir(relative) {
-        return false;
-    }
-
-    let rel_str = relative.to_string_lossy().replace('\\', "/");
-    if exclude.is_excluded(Path::new(&rel_str)) {
         return false;
     }
 
@@ -224,6 +218,17 @@ fn is_obsidian_dir(relative: &Path) -> bool {
     })
 }
 
+fn normalized_relative_path(vault_root: &Path, absolute: &Path) -> Option<PathBuf> {
+    absolute
+        .strip_prefix(vault_root)
+        .ok()
+        .map(|relative| PathBuf::from(relative.to_string_lossy().replace('\\', "/")))
+}
+
+fn is_excluded_path(exclude: &ExcludeSet, relative: &Path) -> bool {
+    exclude.is_excluded(Path::new(&relative.to_string_lossy().replace('\\', "/")))
+}
+
 /// Process a single debounced event. Returns `(tantivy_touched, embedding_touched)`.
 #[cfg(has_embeddings)]
 fn process_event(
@@ -235,17 +240,54 @@ fn process_event(
     absolute: &Path,
     exclude: &ExcludeSet,
 ) -> (bool, bool) {
-    if !should_process_path(vault_root, absolute, exclude) {
+    if !should_process_path(vault_root, absolute) {
         return (false, false);
     }
 
-    let relative = match absolute.strip_prefix(vault_root) {
-        Ok(r) => r.to_path_buf(),
-        Err(_) => return (false, false),
+    let relative = match normalized_relative_path(vault_root, absolute) {
+        Some(r) => r,
+        None => return (false, false),
     };
 
     let mut tv_touched = false;
     let mut emb_touched = false;
+
+    if is_excluded_path(exclude, &relative) {
+        if absolute.exists() {
+            tracing::debug!(path = %relative.display(), "tracking excluded note");
+            match index.write() {
+                Ok(mut idx) => idx.add_excluded_file(&relative),
+                Err(e) => {
+                    tracing::error!("index lock poisoned: {e}");
+                    return (false, false);
+                }
+            }
+        } else {
+            tracing::debug!(path = %relative.display(), "removing excluded note tracking");
+            match index.write() {
+                Ok(mut idx) => idx.remove_file(&relative),
+                Err(e) => {
+                    tracing::error!("index lock poisoned: {e}");
+                    return (false, false);
+                }
+            }
+        }
+
+        if let Some(tv) = tantivy {
+            if let Err(e) = tv.remove_file_batch(&relative) {
+                tracing::warn!(path = %relative.display(), error = %e, "tantivy remove failed");
+            } else {
+                tv_touched = true;
+            }
+        }
+        if let Some(store) = embedding_store
+            && let Ok(mut s) = store.write()
+        {
+            s.remove(&relative);
+            emb_touched = true;
+        }
+        return (tv_touched, emb_touched);
+    }
 
     if absolute.exists() {
         tracing::debug!(path = %relative.display(), "reindexing (create/modify)");
@@ -350,14 +392,45 @@ fn process_event(
     absolute: &Path,
     exclude: &ExcludeSet,
 ) -> bool {
-    if !should_process_path(vault_root, absolute, exclude) {
+    if !should_process_path(vault_root, absolute) {
         return false;
     }
 
-    let relative = match absolute.strip_prefix(vault_root) {
-        Ok(r) => r.to_path_buf(),
-        Err(_) => return false,
+    let relative = match normalized_relative_path(vault_root, absolute) {
+        Some(r) => r,
+        None => return false,
     };
+
+    if is_excluded_path(exclude, &relative) {
+        if absolute.exists() {
+            tracing::debug!(path = %relative.display(), "tracking excluded note");
+            match index.write() {
+                Ok(mut idx) => idx.add_excluded_file(&relative),
+                Err(e) => {
+                    tracing::error!("index lock poisoned: {e}");
+                    return false;
+                }
+            }
+        } else {
+            tracing::debug!(path = %relative.display(), "removing excluded note tracking");
+            match index.write() {
+                Ok(mut idx) => idx.remove_file(&relative),
+                Err(e) => {
+                    tracing::error!("index lock poisoned: {e}");
+                    return false;
+                }
+            }
+        }
+
+        if let Some(tv) = tantivy {
+            if let Err(e) = tv.remove_file_batch(&relative) {
+                tracing::warn!(path = %relative.display(), error = %e, "tantivy remove failed");
+                return false;
+            }
+            return true;
+        }
+        return false;
+    }
 
     if absolute.exists() {
         tracing::debug!(path = %relative.display(), "reindexing (create/modify)");
@@ -413,96 +486,67 @@ mod tests {
         PathBuf::from("/tmp/test-vault")
     }
 
-    fn empty_exclude() -> ExcludeSet {
-        ExcludeSet::build(vec![]).unwrap()
-    }
-
     #[test]
     fn filters_obsidian_directory() {
         let root = vault();
-        let exclude = empty_exclude();
         assert!(!should_process_path(
             &root,
             &root.join(".obsidian/plugins/foo.json"),
-            &exclude,
         ));
         assert!(!should_process_path(
             &root,
             &root.join(".obsidian/workspace.json"),
-            &exclude,
         ));
     }
 
     #[test]
     fn filters_obsidian_mcp_directory() {
         let root = vault();
-        let exclude = empty_exclude();
         assert!(!should_process_path(
             &root,
             &root.join(".obsidian-mcp/config.json"),
-            &exclude,
         ));
         assert!(!should_process_path(
             &root,
             &root.join(".obsidian-mcp/ignore"),
-            &exclude,
         ));
     }
 
     #[test]
     fn filters_non_markdown_files() {
         let root = vault();
-        let exclude = empty_exclude();
-        assert!(!should_process_path(
-            &root,
-            &root.join("image.png"),
-            &exclude
-        ));
-        assert!(!should_process_path(
-            &root,
-            &root.join("data.json"),
-            &exclude
-        ));
+        assert!(!should_process_path(&root, &root.join("image.png")));
+        assert!(!should_process_path(&root, &root.join("data.json")));
         assert!(!should_process_path(
             &root,
             &root.join("subfolder/script.js"),
-            &exclude,
         ));
     }
 
     #[test]
     fn accepts_markdown_files() {
         let root = vault();
-        let exclude = empty_exclude();
-        assert!(should_process_path(&root, &root.join("note.md"), &exclude));
+        assert!(should_process_path(&root, &root.join("note.md")));
         assert!(should_process_path(
             &root,
             &root.join("subfolder/deep/note.md"),
-            &exclude,
         ));
     }
 
     #[test]
     fn accepts_uppercase_markdown_extension() {
         let root = vault();
-        let exclude = empty_exclude();
-        assert!(should_process_path(&root, &root.join("NOTE.MD"), &exclude));
-        assert!(should_process_path(&root, &root.join("Mixed.Md"), &exclude));
-        assert!(should_process_path(
-            &root,
-            &root.join("subfolder/CAPS.MD"),
-            &exclude,
-        ));
+        assert!(should_process_path(&root, &root.join("NOTE.MD")));
+        assert!(should_process_path(&root, &root.join("Mixed.Md")));
+        assert!(should_process_path(&root, &root.join("subfolder/CAPS.MD"),));
     }
 
     #[test]
     fn filters_paths_outside_vault() {
         let root = vault();
-        let exclude = empty_exclude();
         assert!(!should_process_path(
             &root,
             Path::new("/other/place/note.md"),
-            &exclude,
         ));
     }
 
@@ -525,34 +569,31 @@ mod tests {
     }
 
     #[test]
-    fn filters_excluded_paths() {
+    fn accepts_excluded_markdown_paths_for_tracking() {
         let root = vault();
         let exclude = ExcludeSet::build(vec!["Archive/".into()]).unwrap();
-        assert!(!should_process_path(
+        assert!(should_process_path(&root, &root.join("Archive/note.md")));
+        assert!(should_process_path(
             &root,
-            &root.join("Archive/note.md"),
-            &exclude,
+            &root.join("Archive/sub/deep.md")
         ));
-        assert!(!should_process_path(
-            &root,
-            &root.join("Archive/sub/deep.md"),
-            &exclude,
-        ));
+        assert!(is_excluded_path(&exclude, Path::new("Archive/note.md")));
+        assert!(is_excluded_path(&exclude, Path::new("Archive/sub/deep.md")));
     }
 
     #[test]
     fn accepts_non_excluded_paths() {
         let root = vault();
         let exclude = ExcludeSet::build(vec!["Archive/".into()]).unwrap();
-        assert!(should_process_path(
-            &root,
-            &root.join("Active/note.md"),
-            &exclude,
-        ));
+        assert!(should_process_path(&root, &root.join("Active/note.md"),));
         assert!(should_process_path(
             &root,
             &root.join("Daily/2024-01-01.md"),
+        ));
+        assert!(!is_excluded_path(&exclude, Path::new("Active/note.md")));
+        assert!(!is_excluded_path(
             &exclude,
+            Path::new("Daily/2024-01-01.md")
         ));
     }
 
@@ -570,6 +611,60 @@ mod tests {
         {
             start_watcher(vault_root, index, None, exclude)
         }
+    }
+
+    fn call_process_event(
+        vault_root: &Path,
+        index: &Arc<RwLock<VaultIndex>>,
+        absolute: &Path,
+        exclude: &ExcludeSet,
+    ) {
+        #[cfg(has_embeddings)]
+        {
+            let _ = process_event(vault_root, index, None, None, None, absolute, exclude);
+        }
+        #[cfg(not(has_embeddings))]
+        {
+            let _ = process_event(vault_root, index, None, absolute, exclude);
+        }
+    }
+
+    #[tokio::test]
+    async fn excluded_create_event_updates_stats_without_indexing() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault_root = dir.path();
+        std::fs::create_dir_all(vault_root.join("Archive")).unwrap();
+        let path = vault_root.join("Archive/hidden.md");
+        std::fs::write(&path, "# Hidden\n").unwrap();
+
+        let index = Arc::new(RwLock::new(VaultIndex::empty()));
+        let exclude = ExcludeSet::build(vec!["Archive/".into()]).unwrap();
+
+        call_process_event(vault_root, &index, &path, &exclude);
+
+        let idx = index.read().unwrap();
+        assert_eq!(idx.stats().excluded_notes, 1);
+        assert!(idx.get_note(Path::new("Archive/hidden.md")).is_none());
+    }
+
+    #[tokio::test]
+    async fn excluded_delete_event_clears_stats_tracking() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault_root = dir.path();
+        std::fs::create_dir_all(vault_root.join("Archive")).unwrap();
+        let path = vault_root.join("Archive/hidden.md");
+        std::fs::write(&path, "# Hidden\n").unwrap();
+
+        let index = Arc::new(RwLock::new(VaultIndex::empty()));
+        let exclude = ExcludeSet::build(vec!["Archive/".into()]).unwrap();
+
+        call_process_event(vault_root, &index, &path, &exclude);
+        std::fs::remove_file(&path).unwrap();
+        call_process_event(vault_root, &index, &path, &exclude);
+
+        let idx = index.read().unwrap();
+        assert_eq!(idx.stats().excluded_notes, 0);
+        assert!(idx.get_note(Path::new("Archive/hidden.md")).is_none());
     }
 
     #[tokio::test]

@@ -531,6 +531,8 @@ Control which tools are exposed via the `OBSIDIAN_TOOLS` environment variable or
 | `OBSIDIAN_LOG_LEVEL` | No | `info` | `trace`, `debug`, `info`, `warn`, `error` |
 | `OBSIDIAN_TANTIVY` | No | `true` | BM25 full-text index |
 | `OBSIDIAN_TOOLS` | No | `full` | Tool filtering: profile name, comma-separated allow-list, or `!`-prefixed deny-list |
+| `OBSIDIAN_MCP_DATA` | No | `{vault}/.obsidian-mcp` | External obsidian-mcp data directory. When set, cache/config data is stored under `{value}/vaults/{vault_slug}/` and merged with vault-local config |
+| `OBSIDIAN_EXCLUDE_PATHS` | No | *(empty)* | Comma-separated glob patterns excluded from indexing, search, graph, and stats. Merged with `.obsidian-mcp/ignore`; restart after changing ignore files |
 | `OBSIDIAN_EMBEDDINGS` | No | `false` | Semantic embedding search (requires `embeddings` or `embeddings-api` feature) |
 | `OBSIDIAN_EMBEDDINGS_MODEL` | No | `BAAI/bge-small-en-v1.5` | HuggingFace model for embeddings |
 | `OBSIDIAN_EMBEDDING_PROVIDER` | No | *(infer)* | Embedding backend: `local` (fastembed) or `api` (OpenAI-compatible) |

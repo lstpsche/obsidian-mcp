@@ -1203,6 +1203,22 @@ mod vault_semantic_search {
             .expect("open vault with embeddings")
     }
 
+    async fn wait_for_semantic_hit(
+        vault: &Vault,
+        query: &str,
+        top_k: usize,
+        path: &Path,
+    ) -> Vec<(PathBuf, f32)> {
+        for _ in 0..20 {
+            let results = vault.search_semantic(query, top_k).unwrap();
+            if results.iter().any(|(p, _)| p == path) {
+                return results;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        vault.search_semantic(query, top_k).unwrap()
+    }
+
     #[tokio::test]
     async fn search_semantic_returns_results() {
         let (_tmp, _vault) = copy_fixture_to_temp().await;
@@ -1254,7 +1270,8 @@ mod vault_semantic_search {
             )
             .unwrap();
 
-        let results = vault.search_semantic("memory safe programming", 5).unwrap();
+        let results =
+            wait_for_semantic_hit(&vault, "memory safe programming", 5, Path::new("rust.md")).await;
         assert!(
             results.iter().any(|(p, _)| p == Path::new("rust.md")),
             "newly written note should appear in semantic search"
@@ -1430,6 +1447,42 @@ mod semantic_tool_runtime_modes {
             .as_str()
     }
 
+    async fn wait_for_local_tool_hit(
+        vault: &Vault,
+        runtime: &SemanticRuntime,
+        query: &str,
+        expected_path: &str,
+    ) -> Vec<serde_json::Value> {
+        for _ in 0..20 {
+            let result = search_semantic(
+                vault,
+                SearchSemanticParams {
+                    query: query.to_string(),
+                    top_k: Some(5),
+                    include_content: Some(false),
+                    lexical_prefetch: Some(false),
+                    alpha: None,
+                },
+                0.25,
+                runtime,
+            )
+            .await
+            .expect("auto mode should fall back to local backend");
+            let parsed: Vec<serde_json::Value> =
+                serde_json::from_str(extract_text(&result)).expect("parse semantic result");
+            if parsed.iter().any(|entry| {
+                entry
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|path| path == expected_path)
+            }) {
+                return parsed;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        Vec::new()
+    }
+
     #[tokio::test]
     async fn daemon_mode_preserves_semantic_result_schema() {
         let _guard = MODEL_LOCK.lock().await;
@@ -1509,22 +1562,7 @@ mod semantic_tool_runtime_modes {
             prefetch_count: 50,
         };
 
-        let result = search_semantic(
-            &vault,
-            SearchSemanticParams {
-                query: "memory safety".to_string(),
-                top_k: Some(5),
-                include_content: Some(false),
-                lexical_prefetch: Some(false),
-                alpha: None,
-            },
-            0.25,
-            &runtime,
-        )
-        .await
-        .expect("auto mode should fall back to local backend");
-        let parsed: Vec<serde_json::Value> =
-            serde_json::from_str(extract_text(&result)).expect("parse semantic result");
+        let parsed = wait_for_local_tool_hit(&vault, &runtime, "memory safety", "local.md").await;
         assert!(!parsed.is_empty());
         assert!(
             parsed.iter().any(|entry| {
