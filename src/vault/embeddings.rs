@@ -44,6 +44,11 @@ pub struct EmbeddingStore {
     /// embed input is unchanged (see `build_or_load_embedding_store`).
     hashes: HashMap<PathBuf, u64>,
     dim: usize,
+    /// Identity of the model whose vectors this store holds (see
+    /// `EmbeddingModel::model_id`). `None` for stores that were never associated
+    /// with a model (e.g. unit-test fixtures). Persisted so a cold start can
+    /// invalidate the cache on a same-dimension model swap.
+    model_id: Option<String>,
 }
 
 /// Serde-friendly intermediate for bincode persistence.
@@ -56,6 +61,9 @@ pub struct EmbeddingStore {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct EmbeddingCacheData {
     dim: usize,
+    /// Identity of the model that produced these vectors (see
+    /// `EmbeddingModel::model_id`); `None` on stores never bound to a model.
+    model_id: Option<String>,
     entries: Vec<(String, u64, Vec<f32>)>,
 }
 
@@ -81,7 +89,18 @@ impl EmbeddingStore {
             embeddings: HashMap::new(),
             hashes: HashMap::new(),
             dim,
+            model_id: None,
         }
+    }
+
+    /// Record the identity of the model whose vectors this store holds.
+    pub fn set_model_id(&mut self, model_id: impl Into<String>) {
+        self.model_id = Some(model_id.into());
+    }
+
+    /// The identity of the model whose vectors this store holds, if known.
+    pub fn model_id(&self) -> Option<&str> {
+        self.model_id.as_deref()
     }
 
     /// Insert or replace the embedding for a note, recording the hash of the
@@ -160,6 +179,7 @@ impl EmbeddingStore {
     pub fn save(&self, path: &Path) -> VaultResult<()> {
         let data = EmbeddingCacheData {
             dim: self.dim,
+            model_id: self.model_id.clone(),
             entries: self
                 .embeddings
                 .iter()
@@ -210,6 +230,7 @@ impl EmbeddingStore {
             embeddings,
             hashes,
             dim: data.dim,
+            model_id: data.model_id,
         })
     }
 }
@@ -236,6 +257,11 @@ enum EmbeddingBackend {
 pub struct EmbeddingModel {
     backend: EmbeddingBackend,
     dim: usize,
+    /// Stable identity of the loaded model (backend + model name). Written into
+    /// the embedding cache so a cold start can detect a model swap even when the
+    /// new model has the same dimension, and rebuild rather than reuse vectors
+    /// from a different vector space.
+    model_id: String,
 }
 
 impl EmbeddingModel {
@@ -285,6 +311,11 @@ impl EmbeddingModel {
         self.dim
     }
 
+    /// Stable identity of the loaded model (see `model_id` field).
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
     // ── Local backend (fastembed) ──────────────────────────────────────
 
     #[cfg(feature = "embeddings")]
@@ -298,6 +329,7 @@ impl EmbeddingModel {
                 .map(|info| info.dim)
                 .unwrap_or(384);
 
+            let model_id = format!("local:{model_enum:?}");
             let options = fastembed::InitOptions::new(model_enum).with_show_download_progress(true);
 
             let inner = fastembed::TextEmbedding::try_new(options)
@@ -306,6 +338,7 @@ impl EmbeddingModel {
             Ok(Self {
                 backend: EmbeddingBackend::Local(Box::new(std::sync::Mutex::new(inner))),
                 dim,
+                model_id,
             })
         })
         .await
@@ -342,6 +375,7 @@ impl EmbeddingModel {
 
             let model = read_env_with_fallback("OBSIDIAN_EMBEDDING_API_MODEL", "OPENAI_MODEL")
                 .unwrap_or(model_name);
+            let model_id = format!("api:{model}");
 
             let client = build_api_client()?;
 
@@ -371,6 +405,7 @@ impl EmbeddingModel {
                     api_key,
                 },
                 dim,
+                model_id,
             })
         })
         .await
@@ -626,38 +661,66 @@ pub(crate) fn build_or_load_embedding_store(
     note_entries: &[(PathBuf, crate::models::NoteMetadata)],
     model: &EmbeddingModel,
 ) -> VaultResult<EmbeddingStore> {
-    // A cache is reusable only if its embedding dimension matches the model's;
-    // otherwise its vectors are meaningless and we rebuild from scratch.
+    // A cache is reusable only if it was produced by the SAME model — same
+    // dimension AND same model identity. A same-dimension model swap would
+    // otherwise silently mix vectors from two different vector spaces.
     let cached = EmbeddingStore::load(cache_path)
         .ok()
-        .filter(|c| c.dim() == model.dim());
+        .filter(|c| c.dim() == model.dim() && c.model_id() == Some(model.model_id()));
 
     // Prepare embed text + hash for every current note. Reading all note files
     // is cheap (filesystem cache); the cost this avoids is model inference.
-    let prepared: Vec<(PathBuf, String, u64)> = note_entries
-        .iter()
-        .filter_map(|(path, meta)| {
-            let content = super::fs::read_file(vault_root, path).ok()?;
-            let body = super::frontmatter::get_body(&content);
-            let heading_texts: Vec<String> = meta.headings.iter().map(|h| h.text.clone()).collect();
-            let text = prepare_embed_text(&meta.title, &heading_texts, body);
-            let hash = embed_text_hash(&text);
-            Some((path.clone(), text, hash))
-        })
-        .collect();
+    //
+    // A note that is still indexed but whose file read fails *transiently* must
+    // NOT be mistaken for a removal — dropping its cached vector would delete a
+    // good embedding (and force a re-embed) over a momentary I/O blip. So on a
+    // read failure we preserve the cached vector if we have one, and only skip
+    // (cannot embed) a note that is both unreadable and uncached.
+    let mut prepared: Vec<(PathBuf, String, u64)> = Vec::new();
+    let mut carried: Vec<(PathBuf, Vec<f32>, u64)> = Vec::new();
+    for (path, meta) in note_entries {
+        match super::fs::read_file(vault_root, path) {
+            Ok(content) => {
+                let body = super::frontmatter::get_body(&content);
+                let heading_texts: Vec<String> =
+                    meta.headings.iter().map(|h| h.text.clone()).collect();
+                let text = prepare_embed_text(&meta.title, &heading_texts, body);
+                let hash = embed_text_hash(&text);
+                prepared.push((path.clone(), text, hash));
+            }
+            Err(err) => match cached.as_ref().and_then(|c| {
+                c.get(path)
+                    .map(|vec| (vec.to_vec(), c.hash_of(path).unwrap_or(0)))
+            }) {
+                Some((vec, hash)) => {
+                    tracing::warn!(path = %path.display(), error = %err,
+                        "note read failed at cold start; preserving cached embedding");
+                    carried.push((path.clone(), vec, hash));
+                }
+                None => {
+                    tracing::warn!(path = %path.display(), error = %err,
+                        "note read failed at cold start and not cached; skipping");
+                }
+            },
+        }
+    }
 
     let (reuse, to_embed) = partition_reusable(cached.as_ref(), &prepared);
 
     tracing::info!(
         cache = %cache_path.display(),
-        total = prepared.len(),
-        reused = reuse.len(),
+        total = note_entries.len(),
+        reused = reuse.len() + carried.len(),
         to_embed = to_embed.len(),
         had_cache = cached.is_some(),
         "refreshing embedding store"
     );
 
     let mut store = EmbeddingStore::new(model.dim());
+    store.set_model_id(model.model_id());
+    for (path, vec, hash) in carried {
+        store.insert(path, vec, hash);
+    }
     for (path, vec, hash) in reuse {
         store.insert(path, vec, hash);
     }
@@ -939,6 +1002,18 @@ mod tests {
         assert_eq!(loaded.hash_of(Path::new("a.md")), Some(10));
         assert_eq!(loaded.hash_of(Path::new("b.md")), Some(20));
         assert_eq!(loaded.hash_of(Path::new("c.md")), Some(30));
+    }
+
+    #[test]
+    fn persistence_preserves_model_id() {
+        let mut store = make_store();
+        assert_eq!(store.model_id(), None);
+        store.set_model_id("local:BGESmallENV15");
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("embeddings.bin");
+        store.save(&cache_path).unwrap();
+        let loaded = EmbeddingStore::load(&cache_path).unwrap();
+        assert_eq!(loaded.model_id(), Some("local:BGESmallENV15"));
     }
 
     #[test]
