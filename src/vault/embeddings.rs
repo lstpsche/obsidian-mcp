@@ -329,6 +329,11 @@ impl EmbeddingModel {
                 .map(|info| info.dim)
                 .unwrap_or(384);
 
+            // Identity is the fastembed variant. Stable across restarts of a
+            // given binary (verified); a variant *rename* forces a safe rebuild.
+            // Known limitation: a fastembed upgrade that keeps a variant's name
+            // but changes its weights/tokenization would keep this key and reuse
+            // stale vectors — clear the cache dir after such an upgrade.
             let model_id = format!("local:{model_enum:?}");
             let options = fastembed::InitOptions::new(model_enum).with_show_download_progress(true);
 
@@ -375,7 +380,9 @@ impl EmbeddingModel {
 
             let model = read_env_with_fallback("OBSIDIAN_EMBEDDING_API_MODEL", "OPENAI_MODEL")
                 .unwrap_or(model_name);
-            let model_id = format!("api:{model}");
+            // Identity includes the endpoint: the same model name at a different
+            // base URL is a different vector space, so both must key the cache.
+            let model_id = format!("api:{base_url}:{model}");
 
             let client = build_api_client()?;
 
