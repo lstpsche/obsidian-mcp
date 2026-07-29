@@ -48,11 +48,12 @@ pub(crate) fn embed_note(
     let body = frontmatter::get_body(&content);
     let heading_texts: Vec<String> = meta.headings.iter().map(|h| h.text.clone()).collect();
     let text = embeddings::prepare_embed_text(&meta.title, &heading_texts, body);
+    let hash = embeddings::embed_text_hash(&text);
 
     match model.embed_one(&text) {
         Ok(vector) => match store.write() {
             Ok(mut store_guard) => {
-                store_guard.insert(relative.to_path_buf(), vector);
+                store_guard.insert(relative.to_path_buf(), vector, hash);
                 true
             }
             Err(err) => {

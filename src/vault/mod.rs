@@ -965,6 +965,7 @@ impl Vault {
         let body = frontmatter::get_body(&content);
         let heading_texts: Vec<String> = meta.headings.iter().map(|h| h.text.clone()).collect();
         let text = embeddings::prepare_embed_text(&meta.title, &heading_texts, body);
+        let text_hash = embeddings::embed_text_hash(&text);
         drop(idx);
 
         let model = Arc::clone(model);
@@ -987,7 +988,7 @@ impl Vault {
                 }
 
                 let mut s = store.write().unwrap_or_else(|e| e.into_inner());
-                s.insert(path_owned.clone(), vec);
+                s.insert(path_owned.clone(), vec, text_hash);
                 drop(s);
                 let cache_path = Self::embedding_cache_path(&mcp_data);
                 let s = store.read().unwrap_or_else(|e| e.into_inner());

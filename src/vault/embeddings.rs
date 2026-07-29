@@ -39,15 +39,39 @@ pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// n=5000 this is ~2M multiply-adds, well under 5ms on modern hardware.
 pub struct EmbeddingStore {
     embeddings: HashMap<PathBuf, Vec<f32>>,
+    /// Stable content hash of each note's prepared embed text, kept in lockstep
+    /// with `embeddings`. Lets a cold start reuse a cached vector when a note's
+    /// embed input is unchanged (see `build_or_load_embedding_store`).
+    hashes: HashMap<PathBuf, u64>,
     dim: usize,
 }
 
 /// Serde-friendly intermediate for bincode persistence.
 /// Avoids `PathBuf` encoding issues by converting to `String`.
+///
+/// The per-entry `u64` is the prepared-embed-text hash (see `embed_text_hash`).
+/// This is a format change from the pre-incremental cache; an older cache fails
+/// to deserialize and is treated as absent, forcing one full rebuild that then
+/// writes the hashed format (incremental from then on).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct EmbeddingCacheData {
     dim: usize,
-    entries: Vec<(String, Vec<f32>)>,
+    entries: Vec<(String, u64, Vec<f32>)>,
+}
+
+/// Stable 64-bit hash of a note's prepared embed text, used only to detect
+/// whether the embedding input changed between runs. Derived from SHA-256
+/// (already a dependency) so it is deterministic across processes and std
+/// versions — unlike `DefaultHasher`, whose seed is not guaranteed stable.
+/// Not security-sensitive: a collision only risks reusing one stale vector.
+pub(crate) fn embed_text_hash(text: &str) -> u64 {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(text.as_bytes());
+    u64::from_le_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 digest is 32 bytes, so [..8] always fits"),
+    )
 }
 
 impl EmbeddingStore {
@@ -55,16 +79,19 @@ impl EmbeddingStore {
     pub fn new(dim: usize) -> Self {
         Self {
             embeddings: HashMap::new(),
+            hashes: HashMap::new(),
             dim,
         }
     }
 
-    /// Insert or replace the embedding for a note.
+    /// Insert or replace the embedding for a note, recording the hash of the
+    /// prepared embed text (see `embed_text_hash`) so a later cold start can
+    /// tell whether the note's embedding input changed.
     ///
-    /// Vectors with a dimension mismatch are rejected (logged + skipped)
-    /// to prevent garbage cosine-similarity results from a misconfigured
-    /// API backend.
-    pub fn insert(&mut self, path: PathBuf, vec: Vec<f32>) {
+    /// Vectors with a dimension mismatch are rejected (logged + skipped, and
+    /// no hash is recorded) to prevent garbage cosine-similarity results from
+    /// a misconfigured API backend.
+    pub fn insert(&mut self, path: PathBuf, vec: Vec<f32>, hash: u64) {
         if vec.len() != self.dim {
             tracing::warn!(
                 path = %path.display(),
@@ -74,17 +101,24 @@ impl EmbeddingStore {
             );
             return;
         }
+        self.hashes.insert(path.clone(), hash);
         self.embeddings.insert(path, vec);
     }
 
-    /// Remove a note's embedding.
+    /// Remove a note's embedding (and its recorded hash).
     pub fn remove(&mut self, path: &Path) {
         self.embeddings.remove(path);
+        self.hashes.remove(path);
     }
 
     /// Retrieve a note's embedding vector.
     pub fn get(&self, path: &Path) -> Option<&[f32]> {
         self.embeddings.get(path).map(|v| v.as_slice())
+    }
+
+    /// The recorded embed-text hash for a note, if present.
+    pub fn hash_of(&self, path: &Path) -> Option<u64> {
+        self.hashes.get(path).copied()
     }
 
     pub fn len(&self) -> usize {
@@ -129,7 +163,13 @@ impl EmbeddingStore {
             entries: self
                 .embeddings
                 .iter()
-                .map(|(p, v)| (p.to_string_lossy().into_owned(), v.clone()))
+                .map(|(p, v)| {
+                    (
+                        p.to_string_lossy().into_owned(),
+                        self.hashes.get(p).copied().unwrap_or(0),
+                        v.clone(),
+                    )
+                })
                 .collect(),
         };
         let bytes = bincode::serde::encode_to_vec(&data, bincode::config::standard())
@@ -150,7 +190,8 @@ impl EmbeddingStore {
                 .map_err(|e| VaultError::Embedding(format!("cache deserialize error: {e}")))?;
 
         let mut embeddings = HashMap::with_capacity(data.entries.len());
-        for (path_str, vec) in data.entries {
+        let mut hashes = HashMap::with_capacity(data.entries.len());
+        for (path_str, hash, vec) in data.entries {
             if vec.len() != data.dim {
                 tracing::warn!(
                     path = %path_str,
@@ -160,11 +201,14 @@ impl EmbeddingStore {
                 );
                 continue;
             }
-            embeddings.insert(PathBuf::from(path_str), vec);
+            let path = PathBuf::from(path_str);
+            hashes.insert(path.clone(), hash);
+            embeddings.insert(path, vec);
         }
 
         Ok(Self {
             embeddings,
+            hashes,
             dim: data.dim,
         })
     }
@@ -528,7 +572,50 @@ fn parse_usize_env(var_name: &str) -> Option<usize> {
 
 const BATCH_SIZE: usize = 64;
 
-/// Load cached embeddings or rebuild from note entries.
+/// Split the current notes into those whose cached embedding can be reused
+/// (embed input unchanged since the cache was written) and those that must be
+/// (re-)embedded (new note, or embed text changed). Paths present in `cached`
+/// but absent from `prepared` are simply not carried forward (removed notes).
+///
+/// Pure and model-free so the incremental decision can be unit-tested without
+/// a real embedding backend.
+#[allow(clippy::type_complexity)]
+fn partition_reusable<'a>(
+    cached: Option<&EmbeddingStore>,
+    prepared: &'a [(PathBuf, String, u64)],
+) -> (Vec<(PathBuf, Vec<f32>, u64)>, Vec<&'a (PathBuf, String, u64)>) {
+    let mut reuse: Vec<(PathBuf, Vec<f32>, u64)> = Vec::new();
+    let mut embed: Vec<&'a (PathBuf, String, u64)> = Vec::new();
+
+    for entry in prepared {
+        let (path, _text, hash) = entry;
+        let reused = cached.and_then(|c| {
+            if c.hash_of(path) == Some(*hash) {
+                c.get(path).map(|vec| vec.to_vec())
+            } else {
+                None
+            }
+        });
+        match reused {
+            Some(vec) => reuse.push((path.clone(), vec, *hash)),
+            None => embed.push(entry),
+        }
+    }
+
+    (reuse, embed)
+}
+
+/// Load cached embeddings and refresh them incrementally from note entries.
+///
+/// Only notes that are new or whose prepared embed text changed since the
+/// cache was written are (re-)embedded; unchanged notes reuse their cached
+/// vector, and removed notes are dropped. This turns a cold start on a vault
+/// that changed by a handful of notes from a full re-embed of every note
+/// (previously triggered by any note-count change) into embedding only the
+/// deltas — the difference between a ~1-minute and a sub-second startup on a
+/// large vault. The embed input hash (not raw content) is the reuse key, so a
+/// change that doesn't alter the prepared text (e.g. frontmatter-only, or body
+/// beyond the truncation limit) correctly reuses the cached vector.
 ///
 /// The caller is responsible for lock acquisition on the index — this
 /// function receives pre-extracted note entries to stay decoupled from
@@ -539,41 +626,48 @@ pub(crate) fn build_or_load_embedding_store(
     note_entries: &[(PathBuf, crate::models::NoteMetadata)],
     model: &EmbeddingModel,
 ) -> VaultResult<EmbeddingStore> {
-    if let Ok(store) = EmbeddingStore::load(cache_path) {
-        if store.dim() == model.dim() && store.len() == note_entries.len() {
-            tracing::info!(
-                cache = %cache_path.display(),
-                cached = store.len(),
-                "loaded embedding cache"
-            );
-            return Ok(store);
-        }
-        tracing::info!(
-            cache = %cache_path.display(),
-            cached = store.len(),
-            current = note_entries.len(),
-            "embedding cache stale, rebuilding"
-        );
-    }
+    // A cache is reusable only if its embedding dimension matches the model's;
+    // otherwise its vectors are meaningless and we rebuild from scratch.
+    let cached = EmbeddingStore::load(cache_path)
+        .ok()
+        .filter(|c| c.dim() == model.dim());
 
-    let entries: Vec<(PathBuf, String)> = note_entries
+    // Prepare embed text + hash for every current note. Reading all note files
+    // is cheap (filesystem cache); the cost this avoids is model inference.
+    let prepared: Vec<(PathBuf, String, u64)> = note_entries
         .iter()
         .filter_map(|(path, meta)| {
             let content = super::fs::read_file(vault_root, path).ok()?;
             let body = super::frontmatter::get_body(&content);
             let heading_texts: Vec<String> = meta.headings.iter().map(|h| h.text.clone()).collect();
             let text = prepare_embed_text(&meta.title, &heading_texts, body);
-            Some((path.clone(), text))
+            let hash = embed_text_hash(&text);
+            Some((path.clone(), text, hash))
         })
         .collect();
 
+    let (reuse, to_embed) = partition_reusable(cached.as_ref(), &prepared);
+
+    tracing::info!(
+        cache = %cache_path.display(),
+        total = prepared.len(),
+        reused = reuse.len(),
+        to_embed = to_embed.len(),
+        had_cache = cached.is_some(),
+        "refreshing embedding store"
+    );
+
     let mut store = EmbeddingStore::new(model.dim());
-    for chunk in entries.chunks(BATCH_SIZE) {
-        let texts: Vec<&str> = chunk.iter().map(|(_, text)| text.as_str()).collect();
+    for (path, vec, hash) in reuse {
+        store.insert(path, vec, hash);
+    }
+
+    for chunk in to_embed.chunks(BATCH_SIZE) {
+        let texts: Vec<&str> = chunk.iter().map(|(_, text, _)| text.as_str()).collect();
         match model.embed_batch(&texts) {
             Ok(vectors) => {
-                for ((path, _), vector) in chunk.iter().zip(vectors) {
-                    store.insert(path.clone(), vector);
+                for ((path, _, hash), vector) in chunk.iter().zip(vectors) {
+                    store.insert(path.clone(), vector, *hash);
                 }
             }
             Err(err) => {
@@ -582,7 +676,15 @@ pub(crate) fn build_or_load_embedding_store(
         }
     }
 
-    if let Err(err) = store.save(cache_path) {
+    // Persist only when the store actually changed vs the loaded cache, so an
+    // unchanged vault doesn't rewrite an identical cache file every startup.
+    let changed = match &cached {
+        None => true,
+        Some(c) => !to_embed.is_empty() || c.len() != store.len(),
+    };
+    if changed
+        && let Err(err) = store.save(cache_path)
+    {
         tracing::warn!(error = %err, "failed to save embedding cache");
     }
 
@@ -709,9 +811,9 @@ mod tests {
 
     fn make_store() -> EmbeddingStore {
         let mut store = EmbeddingStore::new(3);
-        store.insert(PathBuf::from("a.md"), vec![1.0, 0.0, 0.0]);
-        store.insert(PathBuf::from("b.md"), vec![0.0, 1.0, 0.0]);
-        store.insert(PathBuf::from("c.md"), vec![0.7, 0.7, 0.0]);
+        store.insert(PathBuf::from("a.md"), vec![1.0, 0.0, 0.0], 10);
+        store.insert(PathBuf::from("b.md"), vec![0.0, 1.0, 0.0], 20);
+        store.insert(PathBuf::from("c.md"), vec![0.7, 0.7, 0.0], 30);
         store
     }
 
@@ -754,7 +856,7 @@ mod tests {
         let results = store.query(&query, 10);
         assert!(!results.iter().any(|(p, _)| p == Path::new("a.md")));
 
-        store.insert(PathBuf::from("d.md"), vec![0.9, 0.1, 0.0]);
+        store.insert(PathBuf::from("d.md"), vec![0.9, 0.1, 0.0], 40);
         assert_eq!(store.len(), 3);
         let results = store.query(&query, 1);
         assert_eq!(results[0].0, PathBuf::from("d.md"));
@@ -797,6 +899,83 @@ mod tests {
         assert!(store.is_empty());
         let results = store.query(&[1.0, 0.0, 0.0], 10);
         assert!(results.is_empty());
+    }
+
+    // ── incremental cache: hashing + reuse partition ───────────────
+
+    #[test]
+    fn embed_text_hash_is_deterministic_and_content_sensitive() {
+        assert_eq!(embed_text_hash("hello world"), embed_text_hash("hello world"));
+        assert_ne!(embed_text_hash("hello world"), embed_text_hash("hello  world"));
+        assert_ne!(embed_text_hash("a"), embed_text_hash("b"));
+    }
+
+    #[test]
+    fn insert_records_hash_and_remove_clears_it() {
+        let mut store = EmbeddingStore::new(3);
+        store.insert(PathBuf::from("a.md"), vec![1.0, 0.0, 0.0], 42);
+        assert_eq!(store.hash_of(Path::new("a.md")), Some(42));
+        store.remove(Path::new("a.md"));
+        assert_eq!(store.hash_of(Path::new("a.md")), None);
+        assert!(store.get(Path::new("a.md")).is_none());
+    }
+
+    #[test]
+    fn dim_mismatch_insert_records_no_hash() {
+        let mut store = EmbeddingStore::new(3);
+        // Wrong length: rejected, and no hash should linger.
+        store.insert(PathBuf::from("bad.md"), vec![1.0, 0.0], 7);
+        assert!(store.get(Path::new("bad.md")).is_none());
+        assert_eq!(store.hash_of(Path::new("bad.md")), None);
+    }
+
+    #[test]
+    fn persistence_preserves_hashes() {
+        let store = make_store();
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("embeddings.bin");
+        store.save(&cache_path).unwrap();
+        let loaded = EmbeddingStore::load(&cache_path).unwrap();
+        assert_eq!(loaded.hash_of(Path::new("a.md")), Some(10));
+        assert_eq!(loaded.hash_of(Path::new("b.md")), Some(20));
+        assert_eq!(loaded.hash_of(Path::new("c.md")), Some(30));
+    }
+
+    #[test]
+    fn partition_reuses_unchanged_embeds_changed_and_new() {
+        // Cache holds a.md (hash 10) and b.md (hash 20).
+        let cached = make_store(); // a=10, b=20, c=30
+        let prepared = vec![
+            (PathBuf::from("a.md"), "text a".to_string(), 10), // unchanged -> reuse
+            (PathBuf::from("b.md"), "text b changed".to_string(), 99), // changed -> embed
+            (PathBuf::from("new.md"), "brand new".to_string(), 77), // new -> embed
+            // c.md absent from prepared -> dropped (removed note)
+        ];
+
+        let (reuse, embed) = partition_reusable(Some(&cached), &prepared);
+
+        let reuse_paths: Vec<_> = reuse.iter().map(|(p, _, _)| p.clone()).collect();
+        assert_eq!(reuse_paths, vec![PathBuf::from("a.md")]);
+        // reused vector comes from the cache, with its hash carried
+        assert_eq!(reuse[0].1, vec![1.0, 0.0, 0.0]);
+        assert_eq!(reuse[0].2, 10);
+
+        let embed_paths: Vec<_> = embed.iter().map(|(p, _, _)| p.clone()).collect();
+        assert_eq!(
+            embed_paths,
+            vec![PathBuf::from("b.md"), PathBuf::from("new.md")]
+        );
+    }
+
+    #[test]
+    fn partition_without_cache_embeds_everything() {
+        let prepared = vec![
+            (PathBuf::from("a.md"), "a".to_string(), 1),
+            (PathBuf::from("b.md"), "b".to_string(), 2),
+        ];
+        let (reuse, embed) = partition_reusable(None, &prepared);
+        assert!(reuse.is_empty());
+        assert_eq!(embed.len(), 2);
     }
 
     // ── prepare_embed_text ─────────────────────────────────────────

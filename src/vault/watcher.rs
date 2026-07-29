@@ -357,10 +357,11 @@ fn embed_and_insert(
     let body = super::frontmatter::get_body(&content);
     let heading_texts: Vec<String> = meta.headings.iter().map(|h| h.text.clone()).collect();
     let text = super::embeddings::prepare_embed_text(&meta.title, &heading_texts, body);
+    let hash = super::embeddings::embed_text_hash(&text);
     match model.embed_one(&text) {
         Ok(vec) => {
             if let Ok(mut s) = store.write() {
-                s.insert(relative.to_path_buf(), vec);
+                s.insert(relative.to_path_buf(), vec, hash);
                 true
             } else {
                 false
