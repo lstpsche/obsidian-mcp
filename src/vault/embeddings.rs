@@ -15,9 +15,6 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 #[cfg(feature = "embeddings-api")]
 use std::sync::Arc;
 
-#[cfg(feature = "embeddings")]
-use fastembed::ModelTrait;
-
 use crate::config::EmbeddingProvider;
 use crate::error::{VaultError, VaultResult};
 use sha2::{Digest, Sha256};
@@ -304,7 +301,8 @@ impl EmbeddingStore {
         let identity = self.identity.as_ref().ok_or_else(|| {
             VaultError::Embedding("embedding store has no vector-space identity".into())
         })?;
-        if identity.dimension != self.dim || self.dim == 0 {
+        validate_space_identity(identity)?;
+        if identity.dimension != self.dim {
             return Err(VaultError::Embedding(
                 "embedding store identity has an invalid dimension".into(),
             ));
@@ -313,26 +311,44 @@ impl EmbeddingStore {
         let mut entries = self
             .embeddings
             .iter()
-            .filter_map(|(path, entry)| {
-                entry
-                    .content_hash
-                    .map(|content_hash| EmbeddingCacheEntryRef {
-                        path: path.to_string_lossy().into_owned(),
-                        content_hash,
-                        vector: &entry.vector,
-                    })
+            .map(|(path, entry)| {
+                let path = path.to_str().ok_or_else(|| {
+                    VaultError::Embedding(format!(
+                        "embedding cache path is not valid UTF-8: '{}'",
+                        path.display()
+                    ))
+                })?;
+                validate_cache_path(path)?;
+                validate_vector(&entry.vector, self.dim)?;
+                let content_hash = entry.content_hash.ok_or_else(|| {
+                    VaultError::Embedding(format!(
+                        "embedding cache entry '{path}' has no prepared-text hash"
+                    ))
+                })?;
+                Ok(EmbeddingCacheEntryRef {
+                    path: path.to_string(),
+                    content_hash,
+                    vector: &entry.vector,
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<VaultResult<Vec<_>>>()?;
         entries.sort_unstable_by(|left, right| left.path.cmp(&right.path));
         let data = EmbeddingCacheDataRef {
             magic: CACHE_MAGIC,
             schema_version: CACHE_SCHEMA_VERSION,
             identity,
-            first_pass_complete: self.first_pass_complete && entries.len() == self.embeddings.len(),
+            first_pass_complete: self.first_pass_complete,
             entries,
         };
-        bincode::serde::encode_to_vec(&data, bincode::config::standard())
-            .map_err(|e| VaultError::Embedding(format!("cache serialize error: {e}")))
+        let bytes = bincode::serde::encode_to_vec(&data, bincode::config::standard())
+            .map_err(|e| VaultError::Embedding(format!("cache serialize error: {e}")))?;
+        if bytes.len() as u64 > MAX_CACHE_BYTES {
+            return Err(VaultError::Embedding(format!(
+                "embedding cache is too large to persist: {} bytes (limit {MAX_CACHE_BYTES})",
+                bytes.len()
+            )));
+        }
+        Ok(bytes)
     }
 
     pub(crate) fn persist_cache_bytes_if_live(
@@ -430,11 +446,7 @@ impl EmbeddingStore {
                 data.schema_version
             )));
         }
-        if data.identity.dimension == 0 {
-            return Err(VaultError::Embedding(
-                "embedding cache dimension must be greater than zero".into(),
-            ));
-        }
+        validate_space_identity(&data.identity)?;
         if let Some(expected) = expected
             && &data.identity != expected
         {
@@ -477,6 +489,34 @@ impl EmbeddingStore {
             identity: Some(data.identity),
             first_pass_complete: data.first_pass_complete,
         })
+    }
+}
+
+fn validate_space_identity(identity: &EmbeddingSpaceIdentity) -> VaultResult<()> {
+    if identity.dimension == 0 {
+        return Err(VaultError::Embedding(
+            "embedding cache dimension must be greater than zero".into(),
+        ));
+    }
+    if identity.model.trim().is_empty() {
+        return Err(VaultError::Embedding(
+            "embedding cache model identity must not be empty".into(),
+        ));
+    }
+    if identity.input_version != EMBEDDING_INPUT_VERSION {
+        return Err(VaultError::Embedding(format!(
+            "unsupported embedding input version {}",
+            identity.input_version
+        )));
+    }
+    match (identity.backend, identity.endpoint_fingerprint) {
+        (EmbeddingBackendKind::Local, None) | (EmbeddingBackendKind::Api, Some(_)) => Ok(()),
+        (EmbeddingBackendKind::Local, Some(_)) => Err(VaultError::Embedding(
+            "local embedding cache identity must not contain an API endpoint fingerprint".into(),
+        )),
+        (EmbeddingBackendKind::Api, None) => Err(VaultError::Embedding(
+            "API embedding cache identity is missing its endpoint fingerprint".into(),
+        )),
     }
 }
 
@@ -695,14 +735,8 @@ impl EmbeddingModel {
         let model_name = model_name.to_owned();
 
         tokio::task::spawn_blocking(move || {
-            let model_enum: fastembed::EmbeddingModel = model_name.parse().map_err(|_| {
-                VaultError::Embedding(format!("unknown local embedding model '{model_name}'"))
-            })?;
-
-            let dim = fastembed::EmbeddingModel::get_model_info(&model_enum)
-                .map(|info| info.dim)
-                .unwrap_or(384);
-            let identity = EmbeddingSpaceIdentity::local(format!("{model_enum:?}"), dim);
+            let (model_enum, canonical_model, dim) = resolve_local_model(&model_name)?;
+            let identity = EmbeddingSpaceIdentity::local(canonical_model, dim);
 
             let options = fastembed::InitOptions::new(model_enum).with_show_download_progress(true);
 
@@ -755,6 +789,11 @@ impl EmbeddingModel {
                 ApiEmbeddingClient::start(client, base_url.clone(), model.clone(), api_key)?;
 
             let dim = match parse_usize_env("OBSIDIAN_EMBEDDING_DIM") {
+                Some(0) => {
+                    return Err(VaultError::Embedding(
+                        "OBSIDIAN_EMBEDDING_DIM must be greater than zero".into(),
+                    ));
+                }
                 Some(d) => {
                     tracing::info!(dim = d, "using explicit embedding dimension");
                     d
@@ -821,6 +860,58 @@ impl Embedder for EmbeddingModel {
         };
         validate_embedding_batch(vectors, texts.len(), self.dim)
     }
+}
+
+#[cfg(feature = "embeddings")]
+fn resolve_local_model(
+    configured_name: &str,
+) -> VaultResult<(fastembed::EmbeddingModel, String, usize)> {
+    let configured_name = configured_name.trim();
+    let model = match configured_name.parse().ok() {
+        Some(model) => model,
+        None => {
+            let supported = fastembed::TextEmbedding::list_supported_models();
+            let mut matches = supported
+                .iter()
+                .filter(|info| info.model_code.eq_ignore_ascii_case(configured_name))
+                .map(|info| info.model.clone())
+                .collect::<Vec<_>>();
+            if matches.is_empty()
+                && let Some(repository_name) = configured_name.split_once('/').map(|(_, name)| name)
+            {
+                matches = supported
+                    .iter()
+                    .filter(|info| {
+                        info.model_code
+                            .split_once('/')
+                            .is_some_and(|(_, name)| name.eq_ignore_ascii_case(repository_name))
+                    })
+                    .map(|info| info.model.clone())
+                    .collect();
+            }
+            match matches.as_slice() {
+                [model] => model.clone(),
+                [] => {
+                    return Err(VaultError::Embedding(format!(
+                        "unknown local embedding model '{configured_name}'"
+                    )));
+                }
+                _ => {
+                    return Err(VaultError::Embedding(format!(
+                        "ambiguous local embedding model '{configured_name}'; use a fastembed model enum name"
+                    )));
+                }
+            }
+        }
+    };
+    let info = fastembed::TextEmbedding::get_model_info(&model).map_err(|error| {
+        VaultError::Embedding(format!(
+            "embedding metadata unavailable for local model '{configured_name}': {error}"
+        ))
+    })?;
+    let canonical_model = format!("{model:?}");
+    let dimension = info.dim;
+    Ok((model, canonical_model, dimension))
 }
 
 // ── Provider resolution ────────────────────────────────────────────────
@@ -1224,6 +1315,29 @@ mod tests {
         store
     }
 
+    fn write_cache_data(path: &Path, data: &EmbeddingCacheData) {
+        let bytes = bincode::serde::encode_to_vec(data, bincode::config::standard()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn single_entry_cache(
+        identity: EmbeddingSpaceIdentity,
+        path: &str,
+        vector: Vec<f32>,
+    ) -> EmbeddingCacheData {
+        EmbeddingCacheData {
+            magic: CACHE_MAGIC,
+            schema_version: CACHE_SCHEMA_VERSION,
+            identity,
+            first_pass_complete: true,
+            entries: vec![EmbeddingCacheEntry {
+                path: path.to_string(),
+                content_hash: prepared_text_hash("cached text"),
+                vector,
+            }],
+        }
+    }
+
     #[test]
     fn query_returns_top_k_sorted() {
         let store = make_store();
@@ -1342,6 +1456,179 @@ mod tests {
     }
 
     #[test]
+    fn cache_rejects_legacy_truncated_wrong_magic_and_wrong_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("embeddings.bin");
+
+        std::fs::write(&cache_path, b"legacy cache").unwrap();
+        assert!(EmbeddingStore::load(&cache_path).is_err());
+
+        let valid = make_store().encode_cache().unwrap();
+        std::fs::write(&cache_path, &valid[..valid.len() - 1]).unwrap();
+        assert!(EmbeddingStore::load(&cache_path).is_err());
+
+        let mut wrong_magic = single_entry_cache(test_identity(3), "one.md", vec![1.0; 3]);
+        wrong_magic.magic = *b"NOTCACHE";
+        write_cache_data(&cache_path, &wrong_magic);
+        let error = EmbeddingStore::load(&cache_path).err().unwrap();
+        assert!(error.to_string().contains("legacy embedding cache"));
+
+        let mut wrong_schema = single_entry_cache(test_identity(3), "one.md", vec![1.0; 3]);
+        wrong_schema.schema_version = CACHE_SCHEMA_VERSION + 1;
+        write_cache_data(&cache_path, &wrong_schema);
+        let error = EmbeddingStore::load(&cache_path).err().unwrap();
+        assert!(error.to_string().contains("schema version"));
+    }
+
+    #[test]
+    fn cache_rejects_invalid_and_non_normalized_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("embeddings.bin");
+        let invalid_paths = [
+            "",
+            "/absolute.md",
+            "../escape.md",
+            "folder/../escape.md",
+            "./note.md",
+            "folder\\note.md",
+            "folder//note.md",
+        ];
+
+        for path in invalid_paths {
+            let data = single_entry_cache(test_identity(3), path, vec![1.0; 3]);
+            write_cache_data(&cache_path, &data);
+            assert!(
+                EmbeddingStore::load(&cache_path).is_err(),
+                "cache path should be rejected: {path:?}"
+            );
+        }
+
+        let oversized_path = format!("{}.md", "a".repeat(MAX_CACHE_PATH_BYTES));
+        let data = single_entry_cache(test_identity(3), &oversized_path, vec![1.0; 3]);
+        write_cache_data(&cache_path, &data);
+        assert!(EmbeddingStore::load(&cache_path).is_err());
+    }
+
+    #[test]
+    fn cache_rejects_invalid_identity_and_vector_dimensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("embeddings.bin");
+
+        let invalid_identities = [
+            EmbeddingSpaceIdentity {
+                dimension: 0,
+                ..test_identity(3)
+            },
+            EmbeddingSpaceIdentity {
+                model: "  ".to_string(),
+                ..test_identity(3)
+            },
+            EmbeddingSpaceIdentity {
+                input_version: EMBEDDING_INPUT_VERSION + 1,
+                ..test_identity(3)
+            },
+            EmbeddingSpaceIdentity {
+                endpoint_fingerprint: Some([7; 32]),
+                ..test_identity(3)
+            },
+            EmbeddingSpaceIdentity {
+                backend: EmbeddingBackendKind::Api,
+                endpoint_fingerprint: None,
+                ..test_identity(3)
+            },
+        ];
+        for identity in invalid_identities {
+            let dim = identity.dimension.max(1);
+            let data = single_entry_cache(identity, "one.md", vec![1.0; dim]);
+            write_cache_data(&cache_path, &data);
+            assert!(EmbeddingStore::load(&cache_path).is_err());
+        }
+
+        let data = single_entry_cache(test_identity(3), "one.md", vec![1.0; 2]);
+        write_cache_data(&cache_path, &data);
+        let error = EmbeddingStore::load(&cache_path).err().unwrap();
+        assert!(error.to_string().contains("dimension mismatch"));
+    }
+
+    #[test]
+    fn cache_load_is_bounded_by_current_vault_and_file_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("embeddings.bin");
+        let identity = test_identity(1);
+        let entries = (0..1025)
+            .map(|index| EmbeddingCacheEntry {
+                path: format!("{index}.md"),
+                content_hash: prepared_text_hash("cached text"),
+                vector: vec![1.0],
+            })
+            .collect();
+        write_cache_data(
+            &cache_path,
+            &EmbeddingCacheData {
+                magic: CACHE_MAGIC,
+                schema_version: CACHE_SCHEMA_VERSION,
+                identity: identity.clone(),
+                first_pass_complete: true,
+                entries,
+            },
+        );
+        let error = EmbeddingStore::load_for_space(&cache_path, &identity, 0)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("too many entries"));
+
+        let per_entry =
+            MAX_CACHE_PATH_BYTES + identity.dimension * std::mem::size_of::<f32>() + 128;
+        let derived_limit = 1024usize * per_entry + 1024 * 1024;
+        let file = std::fs::File::create(&cache_path).unwrap();
+        file.set_len((derived_limit + 1) as u64).unwrap();
+        let error = EmbeddingStore::load_for_space(&cache_path, &identity, 0)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn failed_encoding_preserves_previous_cache_and_success_replaces_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("embeddings.bin");
+        let original = make_store();
+        original.save(&cache_path).unwrap();
+        let original_bytes = std::fs::read(&cache_path).unwrap();
+
+        let mut invalid = EmbeddingStore::new_with_identity(test_identity(3));
+        invalid
+            .insert_hashed(
+                PathBuf::from("../escape.md"),
+                prepared_text_hash("bad"),
+                vec![1.0, 0.0, 0.0],
+            )
+            .unwrap();
+        assert!(invalid.save(&cache_path).is_err());
+        assert_eq!(std::fs::read(&cache_path).unwrap(), original_bytes);
+
+        let mut replacement = make_store();
+        replacement
+            .insert_hashed(
+                PathBuf::from("a.md"),
+                prepared_text_hash("replacement"),
+                vec![0.0, 0.0, 1.0],
+            )
+            .unwrap();
+        replacement.save(&cache_path).unwrap();
+        let loaded = EmbeddingStore::load(&cache_path).unwrap();
+        assert_eq!(loaded.get(Path::new("a.md")), Some(&[0.0, 0.0, 1.0][..]));
+    }
+
+    #[test]
+    fn cache_encoding_rejects_entries_without_hashes() {
+        let mut store = EmbeddingStore::new_with_identity(test_identity(3));
+        store.insert(PathBuf::from("one.md"), vec![1.0, 0.0, 0.0]);
+        let error = store.encode_cache().unwrap_err();
+        assert!(error.to_string().contains("prepared-text hash"));
+    }
+
+    #[test]
     fn cache_rejects_wrong_vector_space() {
         let store = make_store();
         let dir = tempfile::tempdir().unwrap();
@@ -1354,6 +1641,39 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.to_string().contains("identity mismatch"));
+    }
+
+    #[test]
+    fn every_vector_space_component_participates_in_cache_compatibility() {
+        let store = make_store();
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("embeddings.bin");
+        store.save(&cache_path).unwrap();
+
+        let mut mismatches = Vec::new();
+        let mut model = test_identity(3);
+        model.model = "other-model".to_string();
+        mismatches.push(model);
+        let mut dimension = test_identity(4);
+        dimension.model = "test-model".to_string();
+        mismatches.push(dimension);
+        let mut input = test_identity(3);
+        input.input_version += 1;
+        mismatches.push(input);
+        mismatches.push(EmbeddingSpaceIdentity {
+            backend: EmbeddingBackendKind::Api,
+            model: "test-model".to_string(),
+            endpoint_fingerprint: Some([1; 32]),
+            dimension: 3,
+            input_version: EMBEDDING_INPUT_VERSION,
+        });
+
+        for expected in mismatches {
+            let error = EmbeddingStore::load_for_space(&cache_path, &expected, 3)
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("identity mismatch"));
+        }
     }
 
     #[test]
@@ -1593,6 +1913,40 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn local_model_enum_and_repository_alias_have_one_canonical_identity() {
+        let (enum_model, enum_identity, enum_dim) = resolve_local_model("BGESmallENV15").unwrap();
+        let (repo_model, repo_identity, repo_dim) =
+            resolve_local_model("BAAI/bge-small-en-v1.5").unwrap();
+
+        assert_eq!(enum_model, repo_model);
+        assert_eq!(enum_identity, "BGESmallENV15");
+        assert_eq!(enum_identity, repo_identity);
+        assert_eq!(enum_dim, repo_dim);
+        assert_eq!(repo_dim, 384);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn unknown_local_model_is_rejected_instead_of_falling_back() {
+        let error = resolve_local_model("definitely-not-a-model").err().unwrap();
+        assert!(error.to_string().contains("unknown local embedding model"));
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn ambiguous_local_repository_alias_is_rejected() {
+        let error = resolve_local_model("Xenova/all-MiniLM-L12-v2")
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("ambiguous local embedding model")
+        );
+    }
+
     // ── API response parsing ──────────────────────────────────────
 
     #[cfg(feature = "embeddings-api")]
@@ -1757,6 +2111,28 @@ mod tests {
                 .err()
                 .unwrap();
             assert!(non_finite.to_string().contains("non-finite"));
+        }
+
+        #[test]
+        fn api_cache_identity_uses_endpoint_fingerprint_not_plaintext_url() {
+            let endpoint = "https://embedding-user:secret@example.invalid/v1/private";
+            let identity = EmbeddingSpaceIdentity::api("test-model".to_string(), endpoint, 3);
+            let mut store = EmbeddingStore::new_with_identity(identity);
+            store
+                .insert_hashed(
+                    PathBuf::from("one.md"),
+                    prepared_text_hash("one"),
+                    vec![1.0, 0.0, 0.0],
+                )
+                .unwrap();
+            let bytes = store.encode_cache().unwrap();
+
+            assert!(
+                !bytes
+                    .windows(endpoint.len())
+                    .any(|window| window == endpoint.as_bytes())
+            );
+            assert!(!String::from_utf8_lossy(&bytes).contains("secret"));
         }
 
         #[test]
