@@ -20,7 +20,10 @@ use super::embeddings::{
 use super::index::VaultIndex;
 
 const RECONCILE_BATCH_SIZE: usize = 32;
+#[cfg(not(test))]
 const MAX_DIRTY_INTERVAL: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const MAX_DIRTY_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -56,6 +59,15 @@ struct RuntimeControl {
 impl Drop for RuntimeControl {
     fn drop(&mut self) {
         self.shared.live.store(false, Ordering::Release);
+        // Synchronize with the final atomic replacement. A persistence closure
+        // that already passed its liveness check may finish before Drop
+        // returns, but it cannot write after Drop has returned.
+        drop(
+            self.shared
+                .persistence_gate
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
         self.shared.notify.notify_waiters();
         if let Some(worker) = self
             .worker
@@ -75,6 +87,7 @@ struct RuntimeShared {
     state: Mutex<RuntimeState>,
     notify: Notify,
     live: Arc<AtomicBool>,
+    persistence_gate: Arc<Mutex<()>>,
     first_load_error: OnceLock<String>,
 }
 
@@ -177,6 +190,7 @@ impl EmbeddingRuntime {
             }),
             notify: Notify::new(),
             live: Arc::new(AtomicBool::new(true)),
+            persistence_gate: Arc::new(Mutex::new(())),
             first_load_error: OnceLock::new(),
         });
         let worker_shared = Arc::clone(&shared);
@@ -382,6 +396,22 @@ where
             dirty |= process_batch(&shared, &store, &model, batch).await;
             dirty |= finalize_reconciliation_if_complete(&shared, &store);
             refresh_status(&shared, &store);
+            let now = Instant::now();
+            if dirty
+                && now >= persist_retry_at
+                && now.duration_since(last_persist) >= MAX_DIRTY_INTERVAL
+                && !persist_dirty(
+                    &shared,
+                    &store,
+                    &mut dirty,
+                    &mut last_persist,
+                    &mut persist_retry_at,
+                    &mut persist_attempt,
+                )
+                .await
+            {
+                return;
+            }
             continue;
         }
 
@@ -390,30 +420,18 @@ where
             && now >= persist_retry_at
             && (pending_empty || now.duration_since(last_persist) >= MAX_DIRTY_INTERVAL);
         if persistence_due {
-            match persist_store(&shared, &store).await {
-                Ok(true) => {
-                    dirty = false;
-                    persist_attempt = 0;
-                    persist_retry_at = Instant::now();
-                    last_persist = Instant::now();
-                    let mut state = shared
-                        .state
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    state.persistence_error = None;
-                }
-                Ok(false) => return,
-                Err(error) => {
-                    persist_attempt = persist_attempt.saturating_add(1);
-                    persist_retry_at = Instant::now() + retry_delay(persist_attempt);
-                    let mut state = shared
-                        .state
-                        .lock()
-                        .unwrap_or_else(|lock_error| lock_error.into_inner());
-                    state.persistence_error = Some(error.to_string());
-                }
+            if !persist_dirty(
+                &shared,
+                &store,
+                &mut dirty,
+                &mut last_persist,
+                &mut persist_retry_at,
+                &mut persist_attempt,
+            )
+            .await
+            {
+                return;
             }
-            refresh_status(&shared, &store);
             continue;
         }
 
@@ -438,6 +456,41 @@ where
             notified.await;
         }
     }
+}
+
+async fn persist_dirty(
+    shared: &Arc<RuntimeShared>,
+    store: &Arc<RwLock<EmbeddingStore>>,
+    dirty: &mut bool,
+    last_persist: &mut Instant,
+    persist_retry_at: &mut Instant,
+    persist_attempt: &mut u8,
+) -> bool {
+    match persist_store(shared, store).await {
+        Ok(true) => {
+            *dirty = false;
+            *persist_attempt = 0;
+            *persist_retry_at = Instant::now();
+            *last_persist = Instant::now();
+            let mut state = shared
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.persistence_error = None;
+        }
+        Ok(false) => return false,
+        Err(error) => {
+            *persist_attempt = persist_attempt.saturating_add(1);
+            *persist_retry_at = Instant::now() + retry_delay(*persist_attempt);
+            let mut state = shared
+                .state
+                .lock()
+                .unwrap_or_else(|lock_error| lock_error.into_inner());
+            state.persistence_error = Some(error.to_string());
+        }
+    }
+    refresh_status(shared, store);
+    true
 }
 
 fn take_due_batch(shared: &RuntimeShared) -> (Vec<PendingWork>, Option<Instant>, bool) {
@@ -773,11 +826,15 @@ async fn persist_store(
     let store = Arc::clone(store);
     let cache_path = shared.cache_path.clone();
     let live = Arc::clone(&shared.live);
+    let persistence_gate = Arc::clone(&shared.persistence_gate);
     tokio::task::spawn_blocking(move || {
         let bytes = {
             let store = store.read().unwrap_or_else(|error| error.into_inner());
             store.encode_cache()?
         };
+        let _guard = persistence_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         EmbeddingStore::persist_cache_bytes_if_live(&cache_path, &bytes, &live)
     })
     .await
@@ -926,6 +983,7 @@ mod tests {
         identity: EmbeddingSpaceIdentity,
         calls: AtomicUsize,
         fail: AtomicBool,
+        inputs: Mutex<Vec<String>>,
     }
 
     impl FakeEmbedder {
@@ -940,6 +998,7 @@ mod tests {
                 },
                 calls: AtomicUsize::new(0),
                 fail: AtomicBool::new(false),
+                inputs: Mutex::new(Vec::new()),
             }
         }
     }
@@ -955,6 +1014,10 @@ mod tests {
 
         fn embed_batch(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>> {
             self.calls.fetch_add(texts.len(), AtomicOrdering::SeqCst);
+            self.inputs
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .extend(texts.iter().map(|text| (*text).to_string()));
             if self.fail.load(AtomicOrdering::SeqCst) {
                 return Err(VaultError::Embedding("injected inference failure".into()));
             }
@@ -969,6 +1032,55 @@ mod tests {
         identity: EmbeddingSpaceIdentity,
         started: std::sync::mpsc::Sender<()>,
         release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    struct SequencedBlockingEmbedder {
+        identity: EmbeddingSpaceIdentity,
+        calls: AtomicUsize,
+        started: tokio::sync::mpsc::UnboundedSender<usize>,
+        releases: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl Embedder for SequencedBlockingEmbedder {
+        fn dimension(&self) -> usize {
+            self.identity.dimension
+        }
+
+        fn space_identity(&self) -> &EmbeddingSpaceIdentity {
+            &self.identity
+        }
+
+        fn embed_batch(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            let _ = self.started.send(call);
+            self.releases
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .recv()
+                .map_err(|error| VaultError::Embedding(error.to_string()))?;
+            Ok(texts
+                .iter()
+                .map(|text| vec![text.len() as f32, 1.0, 0.0])
+                .collect())
+        }
+    }
+
+    struct PartialBatchEmbedder {
+        identity: EmbeddingSpaceIdentity,
+    }
+
+    impl Embedder for PartialBatchEmbedder {
+        fn dimension(&self) -> usize {
+            self.identity.dimension
+        }
+
+        fn space_identity(&self) -> &EmbeddingSpaceIdentity {
+            &self.identity
+        }
+
+        fn embed_batch(&self, _texts: &[&str]) -> VaultResult<Vec<Vec<f32>>> {
+            Ok(vec![vec![0.0, 0.0, 1.0]])
+        }
     }
 
     impl Embedder for BlockingEmbedder {
@@ -1158,6 +1270,176 @@ mod tests {
 
         assert_eq!(fake.calls.load(AtomicOrdering::SeqCst), 0);
         assert!(runtime.status().queryable);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_embeds_only_changed_and_new_notes() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join(".obsidian")).unwrap();
+        std::fs::write(directory.path().join("one.md"), "# One\nunchanged body").unwrap();
+        std::fs::write(directory.path().join("two.md"), "# Two\nold body").unwrap();
+        let old_index = test_index(directory.path()).await;
+        let cache_path = directory.path().join("cache.bin");
+        let fake = Arc::new(FakeEmbedder::new());
+        let mut cache = EmbeddingStore::new_with_identity(fake.identity.clone());
+        for path in [Path::new("one.md"), Path::new("two.md")] {
+            let text = prepared_note_text(directory.path(), &old_index, path);
+            cache
+                .insert_hashed(
+                    path.to_path_buf(),
+                    prepared_text_hash(&text),
+                    vec![1.0, 0.0, 0.0],
+                )
+                .unwrap();
+        }
+        cache.set_first_pass_complete(true);
+        cache.save(&cache_path).unwrap();
+
+        std::fs::write(directory.path().join("two.md"), "# Two\nchanged body").unwrap();
+        std::fs::write(directory.path().join("three.md"), "# Three\nnew body").unwrap();
+        let index = test_index(directory.path()).await;
+        let expected = [Path::new("two.md"), Path::new("three.md")]
+            .map(|path| prepared_note_text(directory.path(), &index, path));
+        let loader_fake = Arc::clone(&fake);
+        let runtime = EmbeddingRuntime::spawn(
+            directory.path().to_path_buf(),
+            index,
+            cache_path,
+            async move { Ok(loader_fake as Arc<dyn Embedder>) },
+        );
+
+        wait_for_status(&runtime, |status| status.phase == EmbeddingPhase::Ready).await;
+        let mut actual = fake
+            .inputs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        actual.sort_unstable();
+        let mut expected = expected.to_vec();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn invalid_batch_preserves_every_last_known_good_entry() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join(".obsidian")).unwrap();
+        std::fs::write(directory.path().join("one.md"), "# One\nold one").unwrap();
+        std::fs::write(directory.path().join("two.md"), "# Two\nold two").unwrap();
+        let old_index = test_index(directory.path()).await;
+        let cache_path = directory.path().join("cache.bin");
+        let identity = FakeEmbedder::new().identity;
+        let mut cache = EmbeddingStore::new_with_identity(identity.clone());
+        for (path, vector) in [
+            (Path::new("one.md"), vec![1.0, 0.0, 0.0]),
+            (Path::new("two.md"), vec![0.0, 1.0, 0.0]),
+        ] {
+            let text = prepared_note_text(directory.path(), &old_index, path);
+            cache
+                .insert_hashed(path.to_path_buf(), prepared_text_hash(&text), vector)
+                .unwrap();
+        }
+        cache.set_first_pass_complete(true);
+        cache.save(&cache_path).unwrap();
+
+        std::fs::write(directory.path().join("one.md"), "# One\nnew one").unwrap();
+        std::fs::write(directory.path().join("two.md"), "# Two\nnew two").unwrap();
+        let index = test_index(directory.path()).await;
+        let runtime = EmbeddingRuntime::spawn(
+            directory.path().to_path_buf(),
+            index,
+            cache_path,
+            async move { Ok(Arc::new(PartialBatchEmbedder { identity }) as Arc<dyn Embedder>) },
+        );
+
+        wait_for_status(&runtime, |status| status.phase == EmbeddingPhase::Degraded).await;
+        let status = runtime.status();
+        assert!(status.queryable);
+        assert_eq!(status.indexed_notes, 2);
+        assert_eq!(status.pending_notes, 2);
+        assert!(
+            status
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("1 vectors for 2 inputs"))
+        );
+        let snapshot = runtime.query_snapshot().unwrap();
+        assert_eq!(
+            snapshot.score_for(Path::new("one.md"), &[1.0, 0.0, 0.0]),
+            1.0
+        );
+        assert_eq!(
+            snapshot.score_for(Path::new("two.md"), &[0.0, 1.0, 0.0]),
+            1.0
+        );
+    }
+
+    #[tokio::test]
+    async fn busy_initial_reconciliation_persists_an_incomplete_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join(".obsidian")).unwrap();
+        for index in 0..(RECONCILE_BATCH_SIZE + 1) {
+            std::fs::write(
+                directory.path().join(format!("note-{index:02}.md")),
+                format!("# Note {index}\nbody {index}"),
+            )
+            .unwrap();
+        }
+        let index = test_index(directory.path()).await;
+        let cache_path = directory.path().join("cache.bin");
+        let identity = FakeEmbedder::new().identity;
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let runtime = EmbeddingRuntime::spawn(
+            directory.path().to_path_buf(),
+            index,
+            cache_path.clone(),
+            async move {
+                Ok(Arc::new(SequencedBlockingEmbedder {
+                    identity,
+                    calls: AtomicUsize::new(0),
+                    started: started_tx,
+                    releases: Mutex::new(release_rx),
+                }) as Arc<dyn Embedder>)
+            },
+        );
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+                .await
+                .unwrap(),
+            Some(0)
+        );
+        tokio::time::sleep(MAX_DIRTY_INTERVAL + Duration::from_millis(20)).await;
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+                .await
+                .unwrap(),
+            Some(1)
+        );
+
+        let checkpoint = EmbeddingStore::load(&cache_path).unwrap();
+        assert_eq!(checkpoint.len(), RECONCILE_BATCH_SIZE);
+        assert!(!checkpoint.first_pass_complete());
+        assert!(!runtime.status().queryable);
+
+        release_tx.send(()).unwrap();
+        wait_for_status(&runtime, |status| status.phase == EmbeddingPhase::Ready).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let persisted = EmbeddingStore::load(&cache_path).ok();
+                if persisted
+                    .as_ref()
+                    .is_some_and(|store| store.first_pass_complete() && store.len() == 33)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
