@@ -45,7 +45,10 @@ mod daemon_integration_tests {
         let vault = create_temp_vault();
         write_note(vault.path(), "note.md", "# Note\nhello world");
         let ensure = server.ensure_vault(vault.path(), false).await;
-        assert!(ensure.ready);
+        assert!(
+            ensure.phase.is_some(),
+            "attach should expose semantic lifecycle status"
+        );
 
         let hint = server.open_hint(vault.path(), "note.md#Heading").await;
         assert_eq!(hint.path, "note.md");
@@ -118,8 +121,12 @@ mod daemon_integration_tests {
             "# Shared\nB_ONLY_MARKER Tomato gardening compost basil soil and watering.",
         );
 
-        server.ensure_vault(vault_a.path(), false).await;
-        server.ensure_vault(vault_b.path(), false).await;
+        server
+            .ensure_vault_ready(vault_a.path(), false, Duration::from_secs(300))
+            .await;
+        server
+            .ensure_vault_ready(vault_b.path(), false, Duration::from_secs(300))
+            .await;
 
         let a_results = server
             .search_semantic(vault_a.path(), "tomato basil soil", 5, true)
@@ -158,7 +165,9 @@ mod daemon_integration_tests {
         let server = DaemonTestServer::start(MODEL_NAME).await;
         let vault = create_temp_vault();
 
-        server.ensure_vault(vault.path(), true).await;
+        server
+            .ensure_vault_ready(vault.path(), true, Duration::from_secs(300))
+            .await;
 
         write_note(
             vault.path(),
@@ -259,21 +268,33 @@ mod daemon_integration_tests {
                     "ensure_vault should succeed: {ensure}"
                 );
 
-                let search = rpc_request(
-                    &endpoint,
-                    "search_semantic",
-                    json!({
-                        "vault_root": vault_root.display().to_string(),
-                        "query": "concurrent clients semantic query",
-                        "top_k": 5,
-                        "include_content": false
-                    }),
-                )
-                .await;
-                assert!(
-                    search.get("error").is_none() || search["error"].is_null(),
-                    "search_semantic should succeed: {search}"
-                );
+                let deadline = Instant::now() + Duration::from_secs(300);
+                let search = loop {
+                    let response = rpc_request(
+                        &endpoint,
+                        "search_semantic",
+                        json!({
+                            "vault_root": vault_root.display().to_string(),
+                            "query": "concurrent clients semantic query",
+                            "top_k": 5,
+                            "include_content": false
+                        }),
+                    )
+                    .await;
+                    if response.get("error").is_none() || response["error"].is_null() {
+                        break response;
+                    }
+                    assert_eq!(
+                        response["error"]["code"],
+                        json!(-32030),
+                        "unexpected semantic query failure: {response}"
+                    );
+                    assert!(
+                        Instant::now() < deadline,
+                        "semantic runtime did not become ready: {response}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                };
                 search["result"]["results"]
                     .as_array()
                     .expect("results should be array")
@@ -298,7 +319,9 @@ mod daemon_integration_tests {
         let server = DaemonTestServer::start(MODEL_NAME).await;
         let vault = create_temp_vault();
 
-        server.ensure_vault(vault.path(), true).await;
+        server
+            .ensure_vault_ready(vault.path(), true, Duration::from_secs(300))
+            .await;
 
         write_note_bytes(vault.path(), "broken.md", b"\xff\xfe\xfd");
         tokio::time::sleep(Duration::from_millis(1200)).await;

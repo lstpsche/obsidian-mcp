@@ -1621,6 +1621,50 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_readers_observe_only_complete_atomic_cache_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("embeddings.bin");
+        let original = make_store();
+        original.save(&cache_path).unwrap();
+
+        let mut replacement = make_store();
+        replacement
+            .insert_hashed(
+                PathBuf::from("a.md"),
+                prepared_text_hash("replacement"),
+                vec![0.0, 0.0, 1.0],
+            )
+            .unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writer_path = cache_path.clone();
+        let writer_start = std::sync::Arc::clone(&start);
+        let writer = std::thread::spawn(move || {
+            writer_start.wait();
+            for iteration in 0..20 {
+                if iteration % 2 == 0 {
+                    replacement.save(&writer_path).unwrap();
+                } else {
+                    original.save(&writer_path).unwrap();
+                }
+            }
+        });
+
+        start.wait();
+        let mut reads = 0;
+        loop {
+            let loaded = EmbeddingStore::load(&cache_path).unwrap();
+            let vector = loaded.get(Path::new("a.md")).unwrap();
+            assert!(vector == [1.0, 0.0, 0.0] || vector == [0.0, 0.0, 1.0]);
+            reads += 1;
+            if writer.is_finished() {
+                break;
+            }
+        }
+        writer.join().unwrap();
+        assert!(reads > 0);
+    }
+
+    #[test]
     fn cache_encoding_rejects_entries_without_hashes() {
         let mut store = EmbeddingStore::new_with_identity(test_identity(3));
         store.insert(PathBuf::from("one.md"), vec![1.0, 0.0, 0.0]);

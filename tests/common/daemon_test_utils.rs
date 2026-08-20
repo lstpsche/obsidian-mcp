@@ -120,6 +120,25 @@ impl DaemonTestServer {
         .await
     }
 
+    pub async fn ensure_vault_ready(
+        &self,
+        vault_root: &Path,
+        watch: bool,
+        timeout: Duration,
+    ) -> EnsureVaultResult {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut last = self.ensure_vault(vault_root, watch).await;
+        while !last.ready {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for semantic readiness: {last:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            last = self.ensure_vault(vault_root, watch).await;
+        }
+        last
+    }
+
     pub async fn search_semantic(
         &self,
         vault_root: &Path,

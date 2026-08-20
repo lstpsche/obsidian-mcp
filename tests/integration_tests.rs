@@ -1297,9 +1297,32 @@ mod vault_semantic_search {
     async fn open_with_embeddings(vault_root: &Path) -> Vault {
         let _guard = MODEL_LOCK.lock().await;
         let config = embeddings_config(vault_root);
-        Vault::open(&config)
+        let vault = Vault::open(&config)
             .await
-            .expect("open vault with embeddings")
+            .expect("open vault with embeddings");
+        wait_for_embeddings_ready(&vault).await;
+        vault
+    }
+
+    async fn wait_for_embeddings_ready(vault: &Vault) {
+        tokio::time::timeout(std::time::Duration::from_secs(300), async {
+            loop {
+                if vault.has_embeddings() {
+                    return;
+                }
+                if let Some(error) = vault.embedding_load_error() {
+                    panic!("embedding model failed to load: {error}");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "timed out waiting for embedding readiness: {:?}",
+                vault.embedding_status()
+            )
+        });
     }
 
     async fn wait_for_semantic_hit(
@@ -1410,9 +1433,11 @@ mod vault_semantic_search {
     async fn open_hybrid(vault_root: &Path) -> Vault {
         let _guard = MODEL_LOCK.lock().await;
         let config = hybrid_config(vault_root);
-        Vault::open(&config)
+        let vault = Vault::open(&config)
             .await
-            .expect("open vault with tantivy + embeddings")
+            .expect("open vault with tantivy + embeddings");
+        wait_for_embeddings_ready(&vault).await;
+        vault
     }
 
     #[tokio::test]
@@ -1552,7 +1577,8 @@ mod semantic_tool_runtime_modes {
         query: &str,
         expected_path: &str,
     ) -> Vec<serde_json::Value> {
-        for _ in 0..20 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        loop {
             let result = search_semantic(
                 vault,
                 SearchSemanticParams {
@@ -1565,21 +1591,26 @@ mod semantic_tool_runtime_modes {
                 0.25,
                 runtime,
             )
-            .await
-            .expect("auto mode should fall back to local backend");
-            let parsed: Vec<serde_json::Value> =
-                serde_json::from_str(extract_text(&result)).expect("parse semantic result");
-            if parsed.iter().any(|entry| {
-                entry
-                    .get("path")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|path| path == expected_path)
-            }) {
-                return parsed;
+            .await;
+            if let Ok(result) = result {
+                let parsed: Vec<serde_json::Value> =
+                    serde_json::from_str(extract_text(&result)).expect("parse semantic result");
+                if parsed.iter().any(|entry| {
+                    entry
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|path| path == expected_path)
+                }) {
+                    return parsed;
+                }
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for local semantic hit; status: {:?}",
+                vault.embedding_status()
+            );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        Vec::new()
     }
 
     #[tokio::test]
@@ -1607,6 +1638,10 @@ mod semantic_tool_runtime_modes {
             vault_ensured: Arc::new(AtomicBool::new(false)),
             prefetch_count: 50,
         };
+
+        server
+            .ensure_vault_ready(vault_dir.path(), true, std::time::Duration::from_secs(300))
+            .await;
 
         let result = search_semantic(
             &vault,
@@ -1704,5 +1739,825 @@ mod semantic_tool_runtime_modes {
         .await;
         let err = result.expect_err("daemon mode should fail without daemon client");
         assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
+    }
+}
+
+#[cfg(all(unix, feature = "embeddings-api"))]
+mod background_embedding_runtime {
+    use super::*;
+    use std::ffi::OsString;
+    use std::process::Stdio;
+    use std::sync::{Arc, LazyLock, Mutex};
+    use std::time::Duration;
+
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use obsidian_mcp::config::EmbeddingProvider;
+    use obsidian_mcp::vault::embedding_runtime::{EmbeddingPhase, EmbeddingRuntimeStatus};
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    static API_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    #[derive(Clone)]
+    struct ApiState {
+        requests: Arc<Mutex<Vec<Vec<String>>>>,
+        blocked_markers: Arc<Mutex<Vec<String>>>,
+        failure_markers: Arc<Mutex<Vec<String>>>,
+        gate: tokio::sync::watch::Sender<bool>,
+    }
+
+    struct ControlledEmbeddingApi {
+        address: std::net::SocketAddr,
+        state: ApiState,
+        shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        task: tokio::task::JoinHandle<std::io::Result<()>>,
+    }
+
+    impl ControlledEmbeddingApi {
+        async fn start() -> Self {
+            let (gate, _) = tokio::sync::watch::channel(true);
+            let state = ApiState {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                blocked_markers: Arc::new(Mutex::new(Vec::new())),
+                failure_markers: Arc::new(Mutex::new(Vec::new())),
+                gate,
+            };
+            let app = Router::new()
+                .route("/v1/embeddings", post(embedding_api_handler))
+                .with_state(state.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind controlled embedding API");
+            let address = listener.local_addr().expect("embedding API address");
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+            });
+            Self {
+                address,
+                state,
+                shutdown_tx: Some(shutdown_tx),
+                task,
+            }
+        }
+
+        fn base_url(&self) -> String {
+            format!("http://{}/v1", self.address)
+        }
+
+        fn block_inputs_containing(&self, markers: &[&str]) {
+            *self
+                .state
+                .blocked_markers
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) =
+                markers.iter().map(|marker| (*marker).to_string()).collect();
+            self.state.gate.send_replace(false);
+        }
+
+        fn release_blocked(&self) {
+            self.state.gate.send_replace(true);
+        }
+
+        fn fail_inputs_containing(&self, markers: &[&str]) {
+            *self
+                .state
+                .failure_markers
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) =
+                markers.iter().map(|marker| (*marker).to_string()).collect();
+        }
+
+        fn clear_failures(&self) {
+            self.state
+                .failure_markers
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clear();
+        }
+
+        fn clear_requests(&self) {
+            self.state
+                .requests
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clear();
+        }
+
+        fn recorded_inputs(&self) -> Vec<String> {
+            self.state
+                .requests
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .iter()
+                .flatten()
+                .cloned()
+                .collect()
+        }
+
+        async fn wait_for_input(&self, marker: &str) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if self
+                        .recorded_inputs()
+                        .iter()
+                        .any(|input| input.contains(marker))
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed out waiting for embedding input '{marker}'; recorded: {:?}",
+                    self.recorded_inputs()
+                )
+            });
+        }
+
+        async fn shutdown(mut self) {
+            if let Some(shutdown_tx) = self.shutdown_tx.take() {
+                let _ = shutdown_tx.send(());
+            }
+            self.task
+                .await
+                .expect("embedding API task should join")
+                .expect("embedding API should stop cleanly");
+        }
+    }
+
+    async fn embedding_api_handler(
+        State(state): State<ApiState>,
+        Json(body): Json<Value>,
+    ) -> Response {
+        let inputs = match &body["input"] {
+            Value::Array(values) => values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            Value::String(value) => vec![value.clone()],
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "input must be a string or array"})),
+                )
+                    .into_response();
+            }
+        };
+        state
+            .requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(inputs.clone());
+
+        let should_fail = {
+            let markers = state
+                .failure_markers
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            inputs
+                .iter()
+                .any(|input| markers.iter().any(|marker| input.contains(marker)))
+        };
+        if should_fail {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "provider echoed FAIL_MARKER and sensitive note content"
+                })),
+            )
+                .into_response();
+        }
+
+        let should_block = {
+            let markers = state
+                .blocked_markers
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            inputs
+                .iter()
+                .any(|input| markers.iter().any(|marker| input.contains(marker)))
+        };
+        if should_block {
+            let mut gate = state.gate.subscribe();
+            while !*gate.borrow() {
+                if gate.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+
+        let data = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, input)| {
+                let checksum = input
+                    .bytes()
+                    .fold(0u32, |sum, byte| sum.wrapping_add(u32::from(byte)));
+                json!({
+                    "index": index,
+                    "embedding": [
+                        1.0,
+                        f64::from(checksum % 997) / 997.0,
+                        input.len() as f64 / 1000.0 + 0.01
+                    ]
+                })
+            })
+            .collect::<Vec<_>>();
+        Json(json!({"data": data})).into_response()
+    }
+
+    struct EmbeddingApiEnv {
+        previous: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl EmbeddingApiEnv {
+        fn install(base_url: &str) -> Self {
+            let values = [
+                ("OBSIDIAN_EMBEDDING_API_BASE", Some(base_url)),
+                ("OPENAI_BASE_URL", None),
+                ("OBSIDIAN_EMBEDDING_API_KEY", Some("integration-test-key")),
+                ("OPENAI_API_KEY", None),
+                ("OBSIDIAN_EMBEDDING_API_MODEL", None),
+                ("OPENAI_MODEL", None),
+                ("OBSIDIAN_EMBEDDING_DIM", None),
+                ("OBSIDIAN_EMBEDDING_CA_CERT", None),
+                ("OBSIDIAN_EMBEDDING_TLS_VERIFY", None),
+            ];
+            let mut previous = Vec::with_capacity(values.len());
+            for (name, value) in values {
+                previous.push((name, std::env::var_os(name)));
+                unsafe {
+                    if let Some(value) = value {
+                        std::env::set_var(name, value);
+                    } else {
+                        std::env::remove_var(name);
+                    }
+                }
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for EmbeddingApiEnv {
+        fn drop(&mut self) {
+            for (name, value) in self.previous.drain(..) {
+                unsafe {
+                    if let Some(value) = value {
+                        std::env::set_var(name, value);
+                    } else {
+                        std::env::remove_var(name);
+                    }
+                }
+            }
+        }
+    }
+
+    fn api_config(vault_root: &Path, model: &str, watch: bool) -> Config {
+        Config {
+            vault_path: vault_root.to_path_buf(),
+            watch,
+            log_level: "error".into(),
+            transport: obsidian_mcp::config::Transport::Stdio,
+            http_host: obsidian_mcp::config::DEFAULT_HTTP_HOST,
+            http_port: obsidian_mcp::config::DEFAULT_HTTP_PORT,
+            tantivy: true,
+            embeddings: true,
+            embeddings_model: model.into(),
+            hybrid_alpha: 0.25,
+            embedding_provider: Some(EmbeddingProvider::Api),
+            tool_filter: ToolFilter::Full,
+            mcp_data_dir: None,
+            exclude_patterns: Vec::new(),
+        }
+    }
+
+    fn create_api_vault() -> tempfile::TempDir {
+        let vault = tempfile::tempdir().expect("temporary vault");
+        std::fs::create_dir_all(vault.path().join(".obsidian")).expect("create .obsidian");
+        vault
+    }
+
+    fn cache_path(vault_root: &Path) -> PathBuf {
+        vault_root
+            .join(".obsidian-mcp")
+            .join("embeddings")
+            .join("embeddings.bin")
+    }
+
+    async fn wait_for_status<F>(vault: &Vault, label: &str, predicate: F) -> EmbeddingRuntimeStatus
+    where
+        F: Fn(&EmbeddingRuntimeStatus) -> bool,
+    {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let status = vault
+                    .embedding_status()
+                    .expect("embedding runtime should be configured");
+                if predicate(&status) {
+                    return status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "timed out waiting for {label}; status: {:?}",
+                vault.embedding_status()
+            )
+        })
+    }
+
+    async fn wait_for_cache_bytes(cache: &Path, previous: Option<&[u8]>) -> Vec<u8> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if let Ok(bytes) = std::fs::read(cache)
+                    && !bytes.is_empty()
+                    && previous.is_none_or(|old| old != bytes)
+                {
+                    return bytes;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for cache update: {}", cache.display()))
+    }
+
+    #[tokio::test]
+    async fn mcp_initialize_and_core_tool_do_not_wait_for_embedding_loader() {
+        let _guard = API_TEST_LOCK.lock().await;
+        let api = ControlledEmbeddingApi::start().await;
+        api.block_inputs_containing(&["dim"]);
+        let vault = create_api_vault();
+        std::fs::write(vault.path().join("note.md"), "# Note\ncore content\n").unwrap();
+
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_obsidian-mcp"))
+            .env("OBSIDIAN_VAULT_PATH", vault.path())
+            .env("OBSIDIAN_WATCH", "false")
+            .env("OBSIDIAN_TANTIVY", "false")
+            .env("OBSIDIAN_EMBEDDINGS", "true")
+            .env("OBSIDIAN_EMBEDDINGS_MODEL", "api-integration-model")
+            .env("OBSIDIAN_EMBEDDING_PROVIDER", "api")
+            .env("OBSIDIAN_EMBEDDING_API_BASE", api.base_url())
+            .env("OBSIDIAN_EMBEDDING_API_KEY", "integration-test-key")
+            .env("OBSIDIAN_SEMANTIC_MODE", "local")
+            .env("OBSIDIAN_LOG_LEVEL", "error")
+            .env_remove("OBSIDIAN_EMBEDDING_API_MODEL")
+            .env_remove("OPENAI_MODEL")
+            .env_remove("OBSIDIAN_EMBEDDING_DIM")
+            .env_remove("OBSIDIAN_EMBEDDING_CA_CERT")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn MCP binary");
+        let mut stdin = child.stdin.take().expect("child stdin");
+        let stdout = child.stdout.take().expect("child stdout");
+        let mut lines = BufReader::new(stdout).lines();
+
+        api.wait_for_input("dim").await;
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "startup-barrier-test", "version": "0.0.1"}
+            }
+        });
+        stdin
+            .write_all(format!("{initialize}\n").as_bytes())
+            .await
+            .expect("write initialize");
+        let initialize_response = tokio::time::timeout(Duration::from_secs(2), lines.next_line())
+            .await
+            .expect("initialize must not wait for embeddings")
+            .expect("read initialize response")
+            .expect("initialize response line");
+        let initialize_response: Value = serde_json::from_str(&initialize_response).unwrap();
+        assert!(initialize_response.get("result").is_some());
+
+        stdin
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write initialized notification");
+        let core_call = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "vault_info", "arguments": {}}
+        });
+        stdin
+            .write_all(format!("{core_call}\n").as_bytes())
+            .await
+            .expect("write core tool call");
+        let core_response = tokio::time::timeout(Duration::from_secs(2), lines.next_line())
+            .await
+            .expect("core tool must not wait for embeddings")
+            .expect("read core response")
+            .expect("core response line");
+        let core_response: Value = serde_json::from_str(&core_response).unwrap();
+        assert!(core_response.get("result").is_some(), "{core_response}");
+
+        api.release_blocked();
+        stdin.shutdown().await.expect("close MCP stdin");
+        drop(stdin);
+        if tokio::time::timeout(Duration::from_secs(3), child.wait())
+            .await
+            .is_err()
+        {
+            child.kill().await.expect("kill test MCP process");
+        }
+        api.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compatible_cache_serves_lkg_while_reconciling_and_prunes_exclusions() {
+        let _guard = API_TEST_LOCK.lock().await;
+        let api = ControlledEmbeddingApi::start().await;
+        let _env = EmbeddingApiEnv::install(&api.base_url());
+        let vault_dir = create_api_vault();
+        std::fs::create_dir_all(vault_dir.path().join("Archive")).unwrap();
+        std::fs::write(
+            vault_dir.path().join("active.md"),
+            "# Active\nBASELINE_MARKER semantic content\n",
+        )
+        .unwrap();
+        std::fs::write(
+            vault_dir.path().join("Archive/hidden.md"),
+            "# Hidden\nHIDDEN_MARKER old archive content\n",
+        )
+        .unwrap();
+        let model = "cache-compatibility-model";
+        let config = api_config(vault_dir.path(), model, false);
+
+        let first = Vault::open(&config).await.unwrap();
+        wait_for_status(&first, "initial ready cache", |status| {
+            status.phase == EmbeddingPhase::Ready && status.indexed_notes == 2
+        })
+        .await;
+        let cache = cache_path(vault_dir.path());
+        let old_cache = wait_for_cache_bytes(&cache, None).await;
+        drop(first);
+
+        std::fs::write(
+            vault_dir.path().join("active.md"),
+            "# Active\nBLOCK_CHANGED latest semantic content\n",
+        )
+        .unwrap();
+        api.clear_requests();
+        api.block_inputs_containing(&["BLOCK_CHANGED"]);
+        let mut pruned_config = api_config(vault_dir.path(), model, false);
+        pruned_config.exclude_patterns = vec!["Archive/".into()];
+        let second = Vault::open(&pruned_config).await.unwrap();
+        api.wait_for_input("BLOCK_CHANGED").await;
+        let warming = wait_for_status(&second, "queryable last-known-good cache", |status| {
+            status.phase == EmbeddingPhase::Warming && status.queryable
+        })
+        .await;
+        assert_eq!(warming.indexed_notes, 1);
+        assert_eq!(warming.total_notes, 1);
+
+        let results = second.search_semantic("query-ready", 10).unwrap();
+        assert!(
+            results
+                .iter()
+                .any(|(path, _)| path == Path::new("active.md"))
+        );
+        assert!(
+            results
+                .iter()
+                .all(|(path, _)| path != Path::new("Archive/hidden.md")),
+            "newly excluded cached paths must be pruned before publication"
+        );
+
+        api.release_blocked();
+        wait_for_status(&second, "changed-note reconciliation", |status| {
+            status.phase == EmbeddingPhase::Ready && status.indexed_notes == 1
+        })
+        .await;
+        let new_cache = wait_for_cache_bytes(&cache, Some(&old_cache)).await;
+        drop(second);
+
+        api.clear_requests();
+        let third = Vault::open(&pruned_config).await.unwrap();
+        wait_for_status(&third, "unchanged-cache restart", |status| {
+            status.phase == EmbeddingPhase::Ready && status.indexed_notes == 1
+        })
+        .await;
+        let restart_inputs = api.recorded_inputs();
+        assert!(
+            !restart_inputs
+                .iter()
+                .any(|input| input.contains("BLOCK_CHANGED") || input.contains("HIDDEN_MARKER")),
+            "unchanged and excluded notes must not be inferred on restart: {restart_inputs:?}"
+        );
+        assert_ne!(old_cache, new_cache);
+        drop(third);
+        api.shutdown().await;
+    }
+
+    #[derive(serde::Serialize)]
+    struct LegacyCache {
+        dim: usize,
+        entries: Vec<(String, Vec<f32>)>,
+    }
+
+    #[tokio::test]
+    async fn invalid_and_wrong_space_caches_rebuild_only_in_background() {
+        let _guard = API_TEST_LOCK.lock().await;
+        let api = ControlledEmbeddingApi::start().await;
+        let _env = EmbeddingApiEnv::install(&api.base_url());
+
+        let seed = create_api_vault();
+        std::fs::write(seed.path().join("note.md"), "# Note\nSEED_MARKER\n").unwrap();
+        let seed_config = api_config(seed.path(), "seed-model", false);
+        let seed_vault = Vault::open(&seed_config).await.unwrap();
+        wait_for_status(&seed_vault, "seed cache", |status| {
+            status.phase == EmbeddingPhase::Ready
+        })
+        .await;
+        let valid_cache = wait_for_cache_bytes(&cache_path(seed.path()), None).await;
+        drop(seed_vault);
+
+        let legacy = bincode::serde::encode_to_vec(
+            LegacyCache {
+                dim: 3,
+                entries: vec![("note.md".into(), vec![1.0, 0.0, 0.0])],
+            },
+            bincode::config::standard(),
+        )
+        .unwrap();
+        let mut trailing = valid_cache.clone();
+        trailing.extend_from_slice(b"trailing-bytes");
+        let cases = vec![
+            ("legacy", legacy, "seed-model"),
+            ("corrupt", vec![0xff; 64], "seed-model"),
+            (
+                "truncated",
+                valid_cache[..valid_cache.len() / 2].to_vec(),
+                "seed-model",
+            ),
+            ("trailing", trailing, "seed-model"),
+            ("wrong-model", valid_cache.clone(), "different-model"),
+        ];
+
+        for (name, bytes, model) in cases {
+            let vault_dir = create_api_vault();
+            std::fs::write(
+                vault_dir.path().join("note.md"),
+                format!("# Note\nCASE_MARKER_{name}\n"),
+            )
+            .unwrap();
+            let cache = cache_path(vault_dir.path());
+            std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+            std::fs::write(&cache, bytes).unwrap();
+            api.clear_requests();
+            api.block_inputs_containing(&["CASE_MARKER"]);
+
+            let vault = tokio::time::timeout(
+                Duration::from_secs(2),
+                Vault::open(&api_config(vault_dir.path(), model, false)),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{name} cache blocked Vault::open"))
+            .unwrap();
+            api.wait_for_input(&format!("CASE_MARKER_{name}")).await;
+            let status = vault.embedding_status().unwrap();
+            assert!(
+                !status.queryable,
+                "{name} cache must not become queryable before rebuild: {status:?}"
+            );
+
+            api.release_blocked();
+            wait_for_status(&vault, &format!("{name} cache rebuild"), |status| {
+                status.phase == EmbeddingPhase::Ready && status.queryable
+            })
+            .await;
+            drop(vault);
+        }
+
+        api.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_and_watcher_updates_are_latest_wins_during_reconciliation() {
+        let _guard = API_TEST_LOCK.lock().await;
+        let api = ControlledEmbeddingApi::start().await;
+        let _env = EmbeddingApiEnv::install(&api.base_url());
+        let vault_dir = create_api_vault();
+        std::fs::write(
+            vault_dir.path().join("watched.md"),
+            "# Watched\nBLOCK_INITIAL stale content\n",
+        )
+        .unwrap();
+        api.block_inputs_containing(&["BLOCK_INITIAL"]);
+        let vault = Vault::open(&api_config(vault_dir.path(), "latest-wins-model", true))
+            .await
+            .unwrap();
+        api.wait_for_input("BLOCK_INITIAL").await;
+
+        std::fs::write(
+            vault_dir.path().join("watched.md"),
+            "# Watched\nWATCH_FINAL authoritative watcher content\n",
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if vault
+                    .search_text("WATCH_FINAL", 20)
+                    .unwrap()
+                    .iter()
+                    .any(|result| result.path == Path::new("watched.md"))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("watcher should update the primary index before release");
+
+        vault
+            .write_note(Path::new("direct.md"), "# Direct\nDIRECT_OLD\n")
+            .unwrap();
+        vault
+            .write_note(Path::new("direct.md"), "# Direct\nDIRECT_FINAL\n")
+            .unwrap();
+        vault
+            .write_note(Path::new("deleted.md"), "# Deleted\nDELETE_ME\n")
+            .unwrap();
+        vault.delete_note(Path::new("deleted.md")).unwrap();
+
+        api.release_blocked();
+        wait_for_status(&vault, "latest-wins reconciliation", |status| {
+            status.phase == EmbeddingPhase::Ready
+                && status.indexed_notes == 2
+                && status.total_notes == 2
+        })
+        .await;
+        let inputs = api.recorded_inputs();
+        assert!(inputs.iter().any(|input| input.contains("WATCH_FINAL")));
+        assert!(inputs.iter().any(|input| input.contains("DIRECT_FINAL")));
+        assert!(!inputs.iter().any(|input| input.contains("DIRECT_OLD")));
+        assert!(!inputs.iter().any(|input| input.contains("DELETE_ME")));
+
+        let results = vault.search_semantic("query-ready", 10).unwrap();
+        assert!(
+            results
+                .iter()
+                .any(|(path, _)| path == Path::new("watched.md"))
+        );
+        assert!(
+            results
+                .iter()
+                .any(|(path, _)| path == Path::new("direct.md"))
+        );
+        assert!(
+            results
+                .iter()
+                .all(|(path, _)| path != Path::new("deleted.md"))
+        );
+        drop(vault);
+        api.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_refresh_serves_lkg_without_phantoms_then_recovers() {
+        let _guard = API_TEST_LOCK.lock().await;
+        let api = ControlledEmbeddingApi::start().await;
+        let _env = EmbeddingApiEnv::install(&api.base_url());
+        let vault_dir = create_api_vault();
+        std::fs::write(
+            vault_dir.path().join("old.md"),
+            "# Old\nOLD_MARKER stable content\n",
+        )
+        .unwrap();
+        let config = api_config(vault_dir.path(), "failure-recovery-model", false);
+        let first = Vault::open(&config).await.unwrap();
+        wait_for_status(&first, "failure seed", |status| {
+            status.phase == EmbeddingPhase::Ready
+        })
+        .await;
+        let cache = cache_path(vault_dir.path());
+        let old_cache = wait_for_cache_bytes(&cache, None).await;
+        drop(first);
+
+        std::fs::write(
+            vault_dir.path().join("old.md"),
+            "# Old\nFAIL_MARKER changed existing note\n",
+        )
+        .unwrap();
+        std::fs::write(
+            vault_dir.path().join("new.md"),
+            "# New\nFAIL_MARKER brand new note\n",
+        )
+        .unwrap();
+        api.clear_requests();
+        api.fail_inputs_containing(&["FAIL_MARKER"]);
+        let second = Vault::open(&config).await.unwrap();
+        let degraded = wait_for_status(&second, "failed refresh", |status| {
+            status.phase == EmbeddingPhase::Degraded && status.queryable
+        })
+        .await;
+        assert_eq!(degraded.indexed_notes, 1);
+        assert_eq!(degraded.total_notes, 2);
+        let error = degraded.last_error.expect("failure should be reported");
+        assert!(error.contains("HTTP status 500"));
+        assert!(!error.contains("sensitive note content"));
+
+        let lkg_results = second.search_semantic("query-ready", 10).unwrap();
+        assert!(
+            lkg_results
+                .iter()
+                .any(|(path, _)| path == Path::new("old.md"))
+        );
+        assert!(
+            lkg_results
+                .iter()
+                .all(|(path, _)| path != Path::new("new.md")),
+            "a failed new note must not gain a phantom vector"
+        );
+
+        api.clear_failures();
+        wait_for_status(&second, "refresh retry recovery", |status| {
+            status.phase == EmbeddingPhase::Ready
+                && status.indexed_notes == 2
+                && status.last_error.is_none()
+        })
+        .await;
+        wait_for_cache_bytes(&cache, Some(&old_cache)).await;
+        drop(second);
+        api.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn note_read_failure_is_degraded_and_retry_recovers() {
+        let _guard = API_TEST_LOCK.lock().await;
+        let api = ControlledEmbeddingApi::start().await;
+        let _env = EmbeddingApiEnv::install(&api.base_url());
+        let vault_dir = create_api_vault();
+        std::fs::write(
+            vault_dir.path().join("note.md"),
+            "# Note\nvalid before loader\n",
+        )
+        .unwrap();
+        api.block_inputs_containing(&["dim"]);
+        let vault = Vault::open(&api_config(vault_dir.path(), "read-retry-model", false))
+            .await
+            .unwrap();
+        api.wait_for_input("dim").await;
+        std::fs::write(vault_dir.path().join("note.md"), b"\xff\xfe\xfd").unwrap();
+        api.release_blocked();
+
+        let degraded = wait_for_status(&vault, "note read degradation", |status| {
+            status.phase == EmbeddingPhase::Degraded && !status.queryable
+        })
+        .await;
+        assert_eq!(degraded.indexed_notes, 0);
+        assert_eq!(degraded.total_notes, 1);
+        assert!(degraded.last_error.is_some());
+
+        std::fs::write(
+            vault_dir.path().join("note.md"),
+            "# Note\nREAD_RECOVERED valid content\n",
+        )
+        .unwrap();
+        wait_for_status(&vault, "note read retry", |status| {
+            status.phase == EmbeddingPhase::Ready
+                && status.queryable
+                && status.indexed_notes == 1
+                && status.last_error.is_none()
+        })
+        .await;
+        assert!(
+            api.recorded_inputs()
+                .iter()
+                .any(|input| input.contains("READ_RECOVERED"))
+        );
+        drop(vault);
+        api.shutdown().await;
     }
 }
