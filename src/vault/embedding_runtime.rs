@@ -1,7 +1,5 @@
 //! Managed background lifecycle for optional semantic embeddings.
 
-#![allow(dead_code)] // Wired into local and daemon owners in the next plan tasks.
-
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -46,7 +44,7 @@ pub struct EmbeddingRuntimeStatus {
 }
 
 #[derive(Clone)]
-pub(crate) struct EmbeddingRuntime {
+pub struct EmbeddingRuntime {
     control: Arc<RuntimeControl>,
 }
 
@@ -96,7 +94,7 @@ struct RuntimeState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PendingKind {
+pub(crate) enum PendingKind {
     Upsert,
     Remove,
 }
@@ -246,6 +244,19 @@ impl EmbeddingRuntime {
             .get()
             .map(String::as_str)
     }
+
+    #[cfg(test)]
+    pub(crate) fn pending_kind(&self, path: &Path) -> Option<PendingKind> {
+        let normalized = super::path::normalize_relative(path).ok()?;
+        self.control
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pending
+            .get(&normalized)
+            .map(|work| work.kind)
+    }
 }
 
 async fn run_coordinator<F>(shared: Arc<RuntimeShared>, loader: F)
@@ -257,13 +268,23 @@ where
         Err(error) => {
             let message = error.to_string();
             let _ = shared.first_load_error.set(message.clone());
+            let total_notes = current_paths(&shared.index).len();
             let mut state = shared
                 .state
                 .lock()
                 .unwrap_or_else(|lock_error| lock_error.into_inner());
-            state.status.phase = EmbeddingPhase::Degraded;
-            state.status.queryable = false;
-            state.status.last_error = Some(message);
+            let pending_notes = distinct_pending_count(&state);
+            replace_status(
+                &mut state,
+                EmbeddingRuntimeStatus {
+                    phase: EmbeddingPhase::Degraded,
+                    queryable: false,
+                    indexed_notes: 0,
+                    total_notes,
+                    pending_notes,
+                    last_error: Some(message),
+                },
+            );
             return;
         }
     };
@@ -770,14 +791,48 @@ fn refresh_status(shared: &RuntimeShared, store: &Arc<RwLock<EmbeddingStore>>) {
     } else {
         EmbeddingPhase::Ready
     };
-    state.status = EmbeddingRuntimeStatus {
-        phase,
-        queryable,
-        indexed_notes,
-        total_notes: paths.len(),
-        pending_notes,
-        last_error,
-    };
+    replace_status(
+        &mut state,
+        EmbeddingRuntimeStatus {
+            phase,
+            queryable,
+            indexed_notes,
+            total_notes: paths.len(),
+            pending_notes,
+            last_error,
+        },
+    );
+}
+
+fn replace_status(state: &mut RuntimeState, next: EmbeddingRuntimeStatus) {
+    let previous = &state.status;
+    let meaningful_transition = previous.phase != next.phase
+        || previous.queryable != next.queryable
+        || previous.last_error.is_some() != next.last_error.is_some()
+        || (previous.total_notes == 0 && next.total_notes > 0);
+
+    if meaningful_transition {
+        match next.phase {
+            EmbeddingPhase::Degraded => tracing::warn!(
+                phase = ?next.phase,
+                queryable = next.queryable,
+                indexed_notes = next.indexed_notes,
+                total_notes = next.total_notes,
+                pending_notes = next.pending_notes,
+                "embedding runtime status changed"
+            ),
+            EmbeddingPhase::Warming | EmbeddingPhase::Ready => tracing::info!(
+                phase = ?next.phase,
+                queryable = next.queryable,
+                indexed_notes = next.indexed_notes,
+                total_notes = next.total_notes,
+                pending_notes = next.pending_notes,
+                "embedding runtime status changed"
+            ),
+        }
+    }
+
+    state.status = next;
 }
 
 fn current_paths(index: &Arc<RwLock<VaultIndex>>) -> HashSet<PathBuf> {

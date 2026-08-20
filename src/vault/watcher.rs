@@ -36,10 +36,8 @@ pub fn start_watcher(
     vault_root: PathBuf,
     index: Arc<RwLock<VaultIndex>>,
     tantivy: Option<Arc<TantivyIndex>>,
-    embedding_model: Option<Arc<super::embeddings::EmbeddingModel>>,
-    embedding_store: Option<Arc<RwLock<super::embeddings::EmbeddingStore>>>,
+    embedding_runtime: Option<super::embedding_runtime::EmbeddingRuntime>,
     exclude: Arc<ExcludeSet>,
-    mcp_data: PathBuf,
 ) -> VaultResult<Debouncer<notify::RecommendedWatcher>> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<DebounceEventResult>(EVENT_CHANNEL_CAPACITY);
     let rt = Handle::current();
@@ -68,31 +66,21 @@ pub fn start_watcher(
             match result {
                 Ok(events) => {
                     let mut tantivy_dirty = false;
-                    let mut embedding_dirty = false;
                     for event in events {
-                        let (tv_touched, emb_touched) = process_event(
+                        tantivy_dirty |= process_event(
                             &vault_root,
                             &index,
                             tantivy.as_deref(),
-                            embedding_model.as_deref(),
-                            embedding_store.as_ref(),
+                            embedding_runtime.as_ref(),
                             &event.path,
                             &exclude,
                         );
-                        tantivy_dirty |= tv_touched;
-                        embedding_dirty |= emb_touched;
                     }
                     if tantivy_dirty
                         && let Some(ref tv) = tantivy
                         && let Err(e) = tv.flush()
                     {
                         tracing::warn!(error = %e, "tantivy batch flush failed");
-                    }
-                    if embedding_dirty
-                        && let Some(ref store) = embedding_store
-                        && let Ok(s) = store.read()
-                    {
-                        save_embedding_cache(&mcp_data, &s);
                     }
                 }
                 Err(e) => {
@@ -227,28 +215,26 @@ fn is_excluded_path(exclude: &ExcludeSet, relative: &Path) -> bool {
     exclude.is_excluded(Path::new(&relative.to_string_lossy().replace('\\', "/")))
 }
 
-/// Process a single debounced event. Returns `(tantivy_touched, embedding_touched)`.
+/// Process a single debounced event. Returns whether Tantivy was touched.
 #[cfg(has_embeddings)]
 fn process_event(
     vault_root: &Path,
     index: &Arc<RwLock<VaultIndex>>,
     tantivy: Option<&TantivyIndex>,
-    embedding_model: Option<&super::embeddings::EmbeddingModel>,
-    embedding_store: Option<&Arc<RwLock<super::embeddings::EmbeddingStore>>>,
+    embedding_runtime: Option<&super::embedding_runtime::EmbeddingRuntime>,
     absolute: &Path,
     exclude: &ExcludeSet,
-) -> (bool, bool) {
+) -> bool {
     if !should_process_path(vault_root, absolute) {
-        return (false, false);
+        return false;
     }
 
     let relative = match normalized_relative_path(vault_root, absolute) {
         Some(r) => r,
-        None => return (false, false),
+        None => return false,
     };
 
     let mut tv_touched = false;
-    let mut emb_touched = false;
 
     if is_excluded_path(exclude, &relative) {
         if absolute.exists() {
@@ -257,7 +243,7 @@ fn process_event(
                 Ok(mut idx) => idx.add_excluded_file(&relative),
                 Err(e) => {
                     tracing::error!("index lock poisoned: {e}");
-                    return (false, false);
+                    return false;
                 }
             }
         } else {
@@ -266,7 +252,7 @@ fn process_event(
                 Ok(mut idx) => idx.remove_file(&relative),
                 Err(e) => {
                     tracing::error!("index lock poisoned: {e}");
-                    return (false, false);
+                    return false;
                 }
             }
         }
@@ -278,13 +264,10 @@ fn process_event(
                 tv_touched = true;
             }
         }
-        if let Some(store) = embedding_store
-            && let Ok(mut s) = store.write()
-        {
-            s.remove(&relative);
-            emb_touched = true;
+        if let Some(runtime) = embedding_runtime {
+            runtime.submit_remove(&relative);
         }
-        return (tv_touched, emb_touched);
+        return tv_touched;
     }
 
     if absolute.exists() {
@@ -293,13 +276,13 @@ fn process_event(
             Ok(mut idx) => {
                 if let Err(e) = idx.reindex_file(vault_root, &relative) {
                     tracing::warn!(path = %relative.display(), error = %e, "reindex failed");
-                    return (false, false);
+                    return false;
                 }
                 idx.get_note(&relative).cloned()
             }
             Err(e) => {
                 tracing::error!("index lock poisoned: {e}");
-                return (false, false);
+                return false;
             }
         };
         if let Some(tv) = tantivy
@@ -311,10 +294,8 @@ fn process_event(
                 tv_touched = true;
             }
         }
-        if let (Some(model), Some(store), Some(m)) =
-            (embedding_model, embedding_store, meta.as_ref())
-        {
-            emb_touched = embed_and_insert(vault_root, &relative, m, model, store);
+        if let Some(runtime) = embedding_runtime {
+            runtime.submit_upsert(&relative);
         }
     } else {
         tracing::debug!(path = %relative.display(), "removing (delete)");
@@ -322,7 +303,7 @@ fn process_event(
             Ok(mut idx) => idx.remove_file(&relative),
             Err(e) => {
                 tracing::error!("index lock poisoned: {e}");
-                return (false, false);
+                return false;
             }
         }
         if let Some(tv) = tantivy {
@@ -332,53 +313,12 @@ fn process_event(
                 tv_touched = true;
             }
         }
-        if let Some(store) = embedding_store
-            && let Ok(mut s) = store.write()
-        {
-            s.remove(&relative);
-            emb_touched = true;
+        if let Some(runtime) = embedding_runtime {
+            runtime.submit_remove(&relative);
         }
     }
 
-    (tv_touched, emb_touched)
-}
-
-#[cfg(has_embeddings)]
-fn embed_and_insert(
-    vault_root: &Path,
-    relative: &Path,
-    meta: &crate::models::NoteMetadata,
-    model: &super::embeddings::EmbeddingModel,
-    store: &Arc<RwLock<super::embeddings::EmbeddingStore>>,
-) -> bool {
-    let Ok(content) = super::fs::read_file(vault_root, relative) else {
-        return false;
-    };
-    let body = super::frontmatter::get_body(&content);
-    let heading_texts: Vec<String> = meta.headings.iter().map(|h| h.text.clone()).collect();
-    let text = super::embeddings::prepare_embed_text(&meta.title, &heading_texts, body);
-    match model.embed_one(&text) {
-        Ok(vec) => {
-            if let Ok(mut s) = store.write() {
-                s.insert(relative.to_path_buf(), vec);
-                true
-            } else {
-                false
-            }
-        }
-        Err(e) => {
-            tracing::warn!(path = %relative.display(), error = %e, "embedding failed in watcher");
-            false
-        }
-    }
-}
-
-#[cfg(has_embeddings)]
-fn save_embedding_cache(mcp_data: &Path, store: &super::embeddings::EmbeddingStore) {
-    let cache_path = mcp_data.join("embeddings").join("embeddings.bin");
-    if let Err(e) = store.save(&cache_path) {
-        tracing::warn!(error = %e, "failed to save embedding cache from watcher");
-    }
+    tv_touched
 }
 
 /// Process a single debounced event. Returns whether Tantivy was touched.
@@ -615,8 +555,7 @@ mod tests {
         let exclude = Arc::new(ExcludeSet::build(vec![]).unwrap());
         #[cfg(has_embeddings)]
         {
-            let mcp_data = vault_root.join(".obsidian-mcp");
-            start_watcher(vault_root, index, None, None, None, exclude, mcp_data)
+            start_watcher(vault_root, index, None, None, exclude)
         }
         #[cfg(not(has_embeddings))]
         {
@@ -632,7 +571,7 @@ mod tests {
     ) {
         #[cfg(has_embeddings)]
         {
-            let _ = process_event(vault_root, index, None, None, None, absolute, exclude);
+            let _ = process_event(vault_root, index, None, None, absolute, exclude);
         }
         #[cfg(not(has_embeddings))]
         {
