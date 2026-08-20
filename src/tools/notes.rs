@@ -566,12 +566,18 @@ mod tests {
         create_test_vault(dir.path());
         std::fs::write(dir.path().join("a.md"), "A").unwrap();
         std::fs::write(dir.path().join("b.md"), "BB").unwrap();
+        std::fs::write(dir.path().join("plain.txt"), "CCC").unwrap();
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
         let output = note_read_many(
             &vault,
             NoteReadManyParams {
-                paths: Some(vec!["b.md".into(), "missing.md".into(), "a.md".into()]),
+                paths: Some(vec![
+                    "b.md".into(),
+                    "missing.md".into(),
+                    "plain.txt".into(),
+                    "a.md".into(),
+                ]),
                 ..Default::default()
             },
         )
@@ -585,9 +591,9 @@ mod tests {
                 .iter()
                 .map(|note| note.path.as_str())
                 .collect::<Vec<_>>(),
-            vec!["b.md", "a.md"]
+            vec!["b.md", "plain.txt", "a.md"]
         );
-        assert_eq!(output.content_bytes, 3);
+        assert_eq!(output.content_bytes, 6);
         assert_eq!(output.skipped_count, 1);
         assert_eq!(
             output.skipped,
@@ -693,6 +699,38 @@ mod tests {
         assert!(output.notes.is_empty());
         assert_eq!(output.skipped_count, 1);
         assert_eq!(output.skipped[0].reason, NoteReadManySkipReason::Unreadable);
+    }
+
+    #[tokio::test]
+    async fn read_many_clamps_byte_limit_and_skips_a_later_oversized_file() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        std::fs::write(
+            dir.path().join("fills-budget.md"),
+            vec![b'x'; MAX_BYTES_CAP],
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("later.md"), "y").unwrap();
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        let output = note_read_many(
+            &vault,
+            NoteReadManyParams {
+                paths: Some(vec!["fills-budget.md".into(), "later.md".into()]),
+                max_bytes: Some(usize::MAX),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(output.notes.len(), 1);
+        assert_eq!(output.notes[0].path, "fills-budget.md");
+        assert_eq!(output.content_bytes, MAX_BYTES_CAP);
+        assert_eq!(output.skipped_count, 1);
+        assert_eq!(output.skipped[0].path, "later.md");
+        assert_eq!(output.skipped[0].reason, NoteReadManySkipReason::ByteLimit);
     }
 
     #[tokio::test]

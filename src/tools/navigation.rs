@@ -458,6 +458,42 @@ mod tests {
         assert_eq!(extract_text(&default), extract_text(&explicitly_disabled));
     }
 
+    #[tokio::test]
+    async fn list_metadata_preserves_recursive_glob_and_max_depth_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        fs::create_dir_all(dir.path().join("journal/deep")).unwrap();
+        fs::write(dir.path().join("journal/deep/hidden.md"), "# Deep").unwrap();
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+        let params = || VaultListParams {
+            recursive: Some(true),
+            glob: Some("journal/**".into()),
+            max_depth: Some(2),
+            ..Default::default()
+        };
+
+        let default = vault_list(&vault, params()).unwrap();
+        let expected: Vec<String> = serde_json::from_str(extract_text(&default)).unwrap();
+        let metadata = vault_list(
+            &vault,
+            VaultListParams {
+                include_metadata: Some(true),
+                ..params()
+            },
+        )
+        .unwrap();
+        let entries: Vec<serde_json::Value> =
+            serde_json::from_str(extract_text(&metadata)).unwrap();
+        let actual: Vec<String> = entries
+            .iter()
+            .map(|entry| entry["path"].as_str().unwrap().to_owned())
+            .collect();
+
+        assert_eq!(actual, expected);
+        assert!(actual.contains(&"journal/deep".to_string()));
+        assert!(!actual.contains(&"journal/deep/hidden.md".to_string()));
+    }
+
     // ── vault_list (tree mode) ──
 
     #[tokio::test]

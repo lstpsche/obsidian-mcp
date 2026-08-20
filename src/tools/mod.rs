@@ -117,7 +117,7 @@ impl ObsidianMcp {
 
     #[tool(
         name = "vault_list",
-        description = "List files and directories in the vault. Supports recursive listing, glob filtering, and tree view (format: \"tree\"). Returns a JSON array of paths (list mode) or a tree-formatted string (tree mode)."
+        description = "List files and directories in the vault. Supports recursive listing, glob filtering, and tree view (format: \"tree\"). List mode returns a JSON array of paths, or objects with indexed title, tags, size, and timestamps when include_metadata is true. Tree mode returns a tree-formatted string."
     )]
     async fn vault_list(
         &self,

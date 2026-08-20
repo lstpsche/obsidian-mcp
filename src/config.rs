@@ -85,6 +85,7 @@ pub struct Config {
 pub const ALL_TOOL_NAMES: &[&str] = &[
     "vault_list",
     "note_read",
+    "note_read_many",
     "note_create",
     "note_write",
     "note_insert",
@@ -106,6 +107,7 @@ pub const ALL_TOOL_NAMES: &[&str] = &[
 const PROFILE_CORE: &[&str] = &[
     "vault_list",
     "note_read",
+    "note_read_many",
     "note_create",
     "note_write",
     "note_insert",
@@ -122,6 +124,7 @@ const PROFILE_CORE: &[&str] = &[
 
 const PROFILE_READ: &[&str] = &[
     "note_read",
+    "note_read_many",
     "vault_list",
     "search_text",
     "search_regex",
@@ -700,6 +703,7 @@ mod tests {
         assert!(disabled.contains("periodic"));
         assert!(disabled.contains("open_in_obsidian"));
         assert!(!disabled.contains("note_read"));
+        assert!(!disabled.contains("note_read_many"));
     }
 
     #[test]
@@ -711,6 +715,7 @@ mod tests {
         assert!(disabled.contains("note_create"));
         assert!(disabled.contains("note_write"));
         assert!(!disabled.contains("note_read"));
+        assert!(!disabled.contains("note_read_many"));
         assert!(!disabled.contains("search_semantic"));
     }
 
@@ -722,6 +727,7 @@ mod tests {
         assert_eq!(disabled.len(), ALL_TOOL_NAMES.len() - PROFILE_MINIMAL.len());
         assert!(disabled.contains("search_regex"));
         assert!(disabled.contains("wikilinks"));
+        assert!(disabled.contains("note_read_many"));
         assert!(!disabled.contains("note_read"));
         assert!(!disabled.contains("vault_list"));
     }
@@ -755,8 +761,8 @@ mod tests {
 
     #[test]
     fn tool_filter_single_valid_tool_is_allow_list() {
-        let filter = ToolFilter::parse("note_read").unwrap();
-        let expected: HashSet<String> = std::iter::once("note_read".to_string()).collect();
+        let filter = ToolFilter::parse("note_read_many").unwrap();
+        let expected: HashSet<String> = std::iter::once("note_read_many".to_string()).collect();
         assert_eq!(filter, ToolFilter::AllowList(expected));
     }
 

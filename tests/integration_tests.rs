@@ -170,6 +170,121 @@ mod vault_read {
     }
 }
 
+// ── Bounded bulk-read workflow ──────────────────────────────────────────
+
+mod bulk_read_workflow {
+    use obsidian_mcp::tools::navigation::{VaultListParams, vault_list};
+    use obsidian_mcp::tools::notes::{NoteReadManyParams, note_read_many};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn reads_and_triages_a_seventeen_note_directory_in_bounded_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".obsidian")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("Inbox")).unwrap();
+
+        for index in 0..17 {
+            let content = format!("---\ntags: [triage]\n---\n# Note {index:02}\nBody {index:02}");
+            std::fs::write(
+                tmp.path().join(format!("Inbox/note-{index:02}.md")),
+                content,
+            )
+            .unwrap();
+        }
+
+        let config = Config {
+            vault_path: tmp.path().to_path_buf(),
+            ..fixture_config()
+        };
+        let vault = Vault::open(&config).await.unwrap();
+        let expected_paths: Vec<String> = (0..17)
+            .map(|index| format!("Inbox/note-{index:02}.md"))
+            .collect();
+
+        let bulk = note_read_many(
+            &vault,
+            NoteReadManyParams {
+                dir: Some("Inbox".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            bulk.notes
+                .iter()
+                .map(|note| note.path.clone())
+                .collect::<Vec<_>>(),
+            expected_paths
+        );
+        assert_eq!(bulk.notes.len(), 17);
+        assert_eq!(bulk.skipped_count, 0);
+        assert!(bulk.skipped.is_empty());
+        assert_eq!(
+            bulk.content_bytes,
+            bulk.notes
+                .iter()
+                .map(|note| note.content.len())
+                .sum::<usize>()
+        );
+
+        let default_list = vault_list(
+            &vault,
+            VaultListParams {
+                path: Some("Inbox".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let default_paths: Vec<String> = serde_json::from_str(
+            default_list.content[0]
+                .as_text()
+                .expect("expected text list")
+                .text
+                .as_str(),
+        )
+        .unwrap();
+        assert_eq!(default_paths, expected_paths);
+
+        let metadata_list = vault_list(
+            &vault,
+            VaultListParams {
+                path: Some("Inbox".into()),
+                include_metadata: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let metadata: Vec<serde_json::Value> = serde_json::from_str(
+            metadata_list.content[0]
+                .as_text()
+                .expect("expected metadata list")
+                .text
+                .as_str(),
+        )
+        .unwrap();
+        assert_eq!(metadata.len(), 17);
+        assert_eq!(
+            metadata
+                .iter()
+                .map(|entry| entry["path"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+            expected_paths
+        );
+        for entry in metadata {
+            assert_eq!(entry["tags"], serde_json::json!(["triage"]));
+            assert!(entry["title"].as_str().is_some());
+            assert!(entry["size"].as_u64().is_some());
+            if let Some(modified) = entry.get("modified") {
+                assert!(modified.as_str().is_some());
+            }
+            assert!(entry.get("content").is_none());
+        }
+    }
+}
+
 // ── Search operations ────────────────────────────────────────────────────
 
 mod vault_search {
@@ -795,7 +910,7 @@ mod tool_filtering {
     }
 
     #[tokio::test]
-    async fn full_profile_exposes_all_18_tools() {
+    async fn full_profile_exposes_all_19_tools() {
         let (_tmp, server) = build_server(ToolFilter::Full).await;
         let tools = server.tool_router.list_all();
         assert_eq!(
@@ -814,12 +929,13 @@ mod tool_filtering {
     }
 
     #[tokio::test]
-    async fn core_profile_exposes_14_tools() {
+    async fn core_profile_exposes_15_tools() {
         let (_tmp, server) = build_server(ToolFilter::Profile("core".into())).await;
         let tools = server.tool_router.list_all();
-        assert_eq!(tools.len(), 14, "core profile should expose 14 tools");
+        assert_eq!(tools.len(), 15, "core profile should expose 15 tools");
 
         assert!(server.tool_router.has_route("note_read"));
+        assert!(server.tool_router.has_route("note_read_many"));
         assert!(server.tool_router.has_route("vault_list"));
         assert!(server.tool_router.has_route("search_text"));
         assert!(server.tool_router.has_route("frontmatter"));
@@ -832,12 +948,13 @@ mod tool_filtering {
     }
 
     #[tokio::test]
-    async fn read_profile_exposes_10_tools() {
+    async fn read_profile_exposes_11_tools() {
         let (_tmp, server) = build_server(ToolFilter::Profile("read".into())).await;
         let tools = server.tool_router.list_all();
-        assert_eq!(tools.len(), 10, "read profile should expose 10 tools");
+        assert_eq!(tools.len(), 11, "read profile should expose 11 tools");
 
         assert!(server.tool_router.has_route("note_read"));
+        assert!(server.tool_router.has_route("note_read_many"));
         assert!(server.tool_router.has_route("vault_list"));
         assert!(server.tool_router.has_route("search_text"));
         assert!(server.tool_router.has_route("search_semantic"));
@@ -872,11 +989,12 @@ mod tool_filtering {
         assert!(!server.tool_router.has_route("search_regex"));
         assert!(!server.tool_router.has_route("wikilinks"));
         assert!(!server.tool_router.has_route("frontmatter"));
+        assert!(!server.tool_router.has_route("note_read_many"));
     }
 
     #[tokio::test]
     async fn allow_list_only_listed_tools() {
-        let allowed: HashSet<String> = ["note_read", "vault_list"]
+        let allowed: HashSet<String> = ["note_read_many", "vault_list"]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -884,15 +1002,16 @@ mod tool_filtering {
         let tools = server.tool_router.list_all();
         assert_eq!(tools.len(), 2, "allow-list should expose only 2 tools");
 
-        assert!(server.tool_router.has_route("note_read"));
+        assert!(server.tool_router.has_route("note_read_many"));
         assert!(server.tool_router.has_route("vault_list"));
+        assert!(!server.tool_router.has_route("note_read"));
         assert!(!server.tool_router.has_route("note_create"));
         assert!(!server.tool_router.has_route("search_text"));
     }
 
     #[tokio::test]
     async fn deny_list_hides_only_listed_tools() {
-        let denied: HashSet<String> = ["open_in_obsidian", "wikilinks"]
+        let denied: HashSet<String> = ["open_in_obsidian", "wikilinks", "note_read_many"]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -900,12 +1019,13 @@ mod tool_filtering {
         let tools = server.tool_router.list_all();
         assert_eq!(
             tools.len(),
-            ALL_TOOL_NAMES.len() - 2,
-            "deny-list should hide 2 tools"
+            ALL_TOOL_NAMES.len() - 3,
+            "deny-list should hide 3 tools"
         );
 
         assert!(!server.tool_router.has_route("open_in_obsidian"));
         assert!(!server.tool_router.has_route("wikilinks"));
+        assert!(!server.tool_router.has_route("note_read_many"));
         assert!(server.tool_router.has_route("note_read"));
         assert!(server.tool_router.has_route("vault_list"));
         assert!(server.tool_router.has_route("search_text"));

@@ -27,7 +27,7 @@ obsidian-mcp /path/to/your/vault
 obsidian-mcp --http /path/to/your/vault
 ```
 
-Add to your MCP client config (Cursor, Claude Desktop, etc.) and you're done — 18 tools are available immediately.
+Add to your MCP client config (Cursor, Claude Desktop, etc.) and you're done — 19 tools are available immediately.
 
 ## What It Can Do
 
@@ -451,26 +451,31 @@ Always available. Full regex syntax for pattern matching across all notes.
 ## Tool Reference
 
 <details>
-<summary><strong>All 18 tools</strong> (click to expand)</summary>
+<summary><strong>All 19 tools</strong> (click to expand)</summary>
 
 ### Navigation
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `vault_list` | `path?`, `recursive?`, `glob?`, `format?`, `max_depth?` | List files (`format: "list"`) or tree view (`format: "tree"`) |
+| `vault_list` | `path?`, `recursive?`, `glob?`, `format?`, `max_depth?`, `include_metadata?` | List files (`format: "list"`) or tree view (`format: "tree"`) |
 | `vault_info` | — | Aggregate vault statistics |
+
+`vault_list` keeps its default JSON string-array response. With `include_metadata: true` in list mode, each indexed Markdown note instead includes `path`, filename-stem `title`, `tags`, `size`, and available filesystem timestamps from the existing index without loading note bodies. Directories, non-Markdown files, and unindexed or excluded notes remain path-only objects. Metadata is not supported in tree mode.
 
 ### Note CRUD
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
 | `note_read` | `path` | Read full note content |
+| `note_read_many` | exactly one of `paths` or `dir`; `recursive?`, `glob?`, `max_files?`, `max_bytes?` | Read a bounded batch with per-path skip reasons |
 | `note_create` | `path`, `content?`, `frontmatter?` | Create a new note |
 | `note_write` | `path`, `content` | Overwrite note content |
 | `note_insert` | `path`, `content`, `position?` | Insert at end (`"end"`, default) or beginning (`"beginning"`) |
 | `note_patch` | `path`, `operation`, `target_type`, `target`, `content` | Patch a heading section, block ref, or frontmatter field |
 | `note_delete` | `path`, `confirm` | Delete a note (requires `confirm: true`) |
 | `note_move` | `from`, `to` | Move or rename a note |
+
+`note_read_many` preserves explicit path order or uses sorted directory order; directory reads are non-recursive by default. It inspects 20 files and returns up to 65,536 content bytes by default, with hard caps of 100 files and 262,144 content bytes. `max_bytes` counts only the UTF-8 bytes in returned note content. The response includes `notes`, bounded `skipped` details (at most 100), total `skipped_count`, and `content_bytes`. Oversized notes are skipped—even when first—and can be fetched deliberately with `note_read`. The typed MCP result is emitted as both `structuredContent` and compatibility JSON text.
 
 For `note_patch` heading targets, bare heading text such as `"Log"` is canonical. ATX marker-prefixed targets such as `"## Log"` are also accepted, so headings copied from `note_inspect` with `view: "targets"` can be used directly.
 
@@ -516,9 +521,9 @@ Control which tools are exposed via the `OBSIDIAN_TOOLS` environment variable or
 
 | Value | Effect |
 |-------|--------|
-| `full` (or unset) | All 18 tools |
-| `core` | 14 tools — drops `search_semantic`, `search_regex`, `periodic`, `open_in_obsidian` |
-| `read` | 10 tools — read-only (no create/write/insert/patch/delete/move) |
+| `full` (or unset) | All 19 tools |
+| `core` | 15 tools — drops `search_semantic`, `wikilinks`, `periodic`, `open_in_obsidian` |
+| `read` | 11 tools — read-only (no create/write/insert/patch/delete/move) |
 | `minimal` | 6 tools — `vault_list`, `vault_info`, `note_read`, `note_create`, `note_write`, `search_text` |
 | `tool1,tool2,...` | Allow-list — only the named tools |
 | `!tool1,!tool2,...` | Deny-list — all tools except the named ones |
