@@ -622,8 +622,7 @@ mod tests {
                 ..Default::default()
             },
         )
-        .err()
-        .expect("tree mode metadata must be rejected");
+        .expect_err("tree mode metadata must be rejected");
 
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
     }
