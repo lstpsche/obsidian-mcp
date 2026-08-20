@@ -15,7 +15,8 @@ use tokio::task::JoinHandle;
 use crate::error::{VaultError, VaultResult};
 
 use super::embeddings::{
-    Embedder, EmbeddingStore, prepare_embed_text, prepared_text_hash, validate_embedding_batch,
+    Embedder, EmbeddingStore, LegacyCacheMigration, migrate_cache_candidates_to_path,
+    prepare_embed_text, prepared_text_hash, validate_embedding_batch,
 };
 use super::index::VaultIndex;
 
@@ -95,6 +96,7 @@ struct RuntimeShared {
     vault_root: PathBuf,
     index: Arc<RwLock<VaultIndex>>,
     cache_path: PathBuf,
+    cache_migration_sources: Vec<PathBuf>,
     state: Mutex<RuntimeState>,
     notify: Notify,
     live: Arc<AtomicBool>,
@@ -178,10 +180,24 @@ impl EmbeddingQuerySnapshot {
 }
 
 impl EmbeddingRuntime {
+    #[cfg(test)]
     pub(crate) fn spawn<F>(
         vault_root: PathBuf,
         index: Arc<RwLock<VaultIndex>>,
         cache_path: PathBuf,
+        loader: F,
+    ) -> Self
+    where
+        F: Future<Output = VaultResult<Arc<dyn Embedder>>> + Send + 'static,
+    {
+        Self::spawn_with_cache_sources(vault_root, index, cache_path, Vec::new(), loader)
+    }
+
+    pub(crate) fn spawn_with_cache_sources<F>(
+        vault_root: PathBuf,
+        index: Arc<RwLock<VaultIndex>>,
+        cache_path: PathBuf,
+        cache_migration_sources: Vec<PathBuf>,
         loader: F,
     ) -> Self
     where
@@ -192,6 +208,7 @@ impl EmbeddingRuntime {
             vault_root,
             index,
             cache_path,
+            cache_migration_sources,
             state: Mutex::new(RuntimeState {
                 status: EmbeddingRuntimeStatus {
                     total_notes,
@@ -367,8 +384,35 @@ where
     let current_paths = current_paths(&shared.index);
     let expected_identity = model.space_identity().clone();
     let cache_path = shared.cache_path.clone();
+    let cache_migration_sources = shared.cache_migration_sources.clone();
+    let live = Arc::clone(&shared.live);
+    let persistence_gate = Arc::clone(&shared.persistence_gate);
     let current_count = current_paths.len();
     let loaded = tokio::task::spawn_blocking(move || {
+        if !cache_migration_sources.is_empty() {
+            let _guard = persistence_gate
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if !live.load(Ordering::Acquire) {
+                return None;
+            }
+            match migrate_cache_candidates_to_path(&cache_migration_sources, &cache_path) {
+                Ok(LegacyCacheMigration::Migrated(path)) => {
+                    tracing::info!(path = %path.display(), "relocated embedding cache in background");
+                }
+                Ok(LegacyCacheMigration::AlreadyPresent(_) | LegacyCacheMigration::NotFound) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        path = %cache_path.display(),
+                        error = %error,
+                        "failed to relocate embedding cache; rebuilding if necessary"
+                    );
+                }
+            }
+        }
+        if !live.load(Ordering::Acquire) {
+            return None;
+        }
         if cache_path.is_file() {
             EmbeddingStore::load_for_space(&cache_path, &expected_identity, current_count).ok()
         } else {
@@ -1328,6 +1372,49 @@ mod tests {
 
         assert_eq!(fake.calls.load(AtomicOrdering::SeqCst), 0);
         assert!(runtime.status().queryable);
+    }
+
+    #[tokio::test]
+    async fn compatible_cache_relocation_runs_in_background_and_reuses_vectors() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join(".obsidian")).unwrap();
+        std::fs::write(directory.path().join("one.md"), "# One\nsemantic body").unwrap();
+        let index = test_index(directory.path()).await;
+        let source_path = directory.path().join("legacy").join("embeddings.bin");
+        let target_path = directory.path().join("active").join("embeddings.bin");
+        let fake = Arc::new(FakeEmbedder::new());
+        let text = prepared_note_text(directory.path(), &index, Path::new("one.md"));
+        let mut cache = EmbeddingStore::new_with_identity(fake.identity.clone());
+        cache
+            .insert_hashed(
+                PathBuf::from("one.md"),
+                prepared_text_hash(&text),
+                vec![1.0, 0.0, 0.0],
+            )
+            .unwrap();
+        cache.set_first_pass_complete(true);
+        cache.save(&source_path).unwrap();
+
+        let loader_fake = Arc::clone(&fake);
+        let runtime = EmbeddingRuntime::spawn_with_cache_sources(
+            directory.path().to_path_buf(),
+            index,
+            target_path.clone(),
+            vec![source_path.clone()],
+            async move { Ok(loader_fake as Arc<dyn Embedder>) },
+        );
+        wait_for_status(&runtime, |status| status.phase == EmbeddingPhase::Ready).await;
+
+        assert_eq!(fake.calls.load(AtomicOrdering::SeqCst), 0);
+        assert!(runtime.status().queryable);
+        assert!(
+            source_path.is_file(),
+            "relocation must not delete its source"
+        );
+        assert!(target_path.is_file(), "relocation must publish the target");
+        let loaded = EmbeddingStore::load(&target_path).unwrap();
+        assert!(loaded.first_pass_complete());
+        assert_eq!(loaded.len(), 1);
     }
 
     #[tokio::test]

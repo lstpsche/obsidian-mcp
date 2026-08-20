@@ -1180,10 +1180,6 @@ pub fn migrate_legacy_cache_to_daemon_store(
         .join("vaults")
         .join(vault_id)
         .join("embeddings.bin");
-    if target.exists() {
-        return Ok(LegacyCacheMigration::AlreadyPresent(target));
-    }
-
     let legacy_source = vault_root
         .join(".obsidian")
         .join("obsidian-mcp")
@@ -1193,19 +1189,44 @@ pub fn migrate_legacy_cache_to_daemon_store(
         .join("embeddings")
         .join("embeddings.bin");
 
-    let source = if legacy_source.is_file() {
-        legacy_source
-    } else if new_source.is_file() {
-        new_source
-    } else {
+    migrate_cache_candidates_to_path(&[new_source, legacy_source], &target)
+}
+
+pub(crate) fn migrate_cache_candidates_to_path(
+    sources: &[PathBuf],
+    target: &Path,
+) -> VaultResult<LegacyCacheMigration> {
+    if target.exists() {
+        return Ok(LegacyCacheMigration::AlreadyPresent(target.to_path_buf()));
+    }
+
+    let Some(source) = sources.iter().find(|source| source.is_file()) else {
         return Ok(LegacyCacheMigration::NotFound);
     };
 
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
+    let parent = target.parent().ok_or_else(|| {
+        VaultError::Embedding(format!(
+            "embedding cache migration target has no parent: {}",
+            target.display()
+        ))
+    })?;
+    std::fs::create_dir_all(parent)?;
+
+    let mut source_file = std::fs::File::open(source)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    std::io::copy(&mut source_file, &mut temp)?;
+    temp.flush()?;
+    temp.as_file().sync_all()?;
+
+    match temp.persist_noclobber(target) {
+        Ok(_) => Ok(LegacyCacheMigration::Migrated(target.to_path_buf())),
+        Err(error)
+            if error.error.kind() == std::io::ErrorKind::AlreadyExists || target.exists() =>
+        {
+            Ok(LegacyCacheMigration::AlreadyPresent(target.to_path_buf()))
+        }
+        Err(error) => Err(VaultError::Io(error.error)),
     }
-    std::fs::copy(&source, &target)?;
-    Ok(LegacyCacheMigration::Migrated(target))
 }
 
 /// Prepare text for embedding from note components.
@@ -1873,7 +1894,7 @@ mod tests {
     }
 
     #[test]
-    fn migrate_legacy_cache_uses_new_source_as_fallback() {
+    fn migrate_legacy_cache_uses_active_local_source() {
         let vault_root = tempfile::tempdir().expect("temp vault root");
         let semantic_home = tempfile::tempdir().expect("temp semantic home");
 
@@ -1899,7 +1920,7 @@ mod tests {
     }
 
     #[test]
-    fn migrate_legacy_cache_prefers_legacy_over_new() {
+    fn migrate_legacy_cache_prefers_active_location_over_older_legacy_location() {
         let vault_root = tempfile::tempdir().expect("temp vault root");
         let semantic_home = tempfile::tempdir().expect("temp semantic home");
 
@@ -1928,9 +1949,58 @@ mod tests {
         };
         assert_eq!(
             std::fs::read(&migrated_path).expect("read target"),
-            b"legacy-bytes",
-            "legacy source should be preferred over new"
+            b"new-bytes",
+            "the active local cache should be preferred over the older legacy location"
         );
+    }
+
+    #[test]
+    fn concurrent_cache_migrations_publish_one_complete_source_without_overwrite() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let first_source = directory.path().join("first.bin");
+        let second_source = directory.path().join("second.bin");
+        let target = directory.path().join("target").join("embeddings.bin");
+        let first_bytes = vec![0x11; 512 * 1024];
+        let second_bytes = vec![0x22; 512 * 1024];
+        std::fs::write(&first_source, &first_bytes).expect("write first source");
+        std::fs::write(&second_source, &second_bytes).expect("write second source");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let workers = [first_source, second_source]
+            .into_iter()
+            .map(|source| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                let target = target.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    migrate_cache_candidates_to_path(&[source], &target)
+                        .expect("migration should resolve atomically")
+                })
+            })
+            .collect::<Vec<_>>();
+
+        barrier.wait();
+        let outcomes = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("migration worker should join"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, LegacyCacheMigration::Migrated(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, LegacyCacheMigration::AlreadyPresent(_)))
+                .count(),
+            1
+        );
+
+        let published = std::fs::read(&target).expect("read published target");
+        assert!(published == first_bytes || published == second_bytes);
     }
 
     // ── resolve_provider ──────────────────────────────────────────

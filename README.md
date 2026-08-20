@@ -439,14 +439,14 @@ Embedding lifecycle:
 
 Core note, graph, BM25, write, and MCP initialization behavior stays available in every phase. Repeated note changes are coalesced by path, and the newest write or removal wins over in-flight inference.
 
-Embedding caches are versioned and atomically replaced. A cache is reusable only when its backend, canonical model, vector dimension, embedding-input version, and—for API backends—the normalized endpoint fingerprint all match. Legacy payloads, incomplete first-pass checkpoints, corrupt data, and mismatched identities are never published; they trigger a one-time background rebuild. Cache locations do not change: local mode uses `{mcp_data}/embeddings/embeddings.bin`, while the daemon uses `<semantic-home>/vaults/<vault_id>/embeddings.bin`. Legacy-location copies remain non-destructive.
+Embedding caches are versioned and atomically replaced. A cache is reusable only when its backend, canonical model, vector dimension, embedding-input version, and—for API backends—the normalized endpoint fingerprint all match. Legacy payloads, incomplete first-pass checkpoints, corrupt data, and mismatched identities are never published; they trigger a one-time background rebuild. Cache locations do not change: local mode uses `{mcp_data}/embeddings/embeddings.bin`, while the daemon uses `<semantic-home>/vaults/<vault_id>/embeddings.bin`. Legacy-location relocation is non-destructive, runs behind the background coordinator, and publishes through the same atomic no-partial-file boundary.
 
 For a remote API, the identity can prove the configured endpoint and model name, but it cannot detect a provider silently replacing model weights behind the same name. Change the configured model identifier (or remove the derived cache) when a provider makes such a revision.
 
 - Finds notes by **meaning**, not keywords — "making money from software" surfaces notes about monetization
 - **Hybrid mode** — `lexical_prefetch: true` combines BM25 candidate retrieval with semantic re-ranking
 - **Tunable blending** — `alpha` controls the weight between lexical and semantic scores (default 0.25)
-- Daemon cache-location migration is one-way and non-destructive: legacy `.obsidian/obsidian-mcp/embeddings.bin` is copied into daemon namespace storage when available and never deleted automatically; an old payload format is then rebuilt in the background rather than trusted
+- Daemon cache-location migration is one-way and non-destructive: the active local cache is preferred, then legacy `.obsidian/obsidian-mcp/embeddings.bin`; relocation runs in the background, never overwrites an existing daemon cache, and an old payload format is rebuilt rather than trusted
 
 ### Regex — `search_regex`
 

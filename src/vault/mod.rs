@@ -148,35 +148,6 @@ impl Vault {
 
         ensure_dir(&mcp_data.join("embeddings"))?;
 
-        #[cfg(has_embeddings)]
-        {
-            let legacy_cache = root
-                .join(".obsidian")
-                .join("obsidian-mcp")
-                .join("embeddings.bin");
-            let new_cache = Self::embedding_cache_path(&mcp_data);
-            if legacy_cache.is_file() && !new_cache.exists() {
-                match std::fs::copy(&legacy_cache, &new_cache) {
-                    Ok(bytes) => {
-                        tracing::info!(
-                            from = %legacy_cache.display(),
-                            to = %new_cache.display(),
-                            bytes,
-                            "migrated legacy embedding cache to new location"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            from = %legacy_cache.display(),
-                            to = %new_cache.display(),
-                            error = %e,
-                            "failed to migrate legacy embedding cache (non-fatal)"
-                        );
-                    }
-                }
-            }
-        }
-
         // ── exclusion patterns ──
         let mut patterns = exclude::load_ignore_patterns(&mcp_home, &mcp_data);
         patterns.extend(config.exclude_patterns.iter().cloned());
@@ -209,18 +180,26 @@ impl Vault {
             let model_name = config.embeddings_model.clone();
             let provider = config.embedding_provider;
             let cache_path = Self::embedding_cache_path(&mcp_data);
+            let cache_migration_sources = vec![
+                root.join(".obsidian")
+                    .join("obsidian-mcp")
+                    .join("embeddings.bin"),
+            ];
             let loader = _embedding_loader.unwrap_or_else(|| {
                 Box::pin(async move {
                     let model = embeddings::EmbeddingModel::load(&model_name, provider).await?;
                     Ok(Arc::new(model) as Arc<dyn embeddings::Embedder>)
                 })
             });
-            Some(embedding_runtime::EmbeddingRuntime::spawn(
-                root.clone(),
-                Arc::clone(&index),
-                cache_path,
-                loader,
-            ))
+            Some(
+                embedding_runtime::EmbeddingRuntime::spawn_with_cache_sources(
+                    root.clone(),
+                    Arc::clone(&index),
+                    cache_path,
+                    cache_migration_sources,
+                    loader,
+                ),
+            )
         } else {
             None
         };
@@ -1763,7 +1742,7 @@ mod tests {
 
     #[cfg(has_embeddings)]
     #[tokio::test]
-    async fn legacy_embedding_cache_migrated_to_new_location() {
+    async fn disabled_embeddings_do_not_relocate_legacy_cache() {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
 
@@ -1781,23 +1760,19 @@ mod tests {
             .join("embeddings")
             .join("embeddings.bin");
         assert!(
-            new_path.exists(),
-            "migration should copy cache to new location"
-        );
-        assert_eq!(
-            std::fs::read(&new_path).unwrap(),
-            test_bytes,
-            "migrated file should have identical content"
+            !new_path.exists(),
+            "disabled embeddings must not move caches"
         );
         assert!(
             legacy_path.exists(),
-            "legacy file must not be deleted by migration"
+            "disabled embeddings must leave the legacy file untouched"
         );
+        assert_eq!(std::fs::read(legacy_path).unwrap(), test_bytes);
     }
 
     #[cfg(has_embeddings)]
     #[tokio::test]
-    async fn legacy_embedding_migration_is_idempotent() {
+    async fn legacy_embedding_cache_relocation_waits_for_background_loader() {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
 
@@ -1805,22 +1780,24 @@ mod tests {
         std::fs::create_dir_all(&legacy_dir).unwrap();
         std::fs::write(legacy_dir.join("embeddings.bin"), b"old-legacy-data").unwrap();
 
-        let new_dir = dir.path().join(".obsidian-mcp").join("embeddings");
-        std::fs::create_dir_all(&new_dir).unwrap();
-        let new_bytes = b"already-migrated-data";
-        std::fs::write(new_dir.join("embeddings.bin"), new_bytes).unwrap();
+        let config = embedding_config(dir.path());
+        let vault = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            Vault::open_with_embedding_loader(&config, Some(blocked_embedding_loader())),
+        )
+        .await
+        .expect("vault open must not wait for cache relocation")
+        .unwrap();
 
-        let _vault = Vault::open(&test_config(dir.path())).await.unwrap();
-
-        assert_eq!(
-            std::fs::read(new_dir.join("embeddings.bin")).unwrap(),
-            new_bytes,
-            "existing new cache must not be overwritten by legacy"
-        );
         assert!(
-            legacy_dir.join("embeddings.bin").exists(),
-            "legacy file must not be deleted"
+            !dir.path()
+                .join(".obsidian-mcp")
+                .join("embeddings")
+                .join("embeddings.bin")
+                .exists(),
+            "cache relocation must stay behind the blocked background loader"
         );
+        drop(vault);
     }
 
     #[cfg(has_embeddings)]

@@ -57,12 +57,25 @@ impl VaultContext {
         let tantivy = Arc::new(tantivy);
 
         #[cfg(has_embeddings)]
-        let embedding_runtime = EmbeddingRuntime::spawn(
-            vault_root.clone(),
-            Arc::clone(&index),
-            state_dir.join("embeddings.bin"),
-            embedding_loader,
-        );
+        let embedding_runtime = {
+            let cache_migration_sources = vec![
+                vault_root
+                    .join(".obsidian-mcp")
+                    .join("embeddings")
+                    .join("embeddings.bin"),
+                vault_root
+                    .join(".obsidian")
+                    .join("obsidian-mcp")
+                    .join("embeddings.bin"),
+            ];
+            EmbeddingRuntime::spawn_with_cache_sources(
+                vault_root.clone(),
+                Arc::clone(&index),
+                state_dir.join("embeddings.bin"),
+                cache_migration_sources,
+                embedding_loader,
+            )
+        };
 
         let context = Self {
             vault_id,
