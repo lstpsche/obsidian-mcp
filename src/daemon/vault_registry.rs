@@ -184,20 +184,71 @@ fn canonicalize_vault_root(vault_root: &Path) -> VaultResult<PathBuf> {
     Ok(canonical)
 }
 
-#[cfg(test)]
+#[cfg(all(test, has_embeddings))]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use super::*;
+    use crate::daemon::protocol::{EnsureVaultParams, SearchSemanticParams, SemanticPhase};
+    use crate::daemon::query;
+    use crate::vault::embeddings::{
+        EMBEDDING_INPUT_VERSION, Embedder, EmbeddingBackendKind, EmbeddingSpaceIdentity,
+    };
 
-    #[cfg(has_embeddings)]
+    struct FakeEmbedder {
+        identity: EmbeddingSpaceIdentity,
+    }
+
+    impl FakeEmbedder {
+        fn new() -> Self {
+            Self {
+                identity: EmbeddingSpaceIdentity {
+                    backend: EmbeddingBackendKind::Local,
+                    model: "daemon-test-model".into(),
+                    endpoint_fingerprint: None,
+                    dimension: 3,
+                    input_version: EMBEDDING_INPUT_VERSION,
+                },
+            }
+        }
+    }
+
+    impl Embedder for FakeEmbedder {
+        fn dimension(&self) -> usize {
+            self.identity.dimension
+        }
+
+        fn space_identity(&self) -> &EmbeddingSpaceIdentity {
+            &self.identity
+        }
+
+        fn embed_batch(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|text| vec![text.len() as f32, 1.0, 0.0])
+                .collect())
+        }
+    }
+
+    fn create_vault(root: &Path) {
+        std::fs::create_dir_all(root.join(".obsidian")).unwrap();
+        std::fs::write(root.join("note.md"), "# Note\nsemantic content\n").unwrap();
+    }
+
+    fn ensure_params(vault_root: &Path) -> EnsureVaultParams {
+        EnsureVaultParams {
+            vault_root: vault_root.display().to_string(),
+            watch: Some(false),
+            model_name: Some("blocked-test-model".into()),
+        }
+    }
+
     #[tokio::test]
     async fn concurrent_ensure_returns_one_context_while_shared_loader_is_blocked() {
         let dir = tempfile::tempdir().unwrap();
         let vault_root = dir.path().join("vault");
-        std::fs::create_dir_all(vault_root.join(".obsidian")).unwrap();
-        std::fs::write(vault_root.join("note.md"), "# Note\n").unwrap();
+        create_vault(&vault_root);
 
         let calls = Arc::new(AtomicUsize::new(0));
         let loader_calls = Arc::clone(&calls);
@@ -248,5 +299,154 @@ mod tests {
         .await
         .expect("shared loader should start in the background");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ensure_reports_warming_and_search_returns_structured_not_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        create_vault(&vault_root);
+        let loader: EmbeddingLoaderFactory = Arc::new(|| Box::pin(std::future::pending()));
+        let registry = VaultRegistry::new_with_loader(
+            dir.path().join("semantic-home"),
+            "blocked-test-model".into(),
+            loader,
+        )
+        .unwrap();
+
+        let ensured = tokio::time::timeout(
+            Duration::from_secs(2),
+            query::ensure_vault(&registry, ensure_params(&vault_root)),
+        )
+        .await
+        .expect("ensure must not wait for the blocked model loader")
+        .unwrap();
+        assert!(!ensured.ready);
+        assert_eq!(ensured.phase, Some(SemanticPhase::Warming));
+        assert_eq!(ensured.total_notes, Some(1));
+
+        let error = query::search_semantic(
+            &registry,
+            SearchSemanticParams {
+                vault_root: vault_root.display().to_string(),
+                query: "semantic".into(),
+                top_k: Some(10),
+                include_content: Some(false),
+            },
+        )
+        .await
+        .expect_err("warming semantic search must not masquerade as empty success");
+        assert_eq!(error.code, crate::daemon::protocol::ERR_VAULT_NOT_READY);
+        assert!(error.message.contains("warming"));
+        let data = error.data.expect("status data should be attached");
+        assert_eq!(data["phase"], "warming");
+        assert_eq!(data["ready"], false);
+        assert_eq!(data["total_notes"], 1);
+    }
+
+    #[tokio::test]
+    async fn ensure_tracks_ready_and_direct_queries_omit_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        create_vault(&vault_root);
+        let loader: EmbeddingLoaderFactory =
+            Arc::new(|| Box::pin(async { Ok(Arc::new(FakeEmbedder::new()) as Arc<dyn Embedder>) }));
+        let registry = VaultRegistry::new_with_loader(
+            dir.path().join("semantic-home"),
+            "blocked-test-model".into(),
+            loader,
+        )
+        .unwrap();
+
+        let ready = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let result = query::ensure_vault(&registry, ensure_params(&vault_root))
+                    .await
+                    .unwrap();
+                if result.ready {
+                    break result;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("semantic runtime should become ready");
+        assert_eq!(ready.phase, Some(SemanticPhase::Ready));
+        assert_eq!(ready.indexed_notes, Some(1));
+        assert_eq!(ready.total_notes, Some(1));
+        assert_eq!(ready.pending_notes, Some(0));
+
+        std::fs::remove_file(vault_root.join("note.md")).unwrap();
+        let result = query::search_semantic(
+            &registry,
+            SearchSemanticParams {
+                vault_root: vault_root.display().to_string(),
+                query: "semantic".into(),
+                top_k: Some(10),
+                include_content: Some(false),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.results.is_empty(),
+            "a stale vector must not produce a ghost hit for a missing note"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_reports_degraded_loader_failure_and_search_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        create_vault(&vault_root);
+        let loader: EmbeddingLoaderFactory = Arc::new(|| {
+            Box::pin(async { Err(VaultError::Embedding("injected safe loader failure".into())) })
+        });
+        let registry = VaultRegistry::new_with_loader(
+            dir.path().join("semantic-home"),
+            "blocked-test-model".into(),
+            loader,
+        )
+        .unwrap();
+
+        let degraded = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let result = query::ensure_vault(&registry, ensure_params(&vault_root))
+                    .await
+                    .unwrap();
+                if result.phase == Some(SemanticPhase::Degraded) {
+                    break result;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("loader failure should become visible as degraded status");
+        assert!(!degraded.ready);
+        assert_eq!(
+            degraded.last_error.as_deref(),
+            Some("Embedding error: injected safe loader failure")
+        );
+
+        let error = query::search_semantic(
+            &registry,
+            SearchSemanticParams {
+                vault_root: vault_root.display().to_string(),
+                query: "semantic".into(),
+                top_k: Some(10),
+                include_content: Some(false),
+            },
+        )
+        .await
+        .expect_err("an unqueryable degraded runtime must reject semantic search");
+        assert_eq!(error.code, crate::daemon::protocol::ERR_VAULT_NOT_READY);
+        assert!(error.message.contains("degraded"));
+        let data = error.data.expect("degraded status should be attached");
+        assert_eq!(data["phase"], "degraded");
+        assert_eq!(data["ready"], false);
+        assert_eq!(
+            data["last_error"],
+            "Embedding error: injected safe loader failure"
+        );
     }
 }

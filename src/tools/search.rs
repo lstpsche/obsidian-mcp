@@ -438,16 +438,6 @@ fn search_semantic_local(
     lexical_prefetch: bool,
     alpha: f32,
 ) -> Result<Vec<SemanticSearchResult>, VaultError> {
-    if !vault.has_embeddings() {
-        let detail = vault
-            .embedding_load_error()
-            .map(|e| format!("Embedding model failed to load: {e}"))
-            .unwrap_or_else(|| {
-                "Embeddings not enabled (compile with --features embeddings or embeddings-api, and set OBSIDIAN_EMBEDDINGS=true)".to_string()
-            });
-        return Err(VaultError::Embedding(detail));
-    }
-
     let candidate_limit = semantic_candidate_limit(top_k);
     let hits = if lexical_prefetch {
         vault.search_hybrid(
@@ -532,7 +522,7 @@ use crate::vault::search_utils::{body_preview, compile_query_word_regex};
 fn local_backend_available(vault: &Vault) -> bool {
     #[cfg(has_embeddings)]
     {
-        vault.has_embeddings()
+        vault.embeddings_configured()
     }
     #[cfg(not(has_embeddings))]
     {
@@ -551,7 +541,6 @@ fn should_fallback_to_local(err: &VaultError) -> bool {
             *code,
             protocol::ERR_DAEMON_UNAVAILABLE
                 | protocol::ERR_BOOTSTRAP_REQUIRED
-                | protocol::ERR_VAULT_NOT_READY
                 | protocol::ERR_INCOMPATIBLE_API_VERSION
         ),
         _ => false,
@@ -559,14 +548,20 @@ fn should_fallback_to_local(err: &VaultError) -> bool {
 }
 
 fn to_semantic_tool_error(err: VaultError) -> rmcp::ErrorData {
-    if matches!(err, VaultError::Embedding(_)) {
-        rmcp::ErrorData::new(
+    match err {
+        VaultError::Embedding(message) => rmcp::ErrorData::new(
             ErrorCode::INVALID_REQUEST,
-            err.to_string(),
+            message,
             None::<serde_json::Value>,
-        )
-    } else {
-        err.into()
+        ),
+        VaultError::DaemonRpc {
+            code,
+            message,
+            data,
+        } if code == protocol::ERR_VAULT_NOT_READY => {
+            rmcp::ErrorData::new(ErrorCode::INVALID_REQUEST, message, data)
+        }
+        other => other.into(),
     }
 }
 
@@ -579,6 +574,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    #[cfg(has_embeddings)]
+    use crate::config::EmbeddingProvider;
     use crate::test_helpers::{create_test_vault, extract_text, tantivy_config, test_config};
     #[cfg(unix)]
     use crate::{
@@ -753,6 +750,79 @@ mod tests {
             }
 
             captured_top_k
+        })
+    }
+
+    #[cfg(all(unix, has_embeddings))]
+    fn start_semantic_not_ready_server(socket_path: PathBuf) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            if socket_path.exists() {
+                let _ = std::fs::remove_file(&socket_path);
+            }
+            let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind unix socket");
+
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept client");
+                let (reader, mut writer) = tokio::io::split(stream);
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.expect("read request");
+                let request: serde_json::Value =
+                    serde_json::from_str(&line).expect("request should be valid JSON");
+                let id = request
+                    .get("id")
+                    .cloned()
+                    .expect("request should include id");
+                let method = request
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("request should include method");
+
+                let response = match method {
+                    "ensure_vault" => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "vault_id": "warming-vault",
+                            "ready": false,
+                            "watch_enabled": true,
+                            "model_name": "test-model",
+                            "phase": "warming",
+                            "indexed_notes": 1,
+                            "total_notes": 4,
+                            "pending_notes": 3
+                        }
+                    }),
+                    "search_semantic" => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": protocol::ERR_VAULT_NOT_READY,
+                            "message": "semantic index is warming; retry the query shortly",
+                            "data": {
+                                "phase": "warming",
+                                "ready": false,
+                                "indexed_notes": 1,
+                                "total_notes": 4,
+                                "pending_notes": 3
+                            }
+                        }
+                    }),
+                    other => panic!("unexpected method in daemon test server: {other}"),
+                };
+
+                writer
+                    .write_all(
+                        format!(
+                            "{}\n",
+                            serde_json::to_string(&response).expect("serialize response")
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("write response");
+                writer.flush().await.expect("flush response");
+            }
         })
     }
 
@@ -1476,5 +1546,113 @@ mod tests {
 
         let captured_top_k = server.await.expect("server join");
         assert_eq!(captured_top_k, semantic_candidate_limit(1));
+    }
+
+    #[cfg(all(unix, has_embeddings))]
+    #[tokio::test]
+    async fn auto_mode_preserves_daemon_warming_error_without_local_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let mut config = test_config(dir.path());
+        config.embeddings = true;
+        config.embedding_provider = Some(EmbeddingProvider::Local);
+        config.embeddings_model = "definitely-not-a-real-local-model".into();
+        let vault = Vault::open(&config).await.unwrap();
+
+        let socket_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = socket_dir.path().join("semanticd.sock");
+        let server = start_semantic_not_ready_server(socket_path.clone());
+        let runtime = SemanticRuntime {
+            mode: SemanticMode::Auto,
+            daemon_client: Some(SemanticDaemonClient::new(
+                IpcEndpoint::UnixSocket(socket_path),
+                DaemonConnectPolicy::default(),
+            )),
+            daemon_unavailable_reason: None,
+            prefetch_count: 50,
+            vault_ensured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        let error = search_semantic(
+            &vault,
+            SearchSemanticParams {
+                query: "semantic".into(),
+                top_k: Some(5),
+                include_content: Some(false),
+                lexical_prefetch: Some(false),
+                alpha: None,
+            },
+            0.25,
+            &runtime,
+        )
+        .await
+        .expect_err("warming daemon must return an explicit MCP error");
+
+        assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+        assert_eq!(
+            error.message,
+            "semantic index is warming; retry the query shortly"
+        );
+        let data = error.data.expect("warming status data should reach MCP");
+        assert_eq!(data["phase"], "warming");
+        assert_eq!(data["ready"], false);
+        assert!(
+            runtime
+                .vault_ensured
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "successful attachment must remain cached even while semantic warm-up continues"
+        );
+        server.await.expect("server join");
+    }
+
+    #[cfg(has_embeddings)]
+    #[tokio::test]
+    async fn auto_mode_still_falls_back_for_actual_daemon_unavailability() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let mut config = test_config(dir.path());
+        config.embeddings = true;
+        config.embedding_provider = Some(EmbeddingProvider::Local);
+        config.embeddings_model = "definitely-not-a-real-local-model".into();
+        let vault = Vault::open(&config).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while vault.embedding_load_error().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("invalid local backend should fail deterministically");
+
+        let ensured = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let runtime = SemanticRuntime {
+            mode: SemanticMode::Auto,
+            daemon_client: None,
+            daemon_unavailable_reason: Some("semantic daemon is offline".into()),
+            prefetch_count: 50,
+            vault_ensured: std::sync::Arc::clone(&ensured),
+        };
+        let error = search_semantic(
+            &vault,
+            SearchSemanticParams {
+                query: "semantic".into(),
+                top_k: Some(5),
+                include_content: Some(false),
+                lexical_prefetch: Some(false),
+                alpha: None,
+            },
+            0.25,
+            &runtime,
+        )
+        .await
+        .expect_err("local backend failure should surface after daemon fallback");
+
+        assert!(
+            !error.message.contains("semantic daemon is offline"),
+            "the local backend should have been attempted"
+        );
+        assert!(
+            !ensured.load(std::sync::atomic::Ordering::Relaxed),
+            "transport failure should invalidate the cached attachment"
+        );
     }
 }

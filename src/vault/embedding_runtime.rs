@@ -122,6 +122,7 @@ impl EmbeddingQuerySnapshot {
             .ok_or_else(|| VaultError::Embedding("embedding query returned no vector".into()))
     }
 
+    #[cfg(test)]
     pub(crate) fn semantic_scores(
         &self,
         query: &str,
@@ -130,6 +131,17 @@ impl EmbeddingQuerySnapshot {
         let query_vector = self.embed_query(query)?;
         let store = self.store.read().unwrap_or_else(|error| error.into_inner());
         Ok(store.query(&query_vector, top_k))
+    }
+
+    pub(crate) fn semantic_scores_for_paths(
+        &self,
+        query: &str,
+        allowed_paths: &HashSet<PathBuf>,
+        top_k: usize,
+    ) -> VaultResult<Vec<(PathBuf, f32)>> {
+        let query_vector = self.embed_query(query)?;
+        let store = self.store.read().unwrap_or_else(|error| error.into_inner());
+        Ok(store.query_paths(&query_vector, allowed_paths, top_k))
     }
 
     pub(crate) fn score_for(&self, path: &Path, query_vector: &[f32]) -> f32 {
@@ -151,11 +163,18 @@ impl EmbeddingRuntime {
     where
         F: Future<Output = VaultResult<Arc<dyn Embedder>>> + Send + 'static,
     {
+        let total_notes = current_paths(&index).len();
         let shared = Arc::new(RuntimeShared {
             vault_root,
             index,
             cache_path,
-            state: Mutex::new(RuntimeState::default()),
+            state: Mutex::new(RuntimeState {
+                status: EmbeddingRuntimeStatus {
+                    total_notes,
+                    ..EmbeddingRuntimeStatus::default()
+                },
+                ..RuntimeState::default()
+            }),
             notify: Notify::new(),
             live: Arc::new(AtomicBool::new(true)),
             first_load_error: OnceLock::new(),

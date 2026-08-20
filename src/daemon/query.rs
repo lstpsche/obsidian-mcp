@@ -1,6 +1,5 @@
 //! Daemon query handlers: vault attach, semantic search, and hybrid search.
 
-use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -8,12 +7,12 @@ use serde_json::Value;
 
 use super::protocol::{
     self, EnsureVaultParams, EnsureVaultResult, OpenHintParams, OpenHintResult, SearchHybridParams,
-    SearchResult, SearchSemanticParams, SemanticHit,
+    SearchResult, SearchSemanticParams, SemanticHit, SemanticPhase, SemanticStatus,
 };
 use super::vault_context::VaultContext;
 use super::vault_registry::VaultRegistry;
 use crate::error::VaultError;
-use crate::vault::search_utils::{body_preview, compile_query_word_regex, normalize_bm25_scores};
+use crate::vault::search_utils::{body_preview, compile_query_word_regex};
 
 const DEFAULT_TOP_K: usize = 10;
 const DEFAULT_PREFETCH_COUNT: usize = 50;
@@ -59,11 +58,17 @@ pub async fn ensure_vault(
         .map_err(map_vault_error)?;
 
     let watch_enabled = context.watch_enabled().map_err(map_vault_error)?;
+    let status = semantic_status(&context);
     Ok(EnsureVaultResult {
         vault_id: context.vault_id().to_string(),
-        ready: true,
+        ready: status.ready,
         watch_enabled,
         model_name: context.model_name().to_string(),
+        phase: Some(status.phase),
+        indexed_notes: Some(status.indexed_notes),
+        total_notes: Some(status.total_notes),
+        pending_notes: Some(status.pending_notes),
+        last_error: status.last_error,
     })
 }
 
@@ -72,6 +77,7 @@ pub async fn search_semantic(
     params: SearchSemanticParams,
 ) -> QueryResult<SearchResult> {
     let context = require_context(registry, &params.vault_root).await?;
+    require_semantic_ready(&context)?;
     let top_k = params.top_k.unwrap_or(DEFAULT_TOP_K);
     let include_content = params.include_content.unwrap_or(false);
 
@@ -91,6 +97,7 @@ pub async fn search_hybrid(
             results: Vec::new(),
         });
     }
+    require_semantic_ready(&context)?;
 
     let top_k = params.top_k.unwrap_or(DEFAULT_TOP_K);
     let include_content = params.include_content.unwrap_or(false);
@@ -106,21 +113,9 @@ pub async fn search_hybrid(
         });
     }
 
-    let query_embedding = context
-        .query_embedding(&params.query)
+    let combined = context
+        .search_hybrid_scores(&params.query, &bm25_hits, alpha, top_k)
         .map_err(map_vault_error)?;
-    let normalized = normalize_bm25_scores(&bm25_hits);
-    let mut combined: Vec<(PathBuf, f32)> = Vec::with_capacity(normalized.len());
-    for (path, normalized_bm25) in normalized {
-        let semantic = context
-            .semantic_score_for(&path, &query_embedding)
-            .map_err(map_vault_error)?;
-        let score = alpha * normalized_bm25 + (1.0 - alpha) * semantic;
-        combined.push((path, score));
-    }
-
-    combined.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-    combined.truncate(top_k);
 
     build_hits(&context, combined, &params.query, include_content)
 }
@@ -190,15 +185,11 @@ fn build_hits(
 
     let mut results = Vec::with_capacity(scores.len());
     for (path, score) in scores {
-        let meta = context.note_metadata(&path).map_err(map_vault_error)?;
-        let title = meta
-            .as_ref()
-            .map(|note| note.title.clone())
-            .unwrap_or_default();
-        let tags = meta
-            .as_ref()
-            .map(|note| note.tags.clone())
-            .unwrap_or_default();
+        let Some(meta) = context.note_metadata(&path).map_err(map_vault_error)? else {
+            continue;
+        };
+        let title = meta.title;
+        let tags = meta.tags;
 
         let (content, snippet) = if include_content {
             (context.read_note(&path).ok(), None)
@@ -233,6 +224,74 @@ fn build_hits(
     }
 
     Ok(SearchResult { results })
+}
+
+fn semantic_status(context: &VaultContext) -> SemanticStatus {
+    #[cfg(has_embeddings)]
+    {
+        let status = context.embedding_status();
+        SemanticStatus {
+            phase: match status.phase {
+                crate::vault::embedding_runtime::EmbeddingPhase::Warming => SemanticPhase::Warming,
+                crate::vault::embedding_runtime::EmbeddingPhase::Ready => SemanticPhase::Ready,
+                crate::vault::embedding_runtime::EmbeddingPhase::Degraded => {
+                    SemanticPhase::Degraded
+                }
+            },
+            ready: status.queryable,
+            indexed_notes: status.indexed_notes,
+            total_notes: status.total_notes,
+            pending_notes: status.pending_notes,
+            last_error: status.last_error,
+        }
+    }
+    #[cfg(not(has_embeddings))]
+    {
+        let _ = context;
+        SemanticStatus {
+            phase: SemanticPhase::Degraded,
+            ready: false,
+            indexed_notes: 0,
+            total_notes: 0,
+            pending_notes: 0,
+            last_error: Some("daemon binary was compiled without embedding support".into()),
+        }
+    }
+}
+
+fn require_semantic_ready(context: &VaultContext) -> QueryResult<()> {
+    let status = semantic_status(context);
+    if status.ready {
+        return Ok(());
+    }
+
+    #[cfg(not(has_embeddings))]
+    let (code, message) = (
+        protocol::ERR_BOOTSTRAP_REQUIRED,
+        "semantic daemon has no embedding backend; use a daemon built with embedding support",
+    );
+    #[cfg(has_embeddings)]
+    let (code, message) = match status.phase {
+        SemanticPhase::Warming => (
+            protocol::ERR_VAULT_NOT_READY,
+            "semantic index is warming; retry the query shortly",
+        ),
+        SemanticPhase::Degraded => (
+            protocol::ERR_VAULT_NOT_READY,
+            "semantic index is degraded and unavailable; inspect status and retry after recovery",
+        ),
+        SemanticPhase::Ready => (
+            protocol::ERR_VAULT_NOT_READY,
+            "semantic index is not queryable yet; retry the query shortly",
+        ),
+    };
+
+    let data = serde_json::to_value(&status).unwrap_or_else(|_| serde_json::json!({}));
+    Err(QueryError {
+        code,
+        message: message.into(),
+        data: Some(data),
+    })
 }
 
 fn split_subpath(path: &str) -> (&str, Option<String>) {

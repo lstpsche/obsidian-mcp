@@ -123,12 +123,41 @@ pub struct EnsureVaultParams {
     pub model_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticPhase {
+    Warming,
+    Ready,
+    Degraded,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct SemanticStatus {
+    pub phase: SemanticPhase,
+    pub ready: bool,
+    pub indexed_notes: usize,
+    pub total_notes: usize,
+    pub pending_notes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct EnsureVaultResult {
     pub vault_id: String,
     pub ready: bool,
     pub watch_enabled: bool,
     pub model_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<SemanticPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexed_notes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_notes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_notes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -204,5 +233,46 @@ mod tests {
         let response = RpcResponse::error(Some(Value::from(1)), ERR_INVALID_PARAMS, "bad params");
         let value = serde_json::to_value(response).expect("response should serialize");
         assert_eq!(value["error"]["code"], Value::from(ERR_INVALID_PARAMS));
+    }
+
+    #[test]
+    fn ensure_vault_decodes_legacy_v1_without_progress_fields() {
+        let result: EnsureVaultResult = serde_json::from_value(serde_json::json!({
+            "vault_id": "legacy",
+            "ready": true,
+            "watch_enabled": true,
+            "model_name": "legacy-model"
+        }))
+        .unwrap();
+
+        assert!(result.ready);
+        assert_eq!(result.phase, None);
+        assert_eq!(result.indexed_notes, None);
+        assert_eq!(result.total_notes, None);
+        assert_eq!(result.pending_notes, None);
+        assert_eq!(result.last_error, None);
+    }
+
+    #[test]
+    fn ensure_vault_round_trips_additive_progress_fields() {
+        let expected = EnsureVaultResult {
+            vault_id: "current".into(),
+            ready: false,
+            watch_enabled: true,
+            model_name: "current-model".into(),
+            phase: Some(SemanticPhase::Warming),
+            indexed_notes: Some(12),
+            total_notes: Some(20),
+            pending_notes: Some(8),
+            last_error: None,
+        };
+
+        let encoded = serde_json::to_value(&expected).unwrap();
+        let decoded: EnsureVaultResult = serde_json::from_value(encoded).unwrap();
+        assert!(!decoded.ready);
+        assert_eq!(decoded.phase, Some(SemanticPhase::Warming));
+        assert_eq!(decoded.indexed_notes, Some(12));
+        assert_eq!(decoded.total_notes, Some(20));
+        assert_eq!(decoded.pending_notes, Some(8));
     }
 }

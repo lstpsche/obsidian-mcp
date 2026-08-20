@@ -517,11 +517,13 @@ impl Vault {
             VaultError::Embedding("embeddings not enabled (OBSIDIAN_EMBEDDINGS=false)".into())
         })?;
         let snapshot = runtime.query_snapshot()?;
-        let mut results = snapshot.semantic_scores(query, usize::MAX)?;
-        let index = self.read_index();
-        results.retain(|(path, _)| index.get_note(path).is_some());
-        results.truncate(top_k);
-        Ok(results)
+        let current_paths = self
+            .read_index()
+            .notes()
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        snapshot.semantic_scores_for_paths(query, &current_paths, top_k)
     }
 
     /// Returns `true` if embeddings are available for semantic search.
@@ -531,6 +533,11 @@ impl Vault {
             .embedding_runtime
             .as_ref()
             .is_some_and(|runtime| runtime.status().queryable)
+    }
+
+    #[cfg(has_embeddings)]
+    pub(crate) fn embeddings_configured(&self) -> bool {
+        self.inner.embedding_runtime.is_some()
     }
 
     /// Returns the error message from a failed embedding model load, if any.

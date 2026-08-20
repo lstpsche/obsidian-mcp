@@ -253,12 +253,30 @@ impl EmbeddingStore {
     /// Find the `top_k` most similar notes to `query_vec`, sorted by
     /// descending cosine similarity.
     pub fn query(&self, query_vec: &[f32], top_k: usize) -> Vec<(PathBuf, f32)> {
-        let mut scored: Vec<(PathBuf, f32)> = self
+        let scored = self
             .embeddings
             .iter()
             .map(|(path, entry)| (path.clone(), cosine_similarity(query_vec, &entry.vector)))
             .collect();
+        Self::rank_scores(scored, top_k)
+    }
 
+    pub(crate) fn query_paths(
+        &self,
+        query_vec: &[f32],
+        allowed_paths: &HashSet<PathBuf>,
+        top_k: usize,
+    ) -> Vec<(PathBuf, f32)> {
+        let scored = self
+            .embeddings
+            .iter()
+            .filter(|(path, _)| allowed_paths.contains(*path))
+            .map(|(path, entry)| (path.clone(), cosine_similarity(query_vec, &entry.vector)))
+            .collect();
+        Self::rank_scores(scored, top_k)
+    }
+
+    fn rank_scores(mut scored: Vec<(PathBuf, f32)>, top_k: usize) -> Vec<(PathBuf, f32)> {
         let cmp = |a: &(PathBuf, f32), b: &(PathBuf, f32)| {
             b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
         };
@@ -798,7 +816,18 @@ fn embed_batch_api(
             .header("Authorization", format!("Bearer {api_key}"))
             .json(&body)
             .send()
-            .map_err(|e| VaultError::Embedding(format!("embedding API request failed: {e}")))?;
+            .map_err(|error| {
+                let detail = if error.is_timeout() {
+                    "request timed out"
+                } else if error.is_connect() {
+                    "connection failed"
+                } else if error.is_builder() {
+                    "request could not be constructed"
+                } else {
+                    "request failed"
+                };
+                VaultError::Embedding(format!("embedding API {detail}"))
+            })?;
 
         let status = response.status();
         if status.as_u16() == 429 && attempt < MAX_RETRIES {
@@ -821,15 +850,14 @@ fn embed_batch_api(
         }
 
         if !status.is_success() {
-            let body_text = response.text().unwrap_or_default();
             return Err(VaultError::Embedding(format!(
-                "embedding API error {status}: {body_text}"
+                "embedding API returned HTTP status {status}"
             )));
         }
 
-        let resp: serde_json::Value = response
-            .json()
-            .map_err(|e| VaultError::Embedding(format!("embedding API parse error: {e}")))?;
+        let resp: serde_json::Value = response.json().map_err(|_| {
+            VaultError::Embedding("embedding API returned invalid JSON".to_string())
+        })?;
 
         return parse_embedding_response(&resp, texts.len());
     }
@@ -1128,6 +1156,17 @@ mod tests {
         let query = vec![1.0, 0.0, 0.0];
         let results = store.query(&query, 100);
         assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn query_paths_ranks_only_authoritative_members() {
+        let store = make_store();
+        let allowed = HashSet::from([PathBuf::from("b.md"), PathBuf::from("c.md")]);
+        let results = store.query_paths(&[1.0, 0.0, 0.0], &allowed, 10);
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|(path, _)| allowed.contains(path)));
+        assert_eq!(results[0].0, PathBuf::from("c.md"));
     }
 
     #[test]
@@ -1626,6 +1665,71 @@ mod tests {
                 .err()
                 .unwrap();
             assert!(non_finite.to_string().contains("non-finite"));
+        }
+
+        #[test]
+        fn api_http_error_does_not_expose_url_key_body_or_input() {
+            use std::io::{Read as _, Write as _};
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request);
+                let body = r#"{"error":"provider echoed sensitive note body and api-secret"}"#;
+                let response = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            });
+            let base_url = format!("http://{address}/secret-url-component");
+            let client = build_api_client().unwrap();
+
+            let error = embed_batch_api(
+                &client,
+                &base_url,
+                "test-model",
+                "api-secret",
+                &["sensitive note body"],
+            )
+            .unwrap_err()
+            .to_string();
+
+            assert!(error.contains("HTTP status 400"));
+            assert!(!error.contains("secret-url-component"));
+            assert!(!error.contains("api-secret"));
+            assert!(!error.contains("sensitive note body"));
+            server.join().unwrap();
+        }
+
+        #[test]
+        fn api_transport_error_does_not_expose_secret_url() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                drop(stream);
+            });
+            let base_url = format!("http://{address}/secret-url-component");
+            let client = build_api_client().unwrap();
+
+            let error = embed_batch_api(
+                &client,
+                &base_url,
+                "test-model",
+                "api-secret",
+                &["sensitive note body"],
+            )
+            .unwrap_err()
+            .to_string();
+
+            assert!(error.contains("embedding API"));
+            assert!(!error.contains("secret-url-component"));
+            assert!(!error.contains("api-secret"));
+            assert!(!error.contains("sensitive note body"));
+            server.join().unwrap();
         }
 
         #[test]

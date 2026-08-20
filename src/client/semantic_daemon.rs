@@ -450,6 +450,92 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn ensure_vault_decodes_legacy_v1_response() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("semanticd.sock");
+        let server = start_unix_server_once(socket_path.clone(), |request| {
+            let id = request
+                .get("id")
+                .cloned()
+                .expect("request id should be present");
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "vault_id": "legacy-vault",
+                    "ready": true,
+                    "watch_enabled": true,
+                    "model_name": "legacy-model"
+                }
+            })
+        })
+        .await;
+
+        let client = SemanticDaemonClient::new(
+            IpcEndpoint::UnixSocket(socket_path),
+            DaemonConnectPolicy::default(),
+        );
+        let result = client
+            .ensure_vault(Path::new("/tmp/vault"), true, None)
+            .await
+            .expect("legacy v1 ensure result should decode");
+
+        assert!(result.ready);
+        assert_eq!(result.phase, None);
+        assert_eq!(result.indexed_notes, None);
+        assert_eq!(result.total_notes, None);
+        assert_eq!(result.pending_notes, None);
+        assert_eq!(result.last_error, None);
+        server.await.expect("server task should complete");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_vault_decodes_additive_progress_fields() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("semanticd.sock");
+        let server = start_unix_server_once(socket_path.clone(), |request| {
+            let id = request
+                .get("id")
+                .cloned()
+                .expect("request id should be present");
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "vault_id": "warming-vault",
+                    "ready": false,
+                    "watch_enabled": true,
+                    "model_name": "current-model",
+                    "phase": "warming",
+                    "indexed_notes": 3,
+                    "total_notes": 9,
+                    "pending_notes": 6
+                }
+            })
+        })
+        .await;
+
+        let client = SemanticDaemonClient::new(
+            IpcEndpoint::UnixSocket(socket_path),
+            DaemonConnectPolicy::default(),
+        );
+        let result = client
+            .ensure_vault(Path::new("/tmp/vault"), true, None)
+            .await
+            .expect("additive v1 ensure result should decode");
+
+        assert!(!result.ready);
+        assert_eq!(result.phase, Some(protocol::SemanticPhase::Warming));
+        assert_eq!(result.indexed_notes, Some(3));
+        assert_eq!(result.total_notes, Some(9));
+        assert_eq!(result.pending_notes, Some(6));
+        assert_eq!(result.last_error, None);
+        server.await.expect("server task should complete");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn call_retries_when_endpoint_is_temporarily_missing() {
         let temp = tempfile::tempdir().expect("tempdir");
         let socket_path = temp.path().join("semanticd.sock");
@@ -495,7 +581,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn rpc_errors_are_reported_with_code_and_message() {
+    async fn rpc_errors_preserve_semantic_status_data() {
         let temp = tempfile::tempdir().expect("tempdir");
         let socket_path = temp.path().join("semanticd.sock");
         let server = start_unix_server_once(socket_path.clone(), |request| {
@@ -508,8 +594,14 @@ mod tests {
                 "id": id,
                 "error": {
                     "code": -32030,
-                    "message": "vault not ready; call ensure_vault first",
-                    "data": { "vault_root": "/tmp/vault" }
+                    "message": "semantic index is warming; retry the query shortly",
+                    "data": {
+                        "phase": "warming",
+                        "ready": false,
+                        "indexed_notes": 2,
+                        "total_notes": 5,
+                        "pending_notes": 3
+                    }
                 }
             })
         })
@@ -519,7 +611,9 @@ mod tests {
             IpcEndpoint::UnixSocket(socket_path),
             DaemonConnectPolicy::default(),
         );
-        let result = client.health("obsidian-mcp-test", "1.0.1").await;
+        let result = client
+            .search_semantic(Path::new("/tmp/vault"), "query", 10, false)
+            .await;
         match result {
             Err(VaultError::DaemonRpc {
                 code,
@@ -527,8 +621,13 @@ mod tests {
                 data,
             }) => {
                 assert_eq!(code, -32030);
-                assert!(message.contains("vault not ready"));
-                assert!(data.is_some());
+                assert!(message.contains("warming"));
+                let data = data.expect("warming status data should be preserved");
+                assert_eq!(data["phase"], "warming");
+                assert_eq!(data["ready"], false);
+                assert_eq!(data["indexed_notes"], 2);
+                assert_eq!(data["total_notes"], 5);
+                assert_eq!(data["pending_notes"], 3);
             }
             other => panic!("expected daemon RPC error, got: {other:?}"),
         }

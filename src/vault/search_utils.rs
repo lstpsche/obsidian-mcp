@@ -1,5 +1,6 @@
 //! Shared search utility functions used by both MCP tools and the semantic daemon.
 
+#[cfg(any(has_embeddings, test))]
 use std::path::PathBuf;
 
 /// Strip YAML frontmatter and title heading, return a character-limited body preview.
@@ -36,6 +37,7 @@ pub(crate) fn compile_query_word_regex(query: &str) -> Option<regex::Regex> {
 ///
 /// When all scores are identical, each normalized score is `1.0`.
 /// Non-finite scores (NaN, infinity) are silently filtered out.
+#[cfg(any(has_embeddings, test))]
 pub(crate) fn normalize_bm25_scores(hits: &[(PathBuf, f32)]) -> Vec<(PathBuf, f32)> {
     if hits.is_empty() {
         return Vec::new();

@@ -164,22 +164,46 @@ impl VaultContext {
         query: &str,
         top_k: usize,
     ) -> VaultResult<Vec<(PathBuf, f32)>> {
+        let current_paths = self
+            .index
+            .read()
+            .map_err(|error| VaultError::Other(format!("daemon index lock poisoned: {error}")))?
+            .notes()
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
         self.embedding_runtime
             .query_snapshot()?
-            .semantic_scores(query, top_k)
+            .semantic_scores_for_paths(query, &current_paths, top_k)
     }
 
     #[cfg(has_embeddings)]
-    pub fn query_embedding(&self, query: &str) -> VaultResult<Vec<f32>> {
-        self.embedding_runtime.query_snapshot()?.embed_query(query)
-    }
-
-    #[cfg(has_embeddings)]
-    pub fn semantic_score_for(&self, path: &Path, query_embedding: &[f32]) -> VaultResult<f32> {
-        Ok(self
-            .embedding_runtime
-            .query_snapshot()?
-            .score_for(path, query_embedding))
+    pub fn search_hybrid_scores(
+        &self,
+        query: &str,
+        bm25_hits: &[(PathBuf, f32)],
+        alpha: f32,
+        top_k: usize,
+    ) -> VaultResult<Vec<(PathBuf, f32)>> {
+        let snapshot = self.embedding_runtime.query_snapshot()?;
+        let query_embedding = snapshot.embed_query(query)?;
+        let normalized = crate::vault::search_utils::normalize_bm25_scores(bm25_hits);
+        let mut combined = normalized
+            .into_iter()
+            .map(|(path, normalized_bm25)| {
+                let semantic = snapshot.score_for(&path, &query_embedding);
+                let score = alpha * normalized_bm25 + (1.0 - alpha) * semantic;
+                (path, score)
+            })
+            .collect::<Vec<_>>();
+        combined.sort_unstable_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        combined.truncate(top_k);
+        Ok(combined)
     }
 
     #[cfg(has_embeddings)]
@@ -199,14 +223,13 @@ impl VaultContext {
     }
 
     #[cfg(not(has_embeddings))]
-    pub fn query_embedding(&self, _query: &str) -> VaultResult<Vec<f32>> {
-        Err(VaultError::Embedding(
-            "daemon binary compiled without embeddings feature".to_string(),
-        ))
-    }
-
-    #[cfg(not(has_embeddings))]
-    pub fn semantic_score_for(&self, _path: &Path, _query_embedding: &[f32]) -> VaultResult<f32> {
+    pub fn search_hybrid_scores(
+        &self,
+        _query: &str,
+        _bm25_hits: &[(PathBuf, f32)],
+        _alpha: f32,
+        _top_k: usize,
+    ) -> VaultResult<Vec<(PathBuf, f32)>> {
         Err(VaultError::Embedding(
             "daemon binary compiled without embeddings feature".to_string(),
         ))
