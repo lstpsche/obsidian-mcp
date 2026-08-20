@@ -15,10 +15,7 @@ use crate::vault::path as vault_path;
 use crate::vault::tantivy_index::TantivyIndex;
 
 #[cfg(has_embeddings)]
-use crate::vault::embeddings::{EmbeddingModel, EmbeddingStore};
-
-#[cfg(has_embeddings)]
-use super::indexer;
+use crate::vault::embedding_runtime::EmbeddingRuntime;
 
 const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(500);
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -28,9 +25,7 @@ pub fn start_watcher(
     vault_root: PathBuf,
     index: Arc<RwLock<VaultIndex>>,
     tantivy: Option<Arc<TantivyIndex>>,
-    embedding_model: Arc<EmbeddingModel>,
-    embedding_store: Arc<RwLock<EmbeddingStore>>,
-    embedding_cache_path: PathBuf,
+    embedding_runtime: EmbeddingRuntime,
     exclude: Arc<ExcludeSet>,
 ) -> VaultResult<Debouncer<notify::RecommendedWatcher>> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<DebounceEventResult>(EVENT_CHANNEL_CAPACITY);
@@ -63,28 +58,21 @@ pub fn start_watcher(
             match result {
                 Ok(events) => {
                     let mut tantivy_dirty = false;
-                    let mut embedding_dirty = false;
                     for event in events {
-                        let (tv, emb) = process_event(
+                        tantivy_dirty |= process_event(
                             &vault_root,
                             &index,
                             tantivy.as_deref(),
-                            &embedding_model,
-                            &embedding_store,
+                            &embedding_runtime,
                             &event.path,
                             &exclude,
                         );
-                        tantivy_dirty |= tv;
-                        embedding_dirty |= emb;
                     }
                     if tantivy_dirty
                         && let Some(ref tv) = tantivy
                         && let Err(err) = tv.flush()
                     {
                         tracing::warn!(error = %err, "daemon tantivy batch flush failed");
-                    }
-                    if embedding_dirty && let Ok(store_guard) = embedding_store.read() {
-                        indexer::save_embedding_cache(&embedding_cache_path, &store_guard);
                     }
                 }
                 Err(err) => {
@@ -193,28 +181,26 @@ fn is_obsidian_dir(relative: &Path) -> bool {
     })
 }
 
-/// Returns `(tantivy_touched, embedding_touched)`.
+/// Returns whether Tantivy was touched.
 #[cfg(has_embeddings)]
 fn process_event(
     vault_root: &Path,
     index: &Arc<RwLock<VaultIndex>>,
     tantivy: Option<&TantivyIndex>,
-    embedding_model: &EmbeddingModel,
-    embedding_store: &Arc<RwLock<EmbeddingStore>>,
+    embedding_runtime: &EmbeddingRuntime,
     absolute: &Path,
     exclude: &ExcludeSet,
-) -> (bool, bool) {
+) -> bool {
     if !should_process_path(vault_root, absolute, exclude) {
-        return (false, false);
+        return false;
     }
 
     let relative = match vault_path::relative_from_absolute(vault_root, absolute) {
         Ok(relative) => relative,
-        Err(_) => return (false, false),
+        Err(_) => return false,
     };
 
     let mut tv_touched = false;
-    let mut emb_touched = false;
 
     if absolute.exists() {
         tracing::debug!(
@@ -225,13 +211,13 @@ fn process_event(
             Ok(mut index_guard) => {
                 if let Err(err) = index_guard.reindex_file(vault_root, &relative) {
                     tracing::warn!(path = %relative.display(), error = %err, "daemon reindex failed");
-                    return (false, false);
+                    return false;
                 }
                 index_guard.get_note(&relative).cloned()
             }
             Err(err) => {
                 tracing::error!(error = %err, "daemon index lock poisoned");
-                return (false, false);
+                return false;
             }
         };
         if let Some(tv) = tantivy
@@ -243,17 +229,14 @@ fn process_event(
                 tv_touched = true;
             }
         }
-        if let Some(ref m) = meta {
-            emb_touched =
-                indexer::embed_note(vault_root, &relative, m, embedding_model, embedding_store);
-        }
+        embedding_runtime.submit_upsert(&relative);
     } else {
         tracing::debug!(path = %relative.display(), "daemon watcher remove (delete)");
         match index.write() {
             Ok(mut index_guard) => index_guard.remove_file(&relative),
             Err(err) => {
                 tracing::error!(error = %err, "daemon index lock poisoned");
-                return (false, false);
+                return false;
             }
         }
         if let Some(tv) = tantivy {
@@ -263,10 +246,10 @@ fn process_event(
                 tv_touched = true;
             }
         }
-        emb_touched = indexer::remove_note_embedding(&relative, embedding_store);
+        embedding_runtime.submit_remove(&relative);
     }
 
-    (tv_touched, emb_touched)
+    tv_touched
 }
 
 /// Returns whether Tantivy was touched.
@@ -370,5 +353,59 @@ mod tests {
         let index = index.read().unwrap();
         assert!(index.get_note(&disk_path).is_some());
         assert!(index.get_note(Path::new(composed)).is_none());
+    }
+
+    #[cfg(has_embeddings)]
+    #[tokio::test]
+    async fn embedding_events_coalesce_to_latest_path_intents_without_inference() {
+        use crate::vault::embedding_runtime::PendingKind;
+        use crate::vault::embeddings::Embedder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let index = Arc::new(RwLock::new(VaultIndex::empty()));
+        let runtime = EmbeddingRuntime::spawn(
+            dir.path().to_path_buf(),
+            Arc::clone(&index),
+            dir.path().join("embeddings.bin"),
+            async { std::future::pending::<VaultResult<Arc<dyn Embedder>>>().await },
+        );
+        let exclude = ExcludeSet::build(vec![]).unwrap();
+        let old_relative = PathBuf::from("old.md");
+        let old_absolute = dir.path().join(&old_relative);
+
+        std::fs::write(&old_absolute, "# First\n").unwrap();
+        let _ = process_event(dir.path(), &index, None, &runtime, &old_absolute, &exclude);
+        assert_eq!(
+            runtime.pending_kind(&old_relative),
+            Some(PendingKind::Upsert)
+        );
+
+        std::fs::write(&old_absolute, "# Latest\n").unwrap();
+        let _ = process_event(dir.path(), &index, None, &runtime, &old_absolute, &exclude);
+        assert_eq!(
+            runtime.pending_kind(&old_relative),
+            Some(PendingKind::Upsert)
+        );
+
+        let new_relative = PathBuf::from("new.md");
+        let new_absolute = dir.path().join(&new_relative);
+        std::fs::rename(&old_absolute, &new_absolute).unwrap();
+        let _ = process_event(dir.path(), &index, None, &runtime, &old_absolute, &exclude);
+        let _ = process_event(dir.path(), &index, None, &runtime, &new_absolute, &exclude);
+        assert_eq!(
+            runtime.pending_kind(&old_relative),
+            Some(PendingKind::Remove)
+        );
+        assert_eq!(
+            runtime.pending_kind(&new_relative),
+            Some(PendingKind::Upsert)
+        );
+
+        std::fs::remove_file(&new_absolute).unwrap();
+        let _ = process_event(dir.path(), &index, None, &runtime, &new_absolute, &exclude);
+        assert_eq!(
+            runtime.pending_kind(&new_relative),
+            Some(PendingKind::Remove)
+        );
     }
 }

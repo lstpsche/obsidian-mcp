@@ -12,11 +12,16 @@ use crate::vault::index::VaultIndex;
 use crate::vault::tantivy_index::TantivyIndex;
 
 #[cfg(has_embeddings)]
-use crate::vault::embeddings::{EmbeddingModel, EmbeddingStore};
+use crate::vault::embedding_runtime::{EmbeddingRuntime, EmbeddingRuntimeStatus};
+#[cfg(has_embeddings)]
+use crate::vault::embeddings::Embedder;
+
+use super::watcher;
 
 #[cfg(has_embeddings)]
-use super::indexer;
-use super::watcher;
+pub(crate) type EmbeddingLoaderFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = VaultResult<Arc<dyn Embedder>>> + Send + 'static>,
+>;
 
 pub struct VaultContext {
     vault_id: String,
@@ -25,22 +30,18 @@ pub struct VaultContext {
     index: Arc<RwLock<VaultIndex>>,
     tantivy: Arc<TantivyIndex>,
     #[cfg(has_embeddings)]
-    embedding_model: Arc<EmbeddingModel>,
-    #[cfg(has_embeddings)]
-    embedding_store: Arc<RwLock<EmbeddingStore>>,
-    #[cfg(has_embeddings)]
-    embedding_cache_path: PathBuf,
+    embedding_runtime: EmbeddingRuntime,
     watcher: Mutex<Option<Debouncer<notify::RecommendedWatcher>>>,
 }
 
 impl VaultContext {
-    pub async fn open(
+    pub(crate) async fn open(
         vault_id: String,
         vault_root: PathBuf,
         model_name: String,
         state_dir: PathBuf,
         watch_enabled: bool,
-        #[cfg(has_embeddings)] embedding_model: Arc<EmbeddingModel>,
+        #[cfg(has_embeddings)] embedding_loader: EmbeddingLoaderFuture,
     ) -> VaultResult<Self> {
         std::fs::create_dir_all(&state_dir)?;
 
@@ -56,17 +57,12 @@ impl VaultContext {
         let tantivy = Arc::new(tantivy);
 
         #[cfg(has_embeddings)]
-        let (embedding_store, embedding_cache_path) = {
-            let embedding_cache_path = state_dir.join("embeddings.bin");
-            let store = indexer::build_or_load_embeddings(
-                &vault_root,
-                &index,
-                &embedding_model,
-                &embedding_cache_path,
-            )?;
-            let store = Arc::new(RwLock::new(store));
-            (store, embedding_cache_path)
-        };
+        let embedding_runtime = EmbeddingRuntime::spawn(
+            vault_root.clone(),
+            Arc::clone(&index),
+            state_dir.join("embeddings.bin"),
+            embedding_loader,
+        );
 
         let context = Self {
             vault_id,
@@ -75,11 +71,7 @@ impl VaultContext {
             index,
             tantivy,
             #[cfg(has_embeddings)]
-            embedding_model,
-            #[cfg(has_embeddings)]
-            embedding_store,
-            #[cfg(has_embeddings)]
-            embedding_cache_path,
+            embedding_runtime,
             watcher: Mutex::new(None),
         };
 
@@ -125,9 +117,7 @@ impl VaultContext {
             self.vault_root.clone(),
             Arc::clone(&self.index),
             Some(Arc::clone(&self.tantivy)),
-            Arc::clone(&self.embedding_model),
-            Arc::clone(&self.embedding_store),
-            self.embedding_cache_path.clone(),
+            self.embedding_runtime.clone(),
             Arc::new(ExcludeSet::build(vec![])?),
         )?;
 
@@ -174,29 +164,27 @@ impl VaultContext {
         query: &str,
         top_k: usize,
     ) -> VaultResult<Vec<(PathBuf, f32)>> {
-        let query_vec = self.embedding_model.embed_one(query)?;
-        let guard = self.embedding_store.read().map_err(|err| {
-            VaultError::Other(format!("daemon embedding store lock poisoned: {err}"))
-        })?;
-        Ok(guard.query(&query_vec, top_k))
+        self.embedding_runtime
+            .query_snapshot()?
+            .semantic_scores(query, top_k)
     }
 
     #[cfg(has_embeddings)]
     pub fn query_embedding(&self, query: &str) -> VaultResult<Vec<f32>> {
-        self.embedding_model.embed_one(query)
+        self.embedding_runtime.query_snapshot()?.embed_query(query)
     }
 
     #[cfg(has_embeddings)]
     pub fn semantic_score_for(&self, path: &Path, query_embedding: &[f32]) -> VaultResult<f32> {
-        let guard = self.embedding_store.read().map_err(|err| {
-            VaultError::Other(format!("daemon embedding store lock poisoned: {err}"))
-        })?;
-        Ok(guard
-            .get(path)
-            .map(|embedding| {
-                crate::vault::embeddings::cosine_similarity(query_embedding, embedding)
-            })
-            .unwrap_or(0.0))
+        Ok(self
+            .embedding_runtime
+            .query_snapshot()?
+            .score_for(path, query_embedding))
+    }
+
+    #[cfg(has_embeddings)]
+    pub fn embedding_status(&self) -> EmbeddingRuntimeStatus {
+        self.embedding_runtime.status()
     }
 
     #[cfg(not(has_embeddings))]

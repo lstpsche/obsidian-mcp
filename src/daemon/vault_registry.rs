@@ -12,10 +12,15 @@ use tokio::sync::OnceCell;
 use crate::error::{VaultError, VaultResult};
 
 #[cfg(has_embeddings)]
-use crate::vault::embeddings::EmbeddingModel;
+use crate::vault::embeddings::{Embedder, EmbeddingModel};
 
 use super::home::{self, SemanticHomePaths};
+#[cfg(has_embeddings)]
+use super::vault_context::EmbeddingLoaderFuture;
 use super::vault_context::VaultContext;
+
+#[cfg(has_embeddings)]
+type EmbeddingLoaderFactory = Arc<dyn Fn() -> EmbeddingLoaderFuture + Send + Sync>;
 
 pub struct VaultRegistry {
     paths: SemanticHomePaths,
@@ -23,11 +28,38 @@ pub struct VaultRegistry {
     contexts: RwLock<HashMap<String, Arc<VaultContext>>>,
     init_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     #[cfg(has_embeddings)]
-    embedding_model: OnceCell<Arc<EmbeddingModel>>,
+    embedding_model: Arc<OnceCell<Arc<dyn Embedder>>>,
+    #[cfg(has_embeddings)]
+    embedding_loader: EmbeddingLoaderFactory,
 }
 
 impl VaultRegistry {
     pub fn new(semantic_home: PathBuf, model_name: String) -> VaultResult<Self> {
+        #[cfg(has_embeddings)]
+        let embedding_loader: EmbeddingLoaderFactory = {
+            let model_name = model_name.clone();
+            Arc::new(move || {
+                let model_name = model_name.clone();
+                Box::pin(async move {
+                    let loaded = EmbeddingModel::load(&model_name, None).await?;
+                    Ok(Arc::new(loaded) as Arc<dyn Embedder>)
+                })
+            })
+        };
+
+        Self::new_with_loader(
+            semantic_home,
+            model_name,
+            #[cfg(has_embeddings)]
+            embedding_loader,
+        )
+    }
+
+    fn new_with_loader(
+        semantic_home: PathBuf,
+        model_name: String,
+        #[cfg(has_embeddings)] embedding_loader: EmbeddingLoaderFactory,
+    ) -> VaultResult<Self> {
         let paths = home::semantic_home_paths(&semantic_home);
         home::ensure_home_layout(&paths)?;
 
@@ -37,7 +69,9 @@ impl VaultRegistry {
             contexts: RwLock::new(HashMap::new()),
             init_locks: tokio::sync::Mutex::new(HashMap::new()),
             #[cfg(has_embeddings)]
-            embedding_model: OnceCell::new(),
+            embedding_model: Arc::new(OnceCell::new()),
+            #[cfg(has_embeddings)]
+            embedding_loader,
         })
     }
 
@@ -81,9 +115,6 @@ impl VaultRegistry {
             return Ok(existing);
         }
 
-        #[cfg(has_embeddings)]
-        let embedding_model = self.embedding_model().await?;
-
         let state_dir = self.paths.vaults_dir.join(&vault_id);
         let context = VaultContext::open(
             vault_id.clone(),
@@ -92,7 +123,7 @@ impl VaultRegistry {
             state_dir,
             watch_enabled,
             #[cfg(has_embeddings)]
-            embedding_model,
+            self.embedding_loader(),
         )
         .await?;
         let context = Arc::new(context);
@@ -100,10 +131,6 @@ impl VaultRegistry {
         let mut guard = self.contexts.write().await;
         guard.insert(vault_id, Arc::clone(&context));
         drop(guard);
-
-        if watch_enabled {
-            context.ensure_watcher()?;
-        }
         Ok(context)
     }
 
@@ -122,15 +149,13 @@ impl VaultRegistry {
     }
 
     #[cfg(has_embeddings)]
-    async fn embedding_model(&self) -> VaultResult<Arc<EmbeddingModel>> {
-        let model = self
-            .embedding_model
-            .get_or_try_init(|| async {
-                let loaded = EmbeddingModel::load(&self.model_name, None).await?;
-                Ok::<Arc<EmbeddingModel>, VaultError>(Arc::new(loaded))
-            })
-            .await?;
-        Ok(Arc::clone(model))
+    fn embedding_loader(&self) -> EmbeddingLoaderFuture {
+        let shared_model = Arc::clone(&self.embedding_model);
+        let loader = Arc::clone(&self.embedding_loader);
+        Box::pin(async move {
+            let model = shared_model.get_or_try_init(|| loader()).await?;
+            Ok(Arc::clone(model))
+        })
     }
 }
 
@@ -157,4 +182,71 @@ fn canonicalize_vault_root(vault_root: &Path) -> VaultResult<PathBuf> {
     }
 
     Ok(canonical)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use super::*;
+
+    #[cfg(has_embeddings)]
+    #[tokio::test]
+    async fn concurrent_ensure_returns_one_context_while_shared_loader_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(vault_root.join(".obsidian")).unwrap();
+        std::fs::write(vault_root.join("note.md"), "# Note\n").unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let loader_calls = Arc::clone(&calls);
+        let loader: EmbeddingLoaderFactory = Arc::new(move || {
+            loader_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        });
+        let registry = Arc::new(
+            VaultRegistry::new_with_loader(
+                dir.path().join("semantic-home"),
+                "blocked-test-model".into(),
+                loader,
+            )
+            .unwrap(),
+        );
+
+        let first_registry = Arc::clone(&registry);
+        let first_root = vault_root.clone();
+        let first = tokio::spawn(async move {
+            first_registry
+                .ensure_vault(&first_root, false, "blocked-test-model")
+                .await
+        });
+        let second_registry = Arc::clone(&registry);
+        let second_root = vault_root.clone();
+        let second = tokio::spawn(async move {
+            second_registry
+                .ensure_vault(&second_root, false, "blocked-test-model")
+                .await
+        });
+
+        let (first, second) = tokio::time::timeout(Duration::from_secs(2), async {
+            (
+                first.await.unwrap().unwrap(),
+                second.await.unwrap().unwrap(),
+            )
+        })
+        .await
+        .expect("ensure_vault must not wait for model loading");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!first.embedding_status().queryable);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shared loader should start in the background");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 }

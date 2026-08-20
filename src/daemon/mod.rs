@@ -2,7 +2,6 @@
 
 pub mod bootstrap;
 pub mod home;
-pub mod indexer;
 pub mod manifest;
 pub mod protocol;
 pub mod query;

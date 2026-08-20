@@ -231,6 +231,7 @@ impl EmbeddingStore {
         self.dim
     }
 
+    #[cfg(test)]
     pub(crate) fn identity(&self) -> Option<&EmbeddingSpaceIdentity> {
         self.identity.as_ref()
     }
@@ -946,84 +947,6 @@ fn read_env_with_fallback(primary: &str, fallback: &str) -> Option<String> {
 #[cfg(feature = "embeddings-api")]
 fn parse_usize_env(var_name: &str) -> Option<usize> {
     std::env::var(var_name).ok()?.trim().parse::<usize>().ok()
-}
-
-// ── Shared embedding index builder ────────────────────────────────────
-
-const BATCH_SIZE: usize = 64;
-
-/// Load cached embeddings or rebuild from note entries.
-///
-/// The caller is responsible for lock acquisition on the index — this
-/// function receives pre-extracted note entries to stay decoupled from
-/// any particular lock strategy.
-pub(crate) fn build_or_load_embedding_store(
-    cache_path: &Path,
-    vault_root: &Path,
-    note_entries: &[(PathBuf, crate::models::NoteMetadata)],
-    model: &EmbeddingModel,
-) -> VaultResult<EmbeddingStore> {
-    let current_paths = note_entries
-        .iter()
-        .map(|(path, _)| path.clone())
-        .collect::<HashSet<_>>();
-    if let Ok(mut store) = EmbeddingStore::load_for_space(
-        cache_path,
-        Embedder::space_identity(model),
-        note_entries.len(),
-    ) {
-        store.retain_paths(&current_paths);
-        debug_assert_eq!(store.identity(), Some(Embedder::space_identity(model)));
-        if store.first_pass_complete() && store.len() == note_entries.len() {
-            tracing::info!(
-                cache = %cache_path.display(),
-                cached = store.len(),
-                "loaded embedding cache"
-            );
-            return Ok(store);
-        }
-        tracing::info!(
-            cache = %cache_path.display(),
-            cached = store.len(),
-            current = note_entries.len(),
-            "embedding cache stale, rebuilding"
-        );
-    }
-
-    let entries: Vec<(PathBuf, String, [u8; 32])> = note_entries
-        .iter()
-        .filter_map(|(path, meta)| {
-            let content = super::fs::read_file(vault_root, path).ok()?;
-            let body = super::frontmatter::get_body(&content);
-            let heading_texts: Vec<String> = meta.headings.iter().map(|h| h.text.clone()).collect();
-            let text = prepare_embed_text(&meta.title, &heading_texts, body);
-            let hash = prepared_text_hash(&text);
-            Some((path.clone(), text, hash))
-        })
-        .collect();
-
-    let mut store = EmbeddingStore::new_with_identity(Embedder::space_identity(model).clone());
-    debug_assert_eq!(store.dim(), Embedder::dimension(model));
-    for chunk in entries.chunks(BATCH_SIZE) {
-        let texts: Vec<&str> = chunk.iter().map(|(_, text, _)| text.as_str()).collect();
-        match model.embed_batch(&texts) {
-            Ok(vectors) => {
-                for ((path, _, hash), vector) in chunk.iter().zip(vectors) {
-                    store.insert_hashed(path.clone(), *hash, vector)?;
-                }
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "embedding batch failed, skipping chunk");
-            }
-        }
-    }
-    store.set_first_pass_complete(true);
-
-    if let Err(err) = store.save(cache_path) {
-        tracing::warn!(error = %err, "failed to save embedding cache");
-    }
-
-    Ok(store)
 }
 
 // ── Text preparation ───────────────────────────────────────────────────
