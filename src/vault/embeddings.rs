@@ -8,7 +8,7 @@
 //!   (`--features embeddings`) and OpenAI-compatible API (`--features embeddings-api`).
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
@@ -1204,6 +1204,14 @@ pub(crate) fn migrate_cache_candidates_to_path(
         return Ok(LegacyCacheMigration::NotFound);
     };
 
+    let source_file = std::fs::File::open(source)?;
+    let source_len = source_file.metadata()?.len();
+    if source_len > MAX_CACHE_BYTES {
+        return Err(VaultError::Embedding(format!(
+            "embedding cache is too large to relocate: {source_len} bytes (limit {MAX_CACHE_BYTES})"
+        )));
+    }
+
     let parent = target.parent().ok_or_else(|| {
         VaultError::Embedding(format!(
             "embedding cache migration target has no parent: {}",
@@ -1212,9 +1220,14 @@ pub(crate) fn migrate_cache_candidates_to_path(
     })?;
     std::fs::create_dir_all(parent)?;
 
-    let mut source_file = std::fs::File::open(source)?;
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    std::io::copy(&mut source_file, &mut temp)?;
+    let mut limited_source = source_file.take(MAX_CACHE_BYTES + 1);
+    let copied = std::io::copy(&mut limited_source, &mut temp)?;
+    if copied > MAX_CACHE_BYTES {
+        return Err(VaultError::Embedding(format!(
+            "embedding cache is too large to relocate: more than {MAX_CACHE_BYTES} bytes"
+        )));
+    }
     temp.flush()?;
     temp.as_file().sync_all()?;
 
@@ -1871,6 +1884,23 @@ mod tests {
         let outcome = migrate_legacy_cache_to_daemon_store(vault_root.path(), semantic_home.path())
             .expect("migration should succeed");
         assert_eq!(outcome, LegacyCacheMigration::NotFound);
+    }
+
+    #[test]
+    fn migrate_legacy_cache_rejects_oversized_source_before_copying() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source = directory.path().join("oversized.bin");
+        let target = directory.path().join("target").join("embeddings.bin");
+        let source_file = std::fs::File::create(&source).expect("create sparse source");
+        source_file
+            .set_len(MAX_CACHE_BYTES + 1)
+            .expect("extend sparse source");
+
+        let error = migrate_cache_candidates_to_path(&[source], &target)
+            .expect_err("oversized migration must fail");
+
+        assert!(error.to_string().contains("too large to relocate"));
+        assert!(!target.exists(), "oversized cache must not be published");
     }
 
     #[test]

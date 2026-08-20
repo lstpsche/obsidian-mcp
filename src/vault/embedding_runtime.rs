@@ -71,12 +71,12 @@ struct RuntimeControl {
 impl Drop for RuntimeControl {
     fn drop(&mut self) {
         self.shared.live.store(false, Ordering::Release);
-        // Synchronize with the final atomic replacement. A persistence closure
-        // that already passed its liveness check may finish before Drop
-        // returns, but it cannot write after Drop has returned.
+        // Synchronize with the final store commit or atomic cache publication.
+        // An operation that already passed its liveness check may finish before
+        // Drop returns, but it cannot mutate observable state afterward.
         drop(
             self.shared
-                .persistence_gate
+                .lifecycle_gate
                 .lock()
                 .unwrap_or_else(|error| error.into_inner()),
         );
@@ -100,7 +100,7 @@ struct RuntimeShared {
     state: Mutex<RuntimeState>,
     notify: Notify,
     live: Arc<AtomicBool>,
-    persistence_gate: Arc<Mutex<()>>,
+    lifecycle_gate: Arc<Mutex<()>>,
     first_load_error: OnceLock<String>,
 }
 
@@ -235,7 +235,7 @@ impl EmbeddingRuntime {
             state: Mutex::new(state),
             notify: Notify::new(),
             live: Arc::new(AtomicBool::new(true)),
-            persistence_gate: Arc::new(Mutex::new(())),
+            lifecycle_gate: Arc::new(Mutex::new(())),
             first_load_error: OnceLock::new(),
         });
         let worker_shared = Arc::clone(&shared);
@@ -303,37 +303,44 @@ impl EmbeddingRuntime {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if state.model.is_none() {
-            let mut status = state.status.clone();
-            status.indexed_notes = 0;
-            status.total_notes = paths.len();
-            status.pending_notes = distinct_pending_count(&state);
-            return status;
-        }
-        let indexed_notes = state.store.as_ref().map_or(0, |store| {
-            let store = store.read().unwrap_or_else(|error| error.into_inner());
-            paths
-                .iter()
-                .filter(|path| store.get(path).is_some())
-                .count()
-        });
-        status_for_loaded_state(&state, paths.len(), indexed_notes)
+        status_for_current_paths(&state, &paths)
     }
 
     pub(crate) fn query_snapshot(&self) -> VaultResult<EmbeddingQuerySnapshot> {
+        {
+            let state = self
+                .control
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let (Some(model), Some(store)) = (&state.model, &state.store)
+                && state.store_queryable
+            {
+                return Ok(EmbeddingQuerySnapshot {
+                    model: Arc::clone(model),
+                    store: Arc::clone(store),
+                });
+            }
+        }
+
+        let paths = current_paths(&self.control.shared.index);
         let state = self
             .control
             .shared
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        match (&state.model, &state.store) {
-            (Some(model), Some(store)) if state.store_queryable => Ok(EmbeddingQuerySnapshot {
+        if let (Some(model), Some(store)) = (&state.model, &state.store)
+            && state.store_queryable
+        {
+            return Ok(EmbeddingQuerySnapshot {
                 model: Arc::clone(model),
                 store: Arc::clone(store),
-            }),
-            _ => Err(VaultError::Embedding(not_ready_message(&state.status))),
+            });
         }
+        let status = status_for_current_paths(&state, &paths);
+        Err(VaultError::Embedding(not_ready_message(&status)))
     }
 
     pub(crate) fn first_load_error(&self) -> Option<&str> {
@@ -418,11 +425,11 @@ where
     let cache_path = shared.cache_path.clone();
     let cache_migration_sources = shared.cache_migration_sources.clone();
     let live = Arc::clone(&shared.live);
-    let persistence_gate = Arc::clone(&shared.persistence_gate);
+    let lifecycle_gate = Arc::clone(&shared.lifecycle_gate);
     let current_count = current_paths.len();
     let loaded = tokio::task::spawn_blocking(move || {
         if !cache_migration_sources.is_empty() {
-            let _guard = persistence_gate
+            let _guard = lifecycle_gate
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             if !live.load(Ordering::Acquire) {
@@ -807,6 +814,13 @@ fn commit_remove(
     store: &Arc<RwLock<EmbeddingStore>>,
     work: &PendingWork,
 ) -> bool {
+    let _lifecycle_guard = shared
+        .lifecycle_gate
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if !shared.live.load(Ordering::Acquire) {
+        return false;
+    }
     let mut state = shared
         .state
         .lock()
@@ -831,6 +845,13 @@ fn commit_upsert(
     content_hash: [u8; 32],
     vector: Vec<f32>,
 ) -> bool {
+    let _lifecycle_guard = shared
+        .lifecycle_gate
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if !shared.live.load(Ordering::Acquire) {
+        return false;
+    }
     let mut state = shared
         .state
         .lock()
@@ -906,6 +927,13 @@ fn finalize_reconciliation_if_complete(
     shared: &RuntimeShared,
     store: &Arc<RwLock<EmbeddingStore>>,
 ) -> bool {
+    let _lifecycle_guard = shared
+        .lifecycle_gate
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if !shared.live.load(Ordering::Acquire) {
+        return false;
+    }
     let mut state = shared
         .state
         .lock()
@@ -941,13 +969,13 @@ async fn persist_store(
     let store = Arc::clone(store);
     let cache_path = shared.cache_path.clone();
     let live = Arc::clone(&shared.live);
-    let persistence_gate = Arc::clone(&shared.persistence_gate);
+    let lifecycle_gate = Arc::clone(&shared.lifecycle_gate);
     tokio::task::spawn_blocking(move || {
         let bytes = {
             let store = store.read().unwrap_or_else(|error| error.into_inner());
             store.encode_cache()?
         };
-        let _guard = persistence_gate
+        let _guard = lifecycle_gate
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         EmbeddingStore::persist_cache_bytes_if_live(&cache_path, &bytes, &live)
@@ -998,6 +1026,27 @@ fn status_for_loaded_state(
         pending_notes,
         last_error,
     }
+}
+
+fn status_for_current_paths(
+    state: &RuntimeState,
+    paths: &HashSet<PathBuf>,
+) -> EmbeddingRuntimeStatus {
+    if state.model.is_none() {
+        let mut status = state.status.clone();
+        status.indexed_notes = 0;
+        status.total_notes = paths.len();
+        status.pending_notes = distinct_pending_count(state);
+        return status;
+    }
+    let indexed_notes = state.store.as_ref().map_or(0, |store| {
+        let store = store.read().unwrap_or_else(|error| error.into_inner());
+        paths
+            .iter()
+            .filter(|path| store.get(path).is_some())
+            .count()
+    });
+    status_for_loaded_state(state, paths.len(), indexed_notes)
 }
 
 fn replace_status(state: &mut RuntimeState, next: EmbeddingRuntimeStatus) {
@@ -1152,6 +1201,7 @@ mod tests {
         identity: EmbeddingSpaceIdentity,
         started: std::sync::mpsc::Sender<()>,
         release: Mutex<std::sync::mpsc::Receiver<()>>,
+        finished: Option<std::sync::mpsc::Sender<()>>,
     }
 
     struct SequencedBlockingEmbedder {
@@ -1219,6 +1269,9 @@ mod tests {
                 .unwrap_or_else(|error| error.into_inner())
                 .recv()
                 .map_err(|error| VaultError::Embedding(error.to_string()))?;
+            if let Some(finished) = &self.finished {
+                let _ = finished.send(());
+            }
             Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect())
         }
     }
@@ -1299,6 +1352,11 @@ mod tests {
         runtime.submit_upsert(Path::new("two.md"));
         assert_eq!(runtime.status().total_notes, 2);
         assert_eq!(runtime.status().pending_notes, 2);
+        let error = runtime
+            .query_snapshot()
+            .err()
+            .expect("blocked loader should not expose a query snapshot");
+        assert!(error.to_string().contains("0/2, 2 pending"));
 
         release_tx.send(()).unwrap();
         wait_for_status(&runtime, |status| status.phase == EmbeddingPhase::Ready).await;
@@ -1722,34 +1780,137 @@ mod tests {
     async fn drop_during_inference_prevents_late_commit_and_persistence() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(directory.path().join(".obsidian")).unwrap();
-        std::fs::write(directory.path().join("one.md"), "# One\nbody").unwrap();
-        let index = test_index(directory.path()).await;
+        std::fs::write(directory.path().join("one.md"), "# One\nold body").unwrap();
+        let old_index = test_index(directory.path()).await;
         let cache_path = directory.path().join("cache.bin");
+        let identity = FakeEmbedder::new().identity;
+        let old_text = prepared_note_text(directory.path(), &old_index, Path::new("one.md"));
+        let mut cache = EmbeddingStore::new_with_identity(identity.clone());
+        cache
+            .insert_hashed(
+                PathBuf::from("one.md"),
+                prepared_text_hash(&old_text),
+                vec![0.0, 1.0, 0.0],
+            )
+            .unwrap();
+        cache.set_first_pass_complete(true);
+        cache.save(&cache_path).unwrap();
+        let original_cache = std::fs::read(&cache_path).unwrap();
+
+        std::fs::write(directory.path().join("one.md"), "# One\nnew body").unwrap();
+        let index = test_index(directory.path()).await;
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let identity = FakeEmbedder::new().identity;
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let model = Arc::new(BlockingEmbedder {
+            identity,
+            started: started_tx,
+            release: Mutex::new(release_rx),
+            finished: Some(finished_tx),
+        });
+        let loader_model = Arc::clone(&model);
         let runtime = EmbeddingRuntime::spawn(
             directory.path().to_path_buf(),
             index,
             cache_path.clone(),
-            async move {
-                Ok(Arc::new(BlockingEmbedder {
-                    identity,
-                    started: started_tx,
-                    release: Mutex::new(release_rx),
-                }) as Arc<dyn Embedder>)
-            },
+            async move { Ok(loader_model as Arc<dyn Embedder>) },
         );
 
         tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(5)))
             .await
             .unwrap()
             .unwrap();
-        drop(runtime);
-        release_tx.send(()).unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let snapshot = runtime.query_snapshot().unwrap();
+        assert_eq!(
+            snapshot.score_for(Path::new("one.md"), &[0.0, 1.0, 0.0]),
+            1.0
+        );
 
-        assert!(!cache_path.exists());
+        let shared = Arc::clone(&runtime.control.shared);
+        let (store, work) = {
+            let state = shared
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let generation = *state
+                .inflight
+                .get(Path::new("one.md"))
+                .expect("changed note should be in flight");
+            (
+                Arc::clone(state.store.as_ref().expect("cache should be loaded")),
+                PendingWork {
+                    path: PathBuf::from("one.md"),
+                    generation,
+                    kind: PendingKind::Upsert,
+                    attempt: 0,
+                    not_before: Instant::now(),
+                },
+            )
+        };
+        let lifecycle_gate = Arc::clone(&shared.lifecycle_gate);
+        let lifecycle_guard = lifecycle_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (drop_done_tx, drop_done_rx) = std::sync::mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            drop(runtime);
+            let _ = drop_done_tx.send(());
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while shared.live.load(AtomicOrdering::Acquire) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            !shared.live.load(AtomicOrdering::Acquire),
+            "runtime drop should mark the coordinator dead before waiting on lifecycle work"
+        );
+
+        let commit_shared = Arc::clone(&shared);
+        let commit_store = Arc::clone(&store);
+        let committer = std::thread::spawn(move || {
+            commit_upsert(
+                &commit_shared,
+                &commit_store,
+                &work,
+                prepared_text_hash("new body"),
+                vec![1.0, 0.0, 0.0],
+            )
+        });
+        drop(lifecycle_guard);
+        drop_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("runtime drop should finish after lifecycle work drains");
+        dropper.join().expect("runtime drop thread should join");
+        assert!(
+            !committer.join().expect("late commit thread should join"),
+            "a commit whose result arrives during shutdown must be discarded"
+        );
+
+        release_tx.send(()).unwrap();
+        tokio::task::spawn_blocking(move || finished_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .expect("in-flight inference should finish after release");
+        drop(store);
+        drop(shared);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&model) > 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted coordinator should release its model handles");
+
+        assert_eq!(
+            snapshot.score_for(Path::new("one.md"), &[0.0, 1.0, 0.0]),
+            1.0,
+            "a held last-known-good snapshot must not change after runtime drop"
+        );
+        assert_eq!(
+            snapshot.score_for(Path::new("one.md"), &[1.0, 0.0, 0.0]),
+            0.0
+        );
+        assert_eq!(std::fs::read(&cache_path).unwrap(), original_cache);
     }
 
     #[tokio::test]
@@ -1783,6 +1944,7 @@ mod tests {
                     identity,
                     started: started_tx,
                     release: Mutex::new(release_rx),
+                    finished: None,
                 }) as Arc<dyn Embedder>)
             },
         );
