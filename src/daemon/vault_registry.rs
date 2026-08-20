@@ -324,6 +324,7 @@ mod tests {
         assert!(!ensured.ready);
         assert_eq!(ensured.phase, Some(SemanticPhase::Warming));
         assert_eq!(ensured.total_notes, Some(1));
+        assert_eq!(ensured.pending_notes, Some(1));
 
         let error = query::search_semantic(
             &registry,

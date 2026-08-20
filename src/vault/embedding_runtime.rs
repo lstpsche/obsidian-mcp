@@ -115,7 +115,8 @@ struct RuntimeState {
     failures: HashMap<PathBuf, String>,
     persistence_error: Option<String>,
     model: Option<Arc<dyn Embedder>>,
-    published_store: Option<Arc<RwLock<EmbeddingStore>>>,
+    store: Option<Arc<RwLock<EmbeddingStore>>>,
+    store_queryable: bool,
     status: EmbeddingRuntimeStatus,
 }
 
@@ -203,19 +204,35 @@ impl EmbeddingRuntime {
     where
         F: Future<Output = VaultResult<Arc<dyn Embedder>>> + Send + 'static,
     {
-        let total_notes = current_paths(&index).len();
+        let initial_paths = current_paths(&index);
+        let total_notes = initial_paths.len();
+        let mut state = RuntimeState {
+            status: EmbeddingRuntimeStatus {
+                total_notes,
+                ..EmbeddingRuntimeStatus::default()
+            },
+            ..RuntimeState::default()
+        };
+        for path in initial_paths {
+            let generation = next_generation(&mut state);
+            state.pending.insert(
+                path.clone(),
+                PendingWork {
+                    path,
+                    generation,
+                    kind: PendingKind::Upsert,
+                    attempt: 0,
+                    not_before: Instant::now(),
+                },
+            );
+        }
+        update_pending_status(&mut state);
         let shared = Arc::new(RuntimeShared {
             vault_root,
             index,
             cache_path,
             cache_migration_sources,
-            state: Mutex::new(RuntimeState {
-                status: EmbeddingRuntimeStatus {
-                    total_notes,
-                    ..EmbeddingRuntimeStatus::default()
-                },
-                ..RuntimeState::default()
-            }),
+            state: Mutex::new(state),
             notify: Notify::new(),
             live: Arc::new(AtomicBool::new(true)),
             persistence_gate: Arc::new(Mutex::new(())),
@@ -279,13 +296,28 @@ impl EmbeddingRuntime {
     }
 
     pub(crate) fn status(&self) -> EmbeddingRuntimeStatus {
-        self.control
+        let paths = current_paths(&self.control.shared.index);
+        let state = self
+            .control
             .shared
             .state
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .status
-            .clone()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.model.is_none() {
+            let mut status = state.status.clone();
+            status.indexed_notes = 0;
+            status.total_notes = paths.len();
+            status.pending_notes = distinct_pending_count(&state);
+            return status;
+        }
+        let indexed_notes = state.store.as_ref().map_or(0, |store| {
+            let store = store.read().unwrap_or_else(|error| error.into_inner());
+            paths
+                .iter()
+                .filter(|path| store.get(path).is_some())
+                .count()
+        });
+        status_for_loaded_state(&state, paths.len(), indexed_notes)
     }
 
     pub(crate) fn query_snapshot(&self) -> VaultResult<EmbeddingQuerySnapshot> {
@@ -295,8 +327,8 @@ impl EmbeddingRuntime {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        match (&state.model, &state.published_store) {
-            (Some(model), Some(store)) if state.status.queryable => Ok(EmbeddingQuerySnapshot {
+        match (&state.model, &state.store) {
+            (Some(model), Some(store)) if state.store_queryable => Ok(EmbeddingQuerySnapshot {
                 model: Arc::clone(model),
                 store: Arc::clone(store),
             }),
@@ -439,9 +471,9 @@ where
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         state.model = Some(Arc::clone(&model));
-        if previously_publishable && (current_paths.is_empty() || has_cached_vectors) {
-            state.published_store = Some(Arc::clone(&store));
-        }
+        state.store = Some(Arc::clone(&store));
+        state.store_queryable =
+            previously_publishable && (current_paths.is_empty() || has_cached_vectors);
         state.initial_started = true;
         state.initial_remaining = current_paths.clone();
         for path in current_paths {
@@ -815,8 +847,8 @@ fn commit_upsert(
     match result {
         Ok(()) => {
             finish_success(&mut state, work);
-            if state.reconciliation_complete && state.published_store.is_none() {
-                state.published_store = Some(Arc::clone(store));
+            if state.reconciliation_complete && !state.store_queryable {
+                state.store_queryable = true;
             }
             true
         }
@@ -896,8 +928,8 @@ fn finalize_reconciliation_if_complete(
         .unwrap_or_else(|error| error.into_inner())
         .notes()
         .len();
-    if state.published_store.is_none() && (total_notes == 0 || has_vectors) {
-        state.published_store = Some(Arc::clone(store));
+    if !state.store_queryable && (total_notes == 0 || has_vectors) {
+        state.store_queryable = true;
     }
     changed
 }
@@ -937,8 +969,16 @@ fn refresh_status(shared: &RuntimeShared, store: &Arc<RwLock<EmbeddingStore>>) {
         .state
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let queryable = state.model.is_some() && state.published_store.is_some();
-    let pending_notes = distinct_pending_count(&state);
+    let next = status_for_loaded_state(&state, paths.len(), indexed_notes);
+    replace_status(&mut state, next);
+}
+
+fn status_for_loaded_state(
+    state: &RuntimeState,
+    total_notes: usize,
+    indexed_notes: usize,
+) -> EmbeddingRuntimeStatus {
+    let pending_notes = distinct_pending_count(state);
     let last_error = state
         .persistence_error
         .clone()
@@ -950,17 +990,14 @@ fn refresh_status(shared: &RuntimeShared, store: &Arc<RwLock<EmbeddingStore>>) {
     } else {
         EmbeddingPhase::Ready
     };
-    replace_status(
-        &mut state,
-        EmbeddingRuntimeStatus {
-            phase,
-            queryable,
-            indexed_notes,
-            total_notes: paths.len(),
-            pending_notes,
-            last_error,
-        },
-    );
+    EmbeddingRuntimeStatus {
+        phase,
+        queryable: state.store_queryable && state.model.is_some() && state.store.is_some(),
+        indexed_notes,
+        total_notes,
+        pending_notes,
+        last_error,
+    }
 }
 
 fn replace_status(state: &mut RuntimeState, next: EmbeddingRuntimeStatus) {
@@ -1235,11 +1272,12 @@ mod tests {
     async fn spawn_returns_while_loader_is_blocked() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(directory.path().join(".obsidian")).unwrap();
+        std::fs::write(directory.path().join("one.md"), "# One\nbody").unwrap();
         let index = test_index(directory.path()).await;
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let runtime = EmbeddingRuntime::spawn(
             directory.path().to_path_buf(),
-            index,
+            Arc::clone(&index),
             directory.path().join("cache.bin"),
             async move {
                 release_rx.await.unwrap();
@@ -1249,9 +1287,24 @@ mod tests {
 
         assert_eq!(runtime.status().phase, EmbeddingPhase::Warming);
         assert!(!runtime.status().queryable);
+        assert_eq!(runtime.status().total_notes, 1);
+        assert_eq!(runtime.status().pending_notes, 1);
+
+        std::fs::write(directory.path().join("two.md"), "# Two\nbody").unwrap();
+        index
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .reindex_file(directory.path(), Path::new("two.md"))
+            .unwrap();
+        runtime.submit_upsert(Path::new("two.md"));
+        assert_eq!(runtime.status().total_notes, 2);
+        assert_eq!(runtime.status().pending_notes, 2);
+
         release_tx.send(()).unwrap();
         wait_for_status(&runtime, |status| status.phase == EmbeddingPhase::Ready).await;
         assert!(runtime.status().queryable);
+        assert_eq!(runtime.status().total_notes, 2);
+        assert_eq!(runtime.status().pending_notes, 0);
     }
 
     #[tokio::test]
@@ -1364,7 +1417,7 @@ mod tests {
         let loader_fake = Arc::clone(&fake);
         let runtime = EmbeddingRuntime::spawn(
             directory.path().to_path_buf(),
-            index,
+            Arc::clone(&index),
             cache_path,
             async move { Ok(loader_fake as Arc<dyn Embedder>) },
         );
@@ -1372,6 +1425,14 @@ mod tests {
 
         assert_eq!(fake.calls.load(AtomicOrdering::SeqCst), 0);
         assert!(runtime.status().queryable);
+
+        index
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove_file(Path::new("one.md"));
+        let status = runtime.status();
+        assert_eq!(status.total_notes, 0);
+        assert_eq!(status.indexed_notes, 0);
     }
 
     #[tokio::test]
