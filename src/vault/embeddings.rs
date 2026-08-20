@@ -12,6 +12,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
+#[cfg(feature = "embeddings-api")]
+use std::sync::Arc;
+
 #[cfg(feature = "embeddings")]
 use fastembed::ModelTrait;
 
@@ -535,12 +538,114 @@ enum EmbeddingBackend {
     Local(Box<std::sync::Mutex<fastembed::TextEmbedding>>),
 
     #[cfg(feature = "embeddings-api")]
-    Api {
+    Api(ApiEmbeddingClient),
+}
+
+#[cfg(feature = "embeddings-api")]
+struct ApiEmbeddingRequest {
+    texts: Vec<String>,
+    response: std::sync::mpsc::Sender<VaultResult<Vec<Vec<f32>>>>,
+}
+
+#[cfg(feature = "embeddings-api")]
+struct ApiEmbeddingClient {
+    sender: Option<std::sync::mpsc::SyncSender<ApiEmbeddingRequest>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "embeddings-api")]
+impl ApiEmbeddingClient {
+    const WORKER_COUNT: usize = 2;
+    const QUEUE_CAPACITY: usize = 2;
+
+    fn start(
         client: reqwest::blocking::Client,
         base_url: String,
         model: String,
         api_key: zeroize::Zeroizing<String>,
-    },
+    ) -> VaultResult<Self> {
+        let (sender, receiver) =
+            std::sync::mpsc::sync_channel::<ApiEmbeddingRequest>(Self::QUEUE_CAPACITY);
+        let receiver = Arc::new(std::sync::Mutex::new(receiver));
+        let base_url = Arc::new(base_url);
+        let model = Arc::new(model);
+        let api_key = Arc::new(api_key);
+        let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(Self::WORKER_COUNT);
+        for worker_index in 0..Self::WORKER_COUNT {
+            let client = client.clone();
+            let receiver = Arc::clone(&receiver);
+            let base_url = Arc::clone(&base_url);
+            let model = Arc::clone(&model);
+            let api_key = Arc::clone(&api_key);
+            let worker = match std::thread::Builder::new()
+                .name(format!("obsidian-mcp-embedding-api-{worker_index}"))
+                .spawn(move || {
+                    loop {
+                        let request = receiver
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .recv();
+                        let Ok(request) = request else {
+                            break;
+                        };
+                        let texts = request.texts.iter().map(String::as_str).collect::<Vec<_>>();
+                        let result = embed_batch_api(
+                            &client,
+                            base_url.as_str(),
+                            model.as_str(),
+                            api_key.as_str(),
+                            &texts,
+                        );
+                        let _ = request.response.send(result);
+                    }
+                }) {
+                Ok(worker) => worker,
+                Err(error) => {
+                    drop(sender);
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
+                    return Err(VaultError::Embedding(format!(
+                        "failed to start embedding API request worker: {error}"
+                    )));
+                }
+            };
+            workers.push(worker);
+        }
+        Ok(Self {
+            sender: Some(sender),
+            workers,
+        })
+    }
+
+    fn embed_batch(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>> {
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or_else(|| VaultError::Embedding("embedding API worker unavailable".into()))?;
+        let (response, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(ApiEmbeddingRequest {
+                texts: texts.iter().map(|text| (*text).to_string()).collect(),
+                response,
+            })
+            .map_err(|_| VaultError::Embedding("embedding API worker stopped".into()))?;
+        receiver
+            .recv()
+            .map_err(|_| VaultError::Embedding("embedding API worker stopped".into()))?
+    }
+}
+
+#[cfg(feature = "embeddings-api")]
+impl Drop for ApiEmbeddingClient {
+    fn drop(&mut self) {
+        self.sender.take();
+        for worker in self.workers.drain(..) {
+            if worker.join().is_err() {
+                tracing::warn!("embedding API request worker panicked during shutdown");
+            }
+        }
+    }
 }
 
 // ── EmbeddingModel ─────────────────────────────────────────────────────
@@ -646,6 +751,8 @@ impl EmbeddingModel {
                 .unwrap_or(model_name);
 
             let client = build_api_client()?;
+            let api_client =
+                ApiEmbeddingClient::start(client, base_url.clone(), model.clone(), api_key)?;
 
             let dim = match parse_usize_env("OBSIDIAN_EMBEDDING_DIM") {
                 Some(d) => {
@@ -654,7 +761,7 @@ impl EmbeddingModel {
                 }
                 None => {
                     tracing::info!("probing embedding API for dimension…");
-                    probe_api_dimension(&client, &base_url, &model, &api_key)?
+                    probe_api_dimension(&api_client)?
                 }
             };
             let identity = EmbeddingSpaceIdentity::api(model.clone(), &base_url, dim);
@@ -672,12 +779,7 @@ impl EmbeddingModel {
             );
 
             Ok(Self {
-                backend: EmbeddingBackend::Api {
-                    client,
-                    base_url,
-                    model,
-                    api_key,
-                },
+                backend: EmbeddingBackend::Api(api_client),
                 dim,
                 identity,
             })
@@ -715,12 +817,7 @@ impl Embedder for EmbeddingModel {
                     .map_err(|e| VaultError::Embedding(format!("embed failed: {e}")))?
             }
             #[cfg(feature = "embeddings-api")]
-            EmbeddingBackend::Api {
-                client,
-                base_url,
-                model,
-                api_key,
-            } => embed_batch_api(client, base_url, model, api_key, texts)?,
+            EmbeddingBackend::Api(client) => client.embed_batch(texts)?,
         };
         validate_embedding_batch(vectors, texts.len(), self.dim)
     }
@@ -775,13 +872,8 @@ fn build_api_client() -> Result<reqwest::blocking::Client, VaultError> {
 }
 
 #[cfg(feature = "embeddings-api")]
-fn probe_api_dimension(
-    client: &reqwest::blocking::Client,
-    base_url: &str,
-    model: &str,
-    api_key: &str,
-) -> Result<usize, VaultError> {
-    let vecs = embed_batch_api(client, base_url, model, api_key, &["dim"])?;
+fn probe_api_dimension(client: &ApiEmbeddingClient) -> Result<usize, VaultError> {
+    let vecs = client.embed_batch(&["dim"])?;
     let first = vecs
         .first()
         .ok_or_else(|| VaultError::Embedding("dimension probe returned empty result".into()))?;
