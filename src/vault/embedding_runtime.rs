@@ -898,9 +898,6 @@ fn finish_success(state: &mut RuntimeState, work: &PendingWork) {
     state.inflight.remove(&work.path);
     state.initial_remaining.remove(&work.path);
     state.failures.remove(&work.path);
-    if !state.pending.contains_key(&work.path) {
-        state.inflight.remove(&work.path);
-    }
     update_pending_status(state);
 }
 

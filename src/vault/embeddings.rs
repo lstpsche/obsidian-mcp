@@ -212,7 +212,6 @@ impl EmbeddingStore {
             .map(|entry| entry.vector.as_slice())
     }
 
-    #[allow(dead_code)] // Used by the managed runtime added with this cache contract.
     pub(crate) fn content_hash(&self, path: &Path) -> Option<&[u8; 32]> {
         self.embeddings
             .get(path)
