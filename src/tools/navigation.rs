@@ -105,32 +105,34 @@ fn vault_list_flat(
         .collect();
 
     let json = if params.include_metadata.unwrap_or(false) {
+        let metadata =
+            vault.get_indexed_note_metadata_batch(paths.iter().map(|path| Path::new(*path)));
         let entries = paths
             .into_iter()
-            .map(|path| {
+            .zip(metadata)
+            .map(|(path, metadata)| {
                 let note_path = Path::new(path);
                 let is_markdown = note_path
                     .extension()
                     .and_then(|extension| extension.to_str())
                     .is_some_and(|extension| extension.eq_ignore_ascii_case("md"));
                 if !is_markdown {
-                    return Ok(VaultListEntry::path_only(path));
+                    return VaultListEntry::path_only(path);
                 }
 
-                match vault.get_note_metadata(note_path) {
-                    Ok(metadata) => Ok(VaultListEntry {
+                match metadata {
+                    Some(metadata) => VaultListEntry {
                         path: path.to_owned(),
                         title: Some(metadata.title),
                         tags: Some(metadata.tags),
                         size: Some(metadata.stat.size),
                         created: metadata.stat.created,
                         modified: metadata.stat.modified,
-                    }),
-                    Err(VaultError::NoteNotFound(_)) => Ok(VaultListEntry::path_only(path)),
-                    Err(error) => Err(rmcp::ErrorData::from(error)),
+                    },
+                    None => VaultListEntry::path_only(path),
                 }
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Vec<_>>();
         serde_json::to_string_pretty(&entries)
     } else {
         serde_json::to_string_pretty(&paths)

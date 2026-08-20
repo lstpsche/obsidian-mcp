@@ -71,6 +71,13 @@ pub struct Vault {
     inner: Arc<VaultInner>,
 }
 
+/// Indexed fields used by bulk vault listings.
+pub(crate) struct NoteListMetadata {
+    pub(crate) title: String,
+    pub(crate) tags: Vec<String>,
+    pub(crate) stat: FileStat,
+}
+
 impl Vault {
     /// Open a vault: validate the path, build the index, and optionally start the watcher.
     pub async fn open(config: &Config) -> VaultResult<Self> {
@@ -476,6 +483,28 @@ impl Vault {
             .get_note(&actual_path)
             .cloned()
             .ok_or(VaultError::NoteNotFound(actual_path))
+    }
+
+    /// Look up metadata for exact index paths under a single read lock.
+    ///
+    /// This intentionally skips filesystem path resolution and is only for paths
+    /// already returned by vault APIs such as [`Vault::list_files`]. Raw caller
+    /// paths must continue to use [`Vault::get_note_metadata`].
+    pub(crate) fn get_indexed_note_metadata_batch<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a Path>,
+    ) -> Vec<Option<NoteListMetadata>> {
+        let index = self.read_index();
+        paths
+            .into_iter()
+            .map(|path| {
+                index.get_note(path).map(|metadata| NoteListMetadata {
+                    title: metadata.title.clone(),
+                    tags: metadata.tags.clone(),
+                    stat: metadata.stat.clone(),
+                })
+            })
+            .collect()
     }
 
     pub fn get_document_map(&self, path: &Path) -> VaultResult<DocumentMap> {
@@ -1165,6 +1194,32 @@ mod tests {
         let meta = vault.get_note_metadata(Path::new(composed)).unwrap();
 
         assert_eq!(meta.path, disk_path);
+    }
+
+    #[tokio::test]
+    async fn vault_batch_metadata_uses_exact_index_paths_without_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let composed = "Knowledge/é.md";
+        let decomposed: String = composed.nfd().collect();
+        let disk_path = PathBuf::from(&decomposed);
+        std::fs::create_dir_all(dir.path().join(disk_path.parent().unwrap())).unwrap();
+        std::fs::write(dir.path().join(&disk_path), "# Unicode\n").unwrap();
+
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+        let metadata = vault.get_indexed_note_metadata_batch([
+            disk_path.as_path(),
+            Path::new("missing.md"),
+            Path::new(composed),
+        ]);
+
+        assert_eq!(metadata.len(), 3);
+        assert_eq!(
+            metadata[0].as_ref().map(|meta| meta.title.as_str()),
+            disk_path.file_stem().and_then(|stem| stem.to_str())
+        );
+        assert!(metadata[1].is_none());
+        assert!(metadata[2].is_none());
     }
 
     #[tokio::test]
