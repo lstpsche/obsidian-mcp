@@ -7,7 +7,8 @@
 //! - `EmbeddingModel`: backend-agnostic wrapper supporting local fastembed
 //!   (`--features embeddings`) and OpenAI-compatible API (`--features embeddings-api`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "embeddings")]
@@ -15,6 +16,60 @@ use fastembed::ModelTrait;
 
 use crate::config::EmbeddingProvider;
 use crate::error::{VaultError, VaultResult};
+use sha2::{Digest, Sha256};
+
+const CACHE_MAGIC: [u8; 8] = *b"OBSMCPEM";
+const CACHE_SCHEMA_VERSION: u16 = 1;
+pub(crate) const EMBEDDING_INPUT_VERSION: u16 = 1;
+const MAX_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_CACHE_ENTRIES: usize = 1_000_000;
+const MAX_CACHE_PATH_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum EmbeddingBackendKind {
+    Local,
+    Api,
+}
+
+/// Identifies the complete vector space represented by an embedding cache.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct EmbeddingSpaceIdentity {
+    pub backend: EmbeddingBackendKind,
+    pub model: String,
+    pub endpoint_fingerprint: Option<[u8; 32]>,
+    pub dimension: usize,
+    pub input_version: u16,
+}
+
+impl EmbeddingSpaceIdentity {
+    #[cfg(feature = "embeddings")]
+    fn local(model: String, dimension: usize) -> Self {
+        Self {
+            backend: EmbeddingBackendKind::Local,
+            model,
+            endpoint_fingerprint: None,
+            dimension,
+            input_version: EMBEDDING_INPUT_VERSION,
+        }
+    }
+
+    #[cfg(feature = "embeddings-api")]
+    fn api(model: String, base_url: &str, dimension: usize) -> Self {
+        Self {
+            backend: EmbeddingBackendKind::Api,
+            model,
+            endpoint_fingerprint: Some(endpoint_fingerprint(base_url)),
+            dimension,
+            input_version: EMBEDDING_INPUT_VERSION,
+        }
+    }
+}
+
+pub(crate) trait Embedder: Send + Sync {
+    fn dimension(&self) -> usize;
+    fn space_identity(&self) -> &EmbeddingSpaceIdentity;
+    fn embed_batch(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>>;
+}
 
 // ── Cosine similarity ──────────────────────────────────────────────────
 
@@ -38,16 +93,48 @@ pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// Search is brute-force cosine similarity — O(n * dim). For dim=384 and
 /// n=5000 this is ~2M multiply-adds, well under 5ms on modern hardware.
 pub struct EmbeddingStore {
-    embeddings: HashMap<PathBuf, Vec<f32>>,
+    embeddings: HashMap<PathBuf, EmbeddingEntry>,
     dim: usize,
+    identity: Option<EmbeddingSpaceIdentity>,
+    first_pass_complete: bool,
 }
 
-/// Serde-friendly intermediate for bincode persistence.
-/// Avoids `PathBuf` encoding issues by converting to `String`.
+#[derive(Debug, Clone)]
+struct EmbeddingEntry {
+    vector: Vec<f32>,
+    content_hash: Option<[u8; 32]>,
+}
+
+#[derive(serde::Serialize)]
+struct EmbeddingCacheDataRef<'a> {
+    magic: [u8; 8],
+    schema_version: u16,
+    identity: &'a EmbeddingSpaceIdentity,
+    first_pass_complete: bool,
+    entries: Vec<EmbeddingCacheEntryRef<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct EmbeddingCacheEntryRef<'a> {
+    path: String,
+    content_hash: [u8; 32],
+    vector: &'a [f32],
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct EmbeddingCacheData {
-    dim: usize,
-    entries: Vec<(String, Vec<f32>)>,
+    magic: [u8; 8],
+    schema_version: u16,
+    identity: EmbeddingSpaceIdentity,
+    first_pass_complete: bool,
+    entries: Vec<EmbeddingCacheEntry>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EmbeddingCacheEntry {
+    path: String,
+    content_hash: [u8; 32],
+    vector: Vec<f32>,
 }
 
 impl EmbeddingStore {
@@ -56,6 +143,17 @@ impl EmbeddingStore {
         Self {
             embeddings: HashMap::new(),
             dim,
+            identity: None,
+            first_pass_complete: false,
+        }
+    }
+
+    pub(crate) fn new_with_identity(identity: EmbeddingSpaceIdentity) -> Self {
+        Self {
+            embeddings: HashMap::new(),
+            dim: identity.dimension,
+            identity: Some(identity),
+            first_pass_complete: false,
         }
     }
 
@@ -65,7 +163,7 @@ impl EmbeddingStore {
     /// to prevent garbage cosine-similarity results from a misconfigured
     /// API backend.
     pub fn insert(&mut self, path: PathBuf, vec: Vec<f32>) {
-        if vec.len() != self.dim {
+        if validate_vector(&vec, self.dim).is_err() {
             tracing::warn!(
                 path = %path.display(),
                 expected = self.dim,
@@ -74,17 +172,50 @@ impl EmbeddingStore {
             );
             return;
         }
-        self.embeddings.insert(path, vec);
+        self.embeddings.insert(
+            path,
+            EmbeddingEntry {
+                vector: vec,
+                content_hash: None,
+            },
+        );
+        self.first_pass_complete = false;
+    }
+
+    pub(crate) fn insert_hashed(
+        &mut self,
+        path: PathBuf,
+        content_hash: [u8; 32],
+        vector: Vec<f32>,
+    ) -> VaultResult<()> {
+        validate_vector(&vector, self.dim)?;
+        self.embeddings.insert(
+            path,
+            EmbeddingEntry {
+                vector,
+                content_hash: Some(content_hash),
+            },
+        );
+        Ok(())
     }
 
     /// Remove a note's embedding.
-    pub fn remove(&mut self, path: &Path) {
-        self.embeddings.remove(path);
+    pub fn remove(&mut self, path: &Path) -> bool {
+        self.embeddings.remove(path).is_some()
     }
 
     /// Retrieve a note's embedding vector.
     pub fn get(&self, path: &Path) -> Option<&[f32]> {
-        self.embeddings.get(path).map(|v| v.as_slice())
+        self.embeddings
+            .get(path)
+            .map(|entry| entry.vector.as_slice())
+    }
+
+    #[allow(dead_code)] // Used by the managed runtime added with this cache contract.
+    pub(crate) fn content_hash(&self, path: &Path) -> Option<&[u8; 32]> {
+        self.embeddings
+            .get(path)
+            .and_then(|entry| entry.content_hash.as_ref())
     }
 
     pub fn len(&self) -> usize {
@@ -99,13 +230,31 @@ impl EmbeddingStore {
         self.dim
     }
 
+    pub(crate) fn identity(&self) -> Option<&EmbeddingSpaceIdentity> {
+        self.identity.as_ref()
+    }
+
+    pub(crate) fn first_pass_complete(&self) -> bool {
+        self.first_pass_complete
+    }
+
+    pub(crate) fn set_first_pass_complete(&mut self, complete: bool) {
+        self.first_pass_complete = complete;
+    }
+
+    pub(crate) fn retain_paths(&mut self, paths: &HashSet<PathBuf>) -> bool {
+        let previous_len = self.embeddings.len();
+        self.embeddings.retain(|path, _| paths.contains(path));
+        self.embeddings.len() != previous_len
+    }
+
     /// Find the `top_k` most similar notes to `query_vec`, sorted by
     /// descending cosine similarity.
     pub fn query(&self, query_vec: &[f32], top_k: usize) -> Vec<(PathBuf, f32)> {
         let mut scored: Vec<(PathBuf, f32)> = self
             .embeddings
             .iter()
-            .map(|(path, vec)| (path.clone(), cosine_similarity(query_vec, vec)))
+            .map(|(path, entry)| (path.clone(), cosine_similarity(query_vec, &entry.vector)))
             .collect();
 
         let cmp = |a: &(PathBuf, f32), b: &(PathBuf, f32)| {
@@ -124,50 +273,214 @@ impl EmbeddingStore {
 
     /// Serialize the store to a binary cache file.
     pub fn save(&self, path: &Path) -> VaultResult<()> {
-        let data = EmbeddingCacheData {
-            dim: self.dim,
-            entries: self
-                .embeddings
-                .iter()
-                .map(|(p, v)| (p.to_string_lossy().into_owned(), v.clone()))
-                .collect(),
+        let identity = self.identity.as_ref().ok_or_else(|| {
+            VaultError::Embedding("embedding store has no vector-space identity".into())
+        })?;
+        if identity.dimension != self.dim || self.dim == 0 {
+            return Err(VaultError::Embedding(
+                "embedding store identity has an invalid dimension".into(),
+            ));
+        }
+
+        let mut entries = self
+            .embeddings
+            .iter()
+            .filter_map(|(path, entry)| {
+                entry
+                    .content_hash
+                    .map(|content_hash| EmbeddingCacheEntryRef {
+                        path: path.to_string_lossy().into_owned(),
+                        content_hash,
+                        vector: &entry.vector,
+                    })
+            })
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        let data = EmbeddingCacheDataRef {
+            magic: CACHE_MAGIC,
+            schema_version: CACHE_SCHEMA_VERSION,
+            identity,
+            first_pass_complete: self.first_pass_complete && entries.len() == self.embeddings.len(),
+            entries,
         };
         let bytes = bincode::serde::encode_to_vec(&data, bincode::config::standard())
             .map_err(|e| VaultError::Embedding(format!("cache serialize error: {e}")))?;
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+            let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+            temp.write_all(&bytes)?;
+            temp.flush()?;
+            temp.as_file().sync_all()?;
+            temp.persist(path)
+                .map_err(|error| VaultError::Io(error.error))?;
+            return Ok(());
         }
-        std::fs::write(path, bytes)?;
-        Ok(())
+        Err(VaultError::Embedding(format!(
+            "embedding cache path has no parent: {}",
+            path.display()
+        )))
     }
 
     /// Deserialize a store from a binary cache file.
     pub fn load(path: &Path) -> VaultResult<Self> {
-        let bytes = std::fs::read(path)?;
-        let (data, _): (EmbeddingCacheData, _) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-                .map_err(|e| VaultError::Embedding(format!("cache deserialize error: {e}")))?;
+        Self::load_bounded(path, None, MAX_CACHE_ENTRIES)
+    }
 
+    pub(crate) fn load_for_space(
+        path: &Path,
+        expected: &EmbeddingSpaceIdentity,
+        current_note_count: usize,
+    ) -> VaultResult<Self> {
+        Self::load_bounded(
+            path,
+            Some(expected),
+            current_note_count.saturating_add(1024),
+        )
+    }
+
+    fn load_bounded(
+        path: &Path,
+        expected: Option<&EmbeddingSpaceIdentity>,
+        max_entries: usize,
+    ) -> VaultResult<Self> {
+        let metadata = std::fs::metadata(path)?;
+        let expected_dim = expected.map_or(384, |identity| identity.dimension.max(1));
+        let per_entry = MAX_CACHE_PATH_BYTES
+            .saturating_add(expected_dim.saturating_mul(std::mem::size_of::<f32>()))
+            .saturating_add(128);
+        let derived_limit = max_entries
+            .max(1)
+            .saturating_mul(per_entry)
+            .saturating_add(1024 * 1024) as u64;
+        let byte_limit = derived_limit.min(MAX_CACHE_BYTES);
+        if metadata.len() > byte_limit {
+            return Err(VaultError::Embedding(format!(
+                "embedding cache is too large: {} bytes (limit {byte_limit})",
+                metadata.len()
+            )));
+        }
+
+        let bytes = std::fs::read(path)?;
+        let config = bincode::config::standard().with_limit::<1073741824>();
+        let (data, consumed): (EmbeddingCacheData, usize) =
+            bincode::serde::decode_from_slice(&bytes, config)
+                .map_err(|e| VaultError::Embedding(format!("cache deserialize error: {e}")))?;
+        if consumed != bytes.len() {
+            return Err(VaultError::Embedding(
+                "embedding cache contains trailing bytes".into(),
+            ));
+        }
+        if data.magic != CACHE_MAGIC {
+            return Err(VaultError::Embedding(
+                "unsupported legacy embedding cache format".into(),
+            ));
+        }
+        if data.schema_version != CACHE_SCHEMA_VERSION {
+            return Err(VaultError::Embedding(format!(
+                "unsupported embedding cache schema version {}",
+                data.schema_version
+            )));
+        }
+        if data.identity.dimension == 0 {
+            return Err(VaultError::Embedding(
+                "embedding cache dimension must be greater than zero".into(),
+            ));
+        }
+        if let Some(expected) = expected
+            && &data.identity != expected
+        {
+            return Err(VaultError::Embedding(
+                "embedding cache vector-space identity mismatch".into(),
+            ));
+        }
+        if data.entries.len() > max_entries {
+            return Err(VaultError::Embedding(format!(
+                "embedding cache contains too many entries: {} (limit {max_entries})",
+                data.entries.len()
+            )));
+        }
+
+        let dim = data.identity.dimension;
         let mut embeddings = HashMap::with_capacity(data.entries.len());
-        for (path_str, vec) in data.entries {
-            if vec.len() != data.dim {
-                tracing::warn!(
-                    path = %path_str,
-                    expected = data.dim,
-                    got = vec.len(),
-                    "skipping cache entry with mismatched embedding dimension"
-                );
-                continue;
+        let mut canonical_paths = HashSet::with_capacity(data.entries.len());
+        for entry in data.entries {
+            let relative = validate_cache_path(&entry.path)?;
+            let canonical = super::path::canonical_unicode_key(&entry.path);
+            if !canonical_paths.insert(canonical) || embeddings.contains_key(&relative) {
+                return Err(VaultError::Embedding(format!(
+                    "embedding cache contains duplicate path '{}'",
+                    entry.path
+                )));
             }
-            embeddings.insert(PathBuf::from(path_str), vec);
+            validate_vector(&entry.vector, dim)?;
+            embeddings.insert(
+                relative,
+                EmbeddingEntry {
+                    vector: entry.vector,
+                    content_hash: Some(entry.content_hash),
+                },
+            );
         }
 
         Ok(Self {
             embeddings,
-            dim: data.dim,
+            dim,
+            identity: Some(data.identity),
+            first_pass_complete: data.first_pass_complete,
         })
     }
+}
+
+fn validate_cache_path(path: &str) -> VaultResult<PathBuf> {
+    if path.is_empty() || path.len() > MAX_CACHE_PATH_BYTES || path.contains('\\') {
+        return Err(VaultError::Embedding(format!(
+            "invalid embedding cache path '{path}'"
+        )));
+    }
+    let original = Path::new(path);
+    let normalized = super::path::normalize_relative(original).map_err(|error| {
+        VaultError::Embedding(format!("invalid embedding cache path '{path}': {error}"))
+    })?;
+    if normalized != original || normalized.to_string_lossy() != path {
+        return Err(VaultError::Embedding(format!(
+            "embedding cache path is not normalized: '{path}'"
+        )));
+    }
+    Ok(normalized)
+}
+
+fn validate_vector(vector: &[f32], expected_dim: usize) -> VaultResult<()> {
+    if vector.len() != expected_dim {
+        return Err(VaultError::Embedding(format!(
+            "embedding dimension mismatch: expected {expected_dim}, got {}",
+            vector.len()
+        )));
+    }
+    if vector.iter().any(|value| !value.is_finite()) {
+        return Err(VaultError::Embedding(
+            "embedding vector contains a non-finite value".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn prepared_text_hash(text: &str) -> [u8; 32] {
+    Sha256::digest(text.as_bytes()).into()
+}
+
+#[cfg(feature = "embeddings-api")]
+fn endpoint_fingerprint(base_url: &str) -> [u8; 32] {
+    let normalized = base_url.trim().trim_end_matches('/');
+    Sha256::digest(normalized.as_bytes()).into()
+}
+
+#[cfg(feature = "embeddings-api")]
+fn short_fingerprint(fingerprint: &[u8; 32]) -> String {
+    fingerprint[..6]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 // ── EmbeddingBackend ───────────────────────────────────────────────────
@@ -192,6 +505,7 @@ enum EmbeddingBackend {
 pub struct EmbeddingModel {
     backend: EmbeddingBackend,
     dim: usize,
+    identity: EmbeddingSpaceIdentity,
 }
 
 impl EmbeddingModel {
@@ -208,24 +522,7 @@ impl EmbeddingModel {
 
     /// Embed a batch of texts. Returns one vector per input text.
     pub fn embed_batch(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>> {
-        match &self.backend {
-            #[cfg(feature = "embeddings")]
-            EmbeddingBackend::Local(inner) => {
-                let mut model = inner
-                    .lock()
-                    .map_err(|e| VaultError::Embedding(format!("model lock poisoned: {e}")))?;
-                model
-                    .embed(texts, Some(64))
-                    .map_err(|e| VaultError::Embedding(format!("embed failed: {e}")))
-            }
-            #[cfg(feature = "embeddings-api")]
-            EmbeddingBackend::Api {
-                client,
-                base_url,
-                model,
-                api_key,
-            } => embed_batch_api(client, base_url, model, api_key, texts),
-        }
+        <Self as Embedder>::embed_batch(self, texts)
     }
 
     /// Embed a single text. Convenience wrapper over `embed_batch`.
@@ -248,11 +545,14 @@ impl EmbeddingModel {
         let model_name = model_name.to_owned();
 
         tokio::task::spawn_blocking(move || {
-            let model_enum: fastembed::EmbeddingModel = model_name.parse().unwrap_or_default();
+            let model_enum: fastembed::EmbeddingModel = model_name.parse().map_err(|_| {
+                VaultError::Embedding(format!("unknown local embedding model '{model_name}'"))
+            })?;
 
             let dim = fastembed::EmbeddingModel::get_model_info(&model_enum)
                 .map(|info| info.dim)
                 .unwrap_or(384);
+            let identity = EmbeddingSpaceIdentity::local(format!("{model_enum:?}"), dim);
 
             let options = fastembed::InitOptions::new(model_enum).with_show_download_progress(true);
 
@@ -262,6 +562,7 @@ impl EmbeddingModel {
             Ok(Self {
                 backend: EmbeddingBackend::Local(Box::new(std::sync::Mutex::new(inner))),
                 dim,
+                identity,
             })
         })
         .await
@@ -311,9 +612,15 @@ impl EmbeddingModel {
                     probe_api_dimension(&client, &base_url, &model, &api_key)?
                 }
             };
+            let identity = EmbeddingSpaceIdentity::api(model.clone(), &base_url, dim);
+            let endpoint = identity
+                .endpoint_fingerprint
+                .as_ref()
+                .map(short_fingerprint)
+                .unwrap_or_default();
 
             tracing::info!(
-                base_url = %base_url,
+                endpoint_fingerprint = %endpoint,
                 model = %model,
                 dim,
                 "API embedding backend ready"
@@ -327,6 +634,7 @@ impl EmbeddingModel {
                     api_key,
                 },
                 dim,
+                identity,
             })
         })
         .await
@@ -338,6 +646,38 @@ impl EmbeddingModel {
         Err(VaultError::Embedding(
             "API embedding backend not compiled (needs --features embeddings-api)".into(),
         ))
+    }
+}
+
+impl Embedder for EmbeddingModel {
+    fn dimension(&self) -> usize {
+        self.dim
+    }
+
+    fn space_identity(&self) -> &EmbeddingSpaceIdentity {
+        &self.identity
+    }
+
+    fn embed_batch(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>> {
+        let vectors = match &self.backend {
+            #[cfg(feature = "embeddings")]
+            EmbeddingBackend::Local(inner) => {
+                let mut model = inner
+                    .lock()
+                    .map_err(|e| VaultError::Embedding(format!("model lock poisoned: {e}")))?;
+                model
+                    .embed(texts, Some(64))
+                    .map_err(|e| VaultError::Embedding(format!("embed failed: {e}")))?
+            }
+            #[cfg(feature = "embeddings-api")]
+            EmbeddingBackend::Api {
+                client,
+                base_url,
+                model,
+                api_key,
+            } => embed_batch_api(client, base_url, model, api_key, texts)?,
+        };
+        validate_embedding_batch(vectors, texts.len(), self.dim)
     }
 }
 
@@ -464,27 +804,54 @@ fn embed_batch_api(
             .json()
             .map_err(|e| VaultError::Embedding(format!("embedding API parse error: {e}")))?;
 
-        return parse_embedding_response(&resp);
+        return parse_embedding_response(&resp, texts.len());
     }
 }
 
 /// Parse an OpenAI-compatible embedding API response into embedding vectors.
 ///
-/// Items are sorted by the `index` field when present, falling back to array
-/// position for providers that omit it. This ensures correct input→output
-/// alignment even when providers return items out of order.
+/// Providers may either omit every `index` and preserve array order, or include
+/// a complete unique index set. Mixed or partial responses are rejected.
 #[cfg(feature = "embeddings-api")]
-fn parse_embedding_response(resp: &serde_json::Value) -> Result<Vec<Vec<f32>>, VaultError> {
+fn parse_embedding_response(
+    resp: &serde_json::Value,
+    expected_count: usize,
+) -> Result<Vec<Vec<f32>>, VaultError> {
     let data = resp["data"]
         .as_array()
         .ok_or_else(|| VaultError::Embedding("missing 'data' array in API response".into()))?;
+    if data.len() != expected_count {
+        return Err(VaultError::Embedding(format!(
+            "embedding API returned {} vectors for {expected_count} inputs",
+            data.len()
+        )));
+    }
+
+    let indexed_response = data.first().is_some_and(|item| !item["index"].is_null());
 
     let mut indexed: Vec<(usize, Vec<f32>)> = Vec::with_capacity(data.len());
     for (array_pos, item) in data.iter().enumerate() {
-        let idx = item["index"]
-            .as_u64()
-            .map(|i| i as usize)
-            .unwrap_or(array_pos);
+        let has_index = !item["index"].is_null();
+        if has_index != indexed_response {
+            return Err(VaultError::Embedding(
+                "embedding API returned mixed indexed and unindexed items".into(),
+            ));
+        }
+        let idx = if indexed_response {
+            let raw = item["index"].as_u64().ok_or_else(|| {
+                VaultError::Embedding("embedding response index must be an unsigned integer".into())
+            })?;
+            usize::try_from(raw).map_err(|_| {
+                VaultError::Embedding("embedding response index is out of range".into())
+            })?
+        } else {
+            array_pos
+        };
+        if idx >= expected_count {
+            return Err(VaultError::Embedding(format!(
+                "embedding response index {idx} is out of range for {expected_count} inputs"
+            )));
+        }
         let vec = item["embedding"]
             .as_array()
             .ok_or_else(|| {
@@ -496,14 +863,45 @@ fn parse_embedding_response(resp: &serde_json::Value) -> Result<Vec<Vec<f32>>, V
                     .ok_or_else(|| {
                         VaultError::Embedding("non-numeric value in embedding vector".into())
                     })
-                    .map(|f| f as f32)
+                    .and_then(|f| {
+                        let value = f as f32;
+                        value.is_finite().then_some(value).ok_or_else(|| {
+                            VaultError::Embedding("non-finite value in embedding vector".into())
+                        })
+                    })
             })
             .collect::<Result<Vec<f32>, _>>()?;
         indexed.push((idx, vec));
     }
 
-    indexed.sort_by_key(|(idx, _)| *idx);
+    if indexed_response {
+        indexed.sort_unstable_by_key(|(idx, _)| *idx);
+        for (expected, (actual, _)) in indexed.iter().enumerate() {
+            if *actual != expected {
+                return Err(VaultError::Embedding(format!(
+                    "embedding response indices are not unique and contiguous: expected {expected}, got {actual}"
+                )));
+            }
+        }
+    }
     Ok(indexed.into_iter().map(|(_, vec)| vec).collect())
+}
+
+pub(crate) fn validate_embedding_batch(
+    vectors: Vec<Vec<f32>>,
+    expected_count: usize,
+    expected_dim: usize,
+) -> VaultResult<Vec<Vec<f32>>> {
+    if vectors.len() != expected_count {
+        return Err(VaultError::Embedding(format!(
+            "embedding backend returned {} vectors for {expected_count} inputs",
+            vectors.len()
+        )));
+    }
+    for vector in &vectors {
+        validate_vector(vector, expected_dim)?;
+    }
+    Ok(vectors)
 }
 
 // ── Env var helpers (API backend) ──────────────────────────────────────
@@ -539,8 +937,18 @@ pub(crate) fn build_or_load_embedding_store(
     note_entries: &[(PathBuf, crate::models::NoteMetadata)],
     model: &EmbeddingModel,
 ) -> VaultResult<EmbeddingStore> {
-    if let Ok(store) = EmbeddingStore::load(cache_path) {
-        if store.dim() == model.dim() && store.len() == note_entries.len() {
+    let current_paths = note_entries
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<HashSet<_>>();
+    if let Ok(mut store) = EmbeddingStore::load_for_space(
+        cache_path,
+        Embedder::space_identity(model),
+        note_entries.len(),
+    ) {
+        store.retain_paths(&current_paths);
+        debug_assert_eq!(store.identity(), Some(Embedder::space_identity(model)));
+        if store.first_pass_complete() && store.len() == note_entries.len() {
             tracing::info!(
                 cache = %cache_path.display(),
                 cached = store.len(),
@@ -556,24 +964,26 @@ pub(crate) fn build_or_load_embedding_store(
         );
     }
 
-    let entries: Vec<(PathBuf, String)> = note_entries
+    let entries: Vec<(PathBuf, String, [u8; 32])> = note_entries
         .iter()
         .filter_map(|(path, meta)| {
             let content = super::fs::read_file(vault_root, path).ok()?;
             let body = super::frontmatter::get_body(&content);
             let heading_texts: Vec<String> = meta.headings.iter().map(|h| h.text.clone()).collect();
             let text = prepare_embed_text(&meta.title, &heading_texts, body);
-            Some((path.clone(), text))
+            let hash = prepared_text_hash(&text);
+            Some((path.clone(), text, hash))
         })
         .collect();
 
-    let mut store = EmbeddingStore::new(model.dim());
+    let mut store = EmbeddingStore::new_with_identity(Embedder::space_identity(model).clone());
+    debug_assert_eq!(store.dim(), Embedder::dimension(model));
     for chunk in entries.chunks(BATCH_SIZE) {
-        let texts: Vec<&str> = chunk.iter().map(|(_, text)| text.as_str()).collect();
+        let texts: Vec<&str> = chunk.iter().map(|(_, text, _)| text.as_str()).collect();
         match model.embed_batch(&texts) {
             Ok(vectors) => {
-                for ((path, _), vector) in chunk.iter().zip(vectors) {
-                    store.insert(path.clone(), vector);
+                for ((path, _, hash), vector) in chunk.iter().zip(vectors) {
+                    store.insert_hashed(path.clone(), *hash, vector)?;
                 }
             }
             Err(err) => {
@@ -581,6 +991,7 @@ pub(crate) fn build_or_load_embedding_store(
             }
         }
     }
+    store.set_first_pass_complete(true);
 
     if let Err(err) = store.save(cache_path) {
         tracing::warn!(error = %err, "failed to save embedding cache");
@@ -707,11 +1118,40 @@ mod tests {
 
     // ── EmbeddingStore ─────────────────────────────────────────────
 
+    fn test_identity(dim: usize) -> EmbeddingSpaceIdentity {
+        EmbeddingSpaceIdentity {
+            backend: EmbeddingBackendKind::Local,
+            model: "test-model".to_string(),
+            endpoint_fingerprint: None,
+            dimension: dim,
+            input_version: EMBEDDING_INPUT_VERSION,
+        }
+    }
+
     fn make_store() -> EmbeddingStore {
-        let mut store = EmbeddingStore::new(3);
-        store.insert(PathBuf::from("a.md"), vec![1.0, 0.0, 0.0]);
-        store.insert(PathBuf::from("b.md"), vec![0.0, 1.0, 0.0]);
-        store.insert(PathBuf::from("c.md"), vec![0.7, 0.7, 0.0]);
+        let mut store = EmbeddingStore::new_with_identity(test_identity(3));
+        store
+            .insert_hashed(
+                PathBuf::from("a.md"),
+                prepared_text_hash("a"),
+                vec![1.0, 0.0, 0.0],
+            )
+            .unwrap();
+        store
+            .insert_hashed(
+                PathBuf::from("b.md"),
+                prepared_text_hash("b"),
+                vec![0.0, 1.0, 0.0],
+            )
+            .unwrap();
+        store
+            .insert_hashed(
+                PathBuf::from("c.md"),
+                prepared_text_hash("c"),
+                vec![0.7, 0.7, 0.0],
+            )
+            .unwrap();
+        store.set_first_pass_complete(true);
         store
     }
 
@@ -779,6 +1219,12 @@ mod tests {
 
         assert_eq!(loaded.dim(), store.dim());
         assert_eq!(loaded.len(), store.len());
+        assert_eq!(loaded.identity(), store.identity());
+        assert!(loaded.first_pass_complete());
+        assert_eq!(
+            loaded.content_hash(Path::new("a.md")),
+            store.content_hash(Path::new("a.md"))
+        );
 
         let query = vec![1.0, 0.0, 0.0];
         let original_results = store.query(&query, 3);
@@ -797,6 +1243,88 @@ mod tests {
         assert!(store.is_empty());
         let results = store.query(&[1.0, 0.0, 0.0], 10);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn cache_rejects_trailing_bytes() {
+        let store = make_store();
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("embeddings.bin");
+        store.save(&cache_path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&cache_path)
+            .unwrap();
+        file.write_all(b"trailing").unwrap();
+
+        let error = EmbeddingStore::load(&cache_path).err().unwrap();
+        assert!(error.to_string().contains("trailing bytes"));
+    }
+
+    #[test]
+    fn cache_rejects_wrong_vector_space() {
+        let store = make_store();
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("embeddings.bin");
+        store.save(&cache_path).unwrap();
+
+        let mut expected = test_identity(3);
+        expected.model = "different-model".to_string();
+        let error = EmbeddingStore::load_for_space(&cache_path, &expected, 3)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("identity mismatch"));
+    }
+
+    #[test]
+    fn cache_rejects_duplicate_normalized_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("embeddings.bin");
+        let data = EmbeddingCacheData {
+            magic: CACHE_MAGIC,
+            schema_version: CACHE_SCHEMA_VERSION,
+            identity: test_identity(3),
+            first_pass_complete: true,
+            entries: vec![
+                EmbeddingCacheEntry {
+                    path: "Cafe\u{301}.md".to_string(),
+                    content_hash: prepared_text_hash("one"),
+                    vector: vec![1.0, 0.0, 0.0],
+                },
+                EmbeddingCacheEntry {
+                    path: "Caf\u{e9}.md".to_string(),
+                    content_hash: prepared_text_hash("two"),
+                    vector: vec![0.0, 1.0, 0.0],
+                },
+            ],
+        };
+        let bytes = bincode::serde::encode_to_vec(&data, bincode::config::standard()).unwrap();
+        std::fs::write(&cache_path, bytes).unwrap();
+
+        let error = EmbeddingStore::load(&cache_path).err().unwrap();
+        assert!(error.to_string().contains("duplicate path"));
+    }
+
+    #[test]
+    fn cache_rejects_non_finite_vectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("embeddings.bin");
+        let data = EmbeddingCacheData {
+            magic: CACHE_MAGIC,
+            schema_version: CACHE_SCHEMA_VERSION,
+            identity: test_identity(3),
+            first_pass_complete: true,
+            entries: vec![EmbeddingCacheEntry {
+                path: "bad.md".to_string(),
+                content_hash: prepared_text_hash("bad"),
+                vector: vec![1.0, f32::NAN, 0.0],
+            }],
+        };
+        let bytes = bincode::serde::encode_to_vec(&data, bincode::config::standard()).unwrap();
+        std::fs::write(&cache_path, bytes).unwrap();
+
+        let error = EmbeddingStore::load(&cache_path).err().unwrap();
+        assert!(error.to_string().contains("non-finite"));
     }
 
     // ── prepare_embed_text ─────────────────────────────────────────
@@ -1004,7 +1532,7 @@ mod tests {
             let resp = serde_json::json!({
                 "data": [{"embedding": [0.1, 0.2, 0.3]}]
             });
-            let result = parse_embedding_response(&resp).unwrap();
+            let result = parse_embedding_response(&resp, 1).unwrap();
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].len(), 3);
             assert!((result[0][0] - 0.1).abs() < 1e-6);
@@ -1018,7 +1546,7 @@ mod tests {
                     {"embedding": [0.3, 0.4]}
                 ]
             });
-            let result = parse_embedding_response(&resp).unwrap();
+            let result = parse_embedding_response(&resp, 2).unwrap();
             assert_eq!(result.len(), 2);
             assert_eq!(result[0], vec![0.1f32, 0.2]);
             assert_eq!(result[1], vec![0.3f32, 0.4]);
@@ -1027,7 +1555,7 @@ mod tests {
         #[test]
         fn parse_missing_data_field() {
             let resp = serde_json::json!({"object": "list"});
-            let err = parse_embedding_response(&resp).unwrap_err();
+            let err = parse_embedding_response(&resp, 1).unwrap_err();
             assert!(err.to_string().contains("missing 'data' array"));
         }
 
@@ -1036,7 +1564,7 @@ mod tests {
             let resp = serde_json::json!({
                 "data": [{"index": 0}]
             });
-            let err = parse_embedding_response(&resp).unwrap_err();
+            let err = parse_embedding_response(&resp, 1).unwrap_err();
             assert!(err.to_string().contains("missing 'embedding' array"));
         }
 
@@ -1045,7 +1573,7 @@ mod tests {
             let resp = serde_json::json!({
                 "data": [{"embedding": [0.1, "bad", 0.3]}]
             });
-            let err = parse_embedding_response(&resp).unwrap_err();
+            let err = parse_embedding_response(&resp, 1).unwrap_err();
             assert!(err.to_string().contains("non-numeric value"));
         }
 
@@ -1057,7 +1585,7 @@ mod tests {
                     {"index": 0, "embedding": [0.1, 0.2]}
                 ]
             });
-            let result = parse_embedding_response(&resp).unwrap();
+            let result = parse_embedding_response(&resp, 2).unwrap();
             assert_eq!(result.len(), 2);
             assert_eq!(result[0], vec![0.1f32, 0.2]);
             assert_eq!(result[1], vec![0.3f32, 0.4]);
@@ -1071,7 +1599,7 @@ mod tests {
                     {"embedding": [0.3, 0.4]}
                 ]
             });
-            let result = parse_embedding_response(&resp).unwrap();
+            let result = parse_embedding_response(&resp, 2).unwrap();
             assert_eq!(result[0], vec![0.1f32, 0.2]);
             assert_eq!(result[1], vec![0.3f32, 0.4]);
         }
@@ -1079,7 +1607,7 @@ mod tests {
         #[test]
         fn parse_empty_data_array() {
             let resp = serde_json::json!({"data": []});
-            let result = parse_embedding_response(&resp).unwrap();
+            let result = parse_embedding_response(&resp, 0).unwrap();
             assert!(result.is_empty());
         }
 
@@ -1088,9 +1616,67 @@ mod tests {
             let resp = serde_json::json!({
                 "data": [{"embedding": []}]
             });
-            let result = parse_embedding_response(&resp).unwrap();
+            let result = parse_embedding_response(&resp, 1).unwrap();
             assert_eq!(result.len(), 1);
             assert!(result[0].is_empty());
+        }
+
+        #[test]
+        fn parse_rejects_partial_response() {
+            let resp = serde_json::json!({
+                "data": [{"embedding": [0.1, 0.2]}]
+            });
+            let error = parse_embedding_response(&resp, 2).err().unwrap();
+            assert!(error.to_string().contains("1 vectors for 2 inputs"));
+        }
+
+        #[test]
+        fn parse_rejects_mixed_index_presence() {
+            let resp = serde_json::json!({
+                "data": [
+                    {"index": 0, "embedding": [0.1, 0.2]},
+                    {"embedding": [0.3, 0.4]}
+                ]
+            });
+            let error = parse_embedding_response(&resp, 2).err().unwrap();
+            assert!(error.to_string().contains("mixed indexed and unindexed"));
+        }
+
+        #[test]
+        fn parse_rejects_duplicate_indices() {
+            let resp = serde_json::json!({
+                "data": [
+                    {"index": 0, "embedding": [0.1, 0.2]},
+                    {"index": 0, "embedding": [0.3, 0.4]}
+                ]
+            });
+            let error = parse_embedding_response(&resp, 2).err().unwrap();
+            assert!(error.to_string().contains("not unique and contiguous"));
+        }
+
+        #[test]
+        fn parse_rejects_out_of_range_index() {
+            let resp = serde_json::json!({
+                "data": [
+                    {"index": 0, "embedding": [0.1, 0.2]},
+                    {"index": 2, "embedding": [0.3, 0.4]}
+                ]
+            });
+            let error = parse_embedding_response(&resp, 2).err().unwrap();
+            assert!(error.to_string().contains("out of range"));
+        }
+
+        #[test]
+        fn common_validator_rejects_wrong_dimension_and_non_finite_values() {
+            let wrong_dimension = validate_embedding_batch(vec![vec![0.1]], 1, 2)
+                .err()
+                .unwrap();
+            assert!(wrong_dimension.to_string().contains("dimension mismatch"));
+
+            let non_finite = validate_embedding_batch(vec![vec![0.1, f32::INFINITY]], 1, 2)
+                .err()
+                .unwrap();
+            assert!(non_finite.to_string().contains("non-finite"));
         }
 
         #[test]

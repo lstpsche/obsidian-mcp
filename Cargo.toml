@@ -37,11 +37,12 @@ flate2 = "1"
 tar = ">=0.4.45, <0.5"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 zeroize = "1"
+tempfile = { version = "3", optional = true }
 
 [features]
 default = []
-embeddings = ["dep:fastembed", "dep:bincode"]
-embeddings-api = ["dep:bincode", "reqwest/blocking", "reqwest/json"]
+embeddings = ["dep:fastembed", "dep:bincode", "dep:tempfile"]
+embeddings-api = ["dep:bincode", "dep:tempfile", "reqwest/blocking", "reqwest/json"]
 
 [dev-dependencies]
 tempfile = "3"
