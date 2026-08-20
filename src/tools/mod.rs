@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::wrapper::Parameters;
+use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{CallToolResult, ErrorData, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 
@@ -137,6 +137,17 @@ impl ObsidianMcp {
         Parameters(params): Parameters<notes::NoteReadParams>,
     ) -> Result<String, ErrorData> {
         notes::note_read(&self.vault, params).await
+    }
+
+    #[tool(
+        name = "note_read_many",
+        description = "Read multiple notes in one bounded call. Provide exactly one of `paths` or `dir`; directory reads are non-recursive by default. The server inspects at most 100 files and returns at most 262144 combined content bytes. Oversized or unprocessed notes are reported in `skipped`; use note_read for an intentionally oversized note."
+    )]
+    async fn note_read_many(
+        &self,
+        Parameters(params): Parameters<notes::NoteReadManyParams>,
+    ) -> Result<Json<notes::NoteReadManyOutput>, ErrorData> {
+        notes::note_read_many(&self.vault, params).await
     }
 
     #[tool(
@@ -371,6 +382,68 @@ mod tests {
         }
     }
 
+    async fn call_tool_raw(
+        server: ObsidianMcp,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let (server_transport, client_transport) = tokio::io::duplex(1024 * 1024);
+        let server_handle = tokio::spawn(async move {
+            server
+                .serve(server_transport)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap();
+        });
+        let (client_read, mut client_write) = tokio::io::split(client_transport);
+        let mut client_lines = BufReader::new(client_read).lines();
+
+        let mut initialize = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "test-client", "version": "0.0.1"}
+            }
+        }))
+        .unwrap();
+        initialize.push(b'\n');
+        client_write.write_all(&initialize).await.unwrap();
+        let _initialize_response = client_lines.next_line().await.unwrap().unwrap();
+
+        let mut initialized = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }))
+        .unwrap();
+        initialized.push(b'\n');
+        client_write.write_all(&initialized).await.unwrap();
+
+        let mut call = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": name,
+                "arguments": arguments
+            }
+        }))
+        .unwrap();
+        call.push(b'\n');
+        client_write.write_all(&call).await.unwrap();
+
+        let response =
+            serde_json::from_str(&client_lines.next_line().await.unwrap().unwrap()).unwrap();
+        client_write.shutdown().await.unwrap();
+        drop(client_lines);
+        server_handle.await.unwrap();
+        response
+    }
+
     #[tokio::test]
     async fn no_disabled_tools_exposes_all() {
         let tmp = tempfile::tempdir().unwrap();
@@ -468,72 +541,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn note_read_many_publishes_typed_input_and_output_schemas() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_test_vault(tmp.path());
+        let vault = Vault::open(&test_config(tmp.path())).await.unwrap();
+        let server = ObsidianMcp::new(vault, 0.25, test_runtime(), HashSet::new());
+        let tool = server
+            .tool_router
+            .get("note_read_many")
+            .expect("missing note_read_many tool");
+
+        let input_schema = serde_json::Value::Object(tool.input_schema.as_ref().clone());
+        assert_eq!(
+            input_schema.pointer("/properties/paths/maxItems"),
+            Some(&serde_json::json!(100))
+        );
+        assert_eq!(
+            input_schema.pointer("/properties/max_files/maximum"),
+            Some(&serde_json::json!(100))
+        );
+        assert_eq!(
+            input_schema.pointer("/properties/max_bytes/maximum"),
+            Some(&serde_json::json!(262144))
+        );
+
+        let output_schema = serde_json::Value::Object(
+            tool.output_schema
+                .as_ref()
+                .expect("note_read_many must advertise outputSchema")
+                .as_ref()
+                .clone(),
+        );
+        assert_eq!(output_schema["type"], "object");
+        for field in ["notes", "skipped", "skipped_count", "content_bytes"] {
+            assert!(
+                output_schema["required"]
+                    .as_array()
+                    .is_some_and(|required| required.contains(&serde_json::json!(field))),
+                "output schema must require '{field}'"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn note_read_many_raw_mcp_returns_matching_text_and_structured_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_test_vault(tmp.path());
+        std::fs::write(tmp.path().join("one.md"), "one").unwrap();
+        std::fs::write(tmp.path().join("two.md"), "two").unwrap();
+        let vault = Vault::open(&test_config(tmp.path())).await.unwrap();
+        let server = ObsidianMcp::new(vault, 0.25, test_runtime(), HashSet::new());
+
+        let response = call_tool_raw(
+            server,
+            "note_read_many",
+            serde_json::json!({"paths": ["two.md", "one.md"]}),
+        )
+        .await;
+
+        let text = response
+            .pointer("/result/content/0/text")
+            .and_then(serde_json::Value::as_str)
+            .expect("missing compatibility text content");
+        let text_value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(text_value, response["result"]["structuredContent"]);
+        assert_eq!(
+            text_value.pointer("/notes/0/path"),
+            Some(&serde_json::json!("two.md"))
+        );
+        assert_eq!(
+            text_value.pointer("/notes/1/path"),
+            Some(&serde_json::json!("one.md"))
+        );
+        assert_eq!(text_value["skipped_count"], 0);
+    }
+
+    #[tokio::test]
     async fn note_create_rejects_stringified_frontmatter_before_writing() {
         let tmp = tempfile::tempdir().unwrap();
         create_test_vault(tmp.path());
         let vault = Vault::open(&test_config(tmp.path())).await.unwrap();
         let server = ObsidianMcp::new(vault, 0.25, test_runtime(), HashSet::new());
 
-        let (server_transport, client_transport) = tokio::io::duplex(4096);
-        let server_handle = tokio::spawn(async move {
-            server
-                .serve(server_transport)
-                .await
-                .unwrap()
-                .waiting()
-                .await
-                .unwrap();
-        });
-        let (client_read, mut client_write) = tokio::io::split(client_transport);
-        let mut client_lines = BufReader::new(client_read).lines();
-
-        let mut initialize = serde_json::to_vec(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-11-25",
-                "capabilities": {},
-                "clientInfo": {"name": "test-client", "version": "0.0.1"}
-            }
-        }))
-        .unwrap();
-        initialize.push(b'\n');
-        client_write.write_all(&initialize).await.unwrap();
-        let _initialize_response = client_lines.next_line().await.unwrap().unwrap();
-
-        let mut initialized = serde_json::to_vec(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized"
-        }))
-        .unwrap();
-        initialized.push(b'\n');
-        client_write.write_all(&initialized).await.unwrap();
-
-        let mut call = serde_json::to_vec(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {
-                "name": "note_create",
-                "arguments": {
-                    "path": "invalid.md",
-                    "content": "body",
-                    "frontmatter": "{\"tags\":[\"rust\",\"mcp\"]}"
-                }
-            }
-        }))
-        .unwrap();
-        call.push(b'\n');
-        client_write.write_all(&call).await.unwrap();
-
-        let response: serde_json::Value =
-            serde_json::from_str(&client_lines.next_line().await.unwrap().unwrap()).unwrap();
+        let response = call_tool_raw(
+            server,
+            "note_create",
+            serde_json::json!({
+                "path": "invalid.md",
+                "content": "body",
+                "frontmatter": "{\"tags\":[\"rust\",\"mcp\"]}"
+            }),
+        )
+        .await;
         assert_eq!(response["error"]["code"], -32602);
         assert!(!tmp.path().join("invalid.md").exists());
-
-        client_write.shutdown().await.unwrap();
-        drop(client_lines);
-        server_handle.await.unwrap();
     }
 }

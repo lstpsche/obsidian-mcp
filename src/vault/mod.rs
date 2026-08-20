@@ -30,8 +30,8 @@ use notify_debouncer_mini::Debouncer;
 use crate::config::Config;
 use crate::error::{VaultError, VaultResult};
 use crate::models::{
-    DocumentMap, NoteMetadata, NotePeriod, PatchRequest, SearchField, SearchMatch, SearchResult,
-    VaultStats, WikiLink,
+    DocumentMap, FileStat, NoteMetadata, NotePeriod, PatchRequest, SearchField, SearchMatch,
+    SearchResult, VaultStats, WikiLink,
 };
 
 use self::exclude::ExcludeSet;
@@ -311,6 +311,10 @@ impl Vault {
 
     pub fn read_note(&self, path: &Path) -> VaultResult<String> {
         fs::read_file(&self.inner.root, path)
+    }
+
+    pub fn file_stat(&self, path: &Path) -> VaultResult<FileStat> {
+        fs::file_stat(&self.inner.root, path)
     }
 
     pub fn write_note(&self, path: &Path, content: &str) -> VaultResult<()> {
