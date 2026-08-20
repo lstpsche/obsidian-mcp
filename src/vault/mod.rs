@@ -17,6 +17,8 @@ pub mod watcher;
 pub mod wikilink;
 
 #[cfg(has_embeddings)]
+pub mod embedding_runtime;
+#[cfg(has_embeddings)]
 pub mod embeddings;
 
 #[cfg(has_embeddings)]

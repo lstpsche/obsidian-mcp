@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 #[cfg(feature = "embeddings")]
 use fastembed::ModelTrait;
@@ -273,6 +274,11 @@ impl EmbeddingStore {
 
     /// Serialize the store to a binary cache file.
     pub fn save(&self, path: &Path) -> VaultResult<()> {
+        let bytes = self.encode_cache()?;
+        Self::persist_cache_bytes(path, &bytes, None).map(|_| ())
+    }
+
+    pub(crate) fn encode_cache(&self) -> VaultResult<Vec<u8>> {
         let identity = self.identity.as_ref().ok_or_else(|| {
             VaultError::Embedding("embedding store has no vector-space identity".into())
         })?;
@@ -303,18 +309,38 @@ impl EmbeddingStore {
             first_pass_complete: self.first_pass_complete && entries.len() == self.embeddings.len(),
             entries,
         };
-        let bytes = bincode::serde::encode_to_vec(&data, bincode::config::standard())
-            .map_err(|e| VaultError::Embedding(format!("cache serialize error: {e}")))?;
+        bincode::serde::encode_to_vec(&data, bincode::config::standard())
+            .map_err(|e| VaultError::Embedding(format!("cache serialize error: {e}")))
+    }
 
+    pub(crate) fn persist_cache_bytes_if_live(
+        path: &Path,
+        bytes: &[u8],
+        live: &AtomicBool,
+    ) -> VaultResult<bool> {
+        Self::persist_cache_bytes(path, bytes, Some(live))
+    }
+
+    fn persist_cache_bytes(
+        path: &Path,
+        bytes: &[u8],
+        live: Option<&AtomicBool>,
+    ) -> VaultResult<bool> {
+        if live.is_some_and(|flag| !flag.load(AtomicOrdering::Acquire)) {
+            return Ok(false);
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
             let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-            temp.write_all(&bytes)?;
+            temp.write_all(bytes)?;
             temp.flush()?;
             temp.as_file().sync_all()?;
+            if live.is_some_and(|flag| !flag.load(AtomicOrdering::Acquire)) {
+                return Ok(false);
+            }
             temp.persist(path)
                 .map_err(|error| VaultError::Io(error.error))?;
-            return Ok(());
+            return Ok(true);
         }
         Err(VaultError::Embedding(format!(
             "embedding cache path has no parent: {}",
