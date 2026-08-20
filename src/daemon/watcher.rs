@@ -15,7 +15,7 @@ use crate::vault::path as vault_path;
 use crate::vault::tantivy_index::TantivyIndex;
 
 #[cfg(has_embeddings)]
-use crate::vault::embedding_runtime::EmbeddingRuntime;
+use crate::vault::embedding_runtime::{EmbeddingRuntime, EmbeddingRuntimeWeak};
 
 const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(500);
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -28,6 +28,7 @@ pub fn start_watcher(
     embedding_runtime: EmbeddingRuntime,
     exclude: Arc<ExcludeSet>,
 ) -> VaultResult<Debouncer<notify::RecommendedWatcher>> {
+    let embedding_runtime = embedding_runtime.downgrade();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<DebounceEventResult>(EVENT_CHANNEL_CAPACITY);
     let rt = Handle::current();
 
@@ -187,7 +188,7 @@ fn process_event(
     vault_root: &Path,
     index: &Arc<RwLock<VaultIndex>>,
     tantivy: Option<&TantivyIndex>,
-    embedding_runtime: &EmbeddingRuntime,
+    embedding_runtime: &EmbeddingRuntimeWeak,
     absolute: &Path,
     exclude: &ExcludeSet,
 ) -> bool {
@@ -363,25 +364,40 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let index = Arc::new(RwLock::new(VaultIndex::empty()));
-        let runtime = EmbeddingRuntime::spawn(
+        let runtime = crate::vault::embedding_runtime::EmbeddingRuntime::spawn(
             dir.path().to_path_buf(),
             Arc::clone(&index),
             dir.path().join("embeddings.bin"),
             async { std::future::pending::<VaultResult<Arc<dyn Embedder>>>().await },
         );
+        let submitter = runtime.downgrade();
         let exclude = ExcludeSet::build(vec![]).unwrap();
         let old_relative = PathBuf::from("old.md");
         let old_absolute = dir.path().join(&old_relative);
 
         std::fs::write(&old_absolute, "# First\n").unwrap();
-        let _ = process_event(dir.path(), &index, None, &runtime, &old_absolute, &exclude);
+        let _ = process_event(
+            dir.path(),
+            &index,
+            None,
+            &submitter,
+            &old_absolute,
+            &exclude,
+        );
         assert_eq!(
             runtime.pending_kind(&old_relative),
             Some(PendingKind::Upsert)
         );
 
         std::fs::write(&old_absolute, "# Latest\n").unwrap();
-        let _ = process_event(dir.path(), &index, None, &runtime, &old_absolute, &exclude);
+        let _ = process_event(
+            dir.path(),
+            &index,
+            None,
+            &submitter,
+            &old_absolute,
+            &exclude,
+        );
         assert_eq!(
             runtime.pending_kind(&old_relative),
             Some(PendingKind::Upsert)
@@ -390,8 +406,22 @@ mod tests {
         let new_relative = PathBuf::from("new.md");
         let new_absolute = dir.path().join(&new_relative);
         std::fs::rename(&old_absolute, &new_absolute).unwrap();
-        let _ = process_event(dir.path(), &index, None, &runtime, &old_absolute, &exclude);
-        let _ = process_event(dir.path(), &index, None, &runtime, &new_absolute, &exclude);
+        let _ = process_event(
+            dir.path(),
+            &index,
+            None,
+            &submitter,
+            &old_absolute,
+            &exclude,
+        );
+        let _ = process_event(
+            dir.path(),
+            &index,
+            None,
+            &submitter,
+            &new_absolute,
+            &exclude,
+        );
         assert_eq!(
             runtime.pending_kind(&old_relative),
             Some(PendingKind::Remove)
@@ -402,7 +432,14 @@ mod tests {
         );
 
         std::fs::remove_file(&new_absolute).unwrap();
-        let _ = process_event(dir.path(), &index, None, &runtime, &new_absolute, &exclude);
+        let _ = process_event(
+            dir.path(),
+            &index,
+            None,
+            &submitter,
+            &new_absolute,
+            &exclude,
+        );
         assert_eq!(
             runtime.pending_kind(&new_relative),
             Some(PendingKind::Remove)

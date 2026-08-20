@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use schemars::JsonSchema;
@@ -49,6 +49,17 @@ pub struct EmbeddingRuntimeStatus {
 #[derive(Clone)]
 pub struct EmbeddingRuntime {
     control: Arc<RuntimeControl>,
+}
+
+/// Non-owning submit handle for background producers such as filesystem watchers.
+///
+/// A watcher may outlive its owning `Vault` or daemon context by one scheduler
+/// turn while its event channel closes. Keeping only a weak handle ensures that
+/// this tail cannot keep the embedding coordinator alive or permit a late cache
+/// write after the owner has been dropped.
+#[derive(Clone)]
+pub(crate) struct EmbeddingRuntimeWeak {
+    control: Weak<RuntimeControl>,
 }
 
 struct RuntimeControl {
@@ -213,6 +224,12 @@ impl EmbeddingRuntime {
         self.submit(path, PendingKind::Remove);
     }
 
+    pub(crate) fn downgrade(&self) -> EmbeddingRuntimeWeak {
+        EmbeddingRuntimeWeak {
+            control: Arc::downgrade(&self.control),
+        }
+    }
+
     fn submit(&self, path: &Path, kind: PendingKind) {
         let normalized = match super::path::normalize_relative(path) {
             Ok(path) if !path.as_os_str().is_empty() => path,
@@ -289,6 +306,28 @@ impl EmbeddingRuntime {
             .pending
             .get(&normalized)
             .map(|work| work.kind)
+    }
+}
+
+impl EmbeddingRuntimeWeak {
+    pub(crate) fn submit_upsert(&self, path: &Path) {
+        self.submit(path, PendingKind::Upsert);
+    }
+
+    pub(crate) fn submit_remove(&self, path: &Path) {
+        self.submit(path, PendingKind::Remove);
+    }
+
+    fn submit(&self, path: &Path, kind: PendingKind) {
+        let Some(control) = self.control.upgrade() else {
+            return;
+        };
+        EmbeddingRuntime { control }.submit(path, kind);
+    }
+
+    #[cfg(test)]
+    fn is_alive(&self) -> bool {
+        self.control.upgrade().is_some()
     }
 }
 
@@ -1169,6 +1208,25 @@ mod tests {
         release_tx.send(()).unwrap();
         wait_for_status(&runtime, |status| status.phase == EmbeddingPhase::Ready).await;
         assert!(runtime.status().queryable);
+    }
+
+    #[tokio::test]
+    async fn weak_submit_handle_does_not_extend_runtime_lifetime() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join(".obsidian")).unwrap();
+        let index = test_index(directory.path()).await;
+        let runtime = EmbeddingRuntime::spawn(
+            directory.path().to_path_buf(),
+            index,
+            directory.path().join("cache.bin"),
+            async { std::future::pending::<VaultResult<Arc<dyn Embedder>>>().await },
+        );
+        let submitter = runtime.downgrade();
+
+        assert!(submitter.is_alive());
+        drop(runtime);
+        assert!(!submitter.is_alive());
+        submitter.submit_upsert(Path::new("ignored.md"));
     }
 
     #[tokio::test]

@@ -39,6 +39,9 @@ pub fn start_watcher(
     embedding_runtime: Option<super::embedding_runtime::EmbeddingRuntime>,
     exclude: Arc<ExcludeSet>,
 ) -> VaultResult<Debouncer<notify::RecommendedWatcher>> {
+    let embedding_runtime = embedding_runtime
+        .as_ref()
+        .map(super::embedding_runtime::EmbeddingRuntime::downgrade);
     let (tx, mut rx) = tokio::sync::mpsc::channel::<DebounceEventResult>(EVENT_CHANNEL_CAPACITY);
     let rt = Handle::current();
 
@@ -221,7 +224,7 @@ fn process_event(
     vault_root: &Path,
     index: &Arc<RwLock<VaultIndex>>,
     tantivy: Option<&TantivyIndex>,
-    embedding_runtime: Option<&super::embedding_runtime::EmbeddingRuntime>,
+    embedding_runtime: Option<&super::embedding_runtime::EmbeddingRuntimeWeak>,
     absolute: &Path,
     exclude: &ExcludeSet,
 ) -> bool {
