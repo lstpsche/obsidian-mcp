@@ -36,12 +36,12 @@ Add to your MCP client config (Cursor, Claude Desktop, etc.) and you're done —
 | **Navigate** | List files, tree view, vault stats |
 | **Read & write** | Create, read, overwrite, append, prepend, move, delete notes |
 | **Patch** | Edit individual heading sections, block references, or frontmatter fields without touching the rest of the note |
-| **Search** | BM25 full-text (Tantivy) with stemming, fuzzy matching, and per-field filtering. Semantic search via local embeddings. Regex. Tag and frontmatter queries. |
+| **Search** | BM25 full-text (Tantivy) with stemming, fuzzy matching, and per-field filtering. Semantic search via managed local or API embeddings. Regex. Tag and frontmatter queries. |
 | **Graph** | Backlinks, outgoing links, broken link detection, orphan discovery |
 | **Frontmatter** | Get/set/remove fields, query notes by metadata |
 | **Periodic notes** | Daily, weekly, monthly, quarterly, yearly — with Obsidian-compatible date formats and template expansion |
 
-All indices (metadata, BM25, embeddings) update in real time via a filesystem watcher.
+Metadata and BM25 indices update immediately through the filesystem watcher. Embeddings reconcile asynchronously through a managed background runtime, so model loading, inference, and cache writes never delay MCP startup or core tools.
 
 ## Installation
 
@@ -419,19 +419,34 @@ Uses the shared local semantic daemon by default (`OBSIDIAN_SEMANTIC_MODE=auto`)
 
 Semantic runtime modes:
 
-- `auto` (default): prefer daemon, fallback to local in-process embeddings when daemon is unavailable and local embeddings are enabled.
+- `auto` (default): prefer daemon, fallback to local in-process embeddings only when the daemon is genuinely unavailable and local embeddings are enabled. A daemon that is attached but warming does not start a competing local index.
 - `daemon`: daemon-only path; semantic calls fail clearly if daemon is unavailable.
-- `local`: force legacy in-process embeddings path.
+- `local`: force the in-process embedding runtime.
 
 Daemon startup policy:
 
 - MCP only initializes/starts the daemon when `OBSIDIAN_WATCH=true`.
 - When `OBSIDIAN_WATCH=false`, MCP skips daemon initialization and semantic search must use local mode (if enabled) or returns a clear error.
 
+Embedding lifecycle:
+
+| Phase | Queryable | Meaning |
+|-------|-----------|---------|
+| `warming` | No | The model is loading or the first verified index is being built. A semantic query returns an explicit retryable not-ready error. |
+| `warming` | Yes | A same-space last-known-good cache is serving queries while changed notes reconcile in the background. |
+| `ready` | Yes | Every currently indexed note has completed reconciliation. An empty vault is also ready. |
+| `degraded` | Yes or no | Some work failed. Verified last-known-good/partial vectors remain usable when any exist. Note-read, inference, and persistence failures retry; a model-load/configuration failure requires correction and restart. |
+
+Core note, graph, BM25, write, and MCP initialization behavior stays available in every phase. Repeated note changes are coalesced by path, and the newest write or removal wins over in-flight inference.
+
+Embedding caches are versioned and atomically replaced. A cache is reusable only when its backend, canonical model, vector dimension, embedding-input version, and—for API backends—the normalized endpoint fingerprint all match. Legacy payloads, incomplete first-pass checkpoints, corrupt data, and mismatched identities are never published; they trigger a one-time background rebuild. Cache locations do not change: local mode uses `{mcp_data}/embeddings/embeddings.bin`, while the daemon uses `<semantic-home>/vaults/<vault_id>/embeddings.bin`. Legacy-location copies remain non-destructive.
+
+For a remote API, the identity can prove the configured endpoint and model name, but it cannot detect a provider silently replacing model weights behind the same name. Change the configured model identifier (or remove the derived cache) when a provider makes such a revision.
+
 - Finds notes by **meaning**, not keywords — "making money from software" surfaces notes about monetization
 - **Hybrid mode** — `lexical_prefetch: true` combines BM25 candidate retrieval with semantic re-ranking
 - **Tunable blending** — `alpha` controls the weight between lexical and semantic scores (default 0.25)
-- Daemon cache migration is one-way and non-destructive: legacy `.obsidian/obsidian-mcp/embeddings.bin` is copied into daemon namespace store when available, and never deleted automatically
+- Daemon cache-location migration is one-way and non-destructive: legacy `.obsidian/obsidian-mcp/embeddings.bin` is copied into daemon namespace storage when available and never deleted automatically; an old payload format is then rebuilt in the background rather than trusted
 
 ### Regex — `search_regex`
 
@@ -577,7 +592,8 @@ obsidian-mcp
  ├─ vault/
  │  ├─ index        In-memory metadata (tags, links, headings)
  │  ├─ tantivy      BM25 full-text search
- │  ├─ embeddings   Semantic vectors (optional)
+ │  ├─ embeddings   Model + strict cache contracts (optional)
+ │  ├─ embedding_runtime  Background reconciliation + readiness
  │  └─ watcher      Filesystem events → index sync
  ├─ models.rs       Shared types
  └─ error.rs        VaultError → MCP ErrorData
@@ -588,7 +604,7 @@ Vault directory (.md files + .obsidian/)
 
 The vault layer is a pure Rust library with no knowledge of MCP. The tools layer is a thin adapter. This separation means the vault code is independently testable and reusable.
 
-In HTTP mode, each MCP session gets its own handler instance, but all sessions share a single `Vault` (thread-safe via `Arc<RwLock<...>>`). One filesystem watcher, one BM25 index, one embedding store — regardless of how many agents are connected.
+In HTTP mode, each MCP session gets its own handler instance, but all sessions share a single `Vault` (thread-safe through shared state). One filesystem watcher, one BM25 index, and one managed embedding coordinator/store serve all connected agents.
 
 ## Development
 
