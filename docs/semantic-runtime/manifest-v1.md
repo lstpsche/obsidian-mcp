@@ -12,6 +12,7 @@ The manifest records the currently provisioned daemon runtime and IPC endpoint s
   "daemon_api_version": 1,
   "daemon_version": "1.0.1",
   "binary_path": "/abs/path/to/obsidian-semanticd",
+  "binary_origin": "sibling",
   "binary_sha256": "optional sha256 hex",
   "ipc": {
     "transport": "unix_socket",
@@ -33,6 +34,7 @@ Notes:
 
 - On Windows, `ipc.transport` is `named_pipe` and `ipc.endpoint` is a pipe name.
 - `binary_sha256` is optional when checksum is unavailable in development scenarios.
+- `binary_origin` is additive and defaults to `unknown` for legacy manifests. Values are `sibling`, `managed_download`, `path`, `override`, and `unknown`.
 - Timestamps are RFC 3339 UTC strings.
 
 ## Field Semantics
@@ -41,6 +43,7 @@ Notes:
 - `daemon_api_version`: protocol contract version exposed by daemon.
 - `daemon_version`: daemon binary version.
 - `binary_path`: absolute path to installed daemon binary.
+- `binary_origin`: ownership provenance used to decide whether automated lifecycle operations may replace/restart the daemon. `path`, `override`, and `unknown` are never mutated by the package upgrader.
 - `ipc`: current daemon IPC endpoint metadata.
 - `pid`: daemon process id known at bootstrap time.
 - `semantic_home`: resolved runtime home.
@@ -84,6 +87,14 @@ This prevents races where multiple clients attempt install/start simultaneously.
   - reconcile with actual binary state
   - restart daemon if possible
   - refresh manifest fields after successful health check
+
+### Package upgrade path
+
+- A healthy `sibling` or `managed_download` daemon may be shut down and restarted from the verified package sibling.
+- The daemon flushes its `shutdown` response before terminating its IPC listener.
+- `path`, `override`, and unresolved legacy ownership remain external and are not stopped or replaced.
+- Normal bootstrap completes an interrupted activation when a locally owned running daemon is older than the installed sibling; it never downgrades a newer daemon.
+- Semantic home, model selection, cache directories, and vault data are preserved.
 
 ## Manifest Authority
 

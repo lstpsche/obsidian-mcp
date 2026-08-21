@@ -84,9 +84,14 @@ Bootstrap is idempotent and shared by all clients.
 2. Acquire install lock (`lock/install.lock`)
 3. Read manifest
 4. Probe manifest endpoint via `health`
-5. If healthy: reuse and exit
-6. If unhealthy/missing:
+5. If healthy:
+   - reuse external/override runtimes when the API is compatible
+   - for locally owned runtimes, compare the running version with the installed sibling
+   - activate a newer sibling after an interrupted package upgrade
+   - never replace a newer running daemon with an older sibling
+6. If unhealthy, missing, or locally owned and older:
    - ensure daemon binary exists
+   - prefer `obsidian-semanticd` beside the running `obsidian-mcp`
    - install/download if missing
    - start daemon
    - perform `health` handshake
@@ -95,6 +100,7 @@ Bootstrap is idempotent and shared by all clients.
 Rules:
 
 - Never spawn duplicate daemon when a healthy daemon already exists.
+- Exact package versions are required when activating a locally owned sibling; API compatibility remains sufficient for external runtimes.
 - Manifest is the authority for endpoint/binary metadata after successful handshake.
 - Model download remains daemon-owned and lazy at runtime; bootstrap only ensures daemon availability.
 - MCP initializes daemon runtime only when `OBSIDIAN_WATCH=true`; with watch disabled, daemon startup is skipped.

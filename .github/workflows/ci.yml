@@ -68,7 +68,39 @@ jobs:
           restore-keys: windows-embeddings-cargo-
 
       - name: Check local embeddings feature
-        run: cargo check --features embeddings
+        run: cargo check --all-features
+
+  upgrade-contract:
+    name: upgrade contract (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - features: embeddings-api
+            cache_suffix: embeddings-api
+          - features: embeddings
+            cache_suffix: embeddings
+          - features: embeddings,embeddings-api
+            cache_suffix: embeddings-and-api
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-upgrade-${{ matrix.cache_suffix }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ubuntu-upgrade-
+
+      - name: Verify preserved feature identity and dry-run contract
+        run: cargo test --features "${{ matrix.features }}" --test upgrade_cli_tests
 
   daemon-integration:
     name: daemon integration (embeddings)

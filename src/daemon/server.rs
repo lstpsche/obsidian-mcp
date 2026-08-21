@@ -12,6 +12,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::watch;
 
 #[cfg(unix)]
 use tokio::net::UnixListener;
@@ -24,7 +25,7 @@ use super::protocol::{
     self, DAEMON_API_VERSION, ERR_INCOMPATIBLE_API_VERSION, ERR_INVALID_PARAMS,
     ERR_INVALID_REQUEST, ERR_METHOD_NOT_FOUND, ERR_PARSE, EnsureVaultParams, HealthParams,
     HealthResult, JSONRPC_VERSION, OpenHintParams, RpcRequest, RpcResponse, SearchHybridParams,
-    SearchSemanticParams,
+    SearchSemanticParams, ShutdownParams, ShutdownResult,
 };
 use super::query;
 use super::vault_registry::VaultRegistry;
@@ -63,16 +64,23 @@ struct ServerState {
     semantic_home: PathBuf,
     started_at: Instant,
     registry: Arc<VaultRegistry>,
+    shutdown_tx: watch::Sender<bool>,
 }
 
 impl ServerState {
-    fn new(model_name: String, semantic_home: PathBuf, registry: Arc<VaultRegistry>) -> Self {
+    fn new(
+        model_name: String,
+        semantic_home: PathBuf,
+        registry: Arc<VaultRegistry>,
+        shutdown_tx: watch::Sender<bool>,
+    ) -> Self {
         Self {
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             model_name,
             semantic_home,
             started_at: Instant::now(),
             registry,
+            shutdown_tx,
         }
     }
 }
@@ -96,12 +104,28 @@ where
         config.semantic_home.clone(),
         config.model_name.clone(),
     )?);
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let state = Arc::new(ServerState::new(
         config.model_name,
         config.semantic_home,
         registry,
+        shutdown_tx,
     ));
-    let shutdown: ShutdownSignal = Box::pin(shutdown);
+    let shutdown: ShutdownSignal = Box::pin(async move {
+        tokio::select! {
+            _ = shutdown => {}
+            _ = async move {
+                loop {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                    if shutdown_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            } => {}
+        }
+    });
 
     match config.endpoint {
         #[cfg(unix)]
@@ -230,12 +254,19 @@ where
             continue;
         }
 
-        let response = match serde_json::from_str::<RpcRequest>(&line) {
-            Ok(request) => route_request(request, Arc::clone(&state)).await,
-            Err(err) => RpcResponse::error(None, ERR_PARSE, format!("parse error: {err}")),
+        let outcome = match serde_json::from_str::<RpcRequest>(&line) {
+            Ok(request) => route_request_with_control(request, Arc::clone(&state)).await,
+            Err(err) => RouteOutcome {
+                response: RpcResponse::error(None, ERR_PARSE, format!("parse error: {err}")),
+                shutdown_after_response: false,
+            },
         };
 
-        write_response(&mut writer, &response).await?;
+        write_response(&mut writer, &outcome.response).await?;
+        if outcome.shutdown_after_response {
+            let _ = state.shutdown_tx.send(true);
+            break;
+        }
     }
 
     Ok(())
@@ -254,23 +285,46 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 async fn route_request(request: RpcRequest, state: Arc<ServerState>) -> RpcResponse {
+    route_request_with_control(request, state).await.response
+}
+
+struct RouteOutcome {
+    response: RpcResponse,
+    shutdown_after_response: bool,
+}
+
+impl RouteOutcome {
+    fn response(response: RpcResponse) -> Self {
+        Self {
+            response,
+            shutdown_after_response: false,
+        }
+    }
+}
+
+async fn route_request_with_control(request: RpcRequest, state: Arc<ServerState>) -> RouteOutcome {
     if request.jsonrpc != JSONRPC_VERSION {
-        return RpcResponse::error(request.id, ERR_INVALID_REQUEST, "jsonrpc must be '2.0'");
+        return RouteOutcome::response(RpcResponse::error(
+            request.id,
+            ERR_INVALID_REQUEST,
+            "jsonrpc must be '2.0'",
+        ));
     }
 
-    match request.method.as_str() {
+    let response = match request.method.as_str() {
         "health" => {
             let params: HealthParams = match parse_params(request.params, request.id.clone()) {
                 Ok(params) => params,
-                Err(err) => return *err,
+                Err(err) => return RouteOutcome::response(*err),
             };
             route_health(request.id, params, &state)
         }
         "ensure_vault" => {
             let params: EnsureVaultParams = match parse_params(request.params, request.id.clone()) {
                 Ok(params) => params,
-                Err(err) => return *err,
+                Err(err) => return RouteOutcome::response(*err),
             };
             match query::ensure_vault(&state.registry, params).await {
                 Ok(result) => response_from_result(request.id, &result),
@@ -281,7 +335,7 @@ async fn route_request(request: RpcRequest, state: Arc<ServerState>) -> RpcRespo
             let params: SearchSemanticParams =
                 match parse_params(request.params, request.id.clone()) {
                     Ok(params) => params,
-                    Err(err) => return *err,
+                    Err(err) => return RouteOutcome::response(*err),
                 };
             match query::search_semantic(&state.registry, params).await {
                 Ok(result) => response_from_result(request.id, &result),
@@ -292,7 +346,7 @@ async fn route_request(request: RpcRequest, state: Arc<ServerState>) -> RpcRespo
             let params: SearchHybridParams = match parse_params(request.params, request.id.clone())
             {
                 Ok(params) => params,
-                Err(err) => return *err,
+                Err(err) => return RouteOutcome::response(*err),
             };
             match query::search_hybrid(&state.registry, params).await {
                 Ok(result) => response_from_result(request.id, &result),
@@ -302,19 +356,31 @@ async fn route_request(request: RpcRequest, state: Arc<ServerState>) -> RpcRespo
         "open_hint" => {
             let params: OpenHintParams = match parse_params(request.params, request.id.clone()) {
                 Ok(params) => params,
-                Err(err) => return *err,
+                Err(err) => return RouteOutcome::response(*err),
             };
             match query::open_hint(&state.registry, params).await {
                 Ok(result) => response_from_result(request.id, &result),
                 Err(err) => response_from_query_error(request.id, err),
             }
         }
+        "shutdown" => {
+            let _: ShutdownParams = match parse_params(request.params, request.id.clone()) {
+                Ok(params) => params,
+                Err(err) => return RouteOutcome::response(*err),
+            };
+            return RouteOutcome {
+                response: response_from_result(request.id, &ShutdownResult { accepted: true }),
+                shutdown_after_response: true,
+            };
+        }
         _ => RpcResponse::error(
             request.id,
             ERR_METHOD_NOT_FOUND,
             format!("unknown method '{}'", request.method),
         ),
-    }
+    };
+
+    RouteOutcome::response(response)
 }
 
 fn parse_params<T: DeserializeOwned>(
@@ -362,6 +428,7 @@ fn route_health(
     let result = HealthResult {
         daemon_version: state.daemon_version.clone(),
         daemon_api_version: DAEMON_API_VERSION,
+        pid: std::process::id(),
         status: "ok".to_string(),
         uptime_ms,
         model_name: state.model_name.clone(),
@@ -407,10 +474,12 @@ mod tests {
             VaultRegistry::new(semantic_home.to_path_buf(), model_name.clone())
                 .expect("registry should be created"),
         );
+        let (shutdown_tx, _) = watch::channel(false);
         Arc::new(ServerState::new(
             model_name,
             semantic_home.to_path_buf(),
             registry,
+            shutdown_tx,
         ))
     }
 
@@ -506,6 +575,7 @@ mod tests {
         let health_response: serde_json::Value =
             serde_json::from_str(&line).expect("health response should be valid JSON");
         assert_eq!(health_response["result"]["daemon_api_version"], json!(1));
+        assert_eq!(health_response["result"]["pid"], json!(std::process::id()));
 
         shutdown_tx
             .send(())
@@ -554,5 +624,69 @@ mod tests {
             response.error.expect("error expected").code,
             ERR_METHOD_NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn route_shutdown_requests_exit_only_for_valid_params() {
+        let tmp = tempfile::tempdir().expect("tempdir should be created");
+        let state = make_state(tmp.path());
+        let outcome = route_request_with_control(
+            RpcRequest {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: Some(json!(1)),
+                method: "shutdown".to_string(),
+                params: json!({}),
+            },
+            state,
+        )
+        .await;
+
+        assert!(outcome.shutdown_after_response);
+        assert_eq!(outcome.response.result, Some(json!({ "accepted": true })));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_response_is_flushed_before_server_exits() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let socket_path = dir.path().join("semanticd-shutdown.sock");
+        let config = DaemonServerConfig {
+            endpoint: IpcEndpoint::UnixSocket(socket_path.clone()),
+            model_name: "BAAI/bge-small-en-v1.5".to_string(),
+            semantic_home: dir.path().to_path_buf(),
+        };
+        let server = tokio::spawn(async move {
+            run_with_shutdown(config, std::future::pending())
+                .await
+                .expect("server should stop cleanly");
+        });
+
+        for _ in 0..50 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let mut stream = tokio::net::UnixStream::connect(&socket_path)
+            .await
+            .expect("client should connect");
+        stream
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"shutdown\",\"params\":{}}\n")
+            .await
+            .expect("shutdown request should write");
+
+        let mut response = String::new();
+        BufReader::new(stream)
+            .read_line(&mut response)
+            .await
+            .expect("shutdown response should read");
+        let response: serde_json::Value =
+            serde_json::from_str(&response).expect("shutdown response should be JSON");
+        assert_eq!(response["result"]["accepted"], json!(true));
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("server should exit after responding")
+            .expect("server task should join");
+        assert!(!socket_path.exists());
     }
 }

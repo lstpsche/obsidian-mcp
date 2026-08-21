@@ -115,6 +115,7 @@ Response result:
 {
   "daemon_version": "1.0.1",
   "daemon_api_version": 1,
+  "pid": 12345,
   "status": "ok",
   "uptime_ms": 1234,
   "model_name": "BAAI/bge-small-en-v1.5",
@@ -126,6 +127,7 @@ Behavior:
 
 - Daemon validates client API range.
 - If daemon API is outside range, returns `-32010`.
+- `pid` is additive lifecycle metadata. Older v1 daemons may omit it; ownership-aware callers then fall back to the manifest PID and still verify executable identity before stopping a process.
 
 ## `ensure_vault`
 
@@ -157,6 +159,30 @@ Rules:
 - `vault_root` must be absolute.
 - `vault_id` derivation follows `README.md` in this directory.
 - Multiple clients calling `ensure_vault` for same vault must converge to the same runtime context.
+
+## `shutdown`
+
+Gracefully terminates the shared daemon for an ownership-verified lifecycle operation.
+
+Request params:
+
+```json
+{}
+```
+
+Response result:
+
+```json
+{
+  "accepted": true
+}
+```
+
+Behavior:
+
+- The daemon writes and flushes the success response before stopping its IPC listener.
+- Callers must establish local ownership separately; this protocol method does not grant permission to replace an externally managed daemon.
+- Older v1 daemons may return `-32601`. A lifecycle manager may use a process signal fallback only after a successful health probe and executable-identity verification.
 
 ## `search_semantic`
 

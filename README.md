@@ -143,7 +143,8 @@ Release asset compatibility expectations:
 
 Upgrade guidance:
 
-- Prefer upgrading `obsidian-mcp`, `obsidian-semanticd`, and `obsidian-semantic-search-plugin` together.
+- Use `obsidian-mcp upgrade` for Cargo-installed `obsidian-mcp` and `obsidian-semanticd` binaries; it preserves the compiled feature set and reconciles the locally owned daemon.
+- Upgrade `obsidian-semantic-search-plugin` through Obsidian's plugin manager.
 - If versions are skewed, startup/handshake fails with explicit API incompatibility errors rather than silent fallback.
 
 ## Transport Modes
@@ -336,9 +337,8 @@ launchctl load ~/Library/LaunchAgents/com.obsidian-mcp.plist
 # Unload (stop)
 launchctl unload ~/Library/LaunchAgents/com.obsidian-mcp.plist
 
-# Restart (after upgrade)
-launchctl unload ~/Library/LaunchAgents/com.obsidian-mcp.plist && \
-  launchctl load ~/Library/LaunchAgents/com.obsidian-mcp.plist
+# A direct, running user LaunchAgent is restarted automatically by:
+obsidian-mcp upgrade
 ```
 
 ### Linux (systemd)
@@ -373,8 +373,8 @@ systemctl --user enable --now obsidian-mcp
 # Check status
 systemctl --user status obsidian-mcp
 
-# Restart (after upgrade)
-systemctl --user restart obsidian-mcp
+# A direct, running user service is restarted automatically by:
+obsidian-mcp upgrade
 
 # View logs
 journalctl --user -u obsidian-mcp -f
@@ -383,21 +383,20 @@ journalctl --user -u obsidian-mcp -f
 ## Upgrading
 
 ```sh
-# Install new version
-cargo install obsidian-mcp --force
-# With features:
-cargo install obsidian-mcp --features embeddings,embeddings-api --force
+# Inspect the verified install and exact command without changing anything
+obsidian-mcp upgrade --dry-run
 
-# Restart the running server to pick up the new binary
-obsidian-mcp restart /path/to/vault
-
-# Or if using a process manager:
-launchctl unload ~/Library/LaunchAgents/com.obsidian-mcp.plist && \
-  launchctl load ~/Library/LaunchAgents/com.obsidian-mcp.plist
-# systemd: systemctl --user restart obsidian-mcp
+# Install the latest crates.io version and activate it
+obsidian-mcp upgrade
 ```
 
-> `cargo install --force` replaces the binary on disk but does **not** restart any running server. You must restart manually — otherwise the old version continues serving.
+`upgrade` supports official crates.io installations recorded in Cargo's install tracker. It preserves the current target, build profile, and exact compiled feature set; verifies both shipped binaries after Cargo finishes; restarts directly managed running launchd/systemd user services; and reconciles a locally owned semantic daemon without changing its home, model, or caches. Explicit semantic-daemon overrides and PATH-owned daemons are left alone.
+
+Vault settings and service definitions are never rewritten. Stdio clients cannot be restarted from inside their active protocol session, so reconnect them after an update. An ad-hoc background process started with `obsidian-mcp serve` must also be restarted with the same arguments or environment; the upgrader cannot safely reconstruct that launch context. If installation succeeds but activation fails, the command exits non-zero with diagnostics and does not silently roll back the Cargo installation.
+
+Homebrew, Nix, source/path, Git, alternate-registry, and pre-built binary installs are rejected before mutation. Upgrade those through the tool that owns the installation.
+
+See [Upgrading](docs/upgrading.md) for the support matrix, guarantees, outcomes, and recovery guidance.
 
 ## Search
 

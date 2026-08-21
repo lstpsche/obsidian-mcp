@@ -32,6 +32,7 @@ fastembed = { version = "5", optional = true }
 bincode = { version = "2", optional = true, features = ["serde"] }
 fs2 = "0.4"
 sha2 = "0.11"
+semver = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 flate2 = "1"
 tar = ">=0.4.45, <0.5"

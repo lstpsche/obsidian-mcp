@@ -8,12 +8,37 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{VaultError, VaultResult};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BinaryOrigin {
+    Sibling,
+    ManagedDownload,
+    Path,
+    Override,
+    #[default]
+    Unknown,
+}
+
+impl BinaryOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sibling => "sibling",
+            Self::ManagedDownload => "managed_download",
+            Self::Path => "path",
+            Self::Override => "override",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeManifest {
     pub schema_version: u32,
     pub daemon_api_version: u32,
     pub daemon_version: String,
     pub binary_path: String,
+    #[serde(default)]
+    pub binary_origin: BinaryOrigin,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary_sha256: Option<String>,
     pub ipc: ManifestIpc,
@@ -39,6 +64,7 @@ pub struct RuntimeManifestInput {
     pub daemon_api_version: u32,
     pub daemon_version: String,
     pub binary_path: String,
+    pub binary_origin: BinaryOrigin,
     pub binary_sha256: Option<String>,
     pub ipc: ManifestIpc,
     pub pid: u32,
@@ -57,6 +83,7 @@ impl RuntimeManifest {
             daemon_api_version: input.daemon_api_version,
             daemon_version: input.daemon_version,
             binary_path: input.binary_path,
+            binary_origin: input.binary_origin,
             binary_sha256: input.binary_sha256,
             ipc: input.ipc,
             pid: input.pid,
@@ -133,6 +160,7 @@ mod tests {
             daemon_api_version: 1,
             daemon_version: "1.0.1".to_string(),
             binary_path: "/tmp/obsidian-semanticd".to_string(),
+            binary_origin: BinaryOrigin::Sibling,
             binary_sha256: Some("abc123".to_string()),
             ipc: ManifestIpc {
                 transport: "unix_socket".to_string(),
@@ -153,5 +181,28 @@ mod tests {
         assert_eq!(loaded.schema_version, 1);
         assert_eq!(loaded.daemon_api_version, 1);
         assert_eq!(loaded.ipc.transport, "unix_socket");
+        assert_eq!(loaded.binary_origin, BinaryOrigin::Sibling);
+    }
+
+    #[test]
+    fn legacy_manifest_defaults_binary_origin_to_unknown() {
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "daemon_api_version": 1,
+            "daemon_version": "1.0.0",
+            "binary_path": "/tmp/semanticd",
+            "ipc": { "transport": "unix_socket", "endpoint": "/tmp/daemon.sock" },
+            "pid": 10,
+            "semantic_home": "/tmp/home",
+            "fastembed_cache_dir": "/tmp/cache",
+            "model_name": "model",
+            "created_at": "now",
+            "updated_at": "now",
+            "last_health_check_at": "now",
+            "last_bootstrap_client": "client",
+            "last_bootstrap_client_version": "1.0.0"
+        });
+        let manifest: RuntimeManifest = serde_json::from_value(value).expect("legacy manifest");
+        assert_eq!(manifest.binary_origin, BinaryOrigin::Unknown);
     }
 }

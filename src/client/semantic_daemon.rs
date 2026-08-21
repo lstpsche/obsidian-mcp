@@ -17,7 +17,7 @@ use tokio::net::windows::named_pipe::ClientOptions;
 
 use crate::config::SemanticRuntimeConfig;
 use crate::daemon::protocol::{
-    self, DAEMON_API_VERSION, EnsureVaultResult, HealthResult, SearchResult,
+    self, DAEMON_API_VERSION, EnsureVaultResult, HealthResult, SearchResult, ShutdownResult,
 };
 use crate::daemon::server::IpcEndpoint;
 use crate::error::{VaultError, VaultResult};
@@ -98,6 +98,11 @@ impl SemanticDaemonClient {
             },
         )
         .await
+    }
+
+    pub async fn shutdown(&self) -> VaultResult<ShutdownResult> {
+        self.call("shutdown", protocol::ShutdownParams::default())
+            .await
     }
 
     pub async fn ensure_vault(

@@ -3,6 +3,7 @@ use tracing_subscriber::EnvFilter;
 use obsidian_mcp::config::DEFAULT_MODEL_NAME;
 use obsidian_mcp::daemon::home::{self, semantic_home_paths};
 use obsidian_mcp::daemon::server::{self, DaemonServerConfig, IpcEndpoint};
+use obsidian_mcp::upgrade::BuildIdentity;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -43,6 +44,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn handle_cli_flags() -> Option<i32> {
     let arg = std::env::args().nth(1)?;
     match arg.as_str() {
+        "--__build-info" => {
+            match BuildIdentity::embedded().to_json() {
+                Ok(identity) => println!("{identity}"),
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    return Some(1);
+                }
+            }
+            Some(0)
+        }
         "--version" | "-v" => {
             println!("obsidian-semanticd {}", env!("CARGO_PKG_VERSION"));
             Some(0)

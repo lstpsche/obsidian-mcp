@@ -108,10 +108,21 @@ pub struct HealthParams {
 pub struct HealthResult {
     pub daemon_version: String,
     pub daemon_api_version: u32,
+    #[serde(default)]
+    pub pid: u32,
     pub status: String,
     pub uptime_ms: u64,
     pub model_name: String,
     pub semantic_home: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ShutdownParams {}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct ShutdownResult {
+    pub accepted: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]

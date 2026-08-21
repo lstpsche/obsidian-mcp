@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-#[cfg(any(unix, test, has_embeddings))]
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -15,6 +14,8 @@ use obsidian_mcp::daemon::bootstrap::{BootstrapConfig, ensure_daemon};
 use obsidian_mcp::daemon::server::IpcEndpoint;
 use obsidian_mcp::error::VaultError;
 use obsidian_mcp::tools::{ObsidianMcp, SemanticRuntime};
+use obsidian_mcp::upgrade::BuildIdentity;
+use obsidian_mcp::upgrade::orchestrator::{self, UpgradeOptions, UpgradeRunOutcome};
 use obsidian_mcp::vault::Vault;
 
 const DEFAULT_PORT: u16 = 37842;
@@ -28,7 +29,7 @@ const DAEMON_DISABLED_BY_WATCH_REASON: &str =
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(code) = handle_cli_flags() {
+    if let Some(code) = handle_cli_flags().await {
         std::process::exit(code);
     }
 
@@ -307,9 +308,19 @@ async fn initialize_daemon_client(
     Ok(initialized)
 }
 
-fn handle_cli_flags() -> Option<i32> {
+async fn handle_cli_flags() -> Option<i32> {
     let arg = std::env::args().nth(1)?;
     match arg.as_str() {
+        "--__build-info" => {
+            match BuildIdentity::embedded().to_json() {
+                Ok(identity) => println!("{identity}"),
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    return Some(1);
+                }
+            }
+            Some(0)
+        }
         "--version" | "-v" => {
             println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
             Some(0)
@@ -318,6 +329,9 @@ fn handle_cli_flags() -> Option<i32> {
             print_help();
             Some(0)
         }
+        "upgrade" => Some(run_upgrade_command().await),
+        #[cfg(windows)]
+        "__apply-upgrade" => Some(run_windows_upgrade_helper().await),
         "serve" | "stop" | "restart" => {
             if subcommand_wants_help() {
                 print_help();
@@ -361,7 +375,8 @@ fn print_help() {
              {name} --http [OPTIONS] [VAULT_PATH]   Run with Streamable HTTP transport\n    \
              {name} serve [OPTIONS] [VAULT_PATH]    Start HTTP server in background\n    \
              {name} stop [--port PORT]              Stop a running HTTP server\n    \
-             {name} restart [OPTIONS] [VAULT_PATH]  Restart HTTP server (stop + serve)\n\
+             {name} restart [OPTIONS] [VAULT_PATH]  Restart HTTP server (stop + serve)\n    \
+             {name} upgrade [--dry-run]             Safely upgrade Cargo-installed binaries\n\
          \n\
          The 'serve' and 'restart' commands daemonize and log to a platform-specific file:\n    \
              macOS:   ~/Library/Logs/obsidian-mcp.log\n    \
@@ -404,6 +419,174 @@ fn print_help() {
         version = env!("CARGO_PKG_VERSION"),
         description = env!("CARGO_PKG_DESCRIPTION"),
     );
+}
+
+async fn run_upgrade_command() -> i32 {
+    let args = std::env::args().skip(2).collect::<Vec<_>>();
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_upgrade_help();
+        return 0;
+    }
+    if args.iter().any(|arg| arg != "--dry-run") || args.len() > 1 {
+        eprintln!(
+            "error: usage: obsidian-mcp upgrade [--dry-run]\n\
+             Try 'obsidian-mcp upgrade --help' for more information."
+        );
+        return 2;
+    }
+    let options = UpgradeOptions::normal(args.first().is_some_and(|arg| arg == "--dry-run"));
+    match orchestrator::run(options).await {
+        Ok(outcome) => print_upgrade_outcome(outcome),
+        Err(err) => {
+            eprintln!("upgrade failed: {err}");
+            1
+        }
+    }
+}
+
+fn print_upgrade_help() {
+    println!(
+        "obsidian-mcp upgrade — safely update Cargo-installed binaries\n\
+         \n\
+         USAGE:\n    \
+             obsidian-mcp upgrade [--dry-run]\n\
+         \n\
+         OPTIONS:\n    \
+             --dry-run    Verify ownership and show the exact preserved build settings\n    \
+             -h, --help   Print this help message\n\
+         \n\
+         Only official crates.io installations tracked by Cargo are supported.\n\
+         Vault settings, semantic caches, and service definitions are not rewritten."
+    );
+}
+
+fn print_upgrade_outcome(outcome: UpgradeRunOutcome) -> i32 {
+    match outcome {
+        UpgradeRunOutcome::DryRun(plan) => {
+            println!(
+                "Upgrade preflight passed for obsidian-mcp {}\n  target: {}\n  features: {}\n  Cargo root: {}",
+                plan.identity.version,
+                plan.identity.target,
+                plan.identity.feature_list(),
+                plan.install.root.display()
+            );
+            println!(
+                "  command: cargo {}",
+                display_command_args(&plan.cargo_args)
+            );
+            if plan.services.is_empty() {
+                println!("  managed HTTP services: none detected");
+            } else {
+                println!("  managed HTTP services:");
+                for service in &plan.services {
+                    println!(
+                        "    - {} ({:?}, {}:{})",
+                        service.id, service.owner, service.host, service.port
+                    );
+                }
+            }
+            println!("Dry run complete; no files or processes were changed.");
+            println!("Next: run 'obsidian-mcp upgrade' to install and activate the update.");
+            0
+        }
+        UpgradeRunOutcome::Completed(report) => {
+            if report.binaries_changed {
+                println!(
+                    "Updated obsidian-mcp {} -> {} (target {}, features {}).",
+                    report.old_identity.version,
+                    report.new_identity.version,
+                    report.new_identity.target,
+                    report.new_identity.feature_list()
+                );
+            } else {
+                if report.activation_attempted {
+                    println!(
+                        "obsidian-mcp {} is already the latest Cargo version; pending runtime activation was repaired.",
+                        report.new_identity.version
+                    );
+                } else {
+                    println!(
+                        "obsidian-mcp {} is already up to date; nothing was restarted.",
+                        report.new_identity.version
+                    );
+                }
+            }
+            if let Some(semantic) = &report.semantic {
+                println!("Semantic daemon: {}", semantic.diagnostic);
+            }
+            for service in &report.services {
+                println!("Service {}: {}", service.target_id, service.diagnostic);
+            }
+            if report.stdio_reconnect_required {
+                println!(
+                    "Reconnect stdio MCP clients to start sessions with the updated binary; their settings are unchanged."
+                );
+            }
+            if report.activation_succeeded() {
+                0
+            } else {
+                eprintln!(
+                    "The binaries were installed, but one or more running components could not be activated. Re-run 'obsidian-mcp upgrade' after resolving the diagnostics above."
+                );
+                1
+            }
+        }
+        #[cfg(windows)]
+        UpgradeRunOutcome::WindowsHandoff { helper } => {
+            println!(
+                "Validated the Cargo installation. Continuing from temporary helper '{}'; this process will now exit. This status confirms handoff only—the helper prints the final upgrade result.",
+                helper.display()
+            );
+            0
+        }
+    }
+}
+
+fn display_command_args(args: &[std::ffi::OsString]) -> String {
+    args.iter()
+        .map(|argument| {
+            let argument = argument.to_string_lossy();
+            if argument
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "-._/:,=".contains(character))
+            {
+                argument.into_owned()
+            } else {
+                format!("{:?}", argument.as_ref())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(windows)]
+async fn run_windows_upgrade_helper() -> i32 {
+    let mut parent_pid = None;
+    let mut original_exe = None;
+    let mut args = std::env::args_os().skip(2);
+    while let Some(argument) = args.next() {
+        if argument == "--parent-pid" {
+            parent_pid = args
+                .next()
+                .and_then(|value| value.to_string_lossy().parse::<u32>().ok());
+        } else if argument == "--original-exe" {
+            original_exe = args.next().map(PathBuf::from);
+        } else {
+            eprintln!("upgrade helper received an unknown argument");
+            return 2;
+        }
+    }
+    let (Some(parent_pid), Some(original_exe)) = (parent_pid, original_exe) else {
+        eprintln!("upgrade helper arguments are incomplete");
+        return 2;
+    };
+    match orchestrator::run(UpgradeOptions::windows_helper(original_exe, parent_pid)).await {
+        Ok(outcome) => print_upgrade_outcome(outcome),
+        Err(err) => {
+            eprintln!("upgrade failed: {err}");
+            1
+        }
+    }
 }
 
 /// Resolve the HTTP port from CLI args and env, skipping subcommand names.
