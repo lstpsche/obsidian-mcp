@@ -132,6 +132,19 @@ impl TantivyIndex {
 
         writer.commit()?;
 
+        // Wait for all background merge operations to complete before
+        // returning.  Without this, the merge threads spawned by the initial
+        // bulk commit can race with watcher-triggered commits and enter a
+        // segment-merge infinite loop (tantivy#2454 variant).
+        //
+        // `wait_merging_threads()` consumes the writer, so we recreate one
+        // afterward for the watcher to use.
+        writer
+            .wait_merging_threads()
+            .map_err(|e| VaultError::Other(format!("tantivy merge wait failed: {e}")))?;
+
+        let writer: IndexWriter = index.writer(WRITER_HEAP_BYTES)?;
+
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
