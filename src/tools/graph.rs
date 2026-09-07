@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use rmcp::model::{CallToolResult, Content, ErrorCode};
+use rmcp::model::{CallToolResult, ContentBlock, ErrorCode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -90,7 +90,7 @@ pub struct OrphanNoteEntry {
 fn to_json_text(value: &impl Serialize) -> Result<CallToolResult, rmcp::ErrorData> {
     let json = serde_json::to_string_pretty(value)
         .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
-    Ok(CallToolResult::success(vec![Content::text(json)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
 }
 
 fn has_resolved_target(vault: &Vault, target: &str) -> bool {

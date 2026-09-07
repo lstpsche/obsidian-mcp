@@ -704,7 +704,13 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(response["error"]["code"], -32602);
+        assert_eq!(response["result"]["isError"], true);
+        assert!(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("failed to deserialize parameters")
+        );
         assert!(!tmp.path().join("invalid.md").exists());
     }
 }

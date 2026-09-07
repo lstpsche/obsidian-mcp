@@ -184,6 +184,8 @@ The `serve` command daemonizes the server and redirects logs to a platform-speci
 
 Default: `http://127.0.0.1:37842`. MCP tools are served at `/mcp`, health check at `/health`.
 
+The same MCP endpoint supports `server/discover` and stateless tool requests with protocol `2026-07-28`, plus the legacy `initialize` and session flow used by `2025-11-25` clients. Modern requests carry the protocol version and client metadata on each call. Reverse proxies must preserve MCP headers and forward an allowed loopback `Host` to the local server.
+
 Benefits over stdio for multi-agent setups:
 - **Shared index** — one in-memory BM25/embedding index instead of N copies
 - **Lower resource usage** — single filesystem watcher, single process
@@ -531,7 +533,9 @@ For `note_patch` heading targets, bare heading text such as `"Log"` is canonical
 
 ## Tool Filtering
 
-Control which tools are exposed via the `OBSIDIAN_TOOLS` environment variable or per-session `X-Obsidian-Tools` HTTP header.
+Control which tools are exposed via the `OBSIDIAN_TOOLS` environment variable or the `X-Obsidian-Tools` HTTP header. The header can only further restrict the server-wide tool set; disabled tools are hidden from listings and cannot be called.
+
+For legacy HTTP sessions, send the header with `initialize`; that filter lasts for the session. With protocol `2026-07-28`, send it on every request that needs the restriction. Stateless requests do not retain a previous request's filter. A missing header uses the server-wide tool set; invalid profile names or invalid header encoding return HTTP 400.
 
 | Value | Effect |
 |-------|--------|
@@ -610,7 +614,7 @@ Vault directory (.md files + .obsidian/)
 
 The vault layer is a pure Rust library with no knowledge of MCP. The tools layer is a thin adapter. This separation means the vault code is independently testable and reusable.
 
-In HTTP mode, each MCP session gets its own handler instance, but all sessions share a single `Vault` (thread-safe through shared state). One filesystem watcher, one BM25 index, and one managed embedding coordinator/store serve all connected agents.
+In HTTP mode, each legacy session or modern stateless request gets its own handler instance, but all handlers share a single `Vault` (thread-safe through shared state). One filesystem watcher, one BM25 index, and one managed embedding coordinator/store serve all connected agents.
 
 ## Development
 

@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rmcp::model::{CallToolResult, Content, ErrorCode};
+use rmcp::model::{CallToolResult, ContentBlock, ErrorCode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -123,7 +123,7 @@ pub async fn frontmatter(
         let fm = vault.get_frontmatter(path)?;
         match fm {
             Some(value) => Ok(CallToolResult::structured(value)),
-            None => Ok(CallToolResult::success(vec![Content::text("null")])),
+            None => Ok(CallToolResult::success(vec![ContentBlock::text("null")])),
         }
     } else if params.action.eq_ignore_ascii_case("set") {
         let key = params.key.as_deref().ok_or_else(|| {
@@ -141,7 +141,7 @@ pub async fn frontmatter(
             )
         })?;
         vault.set_frontmatter_field(path, key, value)?;
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Set frontmatter field '{key}' on '{}'",
             params.path
         ))]))
@@ -154,7 +154,7 @@ pub async fn frontmatter(
             )
         })?;
         vault.remove_frontmatter_field(path, key)?;
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Removed frontmatter field '{key}' from '{}'",
             params.path
         ))]))

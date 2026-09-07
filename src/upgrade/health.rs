@@ -161,8 +161,16 @@ mod tests {
             .port();
         thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("server should accept");
-            let mut request = [0_u8; 512];
-            let _ = stream.read(&mut request);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("request timeout should be set");
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0_u8; 1];
+                stream.read_exact(&mut byte).expect("request should arrive");
+                request.push(byte[0]);
+                assert!(request.len() <= 4096, "request headers should be bounded");
+            }
             stream
                 .write_all(response.as_bytes())
                 .expect("response should write");

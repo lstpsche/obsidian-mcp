@@ -21,7 +21,7 @@ use obsidian_mcp::vault::Vault;
 const DEFAULT_PORT: u16 = 37842;
 
 tokio::task_local! {
-    static SESSION_DISABLED_TOOLS: HashSet<String>;
+    static REQUEST_DISABLED_TOOLS: HashSet<String>;
 }
 
 const DAEMON_DISABLED_BY_WATCH_REASON: &str =
@@ -95,7 +95,7 @@ async fn serve_http(
     };
 
     let mut mcp_config = StreamableHttpServerConfig::default();
-    mcp_config.stateful_mode = true;
+    mcp_config.legacy_session_mode = true;
     mcp_config.json_response = true;
 
     let health_vault = vault.clone();
@@ -103,11 +103,15 @@ async fn serve_http(
         StreamableHttpService::new(
             move || {
                 let mut disabled = server_disabled.clone();
-                SESSION_DISABLED_TOOLS
+                REQUEST_DISABLED_TOOLS
                     .try_with(|extra| {
                         disabled.extend(extra.iter().cloned());
                     })
-                    .ok();
+                    .map_err(|error| {
+                        std::io::Error::other(format!(
+                            "HTTP tool filter context unavailable: {error}"
+                        ))
+                    })?;
                 Ok(ObsidianMcp::new(
                     vault.clone(),
                     hybrid_alpha,
@@ -142,24 +146,27 @@ async fn tool_filter_middleware(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let session_disabled = request
-        .headers()
-        .get("X-Obsidian-Tools")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|raw| match ToolFilter::parse(raw) {
-            Ok(filter) => Some(filter.disabled_tools()),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "invalid X-Obsidian-Tools header, using server default"
-                );
-                None
-            }
-        })
-        .unwrap_or_default();
+    use axum::response::IntoResponse;
 
-    SESSION_DISABLED_TOOLS
-        .scope(session_disabled, next.run(request))
+    let disabled = match request.headers().get("X-Obsidian-Tools") {
+        Some(header) => {
+            let filter = header
+                .to_str()
+                .map_err(|error| format!("Invalid X-Obsidian-Tools encoding: {error}"))
+                .and_then(ToolFilter::parse);
+            match filter {
+                Ok(filter) => filter.disabled_tools(),
+                Err(error) => {
+                    tracing::warn!(%error, "rejected invalid X-Obsidian-Tools header");
+                    return (axum::http::StatusCode::BAD_REQUEST, error).into_response();
+                }
+            }
+        }
+        None => HashSet::new(),
+    };
+
+    REQUEST_DISABLED_TOOLS
+        .scope(disabled, next.run(request))
         .await
 }
 

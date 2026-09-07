@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use rmcp::model::{CallToolResult, Content, ErrorCode};
+use rmcp::model::{CallToolResult, ContentBlock, ErrorCode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -139,7 +139,7 @@ fn vault_list_flat(
     }
     .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
 
-    Ok(CallToolResult::success(vec![Content::text(json)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
 }
 
 fn vault_list_tree(
@@ -179,7 +179,7 @@ fn vault_list_tree(
         output.pop();
     }
 
-    Ok(CallToolResult::success(vec![Content::text(output)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
 }
 
 struct TreeNode {

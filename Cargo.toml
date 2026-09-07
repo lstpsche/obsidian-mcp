@@ -9,7 +9,7 @@ keywords = ["mcp", "obsidian", "vault", "ai"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
-rmcp = { version = "1.6", features = ["server", "transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "3.2", features = ["server", "transport-io", "transport-streamable-http-server"] }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -28,7 +28,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 unicode-normalization = "0.1.25"
 tantivy = "0.26"
-fastembed = { version = "5", optional = true }
+fastembed = { version = "6.0.3", optional = true }
 bincode = { version = "2", optional = true, features = ["serde"] }
 fs2 = "0.4"
 sha2 = "0.11"

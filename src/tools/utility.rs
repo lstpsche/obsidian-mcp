@@ -3,7 +3,7 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -51,7 +51,7 @@ pub async fn vault_info(
         mcp_data_dir,
     };
     let json = serde_json::to_string_pretty(&info).map_err(|e| VaultError::Other(e.to_string()))?;
-    Ok(CallToolResult::success(vec![Content::text(json)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
 }
 
 // ── open_in_obsidian ────────────────────────────────────────────────────
@@ -98,7 +98,7 @@ pub async fn open_in_obsidian(
 
     launch_uri(&uri)?;
 
-    Ok(CallToolResult::success(vec![Content::text(format!(
+    Ok(CallToolResult::success(vec![ContentBlock::text(format!(
         "Opened {} in Obsidian",
         uri_path
     ))]))

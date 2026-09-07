@@ -1,6 +1,6 @@
 //! Text, regex, tag, and frontmatter search tools across vault notes.
 
-use rmcp::model::{CallToolResult, Content, ErrorCode};
+use rmcp::model::{CallToolResult, ContentBlock, ErrorCode};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -66,7 +66,7 @@ pub async fn search_text(
 
     let json = serde_json::to_string_pretty(&results)
         .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
-    Ok(CallToolResult::success(vec![Content::text(json)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
 }
 
 // ── search_regex ────────────────────────────────────────────────────
@@ -98,7 +98,7 @@ pub async fn search_regex(
 
     let json = serde_json::to_string_pretty(&limited)
         .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
-    Ok(CallToolResult::success(vec![Content::text(json)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
 }
 
 // ── search_metadata ─────────────────────────────────────────────────
@@ -184,7 +184,7 @@ fn search_metadata_tag(
 
     let json = serde_json::to_string_pretty(&results)
         .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
-    Ok(CallToolResult::success(vec![Content::text(json)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
 }
 
 fn search_metadata_frontmatter(
@@ -226,7 +226,7 @@ fn search_metadata_frontmatter(
 
     let json = serde_json::to_string_pretty(&results)
         .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
-    Ok(CallToolResult::success(vec![Content::text(json)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
 }
 
 // ── search_semantic ──────────────────────────────────────────────────
@@ -339,7 +339,7 @@ pub async fn search_semantic(
 
     let json = serde_json::to_string_pretty(&results)
         .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
-    Ok(CallToolResult::success(vec![Content::text(json)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
 }
 
 fn semantic_candidate_limit(top_k: usize) -> usize {
