@@ -136,12 +136,8 @@ fn restart_inner<E: CommandExecutor>(
     target: &ServiceTarget,
     expected_version: &str,
 ) -> Result<String, UpgradeError> {
-    let definition = target.definition_path.as_deref().ok_or_else(|| {
-        UpgradeError::Activation(format!("LaunchAgent '{}' has no plist path", target.id))
-    })?;
     let uid = user_id(executor)?;
     let service = format!("gui/{uid}/{}", target.id);
-    let domain = format!("gui/{uid}");
     let active_pid = running_agents(executor)?
         .into_iter()
         .find_map(|(label, pid)| (label == target.id).then_some(pid))
@@ -157,16 +153,7 @@ fn restart_inner<E: CommandExecutor>(
             target.id
         )));
     }
-    checked_output(executor, "launchctl", &["bootout", &service])?;
-    checked_output_os(
-        executor,
-        OsStr::new("launchctl"),
-        &[
-            OsString::from("bootstrap"),
-            OsString::from(&domain),
-            definition.as_os_str().to_owned(),
-        ],
-    )?;
+    checked_output(executor, "launchctl", &["kickstart", "-k", &service])?;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let restarted_pid = loop {
@@ -305,32 +292,17 @@ fn checked_output<E: CommandExecutor>(
     program: &str,
     args: &[&str],
 ) -> Result<(), UpgradeError> {
-    checked_output_os(
-        executor,
+    let output = executor.output(
         OsStr::new(program),
         &args.iter().map(OsString::from).collect::<Vec<_>>(),
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn checked_output_os<E: CommandExecutor>(
-    executor: &E,
-    program: &OsStr,
-    args: &[OsString],
-) -> Result<(), UpgradeError> {
-    let output = executor.output(program, args)?;
+    )?;
     if output.success {
         Ok(())
     } else {
-        let command = format!(
-            "{} {}",
-            program.to_string_lossy(),
-            args.iter()
-                .map(|arg| arg.to_string_lossy())
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-        Err(command_failure(&command, &output.stderr))
+        Err(command_failure(
+            &format!("{program} {}", args.join(" ")),
+            &output.stderr,
+        ))
     }
 }
 
@@ -493,6 +465,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     struct FakeRestart {
+        fail_restart: bool,
         commands: Mutex<Vec<String>>,
         executable: String,
     }
@@ -520,6 +493,14 @@ mod tests {
                     .filter(|command| *command == "launchctl list")
                     .count()
             };
+            if args.first().is_some_and(|arg| arg == "kickstart") && self.fail_restart {
+                return Ok(CommandOutput {
+                    success: false,
+                    code: Some(5),
+                    stdout: Vec::new(),
+                    stderr: b"kickstart rejected".to_vec(),
+                });
+            }
             let stdout = if program == "id" {
                 b"501\n".to_vec()
             } else if program == "lsof" {
@@ -552,7 +533,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn restart_uses_bootout_then_bootstrap_and_verifies_version() {
+    fn restart_preserves_registration_and_verifies_version() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
@@ -569,6 +550,7 @@ mod tests {
                 .expect("health response should write");
         });
         let fake = FakeRestart {
+            fail_restart: false,
             commands: Mutex::new(Vec::new()),
             executable: "/tmp/obsidian-mcp".into(),
         };
@@ -586,15 +568,16 @@ mod tests {
         let result = restart(&fake, &target, "2.5.0");
         assert!(result.success, "{}", result.diagnostic);
         let commands = fake.commands.lock().expect("commands should lock");
-        let bootout = commands
-            .iter()
-            .position(|command| command.contains("bootout gui/501/io.obsidian.mcp"))
-            .expect("bootout should run");
-        let bootstrap = commands
-            .iter()
-            .position(|command| command.contains("bootstrap gui/501 /tmp/io.obsidian.mcp.plist"))
-            .expect("bootstrap should run");
-        assert!(bootout < bootstrap);
+        assert!(
+            commands
+                .iter()
+                .any(|command| command == "launchctl kickstart -k gui/501/io.obsidian.mcp")
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.contains("bootout") || command.contains("bootstrap"))
+        );
         assert_eq!(
             commands
                 .iter()
@@ -603,6 +586,37 @@ mod tests {
             2,
             "live executable identity must be checked before and after restart"
         );
-        assert!(!commands.iter().any(|command| command.contains("kickstart")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn restart_failure_preserves_error_without_unloading_service() {
+        let fake = FakeRestart {
+            fail_restart: true,
+            commands: Mutex::new(Vec::new()),
+            executable: "/tmp/obsidian-mcp".into(),
+        };
+        let target = ServiceTarget {
+            owner: ServiceOwner::Launchd,
+            id: "io.obsidian.mcp".into(),
+            definition_path: Some("/tmp/io.obsidian.mcp.plist".into()),
+            executable: "/tmp/obsidian-mcp".into(),
+            host: "127.0.0.1".into(),
+            port: 0,
+            previous_pid: Some(321),
+            observed_version: Some("2.4.0".into()),
+        };
+        let error = restart_inner(&fake, &target, "2.5.0").unwrap_err();
+        assert!(error.to_string().contains("kickstart rejected"));
+        let commands = fake.commands.lock().unwrap();
+        assert_eq!(
+            commands.last().unwrap(),
+            "launchctl kickstart -k gui/501/io.obsidian.mcp"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.contains("bootout") || command.contains("bootstrap"))
+        );
     }
 }
