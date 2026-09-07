@@ -3,7 +3,7 @@
 //! Uses `notify-debouncer-mini` for 500ms debouncing and bridges events into a
 //! spawned tokio task that updates the [`VaultIndex`].
 //!
-//! `notify-debouncer-mini` 0.5 erases event kinds (create/modify/delete/rename all
+//! `notify-debouncer-mini` 0.7 erases event kinds (create/modify/delete/rename all
 //! become `DebouncedEventKind::Any`). We disambiguate by checking the filesystem at
 //! event time: path exists → reindex, path gone → remove.
 
@@ -11,8 +11,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use notify::RecursiveMode;
-use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer};
+use notify::event::{AccessKind, AccessMode};
+use notify::{EventHandler, EventKind, RecursiveMode, Watcher};
+use notify_debouncer_mini::{
+    DebounceEventHandler, DebounceEventResult, Debouncer, new_debouncer_opt,
+};
 use tokio::runtime::Handle;
 
 use super::exclude::ExcludeSet;
@@ -20,6 +23,57 @@ use super::index::VaultIndex;
 use super::path as vault_path;
 use super::tantivy_index::TantivyIndex;
 use crate::error::{VaultError, VaultResult};
+
+/// Native watcher that discards read-only access events before debouncing.
+///
+/// Linux reports file opens even for indexing reads. The mini debouncer erases
+/// event kinds, so filtering afterwards would create a read/reindex feedback loop.
+pub struct ChangeWatcher(notify::RecommendedWatcher);
+
+impl Watcher for ChangeWatcher {
+    fn new<F: EventHandler>(mut event_handler: F, config: notify::Config) -> notify::Result<Self> {
+        notify::RecommendedWatcher::new(
+            move |result: notify::Result<notify::Event>| {
+                if let Ok(event) = &result
+                    && matches!(event.kind, EventKind::Access(kind)
+                        if kind != AccessKind::Close(AccessMode::Write))
+                    && !event.need_rescan()
+                {
+                    return;
+                }
+                event_handler.handle_event(result);
+            },
+            config,
+        )
+        .map(Self)
+    }
+
+    fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> notify::Result<()> {
+        self.0.watch(path, recursive_mode)
+    }
+
+    fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+        self.0.unwatch(path)
+    }
+
+    fn configure(&mut self, config: notify::Config) -> notify::Result<bool> {
+        self.0.configure(config)
+    }
+
+    fn kind() -> notify::WatcherKind {
+        notify::RecommendedWatcher::kind()
+    }
+}
+
+pub(crate) fn new_change_debouncer(
+    timeout: Duration,
+    event_handler: impl DebounceEventHandler,
+) -> notify::Result<Debouncer<ChangeWatcher>> {
+    new_debouncer_opt(
+        notify_debouncer_mini::Config::default().with_timeout(timeout),
+        event_handler,
+    )
+}
 
 const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(500);
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -38,22 +92,23 @@ pub fn start_watcher(
     tantivy: Option<Arc<TantivyIndex>>,
     embedding_runtime: Option<super::embedding_runtime::EmbeddingRuntime>,
     exclude: Arc<ExcludeSet>,
-) -> VaultResult<Debouncer<notify::RecommendedWatcher>> {
+) -> VaultResult<Debouncer<ChangeWatcher>> {
     let embedding_runtime = embedding_runtime
         .as_ref()
         .map(super::embedding_runtime::EmbeddingRuntime::downgrade);
     let (tx, mut rx) = tokio::sync::mpsc::channel::<DebounceEventResult>(EVENT_CHANNEL_CAPACITY);
     let rt = Handle::current();
 
-    let mut debouncer = new_debouncer(DEBOUNCE_TIMEOUT, move |result: DebounceEventResult| {
-        let tx = tx.clone();
-        rt.spawn(async move {
-            if let Err(e) = tx.send(result).await {
-                tracing::error!("watcher channel closed: {e}");
-            }
-        });
-    })
-    .map_err(|e| VaultError::Watcher(e.to_string()))?;
+    let mut debouncer =
+        new_change_debouncer(DEBOUNCE_TIMEOUT, move |result: DebounceEventResult| {
+            let tx = tx.clone();
+            rt.spawn(async move {
+                if let Err(e) = tx.send(result).await {
+                    tracing::error!("watcher channel closed: {e}");
+                }
+            });
+        })
+        .map_err(|e| VaultError::Watcher(e.to_string()))?;
 
     debouncer
         .watcher()
@@ -104,19 +159,20 @@ pub fn start_watcher(
     index: Arc<RwLock<VaultIndex>>,
     tantivy: Option<Arc<TantivyIndex>>,
     exclude: Arc<ExcludeSet>,
-) -> VaultResult<Debouncer<notify::RecommendedWatcher>> {
+) -> VaultResult<Debouncer<ChangeWatcher>> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<DebounceEventResult>(EVENT_CHANNEL_CAPACITY);
     let rt = Handle::current();
 
-    let mut debouncer = new_debouncer(DEBOUNCE_TIMEOUT, move |result: DebounceEventResult| {
-        let tx = tx.clone();
-        rt.spawn(async move {
-            if let Err(e) = tx.send(result).await {
-                tracing::error!("watcher channel closed: {e}");
-            }
-        });
-    })
-    .map_err(|e| VaultError::Watcher(e.to_string()))?;
+    let mut debouncer =
+        new_change_debouncer(DEBOUNCE_TIMEOUT, move |result: DebounceEventResult| {
+            let tx = tx.clone();
+            rt.spawn(async move {
+                if let Err(e) = tx.send(result).await {
+                    tracing::error!("watcher channel closed: {e}");
+                }
+            });
+        })
+        .map_err(|e| VaultError::Watcher(e.to_string()))?;
 
     debouncer
         .watcher()
@@ -554,7 +610,7 @@ mod tests {
     fn call_start_watcher(
         vault_root: PathBuf,
         index: Arc<RwLock<VaultIndex>>,
-    ) -> VaultResult<Debouncer<notify::RecommendedWatcher>> {
+    ) -> VaultResult<Debouncer<ChangeWatcher>> {
         let exclude = Arc::new(ExcludeSet::build(vec![]).unwrap());
         #[cfg(has_embeddings)]
         {
@@ -618,6 +674,55 @@ mod tests {
         let idx = index.read().unwrap();
         assert_eq!(idx.stats().excluded_notes, 0);
         assert!(idx.get_note(Path::new("Archive/hidden.md")).is_none());
+    }
+
+    #[test]
+    fn watcher_reads_do_not_trigger_more_events() {
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("test.md");
+        let (tx, rx) = mpsc::channel();
+        let mut debouncer = new_change_debouncer(
+            Duration::from_millis(100),
+            move |result: DebounceEventResult| {
+                for event in result.unwrap() {
+                    if event.path.file_name().is_some_and(|name| name == "test.md") {
+                        let content = std::fs::read_to_string(&event.path).unwrap();
+                        let parsed = super::super::frontmatter::parse_frontmatter(&content);
+                        tx.send(parsed.is_ok()).unwrap();
+                    }
+                }
+            },
+        )
+        .unwrap();
+        debouncer
+            .watcher()
+            .watch(&root, RecursiveMode::Recursive)
+            .unwrap();
+
+        // A parse failure must not turn the indexing read into a retry loop.
+        std::fs::write(&path, "---\ntags: [unfinished\n---\n").unwrap();
+        assert!(!rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "reading malformed frontmatter must not schedule another update",
+        );
+
+        // A subsequent edit must still be delivered and parse block sequences.
+        std::fs::write(
+            &path,
+            "---\ntitle: \"Test Document\"\nauthor: \"Jane Doe\"\ntags:\n  - documentation\n  - yaml-test\n---\n\n# Hello\n\nSome content here.\n",
+        )
+        .unwrap();
+        assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "reading valid frontmatter must not schedule another update",
+        );
     }
 
     #[tokio::test]

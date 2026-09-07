@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use notify::RecursiveMode;
-use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer};
+use notify_debouncer_mini::{DebounceEventResult, Debouncer};
 use tokio::runtime::Handle;
 
 use crate::error::{VaultError, VaultResult};
@@ -13,6 +13,7 @@ use crate::vault::exclude::ExcludeSet;
 use crate::vault::index::VaultIndex;
 use crate::vault::path as vault_path;
 use crate::vault::tantivy_index::TantivyIndex;
+use crate::vault::watcher::{ChangeWatcher, new_change_debouncer};
 
 #[cfg(has_embeddings)]
 use crate::vault::embedding_runtime::{EmbeddingRuntime, EmbeddingRuntimeWeak};
@@ -27,20 +28,21 @@ pub fn start_watcher(
     tantivy: Option<Arc<TantivyIndex>>,
     embedding_runtime: EmbeddingRuntime,
     exclude: Arc<ExcludeSet>,
-) -> VaultResult<Debouncer<notify::RecommendedWatcher>> {
+) -> VaultResult<Debouncer<ChangeWatcher>> {
     let embedding_runtime = embedding_runtime.downgrade();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<DebounceEventResult>(EVENT_CHANNEL_CAPACITY);
     let rt = Handle::current();
 
-    let mut debouncer = new_debouncer(DEBOUNCE_TIMEOUT, move |result: DebounceEventResult| {
-        let tx = tx.clone();
-        rt.spawn(async move {
-            if let Err(err) = tx.send(result).await {
-                tracing::error!("daemon watcher channel closed: {err}");
-            }
-        });
-    })
-    .map_err(|err| VaultError::Watcher(err.to_string()))?;
+    let mut debouncer =
+        new_change_debouncer(DEBOUNCE_TIMEOUT, move |result: DebounceEventResult| {
+            let tx = tx.clone();
+            rt.spawn(async move {
+                if let Err(err) = tx.send(result).await {
+                    tracing::error!("daemon watcher channel closed: {err}");
+                }
+            });
+        })
+        .map_err(|err| VaultError::Watcher(err.to_string()))?;
 
     debouncer
         .watcher()
@@ -93,19 +95,20 @@ pub fn start_watcher(
     index: Arc<RwLock<VaultIndex>>,
     tantivy: Option<Arc<TantivyIndex>>,
     exclude: Arc<ExcludeSet>,
-) -> VaultResult<Debouncer<notify::RecommendedWatcher>> {
+) -> VaultResult<Debouncer<ChangeWatcher>> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<DebounceEventResult>(EVENT_CHANNEL_CAPACITY);
     let rt = Handle::current();
 
-    let mut debouncer = new_debouncer(DEBOUNCE_TIMEOUT, move |result: DebounceEventResult| {
-        let tx = tx.clone();
-        rt.spawn(async move {
-            if let Err(err) = tx.send(result).await {
-                tracing::error!("daemon watcher channel closed: {err}");
-            }
-        });
-    })
-    .map_err(|err| VaultError::Watcher(err.to_string()))?;
+    let mut debouncer =
+        new_change_debouncer(DEBOUNCE_TIMEOUT, move |result: DebounceEventResult| {
+            let tx = tx.clone();
+            rt.spawn(async move {
+                if let Err(err) = tx.send(result).await {
+                    tracing::error!("daemon watcher channel closed: {err}");
+                }
+            });
+        })
+        .map_err(|err| VaultError::Watcher(err.to_string()))?;
 
     debouncer
         .watcher()

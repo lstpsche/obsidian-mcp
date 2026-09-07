@@ -37,6 +37,7 @@ use crate::models::{
 use self::exclude::ExcludeSet;
 use self::index::VaultIndex;
 use self::tantivy_index::TantivyIndex;
+use self::watcher::ChangeWatcher;
 
 #[cfg(has_embeddings)]
 type EmbeddingLoaderFuture = std::pin::Pin<
@@ -62,7 +63,7 @@ struct VaultInner {
     /// Kept alive to sustain filesystem watching; never accessed after construction.
     /// Wrapped in `Mutex` to guarantee `Sync` (`Debouncer` contains a `mpsc::Sender`
     /// which is `Send` but not `Sync`).
-    _watcher: Mutex<Option<Debouncer<notify::RecommendedWatcher>>>,
+    _watcher: Mutex<Option<Debouncer<ChangeWatcher>>>,
 }
 
 /// High-level facade over the vault filesystem, index, and watcher.

@@ -655,6 +655,43 @@ mod tests {
         Arc::new(ExcludeSet::build(vec![]).unwrap())
     }
 
+    #[tokio::test]
+    async fn index_build_and_reindex_yaml_block_sequences() {
+        let content = "---\ntitle: \"Test Document\"\nauthor: \"Jane Doe\"\ntags:\n  - documentation\n  - yaml-test\n---\n\n# Hello\n\nSome content here.\n";
+        for newline in ["\n", "\r\n"] {
+            let dir = TempDir::new().unwrap();
+            let path = Path::new("test.md");
+            let content = content.replace('\n', newline);
+            stdfs::write(dir.path().join(path), &content).unwrap();
+
+            let mut index = VaultIndex::build(dir.path(), empty_exclude())
+                .await
+                .unwrap();
+            let note = index
+                .get_note(path)
+                .expect("block sequences must be indexed");
+            assert_eq!(note.tags, ["documentation", "yaml-test"]);
+            let fm = note.frontmatter.as_ref().unwrap();
+            assert_eq!(fm["title"], "Test Document");
+            assert_eq!(fm["author"], "Jane Doe");
+            assert_eq!(
+                fm["tags"],
+                serde_json::json!(["documentation", "yaml-test"])
+            );
+
+            stdfs::write(
+                dir.path().join(path),
+                content.replace("yaml-test", "updated"),
+            )
+            .unwrap();
+            index.reindex_file(dir.path(), path).unwrap();
+            assert_eq!(
+                index.get_note(path).unwrap().tags,
+                ["documentation", "updated"]
+            );
+        }
+    }
+
     fn setup_vault() -> TempDir {
         let dir = TempDir::new().unwrap();
         let root = dir.path();

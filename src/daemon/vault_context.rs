@@ -10,6 +10,7 @@ use crate::models::NoteMetadata;
 use crate::vault::exclude::ExcludeSet;
 use crate::vault::index::VaultIndex;
 use crate::vault::tantivy_index::TantivyIndex;
+use crate::vault::watcher::ChangeWatcher;
 
 #[cfg(has_embeddings)]
 use crate::vault::embedding_runtime::{EmbeddingRuntime, EmbeddingRuntimeStatus};
@@ -31,7 +32,7 @@ pub struct VaultContext {
     tantivy: Arc<TantivyIndex>,
     #[cfg(has_embeddings)]
     embedding_runtime: EmbeddingRuntime,
-    watcher: Mutex<Option<Debouncer<notify::RecommendedWatcher>>>,
+    watcher: Mutex<Option<Debouncer<ChangeWatcher>>>,
 }
 
 impl VaultContext {
