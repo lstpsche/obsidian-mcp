@@ -136,7 +136,9 @@ Current semantic daemon API version: `2` (`DAEMON_API_VERSION` in `src/daemon/pr
 | `obsidian-mcp` | Daemon API version must match exactly | MCP daemon `health` handshake validates `min_api_version`/`max_api_version` against current API version and fails fast on mismatch |
 | `obsidian-semantic-search-plugin` | Daemon API version must match exactly | Plugin bootstrap performs daemon `health` handshake and surfaces explicit incompatibility notices |
 
-Daemon API v2 applies each search request's optional `allowed_paths` scope before ranking and distinguishes an unattached vault from an index that is warming. Clients must support v2; a v1 daemon cannot safely serve scoped searches. Release binaries include both local and API embedding backends.
+Daemon API v2 applies each search request's optional `allowed_paths` scope before ranking and distinguishes an unattached vault from an index that is warming. Clients must support v2; a v1 daemon cannot safely serve scoped searches.
+
+Release binaries for Linux, Windows, and Apple Silicon macOS include local and API embedding backends. Intel macOS binaries include the API backend only because the current ONNX dependency has no prebuilt Intel macOS library. Cargo users on Intel macOS should install with `--features embeddings-api` instead of `--features embeddings`. Every release archive is smoke-tested on its native target.
 
 Release asset compatibility expectations:
 

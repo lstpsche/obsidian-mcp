@@ -55,3 +55,18 @@ pub fn extract_text(result: &CallToolResult) -> &str {
         .text
         .as_str()
 }
+
+pub fn read_http_request_headers(stream: &mut std::net::TcpStream) {
+    use std::io::Read;
+
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("request timeout should be set");
+    let mut request = Vec::new();
+    while !request.ends_with(b"\r\n\r\n") {
+        let mut byte = [0_u8; 1];
+        stream.read_exact(&mut byte).expect("request should arrive");
+        request.push(byte[0]);
+        assert!(request.len() <= 4096, "request headers should be bounded");
+    }
+}

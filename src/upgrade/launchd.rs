@@ -564,15 +564,14 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn restart_waits_for_exec_and_preserves_registration_and_version_check() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::net::TcpListener;
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("health should accept");
-            let mut request = [0_u8; 512];
-            let _ = stream.read(&mut request);
+            crate::test_helpers::read_http_request_headers(&mut stream);
             stream
                 .write_all(
                     b"HTTP/1.0 200 OK\r\n\r\n{\"status\":\"ok\",\"server\":\"obsidian-mcp\",\"version\":\"2.5.0\"}",
