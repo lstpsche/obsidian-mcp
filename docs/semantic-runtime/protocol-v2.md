@@ -1,4 +1,4 @@
-# Semantic Daemon Protocol v1
+# Semantic Daemon Protocol v2
 
 This document defines the local JSON-RPC contract for `obsidian-semanticd`.
 
@@ -63,7 +63,8 @@ Daemon-specific server errors:
 
 - `-32010` incompatible API version
 - `-32020` daemon unavailable
-- `-32030` vault not ready
+- `-32030` vault warming or degraded
+- `-32031` vault not attached
 - `-32040` bootstrap required
 
 ## Common Types
@@ -104,8 +105,8 @@ Request params:
 {
   "client_name": "obsidian-mcp",
   "client_version": "1.0.1",
-  "min_api_version": 1,
-  "max_api_version": 1
+  "min_api_version": 2,
+  "max_api_version": 2
 }
 ```
 
@@ -114,7 +115,7 @@ Response result:
 ```json
 {
   "daemon_version": "1.0.1",
-  "daemon_api_version": 1,
+  "daemon_api_version": 2,
   "pid": 12345,
   "status": "ok",
   "uptime_ms": 1234,
@@ -127,7 +128,7 @@ Behavior:
 
 - Daemon validates client API range.
 - If daemon API is outside range, returns `-32010`.
-- `pid` is additive lifecycle metadata. Older v1 daemons may omit it; ownership-aware callers then fall back to the manifest PID and still verify executable identity before stopping a process.
+- `pid` identifies the responding process. Lifecycle callers verify executable identity before stopping it.
 
 ## `ensure_vault`
 
@@ -182,7 +183,7 @@ Behavior:
 
 - The daemon writes and flushes the success response before stopping its IPC listener.
 - Callers must establish local ownership separately; this protocol method does not grant permission to replace an externally managed daemon.
-- Older v1 daemons may return `-32601`. A lifecycle manager may use a process signal fallback only after a successful health probe and executable-identity verification.
+- Lifecycle shutdown requires a compatible health response and verified executable identity.
 
 ## `search_semantic`
 
@@ -272,6 +273,14 @@ Response result:
 
 | Daemon API | Supported client API range |
 |---|---|
-| `1` | `1..=1` |
+| `2` | `2..=2` |
 
 Any incompatible combination must fail fast at `health` with `-32010`.
+
+## Search scope and attachment recovery
+
+`search_semantic` and `search_hybrid` accept optional `allowed_paths`, an array of exact vault-relative index paths. Omission searches the full vault; an empty array permits no results. The daemon intersects the scope with its current index before semantic ranking or lexical prefetch. Scopes belong to individual requests and do not change the shared vault index.
+
+An absent vault context returns `-32031` (`ERR_VAULT_NOT_ATTACHED`). Clients reattach with `ensure_vault` and may retry the query once. Warming or degraded contexts retain `-32030` (`ERR_VAULT_NOT_READY`) and their structured status; they must not trigger a competing local index.
+
+API v2 requires an exact health-handshake match. Older daemons do not implement scoped ranking and must not be used for v2 requests.

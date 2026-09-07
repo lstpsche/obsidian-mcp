@@ -129,12 +129,14 @@ This pulls the latest `main` and runs `cargo install --path . --features embeddi
 
 ## Semantic Runtime Compatibility
 
-Current semantic daemon API version: `1` (`DAEMON_API_VERSION` in `src/daemon/protocol.rs`).
+Current semantic daemon API version: `2` (`DAEMON_API_VERSION` in `src/daemon/protocol.rs`).
 
 | Component | Compatibility contract | Enforcement |
 |----------|-------------------------|-------------|
 | `obsidian-mcp` | Daemon API version must match exactly | MCP daemon `health` handshake validates `min_api_version`/`max_api_version` against current API version and fails fast on mismatch |
 | `obsidian-semantic-search-plugin` | Daemon API version must match exactly | Plugin bootstrap performs daemon `health` handshake and surfaces explicit incompatibility notices |
+
+Daemon API v2 applies each search request's optional `allowed_paths` scope before ranking and distinguishes an unattached vault from an index that is warming. Clients must support v2; a v1 daemon cannot safely serve scoped searches. Release binaries include both local and API embedding backends.
 
 Release asset compatibility expectations:
 

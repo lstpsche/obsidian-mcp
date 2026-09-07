@@ -79,7 +79,10 @@ fn handle_cli_flags() -> Option<i32> {
             );
             Some(0)
         }
-        _ => None,
+        _ => {
+            eprintln!("error: unknown argument '{arg}'; use --help for usage");
+            Some(2)
+        }
     }
 }
 

@@ -834,8 +834,15 @@ async fn wait_for_health(
     timeout: Duration,
 ) -> VaultResult<protocol::HealthResult> {
     let started = tokio::time::Instant::now();
+    let deadline = started + timeout;
     loop {
-        match probe_health(endpoint).await? {
+        let probe = tokio::time::timeout_at(deadline, probe_health(endpoint))
+            .await
+            .map_err(|_| VaultError::DaemonTimeout {
+                operation: format!("waiting for health on {}", endpoint.endpoint_string()),
+                timeout_ms: timeout.as_millis().min(u64::MAX as u128) as u64,
+            })??;
+        match probe {
             HealthProbeOutcome::Healthy(health) => return Ok(health),
             HealthProbeOutcome::Incompatible(message) => {
                 return Err(VaultError::DaemonBootstrap(format!(
@@ -1097,8 +1104,17 @@ fn process_is_alive(pid: u32) -> bool {
         })
 }
 
-#[cfg(unix)]
 async fn probe_health(endpoint: &IpcEndpoint) -> VaultResult<HealthProbeOutcome> {
+    tokio::time::timeout(Duration::from_secs(2), probe_health_unbounded(endpoint))
+        .await
+        .map_err(|_| VaultError::DaemonTimeout {
+            operation: format!("health probe on {}", endpoint.endpoint_string()),
+            timeout_ms: 2_000,
+        })?
+}
+
+#[cfg(unix)]
+async fn probe_health_unbounded(endpoint: &IpcEndpoint) -> VaultResult<HealthProbeOutcome> {
     let IpcEndpoint::UnixSocket(path) = endpoint;
     let stream = match UnixStream::connect(path).await {
         Ok(stream) => stream,
@@ -1124,7 +1140,7 @@ async fn probe_health(endpoint: &IpcEndpoint) -> VaultResult<HealthProbeOutcome>
 }
 
 #[cfg(windows)]
-async fn probe_health(endpoint: &IpcEndpoint) -> VaultResult<HealthProbeOutcome> {
+async fn probe_health_unbounded(endpoint: &IpcEndpoint) -> VaultResult<HealthProbeOutcome> {
     let IpcEndpoint::NamedPipe(name) = endpoint;
     let stream = match ClientOptions::new().open(name) {
         Ok(stream) => stream,
@@ -1147,7 +1163,7 @@ async fn probe_health(endpoint: &IpcEndpoint) -> VaultResult<HealthProbeOutcome>
 }
 
 #[cfg(not(any(unix, windows)))]
-async fn probe_health(_endpoint: &IpcEndpoint) -> VaultResult<HealthProbeOutcome> {
+async fn probe_health_unbounded(_endpoint: &IpcEndpoint) -> VaultResult<HealthProbeOutcome> {
     Ok(HealthProbeOutcome::Unreachable)
 }
 
@@ -1418,5 +1434,33 @@ mod tests {
 
         shutdown_tx.send(()).expect("shutdown signal should send");
         server_task.await.expect("server task should join");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn health_deadlines_bound_a_connected_silent_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("silent.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let mut streams = Vec::new();
+            loop {
+                streams.push(listener.accept().await.unwrap().0);
+            }
+        });
+        let endpoint = IpcEndpoint::UnixSocket(socket);
+        let result = tokio::time::timeout(Duration::from_secs(4), probe_health(&endpoint))
+            .await
+            .unwrap();
+        assert!(matches!(result, Err(VaultError::DaemonTimeout { .. })));
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_health(&endpoint, Duration::from_millis(50)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(VaultError::DaemonTimeout { .. })));
+        server.abort();
+        let _ = server.await;
     }
 }

@@ -37,11 +37,13 @@ impl VaultRegistry {
     pub fn new(semantic_home: PathBuf, model_name: String) -> VaultResult<Self> {
         #[cfg(has_embeddings)]
         let embedding_loader: EmbeddingLoaderFactory = {
+            let provider =
+                crate::config::EmbeddingProvider::from_env().map_err(VaultError::Embedding)?;
             let model_name = model_name.clone();
             Arc::new(move || {
                 let model_name = model_name.clone();
                 Box::pin(async move {
-                    let loaded = EmbeddingModel::load(&model_name, None).await?;
+                    let loaded = EmbeddingModel::load(&model_name, provider).await?;
                     Ok(Arc::new(loaded) as Arc<dyn Embedder>)
                 })
             })
@@ -333,6 +335,7 @@ mod tests {
                 query: "semantic".into(),
                 top_k: Some(10),
                 include_content: Some(false),
+                allowed_paths: None,
             },
         )
         .await
@@ -385,6 +388,7 @@ mod tests {
                 query: "semantic".into(),
                 top_k: Some(10),
                 include_content: Some(false),
+                allowed_paths: None,
             },
         )
         .await
@@ -436,6 +440,7 @@ mod tests {
                 query: "semantic".into(),
                 top_k: Some(10),
                 include_content: Some(false),
+                allowed_paths: None,
             },
         )
         .await

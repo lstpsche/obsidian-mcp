@@ -215,54 +215,13 @@ pub fn start_watcher(
     Ok(debouncer)
 }
 
-/// Decide whether a filesystem event should trigger an index update.
-///
-/// Returns `false` for:
-/// - Paths inside `.obsidian/` or `.obsidian-mcp/`
-/// - Non-`.md` files
-fn should_process_path(vault_root: &Path, absolute: &Path) -> bool {
-    let relative = match vault_path::relative_from_absolute(vault_root, absolute) {
-        Ok(r) => r,
-        Err(_) => {
-            tracing::trace!(path = %absolute.display(), "event path outside vault root, ignoring");
-            return false;
-        }
-    };
-
-    if is_obsidian_dir(&relative) {
-        return false;
-    }
-
-    match absolute.extension().and_then(|e| e.to_str()) {
-        Some(ext) if ext.eq_ignore_ascii_case("md") => true,
-        Some(ext) => {
-            tracing::trace!(path = %relative.display(), ext, "non-markdown file, ignoring");
-            false
-        }
-        None => {
-            // Deleted files may have lost their extension info if the path no longer
-            // exists. We still accept extensionless paths and let the index handle
-            // the no-op gracefully — `remove_file` on an unknown path is harmless.
-            //
-            // However, directories also lack extensions and we don't want to index
-            // those, so we check if the path *looks* like it had an `.md` extension
-            // by inspecting the string directly.
-            let path_str = absolute.to_string_lossy();
-            if path_str.to_ascii_lowercase().ends_with(".md") {
-                true
-            } else {
-                tracing::trace!(path = %relative.display(), "no extension, ignoring");
-                false
-            }
-        }
-    }
-}
-
-/// Check if a vault-relative path is inside `.obsidian/` or `.obsidian-mcp/`.
-fn is_obsidian_dir(relative: &Path) -> bool {
-    relative.components().next().is_some_and(|c| {
-        let name = c.as_os_str();
-        name == ".obsidian" || name == ".obsidian-mcp"
+/// Filter individual note events. Directory events are reconciled separately.
+pub(crate) fn should_process_path(vault_root: &Path, absolute: &Path) -> bool {
+    normalized_relative_path(vault_root, absolute).is_some_and(|relative| {
+        super::exclude::is_visible_path(&relative)
+            && relative
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
     })
 }
 
@@ -270,208 +229,97 @@ fn normalized_relative_path(vault_root: &Path, absolute: &Path) -> Option<PathBu
     vault_path::relative_from_absolute(vault_root, absolute).ok()
 }
 
+#[cfg(test)]
 fn is_excluded_path(exclude: &ExcludeSet, relative: &Path) -> bool {
-    exclude.is_excluded(Path::new(&relative.to_string_lossy().replace('\\', "/")))
+    exclude.is_excluded(relative)
 }
 
-/// Process a single debounced event. Returns whether Tantivy was touched.
-#[cfg(has_embeddings)]
-fn process_event(
+/// Reconcile all known and current Markdown descendants of a directory event.
+fn event_paths(
+    vault_root: &Path,
+    index: &VaultIndex,
+    absolute: &Path,
+) -> VaultResult<Vec<PathBuf>> {
+    let relative = vault_path::relative_from_absolute(vault_root, absolute)?;
+    if !super::exclude::is_visible_path(&relative) {
+        return Ok(Vec::new());
+    }
+    if should_process_path(vault_root, absolute)
+        && (absolute.is_file() || index.get_note(&relative).is_some())
+    {
+        return Ok(vec![relative]);
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    for path in index
+        .tracked_paths()
+        .filter(|path| path.starts_with(&relative))
+    {
+        paths.insert(path.clone());
+    }
+    if absolute.is_dir() {
+        vault_path::resolve_existing(vault_root, &relative)?;
+        for entry in walkdir::WalkDir::new(absolute)
+            .into_iter()
+            .filter_entry(|entry| {
+                entry.path() == absolute
+                    || super::exclude::is_visible_path(Path::new(entry.file_name()))
+            })
+        {
+            let entry = entry.map_err(|error| {
+                VaultError::Watcher(format!("cannot reconcile {}: {error}", relative.display()))
+            })?;
+            if entry.file_type().is_file() && should_process_path(vault_root, entry.path()) {
+                paths.insert(vault_path::relative_from_absolute(
+                    vault_root,
+                    entry.path(),
+                )?);
+            }
+        }
+    } else if should_process_path(vault_root, absolute) {
+        paths.insert(relative);
+    }
+    Ok(paths.into_iter().collect())
+}
+
+/// Process one debounced event. Returns whether a Tantivy batch needs flushing.
+pub(crate) fn process_event(
     vault_root: &Path,
     index: &Arc<RwLock<VaultIndex>>,
     tantivy: Option<&TantivyIndex>,
-    embedding_runtime: Option<&super::embedding_runtime::EmbeddingRuntimeWeak>,
+    #[cfg(has_embeddings)] embedding_runtime: Option<
+        &super::embedding_runtime::EmbeddingRuntimeWeak,
+    >,
     absolute: &Path,
     exclude: &ExcludeSet,
 ) -> bool {
-    if !should_process_path(vault_root, absolute) {
-        return false;
-    }
-
-    let relative = match normalized_relative_path(vault_root, absolute) {
-        Some(r) => r,
-        None => return false,
+    let mut index = match index.write() {
+        Ok(index) => index,
+        Err(error) => {
+            tracing::error!(%error, "index lock poisoned");
+            return false;
+        }
     };
-
-    let mut tv_touched = false;
-
-    if is_excluded_path(exclude, &relative) {
-        if absolute.exists() {
-            tracing::debug!(path = %relative.display(), "tracking excluded note");
-            match index.write() {
-                Ok(mut idx) => idx.add_excluded_file(&relative),
-                Err(e) => {
-                    tracing::error!("index lock poisoned: {e}");
-                    return false;
-                }
-            }
-        } else {
-            tracing::debug!(path = %relative.display(), "removing excluded note tracking");
-            match index.write() {
-                Ok(mut idx) => idx.remove_file(&relative),
-                Err(e) => {
-                    tracing::error!("index lock poisoned: {e}");
-                    return false;
-                }
-            }
+    let paths = match event_paths(vault_root, &index, absolute) {
+        Ok(paths) => paths,
+        Err(error) => {
+            tracing::warn!(path = %absolute.display(), %error, "watcher reconciliation failed");
+            return false;
         }
-
-        if let Some(tv) = tantivy {
-            if let Err(e) = tv.remove_file_batch(&relative) {
-                tracing::warn!(path = %relative.display(), error = %e, "tantivy remove failed");
-            } else {
-                tv_touched = true;
-            }
-        }
-        if let Some(runtime) = embedding_runtime {
-            runtime.submit_remove(&relative);
-        }
-        return tv_touched;
-    }
-
-    if absolute.exists() {
-        tracing::debug!(path = %relative.display(), "reindexing (create/modify)");
-        let meta = match index.write() {
-            Ok(mut idx) => {
-                if let Err(e) = idx.reindex_file(vault_root, &relative) {
-                    tracing::warn!(path = %relative.display(), error = %e, "reindex failed");
-                    return false;
-                }
-                idx.get_note(&relative).cloned()
-            }
-            Err(e) => {
-                tracing::error!("index lock poisoned: {e}");
-                return false;
-            }
-        };
-        if let Some(tv) = tantivy
-            && let Some(ref m) = meta
-        {
-            if let Err(e) = tv.reindex_file_batch(vault_root, &relative, m) {
-                tracing::warn!(path = %relative.display(), error = %e, "tantivy reindex failed");
-            } else {
-                tv_touched = true;
-            }
-        }
-        if let Some(runtime) = embedding_runtime {
-            runtime.submit_upsert(&relative);
-        }
-    } else {
-        tracing::debug!(path = %relative.display(), "removing (delete)");
-        match index.write() {
-            Ok(mut idx) => idx.remove_file(&relative),
-            Err(e) => {
-                tracing::error!("index lock poisoned: {e}");
-                return false;
-            }
-        }
-        if let Some(tv) = tantivy {
-            if let Err(e) = tv.remove_file_batch(&relative) {
-                tracing::warn!(path = %relative.display(), error = %e, "tantivy remove failed");
-            } else {
-                tv_touched = true;
-            }
-        }
-        if let Some(runtime) = embedding_runtime {
-            runtime.submit_remove(&relative);
-        }
-    }
-
-    tv_touched
-}
-
-/// Process a single debounced event. Returns whether Tantivy was touched.
-#[cfg(not(has_embeddings))]
-fn process_event(
-    vault_root: &Path,
-    index: &Arc<RwLock<VaultIndex>>,
-    tantivy: Option<&TantivyIndex>,
-    absolute: &Path,
-    exclude: &ExcludeSet,
-) -> bool {
-    if !should_process_path(vault_root, absolute) {
-        return false;
-    }
-
-    let relative = match normalized_relative_path(vault_root, absolute) {
-        Some(r) => r,
-        None => return false,
     };
-
-    if is_excluded_path(exclude, &relative) {
-        if absolute.exists() {
-            tracing::debug!(path = %relative.display(), "tracking excluded note");
-            match index.write() {
-                Ok(mut idx) => idx.add_excluded_file(&relative),
-                Err(e) => {
-                    tracing::error!("index lock poisoned: {e}");
-                    return false;
-                }
-            }
-        } else {
-            tracing::debug!(path = %relative.display(), "removing excluded note tracking");
-            match index.write() {
-                Ok(mut idx) => idx.remove_file(&relative),
-                Err(e) => {
-                    tracing::error!("index lock poisoned: {e}");
-                    return false;
-                }
+    for path in &paths {
+        if let Err(error) = index.refresh_file(vault_root, path, exclude, tantivy) {
+            tracing::warn!(path = %path.display(), %error, "watcher reindex failed");
+        }
+        #[cfg(has_embeddings)]
+        if let Some(runtime) = embedding_runtime {
+            if index.get_note(path).is_some() {
+                runtime.submit_upsert(path);
+            } else {
+                runtime.submit_remove(path);
             }
         }
-
-        if let Some(tv) = tantivy {
-            if let Err(e) = tv.remove_file_batch(&relative) {
-                tracing::warn!(path = %relative.display(), error = %e, "tantivy remove failed");
-                return false;
-            }
-            return true;
-        }
-        return false;
     }
-
-    if absolute.exists() {
-        tracing::debug!(path = %relative.display(), "reindexing (create/modify)");
-        let meta = match index.write() {
-            Ok(mut idx) => {
-                if let Err(e) = idx.reindex_file(vault_root, &relative) {
-                    tracing::warn!(path = %relative.display(), error = %e, "reindex failed");
-                    return false;
-                }
-                idx.get_note(&relative).cloned()
-            }
-            Err(e) => {
-                tracing::error!("index lock poisoned: {e}");
-                return false;
-            }
-        };
-        if let Some(tv) = tantivy
-            && let Some(ref m) = meta
-        {
-            if let Err(e) = tv.reindex_file_batch(vault_root, &relative, m) {
-                tracing::warn!(path = %relative.display(), error = %e, "tantivy reindex failed");
-                return false;
-            }
-            return true;
-        }
-        false
-    } else {
-        tracing::debug!(path = %relative.display(), "removing (delete)");
-        match index.write() {
-            Ok(mut idx) => idx.remove_file(&relative),
-            Err(e) => {
-                tracing::error!("index lock poisoned: {e}");
-                return false;
-            }
-        }
-        if let Some(tv) = tantivy {
-            if let Err(e) = tv.remove_file_batch(&relative) {
-                tracing::warn!(path = %relative.display(), error = %e, "tantivy remove failed");
-                return false;
-            }
-            return true;
-        }
-        false
-    }
+    tantivy.is_some() && !paths.is_empty()
 }
 
 #[cfg(test)]
@@ -549,21 +397,15 @@ mod tests {
     }
 
     #[test]
-    fn obsidian_dir_detection() {
-        assert!(is_obsidian_dir(Path::new(".obsidian/plugins/foo.json")));
-        assert!(is_obsidian_dir(Path::new(".obsidian")));
-        assert!(!is_obsidian_dir(Path::new("notes/.obsidian/foo")));
-        assert!(!is_obsidian_dir(Path::new("daily/2024-01-01.md")));
-    }
-
-    #[test]
-    fn obsidian_mcp_dir_detection() {
-        assert!(is_obsidian_dir(Path::new(".obsidian-mcp/ignore")));
-        assert!(is_obsidian_dir(Path::new(".obsidian-mcp")));
-        assert!(is_obsidian_dir(Path::new(
-            ".obsidian-mcp/embeddings/embeddings.bin"
-        )));
-        assert!(!is_obsidian_dir(Path::new("notes/.obsidian-mcp/foo")));
+    fn filters_hidden_components_at_any_depth() {
+        let root = vault();
+        for path in [
+            ".secret/note.md",
+            "notes/.trash/deleted.md",
+            "notes/.hidden.md",
+        ] {
+            assert!(!should_process_path(&root, &root.join(path)));
+        }
     }
 
     #[test]
@@ -767,5 +609,78 @@ mod tests {
 
         // The watcher should not have panicked. VaultIndex stubs are no-ops,
         // so we can't assert index state here — Task 3A integration tests will.
+    }
+
+    #[tokio::test]
+    async fn directory_events_reconcile_descendants_and_excluded_tracking() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("Old/nested")).unwrap();
+        std::fs::write(root.join("Old/nested/note.md"), "quokka").unwrap();
+        let exclude = ExcludeSet::build(vec!["Archive/**".into()]).unwrap();
+        let index = Arc::new(RwLock::new(VaultIndex::empty()));
+        call_process_event(&root, &index, &root.join("Old"), &exclude);
+        assert!(
+            index
+                .read()
+                .unwrap()
+                .get_note(Path::new("Old/nested/note.md"))
+                .is_some()
+        );
+        std::fs::rename(root.join("Old"), root.join("New")).unwrap();
+        call_process_event(&root, &index, &root.join("Old"), &exclude);
+        call_process_event(&root, &index, &root.join("New"), &exclude);
+        assert!(
+            index
+                .read()
+                .unwrap()
+                .get_note(Path::new("Old/nested/note.md"))
+                .is_none()
+        );
+        assert!(
+            index
+                .read()
+                .unwrap()
+                .get_note(Path::new("New/nested/note.md"))
+                .is_some()
+        );
+        std::fs::rename(root.join("New"), root.join("Archive")).unwrap();
+        call_process_event(&root, &index, &root.join("New"), &exclude);
+        call_process_event(&root, &index, &root.join("Archive"), &exclude);
+        assert!(index.read().unwrap().notes().is_empty());
+        assert_eq!(index.read().unwrap().excluded_notes(), 1);
+        std::fs::remove_dir_all(root.join("Archive")).unwrap();
+        call_process_event(&root, &index, &root.join("Archive"), &exclude);
+        assert_eq!(index.read().unwrap().excluded_notes(), 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_external_update_invalidates_metadata_and_lexical_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let exclude = ExcludeSet::build(vec![]).unwrap();
+        let index = Arc::new(RwLock::new(VaultIndex::empty()));
+        let tv = TantivyIndex::build(&root, index.read().unwrap().notes()).unwrap();
+        let path = root.join("note.md");
+        for content in [
+            "---\ntags: [Work]\n---\nquokka",
+            "---\ntags: [unclosed\n---\nchanged",
+        ] {
+            std::fs::write(&path, content).unwrap();
+            assert!(process_event(
+                &root,
+                &index,
+                Some(&tv),
+                #[cfg(has_embeddings)]
+                None,
+                &path,
+                &exclude
+            ));
+            tv.flush().unwrap();
+        }
+        assert!(index.read().unwrap().notes().is_empty());
+        assert_eq!(index.read().unwrap().stats().total_tags, 0);
+        assert_eq!(index.read().unwrap().stats().total_notes, 0);
+        assert!(tv.search("quokka", 10).unwrap().is_empty());
     }
 }

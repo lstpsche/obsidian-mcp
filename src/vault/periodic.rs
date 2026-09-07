@@ -186,14 +186,18 @@ fn momentjs_to_chrono(moment_format: &str) -> String {
 
         if !matched {
             let ch = slice.chars().next().expect("non-empty slice");
-            result.push(ch);
+            if ch == '%' {
+                result.push_str("%%");
+            } else {
+                result.push(ch);
+            }
             pos += ch.len_utf8();
         }
     }
 
     for (idx, literal) in literals.iter().enumerate() {
         let placeholder = format!("\x00{idx}\x00");
-        result = result.replace(&placeholder, literal);
+        result = result.replace(&placeholder, &literal.replace('%', "%%"));
     }
 
     result
@@ -201,15 +205,21 @@ fn momentjs_to_chrono(moment_format: &str) -> String {
 
 /// Format a `NaiveDate` using a Moment.js format string.
 /// Converts to chrono internally and resolves the quarter placeholder.
-fn format_date(date: &NaiveDate, moment_format: &str) -> String {
+fn format_date(date: &NaiveDate, moment_format: &str) -> VaultResult<String> {
     let chrono_fmt = momentjs_to_chrono(moment_format);
-    let formatted = date.format(&chrono_fmt).to_string();
+    let mut formatted = String::new();
+    std::fmt::write(&mut formatted, format_args!("{}", date.format(&chrono_fmt))).map_err(
+        |source| VaultError::InvalidDateFormat {
+            format: moment_format.into(),
+            source,
+        },
+    )?;
 
     if formatted.contains(QUARTER_PLACEHOLDER) {
         let quarter = (date.month() - 1) / 3 + 1;
-        formatted.replace(QUARTER_PLACEHOLDER, &quarter.to_string())
+        Ok(formatted.replace(QUARTER_PLACEHOLDER, &quarter.to_string()))
     } else {
-        formatted
+        Ok(formatted)
     }
 }
 
@@ -332,16 +342,19 @@ fn try_read_core_daily_config(path: &Path) -> VaultResult<Option<PeriodicNoteCon
 
 /// Derive the file path for a periodic note given a date.
 /// Returns path relative to vault root.
-pub fn periodic_note_path(config: &PeriodicNoteConfig, date: &NaiveDate) -> PathBuf {
-    let filename = format!("{}.md", format_date(date, &config.format));
-    match &config.folder {
+pub fn periodic_note_path(config: &PeriodicNoteConfig, date: &NaiveDate) -> VaultResult<PathBuf> {
+    let filename = format!("{}.md", format_date(date, &config.format)?);
+    Ok(match &config.folder {
         Some(folder) if !folder.is_empty() => PathBuf::from(folder).join(filename),
         _ => PathBuf::from(filename),
-    }
+    })
 }
 
 /// Get the file path for the current period's periodic note.
-pub fn current_periodic_note_path(config: &PeriodicNoteConfig, _period: &NotePeriod) -> PathBuf {
+pub fn current_periodic_note_path(
+    config: &PeriodicNoteConfig,
+    _period: &NotePeriod,
+) -> VaultResult<PathBuf> {
     let today = Local::now().date_naive();
     periodic_note_path(config, &today)
 }
@@ -512,22 +525,27 @@ pub fn expand_template(
         _ => VaultError::Io(e),
     })?;
 
-    Ok(expand_template_string(&content, date, title))
+    expand_template_string(&content, date, title)
 }
 
 static DATE_FORMAT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\{\{date:([^}]+)\}\}").unwrap());
 
-fn expand_template_string(content: &str, date: &NaiveDate, title: &str) -> String {
-    let result = DATE_FORMAT_RE
-        .replace_all(content, |caps: &regex::Captures| {
-            format_date(date, &caps[1])
-        })
-        .into_owned();
-
+fn expand_template_string(content: &str, date: &NaiveDate, title: &str) -> VaultResult<String> {
+    let mut result = String::with_capacity(content.len());
+    let mut cursor = 0;
+    for captures in DATE_FORMAT_RE.captures_iter(content) {
+        let matched = captures
+            .get(0)
+            .expect("regex capture always has a full match");
+        result.push_str(&content[cursor..matched.start()]);
+        result.push_str(&format_date(date, &captures[1])?);
+        cursor = matched.end();
+    }
+    result.push_str(&content[cursor..]);
     let result = result.replace("{{title}}", title);
-    let result = result.replace("{{date}}", &format_date(date, "YYYY-MM-DD"));
-    result.replace("{{time}}", &Local::now().format("%H:%M").to_string())
+    let result = result.replace("{{date}}", &format_date(date, "YYYY-MM-DD")?);
+    Ok(result.replace("{{time}}", &Local::now().format("%H:%M").to_string()))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -605,50 +623,50 @@ mod tests {
     #[test]
     fn format_date_daily() {
         let d = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap();
-        assert_eq!(format_date(&d, "YYYY-MM-DD"), "2026-03-19");
+        assert_eq!(format_date(&d, "YYYY-MM-DD").unwrap(), "2026-03-19");
     }
 
     #[test]
     fn format_date_quarter_q1() {
         let d = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap();
-        assert_eq!(format_date(&d, "YYYY-[Q]Q"), "2026-Q1");
+        assert_eq!(format_date(&d, "YYYY-[Q]Q").unwrap(), "2026-Q1");
     }
 
     #[test]
     fn format_date_quarter_q2() {
         let d = NaiveDate::from_ymd_opt(2026, 6, 15).unwrap();
-        assert_eq!(format_date(&d, "YYYY-[Q]Q"), "2026-Q2");
+        assert_eq!(format_date(&d, "YYYY-[Q]Q").unwrap(), "2026-Q2");
     }
 
     #[test]
     fn format_date_quarter_q3() {
         let d = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
-        assert_eq!(format_date(&d, "YYYY-[Q]Q"), "2026-Q3");
+        assert_eq!(format_date(&d, "YYYY-[Q]Q").unwrap(), "2026-Q3");
     }
 
     #[test]
     fn format_date_quarter_q4() {
         let d = NaiveDate::from_ymd_opt(2026, 12, 31).unwrap();
-        assert_eq!(format_date(&d, "YYYY-[Q]Q"), "2026-Q4");
+        assert_eq!(format_date(&d, "YYYY-[Q]Q").unwrap(), "2026-Q4");
     }
 
     #[test]
     fn format_date_monthly() {
         let d = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap();
-        assert_eq!(format_date(&d, "YYYY-MM"), "2026-03");
+        assert_eq!(format_date(&d, "YYYY-MM").unwrap(), "2026-03");
     }
 
     #[test]
     fn format_date_yearly() {
         let d = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap();
-        assert_eq!(format_date(&d, "YYYY"), "2026");
+        assert_eq!(format_date(&d, "YYYY").unwrap(), "2026");
     }
 
     #[test]
     fn format_date_full_text() {
         let d = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap();
         assert_eq!(
-            format_date(&d, "dddd, MMMM D, YYYY"),
+            format_date(&d, "dddd, MMMM D, YYYY").unwrap(),
             "Thursday, March 19, 2026"
         );
     }
@@ -664,7 +682,7 @@ mod tests {
         };
         let d = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap();
         assert_eq!(
-            periodic_note_path(&config, &d),
+            periodic_note_path(&config, &d).unwrap(),
             PathBuf::from("Daily/2026-03-19.md")
         );
     }
@@ -678,7 +696,7 @@ mod tests {
         };
         let d = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap();
         assert_eq!(
-            periodic_note_path(&config, &d),
+            periodic_note_path(&config, &d).unwrap(),
             PathBuf::from("2026-03-19.md")
         );
     }
@@ -692,7 +710,7 @@ mod tests {
         };
         let d = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
         assert_eq!(
-            periodic_note_path(&config, &d),
+            periodic_note_path(&config, &d).unwrap(),
             PathBuf::from("Quarterly/2026-Q3.md")
         );
     }
@@ -706,7 +724,7 @@ mod tests {
         };
         let d = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
         assert_eq!(
-            periodic_note_path(&config, &d),
+            periodic_note_path(&config, &d).unwrap(),
             PathBuf::from("2026-01-01.md")
         );
     }
@@ -956,28 +974,28 @@ mod tests {
     #[test]
     fn template_title_replacement() {
         let d = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
-        let result = expand_template_string("Hello {{title}}!", &d, "World");
+        let result = expand_template_string("Hello {{title}}!", &d, "World").unwrap();
         assert_eq!(result, "Hello World!");
     }
 
     #[test]
     fn template_date_replacement() {
         let d = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap();
-        let result = expand_template_string("Date: {{date}}", &d, "");
+        let result = expand_template_string("Date: {{date}}", &d, "").unwrap();
         assert_eq!(result, "Date: 2026-03-19");
     }
 
     #[test]
     fn template_date_with_custom_format() {
         let d = NaiveDate::from_ymd_opt(2026, 12, 25).unwrap();
-        let result = expand_template_string("{{date:MMMM DD, YYYY}}", &d, "");
+        let result = expand_template_string("{{date:MMMM DD, YYYY}}", &d, "").unwrap();
         assert_eq!(result, "December 25, 2026");
     }
 
     #[test]
     fn template_time_has_hh_mm_pattern() {
         let d = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
-        let result = expand_template_string("Time: {{time}}", &d, "");
+        let result = expand_template_string("Time: {{time}}", &d, "").unwrap();
         let time_part = result.strip_prefix("Time: ").unwrap();
         assert_eq!(time_part.len(), 5);
         assert_eq!(&time_part[2..3], ":");
@@ -990,7 +1008,8 @@ mod tests {
             "# {{title}}\nDate: {{date}}\n{{date:dddd, MMMM D}}",
             &d,
             "2026-03-19",
-        );
+        )
+        .unwrap();
         assert!(result.contains("# 2026-03-19"));
         assert!(result.contains("Date: 2026-03-19"));
         assert!(result.contains("Thursday, March 19"));
@@ -1039,5 +1058,28 @@ mod tests {
         assert!(try_parse_quarter_date("2026-Q5", &chrono_fmt).is_none());
         assert!(try_parse_quarter_date("2026-Q0", &chrono_fmt).is_none());
         assert!(try_parse_quarter_date("not-a-date", &chrono_fmt).is_none());
+    }
+
+    #[test]
+    fn percent_literals_survive_periodic_and_template_formats() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 8).unwrap();
+        assert_eq!(
+            format_date(&date, "YYYY-MM-DD [100%]").unwrap(),
+            "2026-09-08 100%"
+        );
+        assert_eq!(
+            expand_template_string("{{date:[100%] YYYY}}", &date, "").unwrap(),
+            "100% 2026"
+        );
+    }
+
+    #[test]
+    fn date_only_formats_return_errors_for_time_directives() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 8).unwrap();
+        assert!(matches!(
+            format_date(&date, "YYYY-MM-DD HH:mm"),
+            Err(VaultError::InvalidDateFormat { .. })
+        ));
+        assert!(expand_template_string("{{date:HH:mm}}", &date, "").is_err());
     }
 }

@@ -46,6 +46,12 @@ pub enum VaultError {
         source: regex::Error,
     },
 
+    #[error("Invalid date format '{format}' for a date without a time: {source}")]
+    InvalidDateFormat {
+        format: String,
+        source: std::fmt::Error,
+    },
+
     #[error("Watcher error: {0}")]
     Watcher(String),
 
@@ -94,6 +100,7 @@ impl From<VaultError> for rmcp::ErrorData {
             | VaultError::AlreadyExists(_)
             | VaultError::InvalidFrontmatter { .. }
             | VaultError::PatchTargetNotFound { .. }
+            | VaultError::InvalidDateFormat { .. }
             | VaultError::InvalidRegex { .. } => ErrorCode::INVALID_PARAMS,
             VaultError::FrontmatterParse { .. } => ErrorCode::PARSE_ERROR,
             VaultError::Io(_)
@@ -109,7 +116,9 @@ impl From<VaultError> for rmcp::ErrorData {
             VaultError::DaemonRpc { code, .. } => match *code {
                 -32700 => ErrorCode::PARSE_ERROR,
                 -32602 => ErrorCode::INVALID_PARAMS,
-                -32600 | -32601 | -32010 | -32020 | -32030 | -32040 => ErrorCode::INVALID_REQUEST,
+                -32600 | -32601 | -32010 | -32020 | -32030 | -32031 | -32040 => {
+                    ErrorCode::INVALID_REQUEST
+                }
                 _ => ErrorCode::INTERNAL_ERROR,
             },
         };

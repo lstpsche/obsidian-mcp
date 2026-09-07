@@ -48,9 +48,9 @@ jobs:
       - name: Build
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }}
+            cross build --locked --release --features embeddings,embeddings-api --target ${{ matrix.target }}
           else
-            cargo build --release --target ${{ matrix.target }}
+            cargo build --locked --release --features embeddings,embeddings-api --target ${{ matrix.target }}
           fi
         shell: bash
 
@@ -72,6 +72,23 @@ jobs:
           $DAEMON_ARCHIVE = "obsidian-semanticd-${VERSION}-${{ matrix.target }}.zip"
           Compress-Archive -Path "target/${{ matrix.target }}/release/obsidian-mcp.exe" -DestinationPath $MCP_ARCHIVE
           Compress-Archive -Path "target/${{ matrix.target }}/release/obsidian-semanticd.exe" -DestinationPath $DAEMON_ARCHIVE
+
+      - name: Verify native daemon archive
+        shell: bash
+        run: |
+          daemon_host=$(rustc -vV | sed -n 's/^host: //p')
+          if [ "${{ matrix.target }}" != "$daemon_host" ]; then
+            exit 0
+          fi
+          mkdir daemon-smoke
+          daemon_suffix=""
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            daemon_suffix=".exe"
+            python -m zipfile -e obsidian-semanticd-"${GITHUB_REF_NAME#v}"-${{ matrix.target }}.zip daemon-smoke
+          else
+            tar -xzf obsidian-semanticd-"${GITHUB_REF_NAME#v}"-${{ matrix.target }}.tar.gz -C daemon-smoke
+          fi
+          OBSIDIAN_TEST_DAEMON_BINARY="$PWD/daemon-smoke/obsidian-semanticd$daemon_suffix" cargo test --locked --release --all-features --target ${{ matrix.target }} --test semantic_daemon_api_tests
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

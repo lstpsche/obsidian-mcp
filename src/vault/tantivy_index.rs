@@ -215,7 +215,16 @@ impl TantivyIndex {
     ///
     /// Returns `(path, score)` pairs sorted by descending BM25 relevance.
     pub fn search(&self, query: &str, top_k: usize) -> VaultResult<Vec<(PathBuf, f32)>> {
-        if query.is_empty() {
+        self.search_for_paths(query, top_k, None)
+    }
+
+    pub(crate) fn search_for_paths(
+        &self,
+        query: &str,
+        top_k: usize,
+        allowed_paths: Option<&std::collections::HashSet<PathBuf>>,
+    ) -> VaultResult<Vec<(PathBuf, f32)>> {
+        if query.is_empty() || top_k == 0 {
             return Ok(Vec::new());
         }
 
@@ -239,7 +248,18 @@ impl TantivyIndex {
             .parse_query(query)
             .map_err(|e| VaultError::Other(format!("tantivy query parse error: {e}")))?;
 
-        let top_docs = searcher.search(&parsed, &TopDocs::with_limit(top_k).order_by_score())?;
+        let query: Box<dyn tantivy::query::Query> = if let Some(paths) = allowed_paths {
+            let terms = paths
+                .iter()
+                .map(|path| Term::from_field_text(self.ts.f_path, &path.to_string_lossy()));
+            Box::new(tantivy::query::BooleanQuery::intersection(vec![
+                parsed,
+                Box::new(tantivy::query::TermSetQuery::new(terms)),
+            ]))
+        } else {
+            parsed
+        };
+        let top_docs = searcher.search(&*query, &TopDocs::with_limit(top_k).order_by_score())?;
 
         let mut results = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
@@ -267,7 +287,7 @@ impl TantivyIndex {
         fuzzy: bool,
         fields: Option<&[SearchField]>,
     ) -> VaultResult<Vec<(PathBuf, f32)>> {
-        if query.is_empty() {
+        if query.is_empty() || top_k == 0 {
             return Ok(Vec::new());
         }
 
@@ -326,6 +346,7 @@ impl TantivyIndex {
 
         if include_tags {
             for word in query.split_whitespace() {
+                let word = word.to_lowercase();
                 let components: Vec<&str> = word.split('/').collect();
                 let facet = Facet::from_path(components);
                 let term = Term::from_facet(self.ts.f_tags, &facet);
@@ -395,6 +416,7 @@ fn build_document(
     );
 
     for tag in &meta.tags {
+        let tag = tag.to_lowercase();
         let components: Vec<&str> = tag.split('/').collect();
         doc.add_facet(ts.f_tags, Facet::from_path(components));
     }

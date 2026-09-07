@@ -4,6 +4,7 @@ use std::path::Path;
 
 use serde_yaml::Value as YamlValue;
 
+use super::parser::{HeadingPos, extract_headings_with_offsets};
 use crate::error::{VaultError, VaultResult};
 use crate::models::{PatchOperation, PatchRequest, PatchTargetType};
 
@@ -23,12 +24,6 @@ pub fn apply_patch(content: &str, request: &PatchRequest, path: &Path) -> VaultR
 // ============================================================
 // Shared helpers
 // ============================================================
-
-struct ParsedHeading<'a> {
-    level: u8,
-    text: &'a str,
-    line_idx: usize,
-}
 
 /// Returns byte offset of the start of each line.
 fn line_byte_offsets(content: &str) -> Vec<usize> {
@@ -124,21 +119,6 @@ fn normalize_heading_target_segment(segment: &str) -> &str {
     trimmed
 }
 
-/// Collect all headings outside fenced code blocks and frontmatter.
-fn find_headings(content: &str) -> Vec<ParsedHeading<'_>> {
-    let mut out = Vec::new();
-    for_each_non_code_line(content, |idx, line| {
-        if let Some((level, text)) = parse_heading(line) {
-            out.push(ParsedHeading {
-                level,
-                text,
-                line_idx: idx,
-            });
-        }
-    });
-    out
-}
-
 fn ensure_trailing_newline(s: &mut String) {
     if !s.is_empty() && !s.ends_with('\n') {
         s.push('\n');
@@ -149,72 +129,50 @@ fn ensure_trailing_newline(s: &mut String) {
 // Heading patching
 // ============================================================
 
-/// Walk a `::` delimited heading path and return `(heading_line, section_end_line)`.
-/// `section_end_line` is exclusive — the line of the next same-or-higher-level heading, or EOF.
+/// Resolve the body and section boundary using the same Markdown headings as inspection.
 fn resolve_heading_range(
-    headings: &[ParsedHeading<'_>],
+    content: &str,
+    headings: &[HeadingPos],
     target: &str,
-    total_lines: usize,
     path: &Path,
 ) -> VaultResult<(usize, usize)> {
-    let segments: Vec<&str> = target.split(HEADING_DELIMITER).collect();
-    let mut search_start: usize = 0;
-    let mut search_end: usize = total_lines;
-    let mut heading_line: usize = 0;
+    let mut search_start = 0;
+    let mut search_end = content.len();
+    let mut after_heading = 0;
 
-    for segment in &segments {
-        let raw_seg = segment.trim();
-        let normalized_seg = normalize_heading_target_segment(segment);
-        let find_match = |candidate: &str| {
-            headings.iter().find(|h| {
-                h.line_idx >= search_start
-                    && h.line_idx < search_end
-                    && h.text.eq_ignore_ascii_case(candidate)
+    for segment in target.split(HEADING_DELIMITER) {
+        let matches = |candidate: &str| {
+            headings.iter().find(|heading| {
+                let raw = content[heading.offset..heading.end].lines().next();
+                let raw_text = raw.and_then(parse_heading).map(|(_, text)| text);
+                heading.offset >= search_start
+                    && heading.offset < search_end
+                    && (heading.text.eq_ignore_ascii_case(candidate)
+                        || raw_text.is_some_and(|text| text.eq_ignore_ascii_case(candidate)))
             })
         };
-        let found = find_match(raw_seg).or_else(|| {
-            if normalized_seg == raw_seg {
-                None
-            } else {
-                find_match(normalized_seg)
-            }
-        });
-
-        match found {
-            Some(h) => {
-                heading_line = h.line_idx;
-                let section_end = headings
-                    .iter()
-                    .find(|n| n.line_idx > h.line_idx && n.level <= h.level)
-                    .map(|n| n.line_idx)
-                    .unwrap_or(total_lines)
-                    .min(search_end);
-
-                search_start = h.line_idx + 1;
-                search_end = section_end;
-            }
-            None => {
-                return Err(VaultError::PatchTargetNotFound {
-                    path: path.to_path_buf(),
-                    target_type: "heading".into(),
-                    target: target.into(),
-                });
-            }
-        }
+        let heading = matches(segment.trim())
+            .or_else(|| matches(normalize_heading_target_segment(segment)))
+            .ok_or_else(|| VaultError::PatchTargetNotFound {
+                path: path.to_path_buf(),
+                target_type: "heading".into(),
+                target: target.into(),
+            })?;
+        after_heading = heading.end;
+        search_start = heading.end;
+        search_end = headings
+            .iter()
+            .find(|next| next.offset > heading.offset && next.level <= heading.level)
+            .map_or(content.len(), |next| next.offset)
+            .min(search_end);
     }
-
-    Ok((heading_line, search_end))
+    Ok((after_heading, search_end))
 }
 
 fn patch_heading(content: &str, request: &PatchRequest, path: &Path) -> VaultResult<String> {
-    let line_count = content.lines().count();
-    let headings = find_headings(content);
-    let (heading_line, section_end) =
-        resolve_heading_range(&headings, &request.target, line_count, path)?;
-
-    let offsets = line_byte_offsets(content);
-    let after_heading = line_offset(&offsets, heading_line + 1, content.len());
-    let section_end_byte = line_offset(&offsets, section_end, content.len());
+    let headings = extract_headings_with_offsets(content);
+    let (after_heading, section_end_byte) =
+        resolve_heading_range(content, &headings, &request.target, path)?;
 
     let mut result = String::with_capacity(content.len() + request.content.len() + 2);
 
@@ -294,6 +252,7 @@ fn patch_block(content: &str, request: &PatchRequest, path: &Path) -> VaultResul
         }
         PatchOperation::Append => {
             result.push_str(&content[..line_end]);
+            ensure_trailing_newline(&mut result);
             result.push_str(&request.content);
             ensure_trailing_newline(&mut result);
             result.push_str(&content[line_end..]);
@@ -929,8 +888,8 @@ Final thoughts.
     #[test]
     fn heading_inside_code_block_ignored() {
         let content = "# Real Heading\nSome text.\n```\n# Not A Heading\n```\n# After Code\n";
-        let headings = find_headings(content);
-        let texts: Vec<&str> = headings.iter().map(|h| h.text).collect();
+        let headings = extract_headings_with_offsets(content);
+        let texts: Vec<&str> = headings.iter().map(|h| h.text.as_str()).collect();
         assert_eq!(texts, vec!["Real Heading", "After Code"]);
     }
 
@@ -998,8 +957,69 @@ Final thoughts.
     #[test]
     fn frontmatter_yaml_comment_not_heading() {
         let content = "---\n# yaml comment\nkey: val\n---\n# Real Heading\n";
-        let headings = find_headings(content);
+        let headings = extract_headings_with_offsets(content);
         assert_eq!(headings.len(), 1);
         assert_eq!(headings[0].text, "Real Heading");
+    }
+
+    #[test]
+    fn heading_replace_preserves_setext_siblings_and_their_underlines() {
+        let content = "# Parent\nold\n\nSibling\n=======\nkeep\n";
+        let result = apply_patch(
+            content,
+            &req(
+                PatchOperation::Replace,
+                PatchTargetType::Heading,
+                "Parent",
+                "NEW",
+            ),
+            p(),
+        )
+        .unwrap();
+        assert_eq!(result, "# Parent\nNEW\nSibling\n=======\nkeep\n");
+        let result = apply_patch(
+            content,
+            &req(
+                PatchOperation::Replace,
+                PatchTargetType::Heading,
+                "Sibling",
+                "NEW",
+            ),
+            p(),
+        )
+        .unwrap();
+        assert_eq!(result, "# Parent\nold\n\nSibling\n=======\nNEW");
+    }
+
+    #[test]
+    fn heading_targets_round_trip_from_inspection_and_ignore_indented_code() {
+        let content = "## `code` heading\nold\n\n    # Fake\n    code\n\n## Next\nkeep\n";
+        let target = &super::super::parser::build_document_map(content).headings[0];
+        for target in [target.as_str(), "`code` heading"] {
+            let result = apply_patch(
+                content,
+                &req(
+                    PatchOperation::Replace,
+                    PatchTargetType::Heading,
+                    target,
+                    "NEW",
+                ),
+                p(),
+            )
+            .unwrap();
+            assert_eq!(result, "## `code` heading\nNEW\n## Next\nkeep\n");
+        }
+    }
+
+    #[test]
+    fn block_append_at_eof_preserves_reference() {
+        let result = apply_patch(
+            "text ^id",
+            &req(PatchOperation::Append, PatchTargetType::Block, "id", "NEW"),
+            p(),
+        )
+        .unwrap();
+        assert_eq!(result, "text ^id\nNEW\n");
+        assert_eq!(find_block_ref_line(&result, "id"), Some(0));
     }
 }

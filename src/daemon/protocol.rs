@@ -1,11 +1,11 @@
-//! JSON-RPC protocol DTOs for the semantic daemon (v1).
+//! JSON-RPC protocol DTOs for the semantic daemon (v2).
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 pub const JSONRPC_VERSION: &str = "2.0";
-pub const DAEMON_API_VERSION: u32 = 1;
+pub const DAEMON_API_VERSION: u32 = 2;
 
 pub const ERR_PARSE: i64 = -32700;
 pub const ERR_INVALID_REQUEST: i64 = -32600;
@@ -15,6 +15,7 @@ pub const ERR_INTERNAL: i64 = -32603;
 pub const ERR_INCOMPATIBLE_API_VERSION: i64 = -32010;
 pub const ERR_DAEMON_UNAVAILABLE: i64 = -32020;
 pub const ERR_VAULT_NOT_READY: i64 = -32030;
+pub const ERR_VAULT_NOT_ATTACHED: i64 = -32031;
 pub const ERR_BOOTSTRAP_REQUIRED: i64 = -32040;
 
 fn default_params() -> Value {
@@ -179,6 +180,9 @@ pub struct SearchSemanticParams {
     pub top_k: Option<usize>,
     #[serde(default)]
     pub include_content: Option<bool>,
+    /// Restrict ranking to these vault-relative paths; absent means the entire index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -193,6 +197,9 @@ pub struct SearchHybridParams {
     pub alpha: Option<f32>,
     #[serde(default)]
     pub include_content: Option<bool>,
+    /// Restrict ranking to these vault-relative paths; absent means the entire index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]

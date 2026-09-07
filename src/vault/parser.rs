@@ -35,11 +35,12 @@ static BLOCK_REF_RE: LazyLock<Regex> =
 // ---------------------------------------------------------------------------
 
 /// Heading with byte offset preserved for range-finding operations.
-struct HeadingPos {
-    level: u8,
-    text: String,
-    line: usize,
-    offset: usize,
+pub(crate) struct HeadingPos {
+    pub(crate) level: u8,
+    pub(crate) text: String,
+    pub(crate) line: usize,
+    pub(crate) offset: usize,
+    pub(crate) end: usize,
 }
 
 fn heading_level_to_u8(level: HeadingLevel) -> u8 {
@@ -131,7 +132,7 @@ fn parse_wikilink_inner(raw: &str, inner: &str, line: usize) -> WikiLink {
 
 /// Shared implementation that returns headings with both line numbers and byte
 /// offsets.
-fn extract_headings_with_offsets(content: &str) -> Vec<HeadingPos> {
+pub(crate) fn extract_headings_with_offsets(content: &str) -> Vec<HeadingPos> {
     let parser = Parser::new_ext(content, parser_options());
     let mut headings = Vec::new();
     let mut in_heading = false;
@@ -159,6 +160,7 @@ fn extract_headings_with_offsets(content: &str) -> Vec<HeadingPos> {
                     text: current_text.clone(),
                     line: byte_offset_to_line(content, current_offset),
                     offset: current_offset,
+                    end: range.end,
                 });
                 in_heading = false;
             }

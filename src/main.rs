@@ -18,8 +18,6 @@ use obsidian_mcp::upgrade::BuildIdentity;
 use obsidian_mcp::upgrade::orchestrator::{self, UpgradeOptions, UpgradeRunOutcome};
 use obsidian_mcp::vault::Vault;
 
-const DEFAULT_PORT: u16 = 37842;
-
 tokio::task_local! {
     static REQUEST_DISABLED_TOOLS: HashSet<String>;
 }
@@ -345,16 +343,7 @@ async fn handle_cli_flags() -> Option<i32> {
                 return Some(0);
             }
             let result = match arg.as_str() {
-                "stop" => {
-                    let port = resolve_port_from_args();
-                    if !is_port_in_use(port) {
-                        println!("no server running on port {port}");
-                        return Some(0);
-                    }
-                    stop_existing_server(port).map(|()| {
-                        println!("server on port {port} stopped");
-                    })
-                }
+                "stop" => stop_server(),
                 _ => daemonize(),
             };
             match result {
@@ -381,7 +370,7 @@ fn print_help() {
              {name} [OPTIONS] [VAULT_PATH]          Run with stdio transport (default)\n    \
              {name} --http [OPTIONS] [VAULT_PATH]   Run with Streamable HTTP transport\n    \
              {name} serve [OPTIONS] [VAULT_PATH]    Start HTTP server in background\n    \
-             {name} stop [--port PORT]              Stop a running HTTP server\n    \
+             {name} stop [--host ADDR] [--port PORT]              Stop a running HTTP server\n    \
              {name} restart [OPTIONS] [VAULT_PATH]  Restart HTTP server (stop + serve)\n    \
              {name} upgrade [--dry-run]             Safely upgrade Cargo-installed binaries\n\
          \n\
@@ -596,25 +585,30 @@ async fn run_windows_upgrade_helper() -> i32 {
     }
 }
 
-/// Resolve the HTTP port from CLI args and env, skipping subcommand names.
-fn resolve_port_from_args() -> u16 {
-    let mut port = DEFAULT_PORT;
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == "--port"
-            && let Some(val) = args.next()
-            && let Ok(p) = val.parse()
-        {
-            port = p;
-        }
+/// Resolve the HTTP bind endpoint without requiring a vault path.
+fn resolve_endpoint_from_args() -> Result<std::net::SocketAddr, Box<dyn std::error::Error>> {
+    obsidian_mcp::config::resolve_http_endpoint(&parse_cli_args()).map_err(Into::into)
+}
+
+fn connect_address(endpoint: std::net::SocketAddr) -> std::net::SocketAddr {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    let ip = match endpoint.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    SocketAddr::new(ip, endpoint.port())
+}
+
+fn stop_server() -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = resolve_endpoint_from_args()?;
+    if !is_port_in_use(endpoint) {
+        println!("no server running on {endpoint}");
+        return Ok(());
     }
-    if port == DEFAULT_PORT
-        && let Ok(val) = std::env::var("OBSIDIAN_HTTP_PORT")
-        && let Ok(p) = val.parse()
-    {
-        port = p;
-    }
-    port
+    stop_existing_server(endpoint)?;
+    println!("server on {endpoint} stopped");
+    Ok(())
 }
 
 /// Spawn a detached child running `--http` and exit the parent.
@@ -639,8 +633,8 @@ fn daemonize() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let port = resolve_port_from_args();
-    stop_existing_server(port)?;
+    let endpoint = resolve_endpoint_from_args()?;
+    stop_existing_server(endpoint)?;
 
     let log_file = daemon_log_path()?;
     if let Some(parent) = log_file.parent() {
@@ -685,7 +679,7 @@ fn daemonize() -> Result<(), Box<dyn std::error::Error>> {
             )
             .into());
         }
-        if probe_health(port) {
+        if probe_health(endpoint) {
             healthy = true;
             break;
         }
@@ -713,49 +707,32 @@ fn daemonize() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn is_port_in_use(port: u16) -> bool {
-    use std::net::{SocketAddr, TcpStream};
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200)).is_ok()
+fn is_port_in_use(endpoint: std::net::SocketAddr) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &connect_address(endpoint),
+        std::time::Duration::from_millis(200),
+    )
+    .is_ok()
 }
 
-fn probe_health(port: u16) -> bool {
-    use std::io::{Read, Write};
-    use std::net::{SocketAddr, TcpStream};
-
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500))
-    else {
-        return false;
-    };
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_millis(500)))
-        .ok();
-    let req = "GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n";
-    if stream.write_all(req.as_bytes()).is_err() {
-        return false;
-    }
-    let mut buf = [0u8; 512];
-    let Ok(n) = stream.read(&mut buf) else {
-        return false;
-    };
-    let resp = String::from_utf8_lossy(&buf[..n]);
-    resp.contains("200") && resp.contains("\"status\":\"ok\"")
+fn probe_health(endpoint: std::net::SocketAddr) -> bool {
+    obsidian_mcp::upgrade::health::probe(&endpoint.ip().to_string(), endpoint.port()).is_ok()
 }
 
-/// Stop all servers on `port`. Returns `Err` if the port cannot be freed.
-fn stop_existing_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    use std::net::{SocketAddr, TcpStream};
+/// Stop the listener at the selected endpoint, failing if it cannot be freed.
+fn stop_existing_server(endpoint: std::net::SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+    use std::net::TcpStream;
     use std::time::Duration;
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = connect_address(endpoint);
+    let port = endpoint.port();
 
     for round in 0..5 {
         if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err() {
             return Ok(());
         }
 
-        let Some(pid) = find_pid_on_port(port) else {
+        let Some(pid) = find_pid_on_port(endpoint) else {
             if round == 0 {
                 return Err(format!(
                     "port {port} is already in use but could not identify the process"
@@ -819,16 +796,24 @@ fn is_process_alive(pid: u32) -> bool {
 fn is_process_alive(pid: u32) -> bool {
     std::process::Command::new("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-        .stdout(Stdio::null())
         .stderr(Stdio::null())
         .output()
         .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
 }
 
 #[cfg(unix)]
-fn find_pid_on_port(port: u16) -> Option<u32> {
+fn find_pid_on_port(endpoint: std::net::SocketAddr) -> Option<u32> {
+    let selector = if endpoint.ip().is_unspecified() {
+        format!(
+            "-i{}TCP:{}",
+            if endpoint.is_ipv6() { 6 } else { 4 },
+            endpoint.port()
+        )
+    } else {
+        format!("-iTCP@{endpoint}")
+    };
     let output = std::process::Command::new("lsof")
-        .args(["-ti", &format!("tcp:{port}")])
+        .args(["-nP", "-t", &selector, "-sTCP:LISTEN"])
         .output()
         .ok()?;
     String::from_utf8_lossy(&output.stdout)
@@ -838,16 +823,23 @@ fn find_pid_on_port(port: u16) -> Option<u32> {
 }
 
 #[cfg(windows)]
-fn find_pid_on_port(port: u16) -> Option<u32> {
+fn find_pid_on_port(endpoint: std::net::SocketAddr) -> Option<u32> {
     let output = std::process::Command::new("netstat")
         .args(["-ano"])
         .output()
         .ok()?;
-    let needle = format!(":{port}");
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter(|l| l.contains(&needle) && l.contains("LISTENING"))
-        .find_map(|l| l.split_whitespace().last()?.parse::<u32>().ok())
+        .find_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.len() != 5 || fields[0] != "TCP" || fields[3] != "LISTENING" {
+                return None;
+            }
+            let address: std::net::SocketAddr = fields[1].parse().ok()?;
+            (address == endpoint)
+                .then(|| fields[4].parse::<u32>().ok())
+                .flatten()
+        })
         .filter(|&pid| pid != std::process::id())
 }
 

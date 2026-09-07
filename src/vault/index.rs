@@ -65,11 +65,7 @@ impl VaultIndex {
         let walker = WalkDir::new(vault_root)
             .min_depth(1)
             .into_iter()
-            .filter_entry(|e| {
-                e.file_name()
-                    .to_str()
-                    .is_some_and(|name| !name.starts_with('.'))
-            });
+            .filter_entry(|e| super::exclude::is_visible_path(Path::new(e.file_name())));
 
         for entry in walker {
             let entry = entry.map_err(|e| match e.into_io_error() {
@@ -96,7 +92,7 @@ impl VaultIndex {
                 match parse_note_metadata(vault_root, &rel_path) {
                     Ok(metadata) => {
                         for tag in &metadata.tags {
-                            tags.entry(tag.clone())
+                            tags.entry(tag.to_lowercase())
                                 .or_default()
                                 .insert(rel_path.clone());
                         }
@@ -152,6 +148,13 @@ impl VaultIndex {
     /// (because the `LinkResolver` path set changes, potentially altering
     /// ambiguity for other notes' wikilinks).
     pub fn reindex_file(&mut self, vault_root: &Path, path: &Path) -> VaultResult<()> {
+        let metadata = match parse_note_metadata(vault_root, path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                self.remove_file(path);
+                return Err(error);
+            }
+        };
         let was_existing = self.notes.contains_key(path);
         let old_links = self.notes.get(path).map(|n| n.links.clone());
         self.excluded_note_paths.remove(path);
@@ -159,10 +162,9 @@ impl VaultIndex {
         self.remove_note_contributions(path);
         self.link_resolver.remove_path(path);
 
-        let metadata = parse_note_metadata(vault_root, path)?;
         for tag in &metadata.tags {
             self.tags
-                .entry(tag.clone())
+                .entry(tag.to_lowercase())
                 .or_default()
                 .insert(path.to_path_buf());
         }
@@ -191,23 +193,67 @@ impl VaultIndex {
 
     /// Handle a file rename/move.
     pub fn rename_file(&mut self, vault_root: &Path, old: &Path, new: &Path) -> VaultResult<()> {
-        self.excluded_note_paths.remove(old);
-        self.remove_note_contributions(old);
-        self.link_resolver.rename_path(old, new.to_path_buf());
-        self.backlinks.remove(old);
+        self.remove_file(old);
+        self.reindex_file(vault_root, new)
+    }
 
-        let metadata = parse_note_metadata(vault_root, new)?;
-        for tag in &metadata.tags {
-            self.tags
-                .entry(tag.clone())
-                .or_default()
-                .insert(new.to_path_buf());
+    /// Refresh metadata and lexical search together, invalidating unreadable notes.
+    /// The caller holds the index write lock and flushes any Tantivy batch afterwards.
+    pub(crate) fn refresh_file(
+        &mut self,
+        vault_root: &Path,
+        path: &Path,
+        exclude: &ExcludeSet,
+        tantivy: Option<&super::tantivy_index::TantivyIndex>,
+    ) -> VaultResult<()> {
+        let result = if !super::exclude::is_visible_path(path) {
+            self.remove_file(path);
+            Ok(())
+        } else {
+            match std::fs::metadata(vault_root.join(path)) {
+                Ok(metadata) if metadata.is_file() => {
+                    if exclude.is_excluded(path) {
+                        self.remove_file(path);
+                        self.add_excluded_file(path);
+                        Ok(())
+                    } else {
+                        self.reindex_file(vault_root, path)
+                    }
+                }
+                Ok(_) => {
+                    self.remove_file(path);
+                    Ok(())
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    self.remove_file(path);
+                    Ok(())
+                }
+                Err(error) => {
+                    self.remove_file(path);
+                    Err(VaultError::Io(error))
+                }
+            }
+        };
+        let lexical = if let Some(tv) = tantivy {
+            match self.get_note(path) {
+                Some(metadata) => tv.reindex_file_batch(vault_root, path, metadata),
+                None => tv.remove_file_batch(path),
+            }
+        } else {
+            Ok(())
+        };
+        match (result, lexical) {
+            (Err(error), Err(cleanup)) => Err(VaultError::Other(format!(
+                "{error}; synchronizing search for {} also failed: {cleanup}",
+                path.display()
+            ))),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+            _ => Ok(()),
         }
-        self.notes.insert(new.to_path_buf(), metadata);
+    }
 
-        self.rebuild_backlinks();
-        self.recompute_stats();
-        Ok(())
+    pub(crate) fn tracked_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.notes.keys().chain(self.excluded_note_paths.iter())
     }
 
     // ── query methods ───────────────────────────────────────────────
@@ -222,18 +268,19 @@ impl VaultIndex {
 
     pub fn notes_with_tag(&self, tag: &str) -> Vec<&NoteMetadata> {
         self.tags
-            .get(tag)
+            .get(&tag.to_lowercase())
             .map(|paths| paths.iter().filter_map(|p| self.notes.get(p)).collect())
             .unwrap_or_default()
     }
 
     /// Match a tag and all its children (e.g. `inbox` matches `inbox/read`, `inbox/todo`).
     pub fn notes_with_tag_prefix(&self, prefix: &str) -> Vec<&NoteMetadata> {
+        let prefix = prefix.to_lowercase();
         let nested_prefix = format!("{prefix}/");
         let mut seen = HashSet::new();
         let mut results = Vec::new();
         for (tag, paths) in &self.tags {
-            if tag == prefix || tag.starts_with(&nested_prefix) {
+            if tag == &prefix || tag.starts_with(&nested_prefix) {
                 for path in paths {
                     if seen.insert(path)
                         && let Some(note) = self.notes.get(path)
@@ -407,10 +454,10 @@ impl VaultIndex {
         if let Some(old_note) = self.notes.remove(path) {
             let mut empty_tags = Vec::new();
             for tag in &old_note.tags {
-                if let Some(paths) = self.tags.get_mut(tag) {
+                if let Some(paths) = self.tags.get_mut(&tag.to_lowercase()) {
                     paths.remove(path);
                     if paths.is_empty() {
-                        empty_tags.push(tag.clone());
+                        empty_tags.push(tag.to_lowercase());
                     }
                 }
             }

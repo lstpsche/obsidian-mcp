@@ -102,6 +102,10 @@ jobs:
       - name: Verify preserved feature identity and dry-run contract
         run: cargo test --features "${{ matrix.features }}" --test upgrade_cli_tests
 
+      - name: Verify daemon search and restart contract
+        if: contains(matrix.features, 'embeddings-api')
+        run: cargo test --locked --features "${{ matrix.features }}" --test semantic_daemon_api_tests
+
   daemon-integration:
     name: daemon integration (embeddings)
     runs-on: ubuntu-latest

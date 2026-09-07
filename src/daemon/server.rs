@@ -560,7 +560,7 @@ mod tests {
         let mut stream = reader.into_inner();
         stream
             .write_all(
-                br#"{"jsonrpc":"2.0","id":7,"method":"health","params":{"min_api_version":1,"max_api_version":1}}"#
+                br#"{"jsonrpc":"2.0","id":7,"method":"health","params":{"min_api_version":2,"max_api_version":2}}"#
             )
             .await
             .expect("write health request");
@@ -574,7 +574,10 @@ mod tests {
             .expect("read health response");
         let health_response: serde_json::Value =
             serde_json::from_str(&line).expect("health response should be valid JSON");
-        assert_eq!(health_response["result"]["daemon_api_version"], json!(1));
+        assert_eq!(
+            health_response["result"]["daemon_api_version"],
+            json!(DAEMON_API_VERSION)
+        );
         assert_eq!(health_response["result"]["pid"], json!(std::process::id()));
 
         shutdown_tx

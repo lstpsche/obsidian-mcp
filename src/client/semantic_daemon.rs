@@ -136,6 +136,7 @@ impl SemanticDaemonClient {
                 query: query.to_string(),
                 top_k: Some(top_k),
                 include_content: Some(include_content),
+                allowed_paths: None,
             },
         )
         .await
@@ -159,12 +160,13 @@ impl SemanticDaemonClient {
                 prefetch: Some(prefetch),
                 alpha: Some(alpha),
                 include_content: Some(include_content),
+                allowed_paths: None,
             },
         )
         .await
     }
 
-    async fn call<P, R>(&self, method: &str, params: P) -> VaultResult<R>
+    pub(crate) async fn call<P, R>(&self, method: &str, params: P) -> VaultResult<R>
     where
         P: Serialize,
         R: DeserializeOwned,
@@ -430,7 +432,7 @@ mod tests {
                 "id": id,
                 "result": {
                     "daemon_version": "1.0.1",
-                    "daemon_api_version": 1,
+                    "daemon_api_version": DAEMON_API_VERSION,
                     "status": "ok",
                     "uptime_ms": 10,
                     "model_name": "BAAI/bge-small-en-v1.5",
@@ -557,7 +559,7 @@ mod tests {
                     "id": id,
                     "result": {
                         "daemon_version": "1.0.1",
-                        "daemon_api_version": 1,
+                        "daemon_api_version": DAEMON_API_VERSION,
                         "status": "ok",
                         "uptime_ms": 12,
                         "model_name": "BAAI/bge-small-en-v1.5",
@@ -651,7 +653,7 @@ mod tests {
                 "id": 999,
                 "result": {
                     "daemon_version": "1.0.1",
-                    "daemon_api_version": 1,
+                    "daemon_api_version": DAEMON_API_VERSION,
                     "status": "ok",
                     "uptime_ms": 10,
                     "model_name": "BAAI/bge-small-en-v1.5",
@@ -690,7 +692,7 @@ mod tests {
                 "id": id,
                 "result": {
                     "daemon_version": "1.0.1",
-                    "daemon_api_version": 1,
+                    "daemon_api_version": DAEMON_API_VERSION,
                     "status": "ok",
                     "uptime_ms": 10,
                     "model_name": "BAAI/bge-small-en-v1.5",

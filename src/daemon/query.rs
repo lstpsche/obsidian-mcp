@@ -82,7 +82,7 @@ pub async fn search_semantic(
     let include_content = params.include_content.unwrap_or(false);
 
     let scores = context
-        .search_semantic_scores(&params.query, top_k)
+        .search_semantic_scores(&params.query, top_k, params.allowed_paths.as_deref())
         .map_err(map_vault_error)?;
     build_hits(&context, scores, &params.query, include_content)
 }
@@ -105,7 +105,7 @@ pub async fn search_hybrid(
     let alpha = params.alpha.unwrap_or(DEFAULT_ALPHA).clamp(0.0, 1.0);
 
     let bm25_hits = context
-        .search_bm25(&params.query, prefetch)
+        .search_bm25(&params.query, prefetch, params.allowed_paths.as_deref())
         .map_err(map_vault_error)?;
     if bm25_hits.is_empty() {
         return Ok(SearchResult {
@@ -165,8 +165,8 @@ async fn require_context(
     {
         Some(context) => Ok(context),
         None => Err(QueryError::new(
-            protocol::ERR_VAULT_NOT_READY,
-            "vault not ready; call ensure_vault first",
+            protocol::ERR_VAULT_NOT_ATTACHED,
+            "vault not attached; call ensure_vault first",
         )),
     }
 }

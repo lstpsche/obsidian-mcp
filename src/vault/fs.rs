@@ -80,6 +80,24 @@ pub fn write_file(vault_root: &Path, path: &Path, content: &str) -> VaultResult<
     Ok(resolved.relative)
 }
 
+/// Create a file without overwriting an existing path, including concurrent creators.
+pub fn create_file(vault_root: &Path, path: &Path, content: &str) -> VaultResult<PathBuf> {
+    let resolved = vault_path::resolve_for_write(vault_root, path)?;
+    if let Some(parent) = resolved.absolute.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&resolved.absolute)
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::AlreadyExists => VaultError::AlreadyExists(path.to_path_buf()),
+            _ => VaultError::Io(error),
+        })?;
+    file.write_all(content.as_bytes())?;
+    Ok(resolved.relative)
+}
+
 /// Append content to a file. Creates the file if it doesn't exist.
 pub fn append_file(vault_root: &Path, path: &Path, content: &str) -> VaultResult<PathBuf> {
     let resolved = vault_path::resolve_for_write(vault_root, path)?;
@@ -557,5 +575,38 @@ mod tests {
         let files = list_files(vault.path(), Path::new("subfolder"), false, None).unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].display().to_string().contains("nested.md"));
+    }
+
+    #[test]
+    fn concurrent_creators_never_overwrite_the_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|id| {
+                let root = dir.path().to_path_buf();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (
+                        id,
+                        create_file(&root, Path::new("new.md"), &format!("author-{id}")),
+                    )
+                })
+            })
+            .collect();
+        let mut winners = Vec::new();
+        for worker in workers {
+            let (id, result) = worker.join().unwrap();
+            match result {
+                Ok(_) => winners.push(id),
+                Err(VaultError::AlreadyExists(_)) => {}
+                other => panic!("unexpected create result: {other:?}"),
+            }
+        }
+        assert_eq!(winners.len(), 1);
+        assert_eq!(
+            read_file(dir.path(), Path::new("new.md")).unwrap(),
+            format!("author-{}", winners[0])
+        );
     }
 }

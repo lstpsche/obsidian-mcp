@@ -9,7 +9,7 @@ The manifest records the currently provisioned daemon runtime and IPC endpoint s
 ```json
 {
   "schema_version": 1,
-  "daemon_api_version": 1,
+  "daemon_api_version": 2,
   "daemon_version": "1.0.1",
   "binary_path": "/abs/path/to/obsidian-semanticd",
   "binary_origin": "sibling",

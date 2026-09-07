@@ -168,8 +168,15 @@ impl VaultContext {
         Ok(crate::vault::path::resolve_existing(&self.vault_root, path)?.relative)
     }
 
-    pub fn search_bm25(&self, query: &str, top_k: usize) -> VaultResult<Vec<(PathBuf, f32)>> {
-        self.tantivy.search(query, top_k)
+    pub fn search_bm25(
+        &self,
+        query: &str,
+        top_k: usize,
+        allowed_paths: Option<&[String]>,
+    ) -> VaultResult<Vec<(PathBuf, f32)>> {
+        let allowed = allowed_paths.map(|paths| paths.iter().map(PathBuf::from).collect());
+        self.tantivy
+            .search_for_paths(query, top_k, allowed.as_ref())
     }
 
     #[cfg(has_embeddings)]
@@ -177,13 +184,25 @@ impl VaultContext {
         &self,
         query: &str,
         top_k: usize,
+        allowed_paths: Option<&[String]>,
     ) -> VaultResult<Vec<(PathBuf, f32)>> {
+        let allowed = allowed_paths.map(|paths| {
+            paths
+                .iter()
+                .map(PathBuf::from)
+                .collect::<std::collections::HashSet<_>>()
+        });
         let current_paths = self
             .index
             .read()
             .map_err(|error| VaultError::Other(format!("daemon index lock poisoned: {error}")))?
             .notes()
             .keys()
+            .filter(|path| {
+                allowed
+                    .as_ref()
+                    .is_none_or(|allowed| allowed.contains(*path))
+            })
             .cloned()
             .collect::<std::collections::HashSet<_>>();
         self.embedding_runtime
@@ -230,6 +249,7 @@ impl VaultContext {
         &self,
         _query: &str,
         _top_k: usize,
+        _allowed_paths: Option<&[String]>,
     ) -> VaultResult<Vec<(PathBuf, f32)>> {
         Err(VaultError::Embedding(
             "daemon binary compiled without embeddings feature".to_string(),

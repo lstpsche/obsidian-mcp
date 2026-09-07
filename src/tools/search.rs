@@ -14,8 +14,6 @@ use super::SemanticRuntime;
 
 const MAX_RESULTS_CAP: usize = 200;
 const MAX_CONTEXT_LEN_CAP: usize = 2000;
-const SEMANTIC_FILTER_OVERFETCH_FACTOR: usize = 4;
-const SEMANTIC_FILTER_OVERFETCH_MIN_EXTRA: usize = 20;
 
 // ── search_text ─────────────────────────────────────────────────────
 
@@ -332,17 +330,6 @@ pub async fn search_semantic(
     super::output::results(results)
 }
 
-fn semantic_candidate_limit(top_k: usize) -> usize {
-    if top_k == 0 {
-        0
-    } else {
-        top_k
-            .saturating_mul(SEMANTIC_FILTER_OVERFETCH_FACTOR)
-            .max(top_k.saturating_add(SEMANTIC_FILTER_OVERFETCH_MIN_EXTRA))
-            .min(MAX_RESULTS_CAP)
-    }
-}
-
 async fn search_semantic_daemon(
     vault: &Vault,
     params: &SearchSemanticParams,
@@ -374,28 +361,53 @@ async fn search_semantic_daemon(
         }
     }
 
-    let candidate_limit = semantic_candidate_limit(top_k);
-    let daemon_result = if lexical_prefetch {
-        let prefetch_count = runtime.prefetch_count.max(candidate_limit);
-        client
-            .search_hybrid(
-                vault.root(),
-                &params.query,
-                candidate_limit,
-                prefetch_count,
-                alpha,
-                include_content,
-            )
-            .await?
-    } else {
-        client
-            .search_semantic(
-                vault.root(),
-                &params.query,
-                candidate_limit,
-                include_content,
-            )
-            .await?
+    let allowed_paths = vault.indexed_paths();
+    let query = async || {
+        if lexical_prefetch {
+            client
+                .call::<_, protocol::SearchResult>(
+                    "search_hybrid",
+                    protocol::SearchHybridParams {
+                        vault_root: vault.root().display().to_string(),
+                        query: params.query.clone(),
+                        top_k: Some(top_k),
+                        prefetch: Some(runtime.prefetch_count.max(top_k)),
+                        alpha: Some(alpha),
+                        include_content: Some(include_content),
+                        allowed_paths: Some(allowed_paths.clone()),
+                    },
+                )
+                .await
+        } else {
+            client
+                .call::<_, protocol::SearchResult>(
+                    "search_semantic",
+                    protocol::SearchSemanticParams {
+                        vault_root: vault.root().display().to_string(),
+                        query: params.query.clone(),
+                        top_k: Some(top_k),
+                        include_content: Some(include_content),
+                        allowed_paths: Some(allowed_paths.clone()),
+                    },
+                )
+                .await
+        }
+    };
+    let daemon_result = match query().await {
+        Err(VaultError::DaemonRpc {
+            code: protocol::ERR_VAULT_NOT_ATTACHED,
+            ..
+        }) => {
+            runtime
+                .vault_ensured
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            client.ensure_vault(vault.root(), true, None).await?;
+            runtime
+                .vault_ensured
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            query().await?
+        }
+        result => result?,
     };
 
     Ok(daemon_result
@@ -428,16 +440,10 @@ fn search_semantic_local(
     lexical_prefetch: bool,
     alpha: f32,
 ) -> Result<Vec<SemanticSearchResult>, VaultError> {
-    let candidate_limit = semantic_candidate_limit(top_k);
     let hits = if lexical_prefetch {
-        vault.search_hybrid(
-            query,
-            candidate_limit,
-            DEFAULT_PREFETCH_COUNT.max(candidate_limit),
-            alpha,
-        )?
+        vault.search_hybrid(query, top_k, DEFAULT_PREFETCH_COUNT.max(top_k), alpha)?
     } else {
-        vault.search_semantic(query, candidate_limit)?
+        vault.search_semantic(query, top_k)?
     };
 
     let word_re = if !include_content {
@@ -690,6 +696,11 @@ mod tests {
                         }
                     }),
                     "search_semantic" => {
+                        let allowed = request["params"]["allowed_paths"]
+                            .as_array()
+                            .expect("path scope");
+                        assert!(allowed.iter().any(|path| path == "rust.md"));
+                        assert!(!allowed.iter().any(|path| path == filtered_path));
                         captured_top_k = request
                             .get("params")
                             .and_then(|params| params.get("top_k"))
@@ -1431,7 +1442,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn daemon_prefetch_overfetches_without_forcing_min_50() {
+    async fn daemon_prefetch_preserves_configured_count() {
         let (_dir, vault) = setup_search_vault().await;
         let socket_dir = tempfile::tempdir().expect("tempdir");
         let socket_path = socket_dir.path().join("semanticd.sock");
@@ -1469,15 +1480,14 @@ mod tests {
 
         let captured_prefetch = server.await.expect("server join");
         assert_eq!(
-            captured_prefetch,
-            semantic_candidate_limit(5),
-            "runtime prefetch may grow to cover the filtered candidate window"
+            captured_prefetch, 7,
+            "runtime prefetch covers at least the requested result count"
         );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn daemon_semantic_overfetches_before_filtering_hidden_results() {
+    async fn daemon_semantic_sends_visible_paths_before_ranking() {
         let (_dir, vault) = setup_search_vault().await;
         let socket_dir = tempfile::tempdir().expect("tempdir");
         let socket_path = socket_dir.path().join("semanticd.sock");
@@ -1515,16 +1525,12 @@ mod tests {
         assert_eq!(parsed[0]["path"], "rust.md");
 
         let captured_top_k = server.await.expect("server join");
-        assert_eq!(captured_top_k, semantic_candidate_limit(1));
-        assert!(
-            captured_top_k > 1,
-            "daemon request should over-fetch before MCP-side visibility filtering"
-        );
+        assert_eq!(captured_top_k, 1);
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn daemon_semantic_filters_excluded_hits_after_overfetching() {
+    async fn daemon_semantic_sends_exclusion_scope_before_ranking() {
         let (_dir, vault) = setup_excluded_search_vault().await;
         let socket_dir = tempfile::tempdir().expect("tempdir");
         let socket_path = socket_dir.path().join("semanticd.sock");
@@ -1562,7 +1568,7 @@ mod tests {
         assert_eq!(parsed[0]["path"], "rust.md");
 
         let captured_top_k = server.await.expect("server join");
-        assert_eq!(captured_top_k, semantic_candidate_limit(1));
+        assert_eq!(captured_top_k, 1);
     }
 
     #[cfg(all(unix, has_embeddings))]

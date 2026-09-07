@@ -40,7 +40,10 @@ mod daemon_integration_tests {
         let server = DaemonTestServer::start(MODEL_NAME).await;
 
         let api_version = server.health_api_version().await;
-        assert_eq!(api_version, 1);
+        assert_eq!(
+            api_version,
+            obsidian_mcp::daemon::protocol::DAEMON_API_VERSION
+        );
 
         let vault = create_temp_vault();
         write_note(vault.path(), "note.md", "# Note\nhello world");

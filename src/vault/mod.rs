@@ -57,6 +57,7 @@ struct VaultInner {
     mcp_data: PathBuf,
     exclude: Arc<ExcludeSet>,
     index: Arc<RwLock<VaultIndex>>,
+    mutations: Mutex<()>,
     tantivy: Option<Arc<TantivyIndex>>,
     #[cfg(has_embeddings)]
     embedding_runtime: Option<embedding_runtime::EmbeddingRuntime>,
@@ -69,8 +70,8 @@ struct VaultInner {
 /// High-level facade over the vault filesystem, index, and watcher.
 ///
 /// `Vault` is `Clone + Send + Sync` — cloning increments an internal `Arc`.
-/// All read operations acquire a shared lock on the index; write operations
-/// acquire an exclusive lock briefly after the filesystem mutation.
+/// Mutations through shared handles are serialized from reading through indexing.
+/// Metadata queries acquire a shared index lock. External editors are independent.
 #[derive(Clone)]
 pub struct Vault {
     inner: Arc<VaultInner>,
@@ -240,6 +241,7 @@ impl Vault {
                 mcp_data,
                 exclude,
                 index,
+                mutations: Mutex::new(()),
                 tantivy,
                 #[cfg(has_embeddings)]
                 embedding_runtime,
@@ -293,12 +295,21 @@ impl Vault {
     }
 
     pub fn write_note(&self, path: &Path, content: &str) -> VaultResult<()> {
+        let _mutation = self.lock_mutations()?;
+        frontmatter::parse_frontmatter(content)?;
         let actual_path = fs::write_file(&self.inner.root, path, content)?;
         self.reindex(&actual_path)?;
         Ok(())
     }
 
     pub fn append_note(&self, path: &Path, content: &str) -> VaultResult<()> {
+        let _mutation = self.lock_mutations()?;
+        let combined = match fs::read_file(&self.inner.root, path) {
+            Ok(existing) => existing + content,
+            Err(VaultError::NoteNotFound(_)) => content.to_owned(),
+            Err(error) => return Err(error),
+        };
+        frontmatter::parse_frontmatter(&combined)?;
         let actual_path = fs::append_file(&self.inner.root, path, content)?;
         self.reindex(&actual_path)?;
         Ok(())
@@ -312,9 +323,7 @@ impl Vault {
         content: &str,
         frontmatter: Option<&serde_json::Value>,
     ) -> VaultResult<()> {
-        if fs::file_exists(&self.inner.root, path) {
-            return Err(VaultError::AlreadyExists(path.to_path_buf()));
-        }
+        let _mutation = self.lock_mutations()?;
         if let Some(value) = frontmatter
             && !value.is_object()
         {
@@ -324,13 +333,15 @@ impl Vault {
             });
         }
         let full_content = frontmatter::rebuild_content(frontmatter, content);
-        let actual_path = fs::write_file(&self.inner.root, path, &full_content)?;
+        frontmatter::parse_frontmatter(&full_content)?;
+        let actual_path = fs::create_file(&self.inner.root, path, &full_content)?;
         self.reindex(&actual_path)?;
         Ok(())
     }
 
     /// Prepend content after frontmatter (or at the start if none exists).
     pub fn prepend_note(&self, path: &Path, content: &str) -> VaultResult<()> {
+        let _mutation = self.lock_mutations()?;
         let existing = fs::read_file(&self.inner.root, path)?;
         let new_content = match frontmatter::extract_raw_frontmatter(&existing) {
             Some((_, body_start)) => {
@@ -342,12 +353,14 @@ impl Vault {
             }
             None => format!("{content}{existing}"),
         };
+        frontmatter::parse_frontmatter(&new_content)?;
         let actual_path = fs::write_file(&self.inner.root, path, &new_content)?;
         self.reindex(&actual_path)?;
         Ok(())
     }
 
     pub fn delete_note(&self, path: &Path) -> VaultResult<()> {
+        let _mutation = self.lock_mutations()?;
         let actual_path = fs::delete_file(&self.inner.root, path)?;
         self.write_index().remove_file(&actual_path);
         if let Some(tv) = &self.inner.tantivy {
@@ -361,41 +374,20 @@ impl Vault {
     }
 
     pub fn move_note(&self, from: &Path, to: &Path) -> VaultResult<PathBuf> {
+        let _mutation = self.lock_mutations()?;
         let move_result = fs::move_file(&self.inner.root, from, to)?;
         let old_path = move_result.from;
         let new_path = move_result.to;
 
-        if self.inner.exclude.is_excluded(&new_path) {
-            {
-                let mut idx = self.write_index();
-                idx.remove_file(&old_path);
-                idx.add_excluded_file(&new_path);
-                if let Some(tv) = &self.inner.tantivy {
-                    tv.remove_file(&old_path)?;
-                }
-            }
-            #[cfg(has_embeddings)]
-            if let Some(runtime) = &self.inner.embedding_runtime {
-                runtime.submit_remove(&old_path);
-                runtime.submit_remove(&new_path);
-            }
-        } else {
-            {
-                let mut idx = self.write_index();
-                idx.rename_file(&self.inner.root, &old_path, &new_path)?;
-                if let Some(tv) = &self.inner.tantivy {
-                    tv.remove_file(&old_path)?;
-                    if let Some(meta) = idx.get_note(&new_path) {
-                        tv.reindex_file(&self.inner.root, &new_path, meta)?;
-                    }
-                }
-            }
-            #[cfg(has_embeddings)]
-            if let Some(runtime) = &self.inner.embedding_runtime {
-                runtime.submit_remove(&old_path);
-                runtime.submit_upsert(&new_path);
-            }
+        self.write_index().remove_file(&old_path);
+        if let Some(tv) = &self.inner.tantivy {
+            tv.remove_file(&old_path)?;
         }
+        #[cfg(has_embeddings)]
+        if let Some(runtime) = &self.inner.embedding_runtime {
+            runtime.submit_remove(&old_path);
+        }
+        self.reindex(&new_path)?;
 
         Ok(new_path)
     }
@@ -403,8 +395,10 @@ impl Vault {
     // ── patch delegation ───────────────────────────────────────────────
 
     pub fn patch_note(&self, path: &Path, request: &PatchRequest) -> VaultResult<()> {
+        let _mutation = self.lock_mutations()?;
         let content = fs::read_file(&self.inner.root, path)?;
         let patched = patch::apply_patch(&content, request, path)?;
+        frontmatter::parse_frontmatter(&patched)?;
         let actual_path = fs::write_file(&self.inner.root, path, &patched)?;
         self.reindex(&actual_path)?;
         Ok(())
@@ -423,22 +417,34 @@ impl Vault {
         key: &str,
         value: serde_json::Value,
     ) -> VaultResult<()> {
+        let _mutation = self.lock_mutations()?;
         let content = fs::read_file(&self.inner.root, path)?;
         let updated = frontmatter::set_frontmatter_field(&content, key, value)?;
+        frontmatter::parse_frontmatter(&updated)?;
         let actual_path = fs::write_file(&self.inner.root, path, &updated)?;
         self.reindex(&actual_path)?;
         Ok(())
     }
 
     pub fn remove_frontmatter_field(&self, path: &Path, key: &str) -> VaultResult<()> {
+        let _mutation = self.lock_mutations()?;
         let content = fs::read_file(&self.inner.root, path)?;
         let updated = frontmatter::remove_frontmatter_field(&content, key)?;
+        frontmatter::parse_frontmatter(&updated)?;
         let actual_path = fs::write_file(&self.inner.root, path, &updated)?;
         self.reindex(&actual_path)?;
         Ok(())
     }
 
     // ── index delegation (read-lock) ───────────────────────────────────
+
+    pub(crate) fn indexed_paths(&self) -> Vec<String> {
+        self.read_index()
+            .notes()
+            .keys()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect()
+    }
 
     pub fn get_note_metadata(&self, path: &Path) -> VaultResult<NoteMetadata> {
         let actual_path = self.canonical_existing_relative_path(path)?;
@@ -744,7 +750,7 @@ impl Vault {
     ) -> VaultResult<String> {
         let config = periodic::read_periodic_config(&self.inner.root, period)?;
         let date = date.unwrap_or_else(|| Local::now().date_naive());
-        let path = periodic::periodic_note_path(&config, &date);
+        let path = periodic::periodic_note_path(&config, &date)?;
         fs::read_file(&self.inner.root, &path)
     }
 
@@ -754,13 +760,10 @@ impl Vault {
         date: Option<NaiveDate>,
         content_override: Option<&str>,
     ) -> VaultResult<PathBuf> {
+        let _mutation = self.lock_mutations()?;
         let config = periodic::read_periodic_config(&self.inner.root, period)?;
         let date = date.unwrap_or_else(|| Local::now().date_naive());
-        let path = periodic::periodic_note_path(&config, &date);
-
-        if fs::file_exists(&self.inner.root, &path) {
-            return Err(VaultError::AlreadyExists(path));
-        }
+        let path = periodic::periodic_note_path(&config, &date)?;
 
         let content = if let Some(custom) = content_override {
             custom.to_owned()
@@ -782,7 +785,8 @@ impl Vault {
             }
         };
 
-        let actual_path = fs::write_file(&self.inner.root, &path, &content)?;
+        frontmatter::parse_frontmatter(&content)?;
+        let actual_path = fs::create_file(&self.inner.root, &path, &content)?;
         self.reindex(&actual_path)?;
         Ok(actual_path)
     }
@@ -852,6 +856,13 @@ impl Vault {
         Ok(results)
     }
 
+    fn lock_mutations(&self) -> VaultResult<std::sync::MutexGuard<'_, ()>> {
+        self.inner
+            .mutations
+            .lock()
+            .map_err(|error| VaultError::Other(format!("vault mutation lock poisoned: {error}")))
+    }
+
     fn read_index(&self) -> std::sync::RwLockReadGuard<'_, VaultIndex> {
         self.inner.index.read().unwrap_or_else(|e| e.into_inner())
     }
@@ -862,31 +873,30 @@ impl Vault {
 
     fn reindex(&self, path: &Path) -> VaultResult<()> {
         let actual_path = self.canonical_existing_relative_path(path)?;
-        if self.inner.exclude.is_excluded(&actual_path) {
-            self.write_index().add_excluded_file(&actual_path);
-            if let Some(tv) = &self.inner.tantivy {
-                tv.remove_file(&actual_path)?;
-            }
-            #[cfg(has_embeddings)]
-            if let Some(runtime) = &self.inner.embedding_runtime {
-                runtime.submit_remove(&actual_path);
-            }
-            return Ok(());
-        }
-
         let mut idx = self.write_index();
-        idx.reindex_file(&self.inner.root, &actual_path)?;
-        if let Some(tv) = &self.inner.tantivy
-            && let Some(meta) = idx.get_note(&actual_path)
-        {
-            tv.reindex_file(&self.inner.root, &actual_path, meta)?;
-        }
-        drop(idx);
+        let result = idx.refresh_file(
+            &self.inner.root,
+            &actual_path,
+            &self.inner.exclude,
+            self.inner.tantivy.as_deref(),
+        );
         #[cfg(has_embeddings)]
         if let Some(runtime) = &self.inner.embedding_runtime {
-            runtime.submit_upsert(&actual_path);
+            if idx.get_note(&actual_path).is_some() {
+                runtime.submit_upsert(&actual_path);
+            } else {
+                runtime.submit_remove(&actual_path);
+            }
         }
-        Ok(())
+        drop(idx);
+        let flush = self.inner.tantivy.as_ref().map(|tv| tv.flush()).transpose();
+        match (result, flush) {
+            (Err(error), Err(flush)) => Err(VaultError::Other(format!(
+                "{error}; search flush failed: {flush}"
+            ))),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+            _ => Ok(()),
+        }
     }
 
     // ── embedding helpers (feature-gated) ─────────────────────────────
@@ -2057,5 +2067,110 @@ mod tests {
             !vault.mcp_home().join("vaults").exists(),
             "default mcp home must not be namespaced under itself"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_transformations_preserve_every_successful_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open(&tantivy_config(dir.path())).await.unwrap();
+        vault
+            .write_note(Path::new("shared.md"), &"body\n".repeat(20000))
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|id| {
+                let vault = vault.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    vault
+                        .prepend_note(Path::new("shared.md"), &format!("marker-{id}\n"))
+                        .unwrap();
+                    vault
+                        .set_frontmatter_field(
+                            Path::new("shared.md"),
+                            &format!("key-{id}"),
+                            id.into(),
+                        )
+                        .unwrap();
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let content = vault.read_note(Path::new("shared.md")).unwrap();
+        let fm = vault
+            .get_frontmatter(Path::new("shared.md"))
+            .unwrap()
+            .unwrap();
+        for id in 0..8 {
+            assert!(content.contains(&format!("marker-{id}\n")));
+            assert_eq!(fm[format!("key-{id}")], id);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_yaml_write_preserves_file_and_all_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open(&tantivy_config(dir.path())).await.unwrap();
+        let content = "---\ntags: [Work]\n---\nquokka\n";
+        vault.write_note(Path::new("note.md"), content).unwrap();
+        let stats = vault.vault_stats().unwrap();
+        assert!(
+            vault
+                .write_note(Path::new("note.md"), "---\ntags: [unclosed\n---\nchanged")
+                .is_err()
+        );
+        assert_eq!(vault.read_note(Path::new("note.md")).unwrap(), content);
+        assert_eq!(
+            vault.get_note_metadata(Path::new("note.md")).unwrap().tags,
+            vec!["Work"]
+        );
+        assert_eq!(vault.search_text("quokka", 0).unwrap().len(), 1);
+        assert_eq!(vault.vault_stats().unwrap().total_notes, stats.total_notes);
+    }
+
+    #[tokio::test]
+    async fn hidden_writes_and_moves_remain_outside_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open(&tantivy_config(dir.path())).await.unwrap();
+        vault
+            .write_note(Path::new(".secret/hidden.md"), "quokka")
+            .unwrap();
+        assert!(
+            vault
+                .get_note_metadata(Path::new(".secret/hidden.md"))
+                .is_err()
+        );
+        vault.write_note(Path::new("visible.md"), "quokka").unwrap();
+        vault
+            .move_note(Path::new("visible.md"), Path::new("notes/.hidden.md"))
+            .unwrap();
+        assert!(vault.search_text("quokka", 0).unwrap().is_empty());
+        assert_eq!(vault.vault_stats().unwrap().total_notes, 0);
+    }
+
+    #[tokio::test]
+    async fn tag_identity_is_case_insensitive_across_updates_and_search_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open(&tantivy_config(dir.path())).await.unwrap();
+        vault
+            .write_note(Path::new("a.md"), "---\ntags: [Work]\n---\n#WORK/Inbox")
+            .unwrap();
+        assert_eq!(vault.search_by_tag("work").unwrap().len(), 1);
+        assert_eq!(vault.search_by_tag_prefix("wOrK").unwrap().len(), 1);
+        assert_eq!(
+            vault
+                .search_text_with_options("WORK", 0, 10, false, Some(&[SearchField::Tags]))
+                .unwrap()
+                .len(),
+            1
+        );
+        vault.write_note(Path::new("a.md"), "#work").unwrap();
+        assert_eq!(vault.search_by_tag("WORK").unwrap().len(), 1);
+        assert!(vault.search_by_tag("work/inbox").unwrap().is_empty());
+        vault.delete_note(Path::new("a.md")).unwrap();
+        assert!(vault.search_by_tag("work").unwrap().is_empty());
     }
 }

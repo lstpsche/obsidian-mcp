@@ -43,6 +43,18 @@ impl EmbeddingProvider {
         }
     }
 
+    /// Read the optional backend selection, rejecting invalid explicit values.
+    pub fn from_env() -> Result<Option<Self>, String> {
+        match std::env::var("OBSIDIAN_EMBEDDING_PROVIDER") {
+            Ok(value) if value.trim().is_empty() => Ok(None),
+            Ok(value) => Self::parse(value.trim()).map(Some).ok_or_else(|| {
+                format!("invalid OBSIDIAN_EMBEDDING_PROVIDER: {value}; expected local or api")
+            }),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(error) => Err(format!("cannot read OBSIDIAN_EMBEDDING_PROVIDER: {error}")),
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Local => "local",
@@ -280,6 +292,34 @@ pub fn parse_cli_args() -> CliArgs {
     result
 }
 
+/// Resolve the HTTP endpoint consistently for serving and lifecycle commands.
+pub fn resolve_http_endpoint(cli: &CliArgs) -> Result<std::net::SocketAddr, String> {
+    let port = match cli.port {
+        Some(port) => port,
+        None => parse_endpoint_setting("OBSIDIAN_HTTP_PORT")?.unwrap_or(DEFAULT_HTTP_PORT),
+    };
+    let host = match cli.host {
+        Some(host) => host,
+        None => parse_endpoint_setting("OBSIDIAN_HTTP_HOST")?.unwrap_or(DEFAULT_HTTP_HOST),
+    };
+    Ok(std::net::SocketAddr::new(host, port))
+}
+
+fn parse_endpoint_setting<T: std::str::FromStr>(name: &str) -> Result<Option<T>, String>
+where
+    T::Err: std::fmt::Display,
+{
+    match std::env::var(name) {
+        Ok(value) => value
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(|error| format!("invalid {name}: {error}")),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(format!("cannot read {name}: {error}")),
+    }
+}
+
 impl Config {
     /// Load configuration from CLI args and environment variables.
     ///
@@ -307,19 +347,9 @@ impl Config {
             }
         };
 
-        let http_port = cli
-            .port
-            .or_else(|| parse_u16_env("OBSIDIAN_HTTP_PORT"))
-            .unwrap_or(DEFAULT_HTTP_PORT);
-
-        let http_host = cli
-            .host
-            .or_else(|| {
-                std::env::var("OBSIDIAN_HTTP_HOST")
-                    .ok()
-                    .and_then(|v| v.trim().parse().ok())
-            })
-            .unwrap_or(DEFAULT_HTTP_HOST);
+        let endpoint = resolve_http_endpoint(cli)?;
+        let http_host = endpoint.ip();
+        let http_port = endpoint.port();
 
         let watch = std::env::var("OBSIDIAN_WATCH")
             .unwrap_or_else(|_| "true".into())
@@ -345,24 +375,7 @@ impl Config {
             .unwrap_or(DEFAULT_HYBRID_ALPHA)
             .clamp(0.0, 1.0);
 
-        let embedding_provider = std::env::var("OBSIDIAN_EMBEDDING_PROVIDER")
-            .ok()
-            .and_then(|v| {
-                let trimmed = v.trim();
-                if trimmed.is_empty() {
-                    return None;
-                }
-                match EmbeddingProvider::parse(trimmed) {
-                    Some(p) => Some(p),
-                    None => {
-                        tracing::warn!(
-                            value = trimmed,
-                            "unknown OBSIDIAN_EMBEDDING_PROVIDER, ignoring"
-                        );
-                        None
-                    }
-                }
-            });
+        let embedding_provider = EmbeddingProvider::from_env()?;
 
         let tool_filter = match std::env::var("OBSIDIAN_TOOLS").ok() {
             Some(raw) if !raw.trim().is_empty() => ToolFilter::parse(raw.trim())?,
@@ -592,10 +605,6 @@ fn parse_u64_env(var_name: &str) -> Option<u64> {
 
 fn parse_u32_env(var_name: &str) -> Option<u32> {
     std::env::var(var_name).ok()?.trim().parse::<u32>().ok()
-}
-
-fn parse_u16_env(var_name: &str) -> Option<u16> {
-    std::env::var(var_name).ok()?.trim().parse::<u16>().ok()
 }
 
 fn parse_usize_env(var_name: &str) -> Option<usize> {

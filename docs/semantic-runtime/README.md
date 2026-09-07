@@ -1,4 +1,4 @@
-# Semantic Runtime (v1)
+# Semantic Runtime
 
 This directory defines the shared local semantic-search runtime contract used by:
 
@@ -63,7 +63,7 @@ This guarantees stable per-vault isolation and prevents cross-vault embedding re
 
 ## Versioning And Compatibility
 
-- Protocol/API contract version: `1`
+- Protocol/API contract version: `2`
 - Manifest schema version: `1`
 - Daemon must expose `daemon_api_version` in `health`.
 - Clients must send accepted API range in `health` handshake:
@@ -107,5 +107,5 @@ Rules:
 
 ## Contract Documents
 
-- Protocol: `docs/semantic-runtime/protocol-v1.md`
+- Protocol: `docs/semantic-runtime/protocol-v2.md`
 - Manifest: `docs/semantic-runtime/manifest-v1.md`

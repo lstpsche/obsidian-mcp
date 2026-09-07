@@ -50,14 +50,18 @@ struct HttpServer {
 
 impl HttpServer {
     async fn start(filter: &str) -> Self {
+        Self::start_on_host(filter, "127.0.0.1").await
+    }
+
+    async fn start_on_host(filter: &str, host: &str) -> Self {
         let vault = temporary_vault();
-        let port = TcpListener::bind(("127.0.0.1", 0))
+        let port = TcpListener::bind((host, 0))
             .unwrap()
             .local_addr()
             .unwrap()
             .port();
         let child = server_command(&vault)
-            .args(["--http", "--host", "127.0.0.1", "--port", &port.to_string()])
+            .args(["--http", "--host", host, "--port", &port.to_string()])
             .env("OBSIDIAN_TOOLS", filter)
             .spawn()
             .unwrap();
@@ -69,7 +73,10 @@ impl HttpServer {
                 .timeout(Duration::from_secs(10))
                 .build()
                 .unwrap(),
-            url: format!("http://127.0.0.1:{port}"),
+            url: format!(
+                "http://{}",
+                std::net::SocketAddr::new(host.parse().unwrap(), port)
+            ),
         };
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
@@ -683,4 +690,92 @@ async fn advertised_schemas_match_results_and_annotations_over_http() {
         );
     }
     server.stop().await;
+}
+
+#[tokio::test]
+async fn zero_search_limits_return_structured_empty_results() {
+    let server = HttpServer::start("full").await;
+    for options in [json!({"fuzzy": true}), json!({"fields": ["body"]})] {
+        let mut arguments = options;
+        arguments["query"] = json!("Transport");
+        arguments["max_results"] = json!(0);
+        let response = server
+            .request(
+                "tools/call",
+                json!({"name":"search_text", "arguments":arguments}),
+                MODERN,
+            )
+            .send()
+            .await
+            .unwrap();
+        let body = response.text().await.unwrap();
+        assert!(body.contains("structuredContent"), "{body}");
+        assert!(body.contains("\"results\":[]"), "{body}");
+    }
+}
+
+#[tokio::test]
+async fn unknown_daemon_argument_does_not_start_a_runtime() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("semantic");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_obsidian-semanticd"));
+    command
+        .arg("--build-info")
+        .env("OBSIDIAN_SEMANTIC_HOME", &home)
+        .env_remove("OBSIDIAN_SEMANTIC_ENDPOINT")
+        .kill_on_drop(true);
+    let output = timeout(Duration::from_secs(5), command.output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown argument"));
+    assert!(!home.exists());
+}
+
+#[tokio::test]
+async fn stop_uses_the_configured_ipv6_host_from_cli_and_environment() {
+    for use_env in [false, true] {
+        let mut server = HttpServer::start_on_host("full", "::1").await;
+        let port = reqwest::Url::parse(&server.url).unwrap().port().unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_obsidian-mcp"));
+        command
+            .args(["stop", "--port", &port.to_string()])
+            .kill_on_drop(true);
+        if use_env {
+            command.env("OBSIDIAN_HTTP_HOST", "::1");
+        } else {
+            command.args(["--host", "::1"]);
+        }
+        let (_, stopped) = timeout(Duration::from_secs(60), async {
+            tokio::join!(
+                async {
+                    let output = command.output().await.unwrap();
+                    assert!(
+                        output.status.success(),
+                        "stop failed: stdout={} stderr={}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    assert!(
+                        String::from_utf8_lossy(&output.stdout).contains("stopped"),
+                        "{}",
+                        String::from_utf8_lossy(&output.stdout)
+                    );
+                },
+                server.child.wait()
+            )
+        })
+        .await
+        .unwrap();
+        stopped.unwrap();
+        assert!(
+            server
+                .client
+                .get(format!("{}/health", server.url))
+                .send()
+                .await
+                .is_err()
+        );
+    }
 }
