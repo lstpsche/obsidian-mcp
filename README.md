@@ -537,10 +537,12 @@ Control which tools are exposed via the `OBSIDIAN_TOOLS` environment variable or
 |-------|--------|
 | `full` (or unset) | All 19 tools |
 | `core` | 15 tools — drops `search_semantic`, `wikilinks`, `periodic`, `open_in_obsidian` |
-| `read` | 11 tools — read-only (no create/write/insert/patch/delete/move) |
+| `read` | 10 tools — read-only (excludes all mutation tools, including `frontmatter`) |
 | `minimal` | 6 tools — `vault_list`, `vault_info`, `note_read`, `note_create`, `note_write`, `search_text` |
 | `tool1,tool2,...` | Allow-list — only the named tools |
 | `!tool1,!tool2,...` | Deny-list — all tools except the named ones |
+
+The `read` profile exposes frontmatter as part of the raw Markdown returned by `note_read`. For structured frontmatter `get`, `set`, and `remove` actions, use `full`, `core`, or an explicit allow-list containing `frontmatter` (for example, `OBSIDIAN_TOOLS=note_read,frontmatter`). Allowing `frontmatter` enables all three actions.
 
 ## Configuration
 

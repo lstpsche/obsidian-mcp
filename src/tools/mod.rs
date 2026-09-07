@@ -83,7 +83,6 @@ pub struct ObsidianMcp {
     vault: Vault,
     hybrid_alpha: f32,
     semantic_runtime: SemanticRuntime,
-    #[allow(dead_code)]
     pub tool_router: ToolRouter<Self>,
 }
 
@@ -348,7 +347,7 @@ impl ObsidianMcp {
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for ObsidianMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -386,6 +385,22 @@ mod tests {
         server: ObsidianMcp,
         name: &str,
         arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        request_raw(
+            server,
+            "tools/call",
+            serde_json::json!({
+                "name": name,
+                "arguments": arguments
+            }),
+        )
+        .await
+    }
+
+    async fn request_raw(
+        server: ObsidianMcp,
+        method: &str,
+        params: serde_json::Value,
     ) -> serde_json::Value {
         let (server_transport, client_transport) = tokio::io::duplex(1024 * 1024);
         let server_handle = tokio::spawn(async move {
@@ -426,11 +441,8 @@ mod tests {
         let mut call = serde_json::to_vec(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": 2,
-            "method": "tools/call",
-            "params": {
-                "name": name,
-                "arguments": arguments
-            }
+            "method": method,
+            "params": params
         }))
         .unwrap();
         call.push(b'\n');
@@ -445,55 +457,114 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_disabled_tools_exposes_all() {
+    async fn tool_filters_are_enforced_over_protocol() {
         let tmp = tempfile::tempdir().unwrap();
         create_test_vault(tmp.path());
         let vault = Vault::open(&test_config(tmp.path())).await.unwrap();
-        let server = ObsidianMcp::new(vault, 0.25, test_runtime(), HashSet::new());
-
-        for name in ALL_TOOL_NAMES {
-            assert!(
-                server.tool_router.has_route(name),
-                "expected tool '{name}' to be enabled"
-            );
+        for filter in [
+            "full",
+            "core",
+            "read",
+            "minimal",
+            "note_read,vault_list",
+            "!note_delete,!note_write",
+        ] {
+            let disabled = crate::config::ToolFilter::parse(filter)
+                .unwrap()
+                .disabled_tools();
+            let server = ObsidianMcp::new(vault.clone(), 0.25, test_runtime(), disabled.clone());
+            let response = request_raw(server, "tools/list", serde_json::json!({})).await;
+            let advertised: HashSet<&str> = response["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap())
+                .collect();
+            let expected: HashSet<&str> = ALL_TOOL_NAMES
+                .iter()
+                .copied()
+                .filter(|name| !disabled.contains(*name))
+                .collect();
+            assert_eq!(advertised, expected, "filter {filter}");
         }
+        let disabled = ALL_TOOL_NAMES.iter().map(|name| name.to_string()).collect();
+        let server = ObsidianMcp::new(vault, 0.25, test_runtime(), disabled);
+        let response = request_raw(server, "tools/list", serde_json::json!({})).await;
+        assert_eq!(response["result"]["tools"], serde_json::json!([]));
     }
 
     #[tokio::test]
-    async fn disabled_tools_are_hidden() {
+    async fn disabled_calls_are_rejected_before_execution_or_deserialization() {
         let tmp = tempfile::tempdir().unwrap();
         create_test_vault(tmp.path());
+        let path = tmp.path().join("note.md");
+        std::fs::write(&path, "Keep this note").unwrap();
         let vault = Vault::open(&test_config(tmp.path())).await.unwrap();
-
-        let disabled: HashSet<String> = ["open_in_obsidian", "wikilinks", "periodic"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let disabled = crate::config::ToolFilter::parse("read")
+            .unwrap()
+            .disabled_tools();
+        for (name, arguments) in [
+            (
+                "note_delete",
+                serde_json::json!({"path": "note.md", "confirm": true}),
+            ),
+            ("note_delete", serde_json::json!({})),
+            (
+                "frontmatter",
+                serde_json::json!({"action": "set", "path": "note.md", "key": "tag", "value": "changed"}),
+            ),
+            (
+                "frontmatter",
+                serde_json::json!({"action": "remove", "path": "note.md", "key": "tag"}),
+            ),
+        ] {
+            let server = ObsidianMcp::new(vault.clone(), 0.25, test_runtime(), disabled.clone());
+            let response = call_tool_raw(server, name, arguments).await;
+            assert_eq!(response["error"]["code"], -32602);
+            assert_eq!(response["error"]["message"], "tool not found");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "Keep this note");
+        }
         let server = ObsidianMcp::new(vault, 0.25, test_runtime(), disabled);
-
-        assert!(!server.tool_router.has_route("open_in_obsidian"));
-        assert!(!server.tool_router.has_route("wikilinks"));
-        assert!(!server.tool_router.has_route("periodic"));
-
-        assert!(server.tool_router.has_route("note_read"));
-        assert!(server.tool_router.has_route("vault_list"));
-        assert!(server.tool_router.has_route("search_text"));
+        let response =
+            call_tool_raw(server, "note_read", serde_json::json!({"path": "note.md"})).await;
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(response["result"]["content"][0]["text"], "Keep this note");
     }
 
     #[tokio::test]
-    async fn disable_all_tools_hides_everything() {
+    async fn frontmatter_remains_available_when_enabled() {
         let tmp = tempfile::tempdir().unwrap();
         create_test_vault(tmp.path());
         let vault = Vault::open(&test_config(tmp.path())).await.unwrap();
-
-        let disabled: HashSet<String> = ALL_TOOL_NAMES.iter().map(|s| s.to_string()).collect();
-        let server = ObsidianMcp::new(vault, 0.25, test_runtime(), disabled);
-
-        for name in ALL_TOOL_NAMES {
-            assert!(
-                !server.tool_router.has_route(name),
-                "expected tool '{name}' to be disabled"
-            );
+        for filter in ["full", "core", "frontmatter"] {
+            std::fs::write(tmp.path().join("note.md"), "Keep this note").unwrap();
+            let disabled = crate::config::ToolFilter::parse(filter)
+                .unwrap()
+                .disabled_tools();
+            let server = ObsidianMcp::new(vault.clone(), 0.25, test_runtime(), disabled.clone());
+            let response = call_tool_raw(
+                server,
+                "frontmatter",
+                serde_json::json!({
+                    "action": "set", "path": "note.md", "key": "tag", "value": "saved"
+                }),
+            )
+            .await;
+            assert!(response.get("error").is_none(), "{filter}: {response}");
+            let server = ObsidianMcp::new(vault.clone(), 0.25, test_runtime(), disabled);
+            let response = call_tool_raw(
+                server,
+                "frontmatter",
+                serde_json::json!({
+                    "action": "get", "path": "note.md"
+                }),
+            )
+            .await;
+            assert!(response.get("error").is_none(), "{filter}: {response}");
+            let properties: serde_json::Value =
+                serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(properties["tag"], "saved");
         }
     }
 

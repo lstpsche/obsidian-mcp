@@ -131,7 +131,6 @@ const PROFILE_READ: &[&str] = &[
     "search_metadata",
     "search_semantic",
     "note_inspect",
-    "frontmatter",
     "wikilinks",
     "vault_info",
 ];
@@ -710,6 +709,7 @@ mod tests {
     fn tool_filter_profile_read() {
         let filter = ToolFilter::parse("read").unwrap();
         assert_eq!(filter, ToolFilter::Profile("read".into()));
+        assert!(filter.disabled_tools().contains("frontmatter"));
         let disabled = filter.disabled_tools();
         assert_eq!(disabled.len(), ALL_TOOL_NAMES.len() - PROFILE_READ.len());
         assert!(disabled.contains("note_create"));
