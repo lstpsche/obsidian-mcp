@@ -3,7 +3,7 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-use rmcp::model::{CallToolResult, ContentBlock};
+use rmcp::model::CallToolResult;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -50,8 +50,7 @@ pub async fn vault_info(
         exclude_patterns: vault.exclude().patterns().to_vec(),
         mcp_data_dir,
     };
-    let json = serde_json::to_string_pretty(&info).map_err(|e| VaultError::Other(e.to_string()))?;
-    Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
+    super::output::json(&info)
 }
 
 // ── open_in_obsidian ────────────────────────────────────────────────────
@@ -98,10 +97,7 @@ pub async fn open_in_obsidian(
 
     launch_uri(&uri)?;
 
-    Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-        "Opened {} in Obsidian",
-        uri_path
-    ))]))
+    super::output::message(format!("Opened {} in Obsidian", uri_path))
 }
 
 /// Percent-encode a string for use in URI query parameters.

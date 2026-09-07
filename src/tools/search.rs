@@ -1,6 +1,6 @@
 //! Text, regex, tag, and frontmatter search tools across vault notes.
 
-use rmcp::model::{CallToolResult, ContentBlock, ErrorCode};
+use rmcp::model::{CallToolResult, ErrorCode};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -64,9 +64,7 @@ pub async fn search_text(
         all.into_iter().take(max_results).collect()
     };
 
-    let json = serde_json::to_string_pretty(&results)
-        .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
-    Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
+    super::output::results(results)
 }
 
 // ── search_regex ────────────────────────────────────────────────────
@@ -96,9 +94,7 @@ pub async fn search_regex(
     let results = vault.search_regex(&params.pattern, context_length)?;
     let limited: Vec<_> = results.into_iter().take(max_results).collect();
 
-    let json = serde_json::to_string_pretty(&limited)
-        .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
-    Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
+    super::output::results(limited)
 }
 
 // ── search_metadata ─────────────────────────────────────────────────
@@ -182,9 +178,7 @@ fn search_metadata_tag(
         vault.search_by_tag(tag)?
     };
 
-    let json = serde_json::to_string_pretty(&results)
-        .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
-    Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
+    super::output::results(results)
 }
 
 fn search_metadata_frontmatter(
@@ -224,9 +218,7 @@ fn search_metadata_frontmatter(
         }
     };
 
-    let json = serde_json::to_string_pretty(&results)
-        .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
-    Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
+    super::output::results(results)
 }
 
 // ── search_semantic ──────────────────────────────────────────────────
@@ -263,7 +255,7 @@ pub struct SearchSemanticParams {
 }
 
 #[derive(serde::Serialize, JsonSchema)]
-struct SemanticSearchResult {
+pub(super) struct SemanticSearchResult {
     path: std::path::PathBuf,
     title: String,
     score: f32,
@@ -337,9 +329,7 @@ pub async fn search_semantic(
     }
     .map_err(to_semantic_tool_error)?;
 
-    let json = serde_json::to_string_pretty(&results)
-        .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
-    Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
+    super::output::results(results)
 }
 
 fn semantic_candidate_limit(top_k: usize) -> usize {
@@ -1416,6 +1406,30 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn validate_semantic_output(result: &CallToolResult) {
+        let schema = serde_json::to_value(rmcp::handler::server::tool::schema_for_output::<
+            crate::tools::output::Results<Vec<SemanticSearchResult>>,
+        >())
+        .unwrap();
+        let structured = result.structured_content.as_ref().unwrap();
+        jsonschema::validator_for(&schema)
+            .unwrap()
+            .validate(structured)
+            .unwrap();
+        let text: Vec<serde_json::Value> = serde_json::from_str(extract_text(result)).unwrap();
+        let entries = structured["results"].as_array().unwrap();
+        assert_eq!(entries.len(), text.len());
+        for (structured, text) in entries.iter().zip(text) {
+            let mut structured = structured.clone();
+            let score = structured["score"].as_f64().unwrap();
+            let text_score = text["score"].as_f64().unwrap();
+            assert!((score - text_score).abs() < f32::EPSILON as f64);
+            structured["score"] = text["score"].clone();
+            assert_eq!(structured, text);
+        }
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn daemon_prefetch_overfetches_without_forcing_min_50() {
         let (_dir, vault) = setup_search_vault().await;
@@ -1448,6 +1462,7 @@ mod tests {
         )
         .await
         .expect("daemon search should succeed");
+        validate_semantic_output(&result);
         let parsed: Vec<serde_json::Value> =
             serde_json::from_str(extract_text(&result)).expect("parse result");
         assert!(parsed.is_empty(), "mock daemon returns empty result set");
@@ -1493,6 +1508,7 @@ mod tests {
         )
         .await
         .expect("daemon search should succeed");
+        validate_semantic_output(&result);
         let parsed: Vec<serde_json::Value> =
             serde_json::from_str(extract_text(&result)).expect("parse result");
         assert_eq!(parsed.len(), 1);
@@ -1539,6 +1555,7 @@ mod tests {
         )
         .await
         .expect("daemon search should succeed");
+        validate_semantic_output(&result);
         let parsed: Vec<serde_json::Value> =
             serde_json::from_str(extract_text(&result)).expect("parse result");
         assert_eq!(parsed.len(), 1);

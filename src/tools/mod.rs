@@ -4,6 +4,7 @@ pub mod graph;
 pub mod metadata;
 pub mod navigation;
 pub mod notes;
+mod output;
 pub mod periodic;
 pub mod search;
 pub mod utility;
@@ -13,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::schema_for_output;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{CallToolResult, ErrorData, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
@@ -116,6 +118,8 @@ impl ObsidianMcp {
 
     #[tool(
         name = "vault_list",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
+        output_schema = schema_for_output::<navigation::VaultListOutput>(),
         description = "List files and directories in the vault. Supports recursive listing, glob filtering, and tree view (format: \"tree\"). List mode returns a JSON array of paths, or objects with indexed title, tags, size, and timestamps when include_metadata is true. Tree mode returns a tree-formatted string."
     )]
     async fn vault_list(
@@ -129,17 +133,25 @@ impl ObsidianMcp {
 
     #[tool(
         name = "note_read",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
+        output_schema = schema_for_output::<output::TextOutput>(),
         description = "Read the full content of a note. Returns the raw markdown including frontmatter."
     )]
     async fn note_read(
         &self,
         Parameters(params): Parameters<notes::NoteReadParams>,
-    ) -> Result<String, ErrorData> {
-        notes::note_read(&self.vault, params).await
+    ) -> Result<CallToolResult, ErrorData> {
+        output::content(notes::note_read(&self.vault, params).await?)
     }
 
     #[tool(
         name = "note_read_many",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Read multiple notes in one bounded call. Provide exactly one of `paths` or `dir`; directory reads are non-recursive by default. The server inspects at most 100 files and returns at most 262144 combined content bytes. Oversized or unprocessed notes are reported in `skipped`; use note_read for an intentionally oversized note."
     )]
     async fn note_read_many(
@@ -151,28 +163,34 @@ impl ObsidianMcp {
 
     #[tool(
         name = "note_create",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false),
+        output_schema = schema_for_output::<output::MessageOutput>(),
         description = "Create a new note with optional content and YAML frontmatter. Parent directories are created automatically. Fails if the note already exists."
     )]
     async fn note_create(
         &self,
         Parameters(params): Parameters<notes::NoteCreateParams>,
-    ) -> Result<String, ErrorData> {
-        notes::note_create(&self.vault, params).await
+    ) -> Result<CallToolResult, ErrorData> {
+        output::message(notes::note_create(&self.vault, params).await?)
     }
 
     #[tool(
         name = "note_write",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false),
+        output_schema = schema_for_output::<output::MessageOutput>(),
         description = "Overwrite a note's entire content. The note must already exist."
     )]
     async fn note_write(
         &self,
         Parameters(params): Parameters<notes::NoteWriteParams>,
-    ) -> Result<String, ErrorData> {
-        notes::note_write(&self.vault, params).await
+    ) -> Result<CallToolResult, ErrorData> {
+        output::message(notes::note_write(&self.vault, params).await?)
     }
 
     #[tool(
         name = "note_insert",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false),
+        output_schema = schema_for_output::<output::MessageOutput>(),
         description = "Insert content into an existing note. \
             Position: \"end\" (default) appends after existing content; \
             \"beginning\" inserts after frontmatter (or at the very start if none)."
@@ -180,47 +198,55 @@ impl ObsidianMcp {
     async fn note_insert(
         &self,
         Parameters(params): Parameters<notes::NoteInsertParams>,
-    ) -> Result<String, ErrorData> {
-        notes::note_insert(&self.vault, params).await
+    ) -> Result<CallToolResult, ErrorData> {
+        output::message(notes::note_insert(&self.vault, params).await?)
     }
 
     #[tool(
         name = "note_patch",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false),
+        output_schema = schema_for_output::<output::MessageOutput>(),
         description = "Patch a specific section of a note by targeting a heading, block reference, or frontmatter field. Supports append, prepend, and replace operations. Heading targets use bare text such as \"Log\"; ATX marker-prefixed targets such as \"## Log\" are also accepted."
     )]
     async fn note_patch(
         &self,
         Parameters(params): Parameters<notes::NotePatchParams>,
-    ) -> Result<String, ErrorData> {
-        notes::note_patch(&self.vault, params).await
+    ) -> Result<CallToolResult, ErrorData> {
+        output::message(notes::note_patch(&self.vault, params).await?)
     }
 
     #[tool(
         name = "note_delete",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false),
+        output_schema = schema_for_output::<output::MessageOutput>(),
         description = "Delete a note from the vault. Requires `confirm: true` as a safety check to prevent accidental data loss."
     )]
     async fn note_delete(
         &self,
         Parameters(params): Parameters<notes::NoteDeleteParams>,
-    ) -> Result<String, ErrorData> {
-        notes::note_delete(&self.vault, params).await
+    ) -> Result<CallToolResult, ErrorData> {
+        output::message(notes::note_delete(&self.vault, params).await?)
     }
 
     #[tool(
         name = "note_move",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false),
+        output_schema = schema_for_output::<output::MessageOutput>(),
         description = "Move or rename a note. Parent directories at the destination are created automatically."
     )]
     async fn note_move(
         &self,
         Parameters(params): Parameters<notes::NoteMoveParams>,
-    ) -> Result<String, ErrorData> {
-        notes::note_move(&self.vault, params).await
+    ) -> Result<CallToolResult, ErrorData> {
+        output::message(notes::note_move(&self.vault, params).await?)
     }
 
     // ── Search ──────────────────────────────────────────────────────
 
     #[tool(
         name = "search_text",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
+        output_schema = schema_for_output::<output::Results<Vec<crate::models::SearchResult>>>(),
         description = "BM25-ranked full-text search across all notes. Returns matching files with relevance scores and context snippets. Supports stemming (e.g. 'program' matches 'programming'), optional fuzzy matching for typo tolerance, and field-level filtering."
     )]
     async fn search_text(
@@ -232,6 +258,8 @@ impl ObsidianMcp {
 
     #[tool(
         name = "search_regex",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
+        output_schema = schema_for_output::<output::Results<Vec<crate::models::SearchResult>>>(),
         description = "Search across all notes using a regular expression pattern. Returns matching files with context snippets."
     )]
     async fn search_regex(
@@ -243,6 +271,8 @@ impl ObsidianMcp {
 
     #[tool(
         name = "search_metadata",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
+        output_schema = schema_for_output::<output::Results<Vec<crate::models::NoteMetadata>>>(),
         description = "Search notes by metadata. Set type=\"tag\" to find notes with a specific tag (both inline #tags and frontmatter tags), or type=\"frontmatter\" to query by frontmatter field value. For tags: provide `tag` (required) and optional `include_nested`. For frontmatter: provide `field` (required), optional `operator` (eq/contains/exists), and `value` (required for eq/contains)."
     )]
     async fn search_metadata(
@@ -254,6 +284,8 @@ impl ObsidianMcp {
 
     #[tool(
         name = "search_semantic",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = true),
+        output_schema = schema_for_output::<output::Results<Vec<search::SemanticSearchResult>>>(),
         description = "Semantic search using daemon-backed runtime (preferred) with local compatibility fallback based on OBSIDIAN_SEMANTIC_MODE. Finds conceptually related notes without requiring exact keyword matches."
     )]
     async fn search_semantic(
@@ -273,6 +305,8 @@ impl ObsidianMcp {
 
     #[tool(
         name = "note_inspect",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
+        output_schema = schema_for_output::<metadata::NoteInspectOutput>(),
         description = "Inspect a note. Views: \"metadata\" (default) returns tags, headings, outgoing links, block refs, backlinks count, frontmatter, and file stats. \"targets\" lists patchable headings with Markdown level markers, block refs, and frontmatter fields (use before note_patch)."
     )]
     async fn note_inspect(
@@ -284,6 +318,8 @@ impl ObsidianMcp {
 
     #[tool(
         name = "frontmatter",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false),
+        output_schema = schema_for_output::<metadata::FrontmatterOutput>(),
         description = "Read, set, or remove frontmatter fields on a note. Actions: \"get\" returns all frontmatter as JSON (or null), \"set\" upserts a field (requires key + value), \"remove\" deletes a field (requires key)."
     )]
     async fn frontmatter(
@@ -297,6 +333,8 @@ impl ObsidianMcp {
 
     #[tool(
         name = "wikilinks",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
+        output_schema = schema_for_output::<graph::WikilinksOutput>(),
         description = "Query the vault's wikilink graph. Queries: \"backlinks\" (requires path) finds notes linking TO a note, \"outgoing\" (requires path) finds links FROM a note with resolution status, \"broken\" (optional path) finds unresolved wikilinks, \"orphans\" finds disconnected notes."
     )]
     async fn wikilinks(
@@ -310,6 +348,8 @@ impl ObsidianMcp {
 
     #[tool(
         name = "periodic",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false),
+        output_schema = schema_for_output::<periodic::PeriodicOutput>(),
         description = "Manage periodic notes (daily, weekly, monthly, quarterly, yearly). \
             Actions: \"get\" — read note content (params: period, date?); \
             \"create\" — create from template or custom content (params: period, date?, content?); \
@@ -318,7 +358,7 @@ impl ObsidianMcp {
     async fn periodic(
         &self,
         Parameters(params): Parameters<periodic::PeriodicParams>,
-    ) -> Result<String, ErrorData> {
+    ) -> Result<CallToolResult, ErrorData> {
         periodic::periodic(&self.vault, params).await
     }
 
@@ -326,6 +366,8 @@ impl ObsidianMcp {
 
     #[tool(
         name = "vault_info",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
+        output_schema = schema_for_output::<utility::VaultInfo>(),
         description = "Return aggregate vault statistics: total notes, files, tags, links, and vault size in bytes."
     )]
     async fn vault_info(
@@ -337,6 +379,8 @@ impl ObsidianMcp {
 
     #[tool(
         name = "open_in_obsidian",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false),
+        output_schema = schema_for_output::<output::MessageOutput>(),
         description = "Open a note in the Obsidian desktop app via the obsidian:// URI scheme. Requires Obsidian to be installed."
     )]
     async fn open_in_obsidian(

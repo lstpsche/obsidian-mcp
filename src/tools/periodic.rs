@@ -1,9 +1,9 @@
 //! Periodic note tool — unified handler for daily, weekly, monthly, quarterly, yearly notes.
 
 use chrono::NaiveDate;
-use rmcp::model::ErrorCode;
+use rmcp::model::{CallToolResult, ErrorCode};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::models::NotePeriod;
 use crate::vault::Vault;
@@ -35,23 +35,62 @@ pub struct PeriodicParams {
     pub limit: Option<usize>,
 }
 
-pub async fn periodic(vault: &Vault, params: PeriodicParams) -> Result<String, rmcp::ErrorData> {
+#[derive(Serialize, JsonSchema)]
+#[serde(tag = "action", rename_all = "snake_case")]
+#[schemars(extend("type" = "object"))]
+pub(super) enum PeriodicOutput {
+    Get {
+        content: String,
+    },
+    Create {
+        path: std::path::PathBuf,
+        message: String,
+    },
+    List {
+        results: Vec<PeriodicEntry>,
+    },
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(super) struct PeriodicEntry {
+    /// Filename stem in the configured periodic-note date format.
+    date: String,
+    path: std::path::PathBuf,
+}
+
+pub async fn periodic(
+    vault: &Vault,
+    params: PeriodicParams,
+) -> Result<CallToolResult, rmcp::ErrorData> {
     match params.action.to_ascii_lowercase().as_str() {
         "get" => {
             let date = params.date.map(|s| parse_date(&s)).transpose()?;
-            Ok(vault.get_periodic_note(&params.period, date)?)
+            let content = vault.get_periodic_note(&params.period, date)?;
+            super::output::with_text(
+                &PeriodicOutput::Get {
+                    content: content.clone(),
+                },
+                content,
+            )
         }
         "create" => {
             let date = params.date.map(|s| parse_date(&s)).transpose()?;
             let path =
                 vault.create_periodic_note(&params.period, date, params.content.as_deref())?;
-            Ok(format!("Created: {}", path.display()))
+            let message = format!("Created: {}", path.display());
+            super::output::with_text(
+                &PeriodicOutput::Create {
+                    path,
+                    message: message.clone(),
+                },
+                message,
+            )
         }
         "list" => {
             let limit = params.limit.unwrap_or(10);
             let paths = vault.list_recent_periodic_notes(&params.period, limit)?;
 
-            let items: Vec<serde_json::Value> = paths
+            let items: Vec<PeriodicEntry> = paths
                 .into_iter()
                 .map(|p| {
                     let date = p
@@ -59,17 +98,18 @@ pub async fn periodic(vault: &Vault, params: PeriodicParams) -> Result<String, r
                         .and_then(|s| s.to_str())
                         .unwrap_or_default()
                         .to_string();
-                    serde_json::json!({ "path": p.to_string_lossy(), "date": date })
+                    PeriodicEntry { path: p, date }
                 })
                 .collect();
 
-            serde_json::to_string_pretty(&items).map_err(|e| {
+            let text = serde_json::to_string_pretty(&items).map_err(|e| {
                 rmcp::ErrorData::new(
                     ErrorCode::INTERNAL_ERROR,
                     e.to_string(),
                     None::<serde_json::Value>,
                 )
-            })
+            })?;
+            super::output::with_text(&PeriodicOutput::List { results: items }, text)
         }
         other => Err(rmcp::ErrorData::new(
             ErrorCode::INVALID_PARAMS,
@@ -84,7 +124,7 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::test_helpers::{create_test_vault, test_config};
+    use crate::test_helpers::{create_test_vault, extract_text, test_config};
 
     fn setup_daily_config(dir: &std::path::Path) {
         create_test_vault(dir);
@@ -149,7 +189,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let items: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        let items: Vec<serde_json::Value> = serde_json::from_str(extract_text(&result)).unwrap();
         assert!(items.is_empty());
     }
 
@@ -170,7 +210,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(msg.contains("Created"));
+        assert!(extract_text(&msg).contains("Created"));
 
         let content = periodic(
             &vault,
@@ -182,6 +222,6 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(content.contains("hello periodic"));
+        assert!(extract_text(&content).contains("hello periodic"));
     }
 }

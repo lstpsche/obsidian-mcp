@@ -468,3 +468,219 @@ async fn stdio_keeps_the_legacy_initialize_and_tool_call_flow() {
             .success()
     );
 }
+
+fn validate_output(tool: &Value, result: &Value) {
+    assert_ne!(result["isError"], true, "{result}");
+    let structured = result.get("structuredContent").expect("structured result");
+    let validator = jsonschema::validator_for(&tool["outputSchema"]).unwrap();
+    let errors: Vec<_> = validator
+        .iter_errors(structured)
+        .map(|e| e.to_string())
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "{}: {errors:?}; {structured}",
+        tool["name"]
+    );
+    assert!(
+        !validator.is_valid(&json!({})),
+        "{} must describe required result fields",
+        tool["name"]
+    );
+
+    let text = result["content"][0]["text"].as_str().unwrap();
+    if tool["name"] == "frontmatter" && structured["action"] == "get" {
+        assert_eq!(
+            serde_json::from_str::<Value>(text).unwrap(),
+            structured["frontmatter"]
+        );
+    } else if let Some(message) = structured.get("message") {
+        assert_eq!(text, message.as_str().unwrap());
+    } else if let Some(content) = structured.get("content") {
+        assert_eq!(text, content.as_str().unwrap());
+    } else if let Some(results) = structured.get("results") {
+        assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *results);
+    } else {
+        assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *structured);
+    }
+}
+
+#[tokio::test]
+async fn advertised_schemas_match_results_and_annotations_over_http() {
+    let server = HttpServer::start("full").await;
+    std::fs::create_dir_all(server.vault.path().join(".obsidian")).unwrap();
+    std::fs::write(
+        server.vault.path().join(".obsidian/daily-notes.json"),
+        r#"{"format":"YYYY-MM-DD","folder":"Daily"}"#,
+    )
+    .unwrap();
+    let listing = rpc_response(
+        server
+            .request("tools/list", json!({}), MODERN)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    let tools = listing["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 19);
+    let readonly = [
+        "vault_list",
+        "vault_info",
+        "note_read",
+        "note_read_many",
+        "note_inspect",
+        "search_text",
+        "search_regex",
+        "search_metadata",
+        "search_semantic",
+        "wikilinks",
+    ];
+    let destructive = [
+        "note_write",
+        "note_patch",
+        "note_delete",
+        "note_move",
+        "frontmatter",
+    ];
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap();
+        assert_eq!(tool["outputSchema"]["type"], "object", "{name}");
+        jsonschema::meta::validate(&tool["inputSchema"]).unwrap();
+        jsonschema::meta::validate(&tool["outputSchema"]).unwrap();
+        jsonschema::validator_for(&tool["inputSchema"]).unwrap();
+        jsonschema::validator_for(&tool["outputSchema"]).unwrap();
+        assert_eq!(
+            tool["annotations"]["readOnlyHint"],
+            readonly.contains(&name),
+            "{name}"
+        );
+        assert_eq!(
+            tool["annotations"]["destructiveHint"],
+            destructive.contains(&name),
+            "{name}"
+        );
+        assert_eq!(
+            tool["annotations"]["idempotentHint"],
+            readonly.contains(&name) || name == "note_write",
+            "{name}"
+        );
+        assert_eq!(
+            tool["annotations"]["openWorldHint"],
+            name == "search_semantic",
+            "{name}"
+        );
+    }
+    let mut covered = std::collections::HashSet::new();
+    for (name, arguments) in [
+        ("vault_info", json!({})),
+        ("vault_list", json!({"glob":"absent*"})),
+        ("vault_list", json!({})),
+        ("vault_list", json!({"include_metadata":true})),
+        ("vault_list", json!({"format":"tree"})),
+        ("note_read", json!({"path":"note.md"})),
+        ("note_read_many", json!({"paths":["note.md"]})),
+        (
+            "note_create",
+            json!({"path":"schema.md","content":"# Schema\nhello #schema [[note]]\n"}),
+        ),
+        ("note_inspect", json!({"path":"schema.md"})),
+        ("note_inspect", json!({"path":"schema.md","view":"targets"})),
+        ("frontmatter", json!({"action":"get","path":"schema.md"})),
+        (
+            "frontmatter",
+            json!({"action":"set","path":"schema.md","key":"value","value":null}),
+        ),
+        (
+            "frontmatter",
+            json!({"action":"set","path":"schema.md","key":"tags","value":["schema"]}),
+        ),
+        ("frontmatter", json!({"action":"GET","path":"schema.md"})),
+        (
+            "frontmatter",
+            json!({"action":"remove","path":"schema.md","key":"value"}),
+        ),
+        ("search_text", json!({"query":"Schema"})),
+        ("search_text", json!({"query":"doesnotexist"})),
+        ("search_regex", json!({"pattern":"Schema"})),
+        ("search_metadata", json!({"type":"tag","tag":"schema"})),
+        (
+            "search_metadata",
+            json!({"type":"frontmatter","field":"tags","value":"schema"}),
+        ),
+        ("wikilinks", json!({"query":"backlinks","path":"note.md"})),
+        ("wikilinks", json!({"query":"outgoing","path":"schema.md"})),
+        ("wikilinks", json!({"query":"broken"})),
+        ("wikilinks", json!({"query":"orphans"})),
+        ("periodic", json!({"action":"list","period":"daily"})),
+        (
+            "periodic",
+            json!({"action":"create","period":"daily","date":"2026-01-01","content":"Daily content"}),
+        ),
+        (
+            "periodic",
+            json!({"action":"get","period":"daily","date":"2026-01-01"}),
+        ),
+        ("periodic", json!({"action":"list","period":"daily"})),
+        (
+            "note_write",
+            json!({"path":"schema.md","content":"# Schema\nbody\n"}),
+        ),
+        ("note_insert", json!({"path":"schema.md","content":"more"})),
+        (
+            "note_patch",
+            json!({"path":"schema.md","operation":"append","target_type":"heading","target":"Schema","content":"patched"}),
+        ),
+        ("note_move", json!({"from":"schema.md","to":"moved.md"})),
+        ("note_delete", json!({"path":"moved.md","confirm":true})),
+    ] {
+        let response = rpc_response(
+            server
+                .request(
+                    "tools/call",
+                    json!({"name":name,"arguments":arguments}),
+                    MODERN,
+                )
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(response.get("error").is_none(), "{name}: {response}");
+        let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+        validate_output(tool, &response["result"]);
+        covered.insert(name);
+    }
+    assert_eq!(covered.len(), 17); // Desktop launch and semantic inference require separate fixtures.
+    for (name, arguments) in [
+        ("note_read", json!({"path":"missing.md"})),
+        (
+            "frontmatter",
+            json!({"path":"note.md","action":"set","key":"x"}),
+        ),
+        ("search_regex", json!({"pattern":"["})),
+        ("search_semantic", json!({"query":"Schema"})),
+        ("open_in_obsidian", json!({"path":"../../outside.md"})),
+    ] {
+        let response = server
+            .request(
+                "tools/call",
+                json!({"name":name,"arguments":arguments}),
+                MODERN,
+            )
+            .send()
+            .await
+            .unwrap();
+        assert!(matches!(response.status().as_u16(), 200 | 400));
+        let response: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+        assert!(
+            response.get("error").is_some() || response["result"]["isError"] == true,
+            "{name}: {response}"
+        );
+        assert!(
+            response["result"].get("structuredContent").is_none(),
+            "errors must not masquerade as successful output"
+        );
+    }
+    server.stop().await;
+}

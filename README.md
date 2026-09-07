@@ -491,6 +491,12 @@ Always available. Full regex syntax for pattern matching across all notes.
 | `note_delete` | `path`, `confirm` | Delete a note (requires `confirm: true`) |
 | `note_move` | `from`, `to` | Move or rename a note |
 
+Every tool advertises an object-shaped `outputSchema` and returns matching `structuredContent`. Text responses retain their existing format: Markdown for note reads, JSON arrays for searches and listings, and confirmation messages for writes. Structured results use `content` for text, `results` for collections, and `message` for confirmations. `vault_info`, `note_inspect`, and `note_read_many` retain their domain-specific fields; `periodic` includes an `action` discriminator.
+
+For `frontmatter`, structured results use `{ "action": "get", "frontmatter": ... }`, with `null` when frontmatter is absent, or `{ "action": "set" | "remove", "message": ... }`. Clients consuming the previous bare structured frontmatter object must read `structuredContent.frontmatter`; the JSON text response is unchanged.
+
+Tools explicitly advertise read-only, destructive, idempotent, and open-world annotations. Mixed-action tools use conservative annotations covering every action: `frontmatter` is destructive, while `periodic` can create notes. Semantic search is open-world because it may use a configured external embedding API. These annotations describe behavior; tool filtering and vault path validation enforce access. After upgrading, refresh the connected app in ChatGPT to reload tool schemas and annotations.
+
 `note_read_many` preserves explicit path order or uses sorted directory order; directory reads are non-recursive by default. It inspects 20 files and returns up to 65,536 content bytes by default, with hard caps of 100 files and 262,144 content bytes. `max_bytes` counts only the UTF-8 bytes in returned note content. The response includes `notes`, bounded `skipped` details (at most 100), total `skipped_count`, and `content_bytes`. Oversized notes are skipped—even when first—and can be fetched deliberately with `note_read`. The typed MCP result is emitted as both `structuredContent` and compatibility JSON text.
 
 For `note_patch` heading targets, bare heading text such as `"Log"` is canonical. ATX marker-prefixed targets such as `"## Log"` are also accepted, so headings copied from `note_inspect` with `view: "targets"` can be used directly.

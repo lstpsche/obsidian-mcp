@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rmcp::model::{CallToolResult, ContentBlock, ErrorCode};
+use rmcp::model::{CallToolResult, ErrorCode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -22,7 +22,7 @@ pub struct NoteInspectParams {
 }
 
 #[derive(Serialize, JsonSchema)]
-struct NoteMetadataOutput {
+pub(super) struct NoteMetadataOutput {
     path: PathBuf,
     title: String,
     tags: Vec<String>,
@@ -32,6 +32,31 @@ struct NoteMetadataOutput {
     block_refs: Vec<String>,
     backlinks_count: usize,
     stat: FileStat,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(untagged)]
+#[schemars(extend("type" = "object"))]
+pub(super) enum NoteInspectOutput {
+    Metadata(NoteMetadataOutput),
+    Targets(crate::models::DocumentMap),
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(tag = "action", rename_all = "snake_case")]
+#[schemars(extend("type" = "object"))]
+pub(super) enum FrontmatterOutput {
+    Get {
+        /// The note's properties, or null when no frontmatter is present.
+        #[schemars(required, schema_with = "super::json_value_schema")]
+        frontmatter: Option<serde_json::Value>,
+    },
+    Set {
+        message: String,
+    },
+    Remove {
+        message: String,
+    },
 }
 
 /// Inspect a note's metadata or patch targets.
@@ -74,7 +99,7 @@ async fn note_inspect_metadata(
         stat: meta.stat,
     };
 
-    let value = serde_json::to_value(output)
+    let value = serde_json::to_value(NoteInspectOutput::Metadata(output))
         .map_err(|e| VaultError::Other(format!("serialization error: {e}")))?;
     Ok(CallToolResult::structured(value))
 }
@@ -86,7 +111,7 @@ async fn note_inspect_targets(
     let path = Path::new(note_path);
     let map = vault.get_document_map(path)?;
 
-    let value = serde_json::to_value(map)
+    let value = serde_json::to_value(NoteInspectOutput::Targets(map))
         .map_err(|e| VaultError::Other(format!("serialization error: {e}")))?;
     Ok(CallToolResult::structured(value))
 }
@@ -121,10 +146,9 @@ pub async fn frontmatter(
 
     if params.action.eq_ignore_ascii_case("get") {
         let fm = vault.get_frontmatter(path)?;
-        match fm {
-            Some(value) => Ok(CallToolResult::structured(value)),
-            None => Ok(CallToolResult::success(vec![ContentBlock::text("null")])),
-        }
+        let text = serde_json::to_string(&fm)
+            .map_err(|error| VaultError::Other(format!("JSON serialization failed: {error}")))?;
+        super::output::with_text(&FrontmatterOutput::Get { frontmatter: fm }, text)
     } else if params.action.eq_ignore_ascii_case("set") {
         let key = params.key.as_deref().ok_or_else(|| {
             rmcp::ErrorData::new(
@@ -141,10 +165,13 @@ pub async fn frontmatter(
             )
         })?;
         vault.set_frontmatter_field(path, key, value)?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-            "Set frontmatter field '{key}' on '{}'",
-            params.path
-        ))]))
+        let message = format!("Set frontmatter field '{key}' on '{}'", params.path);
+        super::output::with_text(
+            &FrontmatterOutput::Set {
+                message: message.clone(),
+            },
+            message,
+        )
     } else if params.action.eq_ignore_ascii_case("remove") {
         let key = params.key.as_deref().ok_or_else(|| {
             rmcp::ErrorData::new(
@@ -154,10 +181,13 @@ pub async fn frontmatter(
             )
         })?;
         vault.remove_frontmatter_field(path, key)?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-            "Removed frontmatter field '{key}' from '{}'",
-            params.path
-        ))]))
+        let message = format!("Removed frontmatter field '{key}' from '{}'", params.path);
+        super::output::with_text(
+            &FrontmatterOutput::Remove {
+                message: message.clone(),
+            },
+            message,
+        )
     } else {
         Err(rmcp::ErrorData::new(
             ErrorCode::INVALID_PARAMS,
@@ -383,7 +413,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(result.structured_content.is_none());
+        assert_eq!(
+            result.structured_content,
+            Some(serde_json::json!({"action": "get", "frontmatter": null}))
+        );
         let text = result.content[0].as_text().expect("expected text content");
         assert_eq!(text.text, "null");
 
@@ -409,7 +442,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let fm = result.structured_content.unwrap();
+        let fm = result.structured_content.unwrap()["frontmatter"].clone();
         assert_eq!(fm["status"], "draft");
 
         frontmatter(
@@ -434,7 +467,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let fm = result.structured_content.unwrap();
+        let fm = result.structured_content.unwrap()["frontmatter"].clone();
         assert_eq!(fm["status"], "draft");
         assert_eq!(fm["tags"], serde_json::json!(["rust", "mcp"]));
 
@@ -465,7 +498,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let fm = result.structured_content.unwrap();
+        let fm = result.structured_content.unwrap()["frontmatter"].clone();
         assert_eq!(fm["empty"], serde_json::Value::Null);
         assert_eq!(fm["literal_json"], "[\"rust\",\"mcp\"]");
 
@@ -491,7 +524,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let fm = result.structured_content.unwrap();
+        let fm = result.structured_content.unwrap()["frontmatter"].clone();
         assert!(fm.get("status").is_none());
         assert_eq!(fm["tags"], serde_json::json!(["rust", "mcp"]));
     }

@@ -3,11 +3,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use rmcp::model::{CallToolResult, ContentBlock, ErrorCode};
+use rmcp::model::{CallToolResult, ErrorCode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::error::VaultError;
 use crate::vault::Vault;
 
 // ── param struct ────────────────────────────────────────────────────
@@ -87,10 +86,15 @@ pub struct OrphanNoteEntry {
 
 // ── handler functions ───────────────────────────────────────────────
 
-fn to_json_text(value: &impl Serialize) -> Result<CallToolResult, rmcp::ErrorData> {
-    let json = serde_json::to_string_pretty(value)
-        .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
-    Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
+pub(super) type WikilinksOutput = super::output::Results<WikilinkEntries>;
+
+#[derive(Serialize, JsonSchema)]
+#[serde(untagged)]
+pub(super) enum WikilinkEntries {
+    Backlinks(Vec<BacklinkSource>),
+    Outgoing(Vec<OutgoingLink>),
+    Broken(Vec<BrokenLink>),
+    Orphans(Vec<OrphanNoteEntry>),
 }
 
 fn has_resolved_target(vault: &Vault, target: &str) -> bool {
@@ -174,7 +178,7 @@ async fn wikilinks_backlinks(
         })
         .collect();
 
-    to_json_text(&result)
+    super::output::results(WikilinkEntries::Backlinks(result))
 }
 
 async fn wikilinks_outgoing(
@@ -202,7 +206,7 @@ async fn wikilinks_outgoing(
         })
         .collect();
 
-    to_json_text(&result)
+    super::output::results(WikilinkEntries::Outgoing(result))
 }
 
 async fn wikilinks_broken(
@@ -238,7 +242,7 @@ async fn wikilinks_broken(
         }
     };
 
-    to_json_text(&result)
+    super::output::results(WikilinkEntries::Broken(result))
 }
 
 async fn wikilinks_orphans(vault: &Vault) -> Result<CallToolResult, rmcp::ErrorData> {
@@ -292,7 +296,7 @@ async fn wikilinks_orphans(vault: &Vault) -> Result<CallToolResult, rmcp::ErrorD
     }
 
     disconnected.sort_by(|a, b| a.path.cmp(&b.path));
-    to_json_text(&disconnected)
+    super::output::results(WikilinkEntries::Orphans(disconnected))
 }
 
 #[cfg(test)]

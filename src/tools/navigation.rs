@@ -4,11 +4,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use rmcp::model::{CallToolResult, ContentBlock, ErrorCode};
+use rmcp::model::{CallToolResult, ErrorCode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::error::VaultError;
 use crate::vault::Vault;
 
 /// Parameters for the `vault_list` tool.
@@ -28,8 +27,8 @@ pub struct VaultListParams {
     pub include_metadata: Option<bool>,
 }
 
-#[derive(Serialize)]
-struct VaultListEntry {
+#[derive(Serialize, JsonSchema)]
+pub(super) struct VaultListEntry {
     path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     title: Option<String>,
@@ -41,6 +40,21 @@ struct VaultListEntry {
     created: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     modified: Option<DateTime<Utc>>,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(untagged)]
+#[schemars(extend("type" = "object"))]
+pub(super) enum VaultListOutput {
+    List(super::output::Results<VaultListEntries>),
+    Tree(super::output::TextOutput),
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(untagged)]
+pub(super) enum VaultListEntries {
+    Paths(Vec<String>),
+    Metadata(Vec<VaultListEntry>),
 }
 
 impl VaultListEntry {
@@ -104,7 +118,7 @@ fn vault_list_flat(
         .filter_map(|p| p.to_str())
         .collect();
 
-    let json = if params.include_metadata.unwrap_or(false) {
+    let entries = if params.include_metadata.unwrap_or(false) {
         let metadata =
             vault.get_indexed_note_metadata_batch(paths.iter().map(|path| Path::new(*path)));
         let entries = paths
@@ -133,13 +147,17 @@ fn vault_list_flat(
                 }
             })
             .collect::<Vec<_>>();
-        serde_json::to_string_pretty(&entries)
+        VaultListEntries::Metadata(entries)
     } else {
-        serde_json::to_string_pretty(&paths)
-    }
-    .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
-
-    Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
+        VaultListEntries::Paths(paths.into_iter().map(str::to_owned).collect())
+    };
+    let text = serde_json::to_string_pretty(&entries).map_err(|error| {
+        crate::error::VaultError::Other(format!("JSON serialization failed: {error}"))
+    })?;
+    super::output::with_text(
+        &VaultListOutput::List(super::output::Results { results: entries }),
+        text,
+    )
 }
 
 fn vault_list_tree(
@@ -179,7 +197,12 @@ fn vault_list_tree(
         output.pop();
     }
 
-    Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
+    super::output::with_text(
+        &VaultListOutput::Tree(super::output::TextOutput {
+            content: output.clone(),
+        }),
+        output,
+    )
 }
 
 struct TreeNode {
