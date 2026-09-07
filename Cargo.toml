@@ -1,6 +1,6 @@
 [package]
 name = "obsidian-mcp"
-version = "2.5.2"
+version = "3.0.0"
 edition = "2024"
 description = "MCP server for Obsidian vaults — direct filesystem access for AI agents"
 license = "MIT"
