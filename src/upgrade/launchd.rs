@@ -155,31 +155,7 @@ fn restart_inner<E: CommandExecutor>(
     }
     checked_output(executor, "launchctl", &["kickstart", "-k", &service])?;
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    let restarted_pid = loop {
-        let running = running_agents(executor)?;
-        if let Some(pid) = running
-            .iter()
-            .find_map(|(label, pid)| (label == &target.id).then_some(*pid))
-            && pid != active_pid
-        {
-            break pid;
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(UpgradeError::Activation(format!(
-                "LaunchAgent '{}' did not report a new running process",
-                target.id
-            )));
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    };
-    if !process_matches(executor, restarted_pid, &target.executable)? {
-        return Err(UpgradeError::Activation(format!(
-            "restarted LaunchAgent '{}' no longer runs '{}'",
-            target.id,
-            target.executable.display()
-        )));
-    }
+    wait_for_executable(executor, target, active_pid, Duration::from_secs(15))?;
     let observation = health::wait_for_version(
         &target.host,
         target.port,
@@ -187,6 +163,42 @@ fn restart_inner<E: CommandExecutor>(
         Duration::from_secs(15),
     )?;
     Ok(observation.version)
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_executable<E: CommandExecutor>(
+    executor: &E,
+    target: &ServiceTarget,
+    previous_pid: u32,
+    timeout: Duration,
+) -> Result<(), UpgradeError> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let pid = running_agents(executor)?
+            .into_iter()
+            .find_map(|(label, pid)| (label == target.id).then_some(pid));
+        // launchd can report a new PID before that process has exec'd the program.
+        let diagnostic = match pid {
+            Some(pid) if pid != previous_pid => {
+                match process_matches(executor, pid, &target.executable) {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => format!(
+                        "process {pid} does not yet run '{}'",
+                        target.executable.display()
+                    ),
+                    Err(error) => error.to_string(),
+                }
+            }
+            _ => "no new running process was reported".into(),
+        };
+        if std::time::Instant::now() >= deadline {
+            return Err(UpgradeError::Activation(format!(
+                "timed out verifying restarted LaunchAgent '{}': {diagnostic}",
+                target.id
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -466,6 +478,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     struct FakeRestart {
         fail_restart: bool,
+        startup_mismatches: usize,
+        startup_inspection_errors: usize,
         commands: Mutex<Vec<String>>,
         executable: String,
     }
@@ -501,8 +515,24 @@ mod tests {
                     stderr: b"kickstart rejected".to_vec(),
                 });
             }
+            if program == "lsof"
+                && list_calls > 1
+                && list_calls <= self.startup_inspection_errors + 1
+            {
+                return Ok(CommandOutput {
+                    success: false,
+                    code: Some(1),
+                    stdout: Vec::new(),
+                    stderr: b"process not inspectable yet".to_vec(),
+                });
+            }
             let stdout = if program == "id" {
                 b"501\n".to_vec()
+            } else if program == "lsof"
+                && list_calls > 1
+                && list_calls <= self.startup_mismatches + 1
+            {
+                b"p654\nftxt\nn/usr/libexec/xpcproxy\n".to_vec()
             } else if program == "lsof" {
                 format!("p654\nftxt\nn{}\n", self.executable).into_bytes()
             } else if args == [OsString::from("list")] {
@@ -533,7 +563,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn restart_preserves_registration_and_verifies_version() {
+    fn restart_waits_for_exec_and_preserves_registration_and_version_check() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
@@ -551,6 +581,8 @@ mod tests {
         });
         let fake = FakeRestart {
             fail_restart: false,
+            startup_mismatches: 2,
+            startup_inspection_errors: 1,
             commands: Mutex::new(Vec::new()),
             executable: "/tmp/obsidian-mcp".into(),
         };
@@ -583,9 +615,60 @@ mod tests {
                 .iter()
                 .filter(|command| command.starts_with("lsof "))
                 .count(),
-            2,
-            "live executable identity must be checked before and after restart"
+            4,
+            "identity must be checked before restart and retried while the new process starts"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn startup_verification_rejects_unchanged_pid_and_persistent_wrong_executable() {
+        let target = ServiceTarget {
+            owner: ServiceOwner::Launchd,
+            id: "io.obsidian.mcp".into(),
+            definition_path: None,
+            executable: "/tmp/obsidian-mcp".into(),
+            host: "127.0.0.1".into(),
+            port: 0,
+            previous_pid: Some(321),
+            observed_version: None,
+        };
+        for (commands, inspection_errors, diagnostic) in [
+            (Vec::new(), 0, "no new running process"),
+            (
+                vec!["launchctl list".into()],
+                0,
+                "does not yet run '/tmp/obsidian-mcp'",
+            ),
+            (
+                vec!["launchctl list".into()],
+                100,
+                "process not inspectable yet",
+            ),
+        ] {
+            let fake = FakeRestart {
+                fail_restart: false,
+                startup_mismatches: 100,
+                startup_inspection_errors: inspection_errors,
+                commands: Mutex::new(commands),
+                executable: target.executable.display().to_string(),
+            };
+            let error = wait_for_executable(&fake, &target, 321, Duration::ZERO).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("timed out verifying restarted LaunchAgent")
+            );
+            assert!(error.to_string().contains(diagnostic), "{error}");
+            assert!(
+                !fake
+                    .commands
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|command| command.contains("kickstart"))
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -593,6 +676,8 @@ mod tests {
     fn restart_failure_preserves_error_without_unloading_service() {
         let fake = FakeRestart {
             fail_restart: true,
+            startup_mismatches: 0,
+            startup_inspection_errors: 0,
             commands: Mutex::new(Vec::new()),
             executable: "/tmp/obsidian-mcp".into(),
         };
