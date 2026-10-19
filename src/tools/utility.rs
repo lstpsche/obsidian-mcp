@@ -125,7 +125,7 @@ async fn embedding_info(vault: &Vault, runtime: &SemanticRuntime) -> EmbeddingIn
         };
     }
 
-    let Some(client) = &runtime.daemon_client else {
+    let Some(client) = runtime.resolved_daemon_client() else {
         return EmbeddingInfo {
             source: EmbeddingSource::Daemon,
             availability: EmbeddingAvailability::Unavailable,
@@ -284,6 +284,7 @@ mod tests {
     fn test_runtime(mode: SemanticMode) -> SemanticRuntime {
         SemanticRuntime {
             mode,
+            pending_daemon_bootstrap: None,
             daemon_client: None,
             daemon_unavailable_reason: None,
             prefetch_count: 50,

@@ -23,6 +23,12 @@ not activate local inference. `local` mode starts the in-process backend directl
 The existing daemon-call timeout is separate from the provider's API timeout and
 must accommodate slow query embedding when using a self-hosted endpoint.
 
+Bootstrap timeouts retain a continuation for later semantic searches. Existing
+manifest resolution repeats its ownership/version checks; a newly started daemon
+resumes health verification and manifest publication for that exact process
+without spawning again. Handler clones share the resolved client. Passive status
+only observes resolved clients and never resumes bootstrap or attaches a vault.
+
 ## Runtime Topology
 
 ```text

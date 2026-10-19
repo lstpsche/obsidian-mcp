@@ -518,7 +518,18 @@ pub fn expand_template(
     } else {
         template_path.to_path_buf()
     };
-    let full_path = super::path::resolve_existing(vault_root, &relative_path)?.absolute;
+    let relative_path = super::path::normalize_relative(&relative_path)?;
+    let canonical_root = vault_root.canonicalize()?;
+    let full_path = match canonical_root.join(&relative_path).canonicalize() {
+        Ok(full_path) => {
+            super::path::relative_from_absolute(&canonical_root, &full_path)?;
+            full_path
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            super::path::resolve_existing(&canonical_root, &relative_path)?.absolute
+        }
+        Err(error) => return Err(VaultError::Io(error)),
+    };
 
     let content = std::fs::read_to_string(&full_path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => VaultError::NoteNotFound(template_path.to_path_buf()),

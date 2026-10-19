@@ -19,8 +19,9 @@ use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{CallToolResult, ErrorData, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 
-use crate::client::semantic_daemon::SemanticDaemonClient;
+use crate::client::semantic_daemon::{DaemonConnectPolicy, SemanticDaemonClient};
 use crate::config::SemanticMode;
+use crate::daemon::bootstrap::PendingBootstrap;
 use crate::daemon::protocol;
 use crate::error::VaultError;
 use crate::vault::Vault;
@@ -78,6 +79,7 @@ where
 pub struct SemanticRuntime {
     pub mode: SemanticMode,
     pub daemon_client: Option<SemanticDaemonClient>,
+    pub pending_daemon_bootstrap: Option<Arc<PendingDaemonBootstrap>>,
     pub daemon_unavailable_reason: Option<String>,
     pub prefetch_count: usize,
     pub vault_ensured: Arc<AtomicBool>,
@@ -85,11 +87,65 @@ pub struct SemanticRuntime {
     pub daemon_health_pending: Arc<AtomicBool>,
 }
 
+/// Shared startup continuation; passive status only observes an initialized client.
+pub struct PendingDaemonBootstrap {
+    bootstrap: tokio::sync::Mutex<PendingBootstrap>,
+    policy: DaemonConnectPolicy,
+    client: tokio::sync::OnceCell<SemanticDaemonClient>,
+}
+
+impl PendingDaemonBootstrap {
+    pub fn new(bootstrap: PendingBootstrap, policy: DaemonConnectPolicy) -> Self {
+        Self {
+            bootstrap: tokio::sync::Mutex::new(bootstrap),
+            policy,
+            client: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    async fn resolve(&self) -> crate::error::VaultResult<&SemanticDaemonClient> {
+        self.client
+            .get_or_try_init(|| async {
+                let initialized = self.bootstrap.lock().await.resume().await?;
+                let client = SemanticDaemonClient::new(initialized.endpoint, self.policy);
+                client
+                    .health("obsidian-mcp", env!("CARGO_PKG_VERSION"))
+                    .await?;
+                Ok(client)
+            })
+            .await
+    }
+}
+
 impl SemanticRuntime {
+    /// Inspect a resolved client without resuming bootstrap or starting a daemon.
+    pub fn resolved_daemon_client(&self) -> Option<&SemanticDaemonClient> {
+        self.daemon_client.as_ref().or_else(|| {
+            self.pending_daemon_bootstrap
+                .as_ref()
+                .and_then(|pending| pending.client.get())
+        })
+    }
+
+    /// Resume startup only for a request that intends to use semantic search.
+    pub async fn resolve_daemon_client(&self) -> crate::error::VaultResult<&SemanticDaemonClient> {
+        if let Some(client) = self.resolved_daemon_client() {
+            return Ok(client);
+        }
+        if let Some(pending) = &self.pending_daemon_bootstrap {
+            return pending.resolve().await;
+        }
+        Err(VaultError::DaemonUnavailable(
+            self.daemon_unavailable_reason
+                .clone()
+                .unwrap_or_else(|| "semantic daemon client is not initialized".into()),
+        ))
+    }
+
     /// Retry a deferred startup handshake before using the resolved daemon.
     pub async fn ensure_daemon_health(&self) -> crate::error::VaultResult<()> {
         if self.daemon_health_pending.load(Ordering::Acquire) {
-            let client = self.daemon_client.as_ref().ok_or_else(|| {
+            let client = self.resolved_daemon_client().ok_or_else(|| {
                 VaultError::DaemonUnavailable("semantic daemon client is not initialized".into())
             })?;
             client
@@ -473,6 +529,7 @@ mod tests {
     fn test_runtime() -> SemanticRuntime {
         SemanticRuntime {
             mode: SemanticMode::Local,
+            pending_daemon_bootstrap: None,
             daemon_client: None,
             daemon_unavailable_reason: None,
             prefetch_count: 50,

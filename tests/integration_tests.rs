@@ -873,6 +873,7 @@ mod tool_filtering {
     fn test_runtime() -> SemanticRuntime {
         SemanticRuntime {
             mode: SemanticMode::Local,
+            pending_daemon_bootstrap: None,
             daemon_client: None,
             daemon_unavailable_reason: None,
             prefetch_count: 50,
@@ -1753,6 +1754,7 @@ mod semantic_tool_runtime_modes {
 
         let runtime = SemanticRuntime {
             mode: SemanticMode::Daemon,
+            pending_daemon_bootstrap: None,
             daemon_client: Some(SemanticDaemonClient::new(
                 IpcEndpoint::UnixSocket(server.endpoint_path().to_path_buf()),
                 DaemonConnectPolicy::default(),
@@ -1815,6 +1817,7 @@ mod semantic_tool_runtime_modes {
 
         let runtime = SemanticRuntime {
             mode: SemanticMode::Auto,
+            pending_daemon_bootstrap: None,
             daemon_client: None,
             daemon_unavailable_reason: Some("daemon socket unavailable".to_string()),
             vault_ensured: Arc::new(AtomicBool::new(false)),
@@ -1848,6 +1851,7 @@ mod semantic_tool_runtime_modes {
 
         let runtime = SemanticRuntime {
             mode: SemanticMode::Daemon,
+            pending_daemon_bootstrap: None,
             daemon_client: None,
             daemon_unavailable_reason: Some("not connected".to_string()),
             vault_ensured: Arc::new(AtomicBool::new(false)),

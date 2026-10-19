@@ -450,8 +450,10 @@ Semantic runtime modes:
 
 A slow daemon query or a warming index does not establish that the daemon stopped
 working. Those errors remain visible and do not activate a competing local index.
-If the initial health probe times out after resolving a daemon client, later
-requests retry the health handshake before using that daemon.
+If bootstrap or the initial health probe times out, later semantic searches resume
+startup and complete the handshake before using that daemon. An already started
+process retains its endpoint and startup metadata so recovery does not launch a
+second process. Passive `vault_info` inspection never resumes bootstrap.
 
 Daemon startup policy:
 

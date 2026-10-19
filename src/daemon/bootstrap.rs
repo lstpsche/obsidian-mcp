@@ -64,6 +64,82 @@ pub struct BootstrapResult {
     pub reused_existing: bool,
 }
 
+/// A timeout preserves enough startup state to resume without spawning twice.
+pub enum BootstrapAttempt {
+    Ready(Box<BootstrapResult>),
+    Pending(PendingBootstrap),
+}
+
+pub struct PendingBootstrap {
+    context: PendingBootstrapContext,
+    operation: String,
+    timeout_ms: u64,
+}
+
+enum PendingBootstrapContext {
+    Manifest(BootstrapConfig),
+    Started(Box<StartedDaemonBootstrap>),
+}
+
+#[derive(Clone)]
+struct StartedDaemonBootstrap {
+    config: BootstrapConfig,
+    paths: SemanticHomePaths,
+    endpoint: IpcEndpoint,
+    daemon_binary_path: PathBuf,
+    binary_origin: BinaryOrigin,
+    binary_sha256: Option<String>,
+    pid: u32,
+    model_name: String,
+    expected_version: Option<String>,
+}
+
+impl PendingBootstrap {
+    fn new(context: PendingBootstrapContext, operation: String, timeout_ms: u64) -> Self {
+        Self {
+            context,
+            operation,
+            timeout_ms,
+        }
+    }
+
+    pub fn timeout_error(&self) -> VaultError {
+        VaultError::DaemonTimeout {
+            operation: self.operation.clone(),
+            timeout_ms: self.timeout_ms,
+        }
+    }
+
+    /// Complete the original startup contract, retaining its selected endpoint.
+    pub async fn resume(&mut self) -> VaultResult<BootstrapResult> {
+        match &self.context {
+            PendingBootstrapContext::Manifest(config) => {
+                let config = config.clone();
+                match ensure_daemon_inner(&config, None, Some(&mut self.context)).await? {
+                    BootstrapAttempt::Ready(result) => Ok(*result),
+                    BootstrapAttempt::Pending(pending) => {
+                        *self = pending;
+                        Err(self.timeout_error())
+                    }
+                }
+            }
+            PendingBootstrapContext::Started(started) => {
+                let _install_lock = InstallLock::acquire_async(&started.paths).await?;
+                complete_started_daemon(started).await
+            }
+        }
+    }
+}
+
+impl BootstrapAttempt {
+    fn into_result(self) -> VaultResult<BootstrapResult> {
+        match self {
+            Self::Ready(result) => Ok(*result),
+            Self::Pending(pending) => Err(pending.timeout_error()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonReconcileOutcome {
     pub origin: BinaryOrigin,
@@ -313,7 +389,12 @@ pub async fn prepare_daemon_for_upgrade(
 
 /// Ensure a shared daemon exists and is healthy.
 pub async fn ensure_daemon(config: &BootstrapConfig) -> VaultResult<BootstrapResult> {
-    ensure_daemon_inner(config, None).await
+    begin_daemon_bootstrap(config).await?.into_result()
+}
+
+/// Start bootstrap while retaining recoverable timeout state for an MCP client.
+pub async fn begin_daemon_bootstrap(config: &BootstrapConfig) -> VaultResult<BootstrapAttempt> {
+    ensure_daemon_inner(config, None, None).await
 }
 
 /// Ensure the daemon using a verified package sibling when a temporary
@@ -322,13 +403,16 @@ pub async fn ensure_daemon_from_sibling(
     config: &BootstrapConfig,
     sibling: &Path,
 ) -> VaultResult<BootstrapResult> {
-    ensure_daemon_inner(config, Some(sibling)).await
+    ensure_daemon_inner(config, Some(sibling), None)
+        .await?
+        .into_result()
 }
 
 async fn ensure_daemon_inner(
     config: &BootstrapConfig,
     preferred_sibling: Option<&Path>,
-) -> VaultResult<BootstrapResult> {
+    continuation: Option<&mut PendingBootstrapContext>,
+) -> VaultResult<BootstrapAttempt> {
     let semantic_home =
         home::resolve_semantic_home_with_override(config.semantic_home_override.as_deref(), None)?;
     let paths = home::semantic_home_paths(&semantic_home);
@@ -342,7 +426,20 @@ async fn ensure_daemon_inner(
     if let Some(current_manifest) = existing_manifest.as_mut() {
         let endpoint =
             endpoint_from_manifest(current_manifest).unwrap_or_else(|| default_endpoint.clone());
-        match probe_health(&endpoint).await? {
+        let probe = match probe_health(&endpoint).await {
+            Err(VaultError::DaemonTimeout {
+                operation,
+                timeout_ms,
+            }) => {
+                return Ok(BootstrapAttempt::Pending(PendingBootstrap::new(
+                    PendingBootstrapContext::Manifest(config.clone()),
+                    operation,
+                    timeout_ms,
+                )));
+            }
+            result => result?,
+        };
+        match probe {
             HealthProbeOutcome::Healthy(health) => {
                 let sibling = preferred_sibling
                     .filter(|path| path.is_file())
@@ -386,13 +483,13 @@ async fn ensure_daemon_inner(
                     current_manifest.touch_health();
                     manifest::save_atomic(&paths.manifest_path, current_manifest)?;
                     let daemon_binary_path = PathBuf::from(&current_manifest.binary_path);
-                    return Ok(BootstrapResult {
+                    return Ok(BootstrapAttempt::Ready(Box::new(BootstrapResult {
                         semantic_home,
                         endpoint,
                         daemon_binary_path,
                         manifest: current_manifest.clone(),
                         reused_existing: true,
-                    });
+                    })));
                 }
             }
             HealthProbeOutcome::Incompatible(message) => {
@@ -465,14 +562,30 @@ async fn ensure_daemon_inner(
         start_daemon_process(&daemon_binary_path, &paths, &endpoint, &daemon_model_name)?;
     let pid = child.id().unwrap_or_default();
 
+    let started = StartedDaemonBootstrap {
+        config: config.clone(),
+        paths,
+        endpoint,
+        daemon_binary_path,
+        binary_origin,
+        binary_sha256,
+        pid,
+        model_name: daemon_model_name,
+        expected_version: expected_started_version,
+    };
+    if let Some(continuation) = continuation {
+        // Save the child identity before an awaiting request can be cancelled.
+        *continuation = PendingBootstrapContext::Started(Box::new(started.clone()));
+    }
+
     tokio::time::sleep(Duration::from_millis(50)).await;
     match child.try_wait() {
         Ok(Some(status)) => {
             return Err(VaultError::DaemonBootstrap(format!(
                 "daemon process exited immediately with {status} \
                  (binary: '{}', check {})",
-                daemon_binary_path.display(),
-                paths.daemon_stderr_log_path.display()
+                started.daemon_binary_path.display(),
+                started.paths.daemon_stderr_log_path.display()
             )));
         }
         Ok(None) => {}
@@ -482,9 +595,30 @@ async fn ensure_daemon_inner(
     }
     drop(child);
 
-    let health = wait_for_health(&endpoint, Duration::from_secs(10)).await?;
-    if let Some(expected_version) = expected_started_version
-        && health.daemon_version != expected_version
+    match complete_started_daemon(&started).await {
+        Ok(result) => Ok(BootstrapAttempt::Ready(Box::new(result))),
+        Err(VaultError::DaemonTimeout {
+            operation,
+            timeout_ms,
+        }) => Ok(BootstrapAttempt::Pending(PendingBootstrap::new(
+            PendingBootstrapContext::Started(Box::new(started)),
+            operation,
+            timeout_ms,
+        ))),
+        Err(error) => Err(error),
+    }
+}
+
+async fn complete_started_daemon(started: &StartedDaemonBootstrap) -> VaultResult<BootstrapResult> {
+    let health = wait_for_health(&started.endpoint, Duration::from_secs(10)).await?;
+    if health.pid != started.pid {
+        return Err(VaultError::DaemonBootstrap(format!(
+            "semantic daemon endpoint reports PID {}, expected started PID {}",
+            health.pid, started.pid
+        )));
+    }
+    if let Some(expected_version) = &started.expected_version
+        && &health.daemon_version != expected_version
     {
         return Err(VaultError::DaemonBootstrap(format!(
             "started sibling semantic daemon reports version '{}', expected '{expected_version}'",
@@ -492,30 +626,30 @@ async fn ensure_daemon_inner(
         )));
     }
     let ipc = ManifestIpc {
-        transport: endpoint_transport(&endpoint).to_string(),
-        endpoint: endpoint.endpoint_string(),
+        transport: endpoint_transport(&started.endpoint).to_string(),
+        endpoint: started.endpoint.endpoint_string(),
     };
 
     let runtime_manifest = RuntimeManifest::from_input(RuntimeManifestInput {
         daemon_api_version: health.daemon_api_version,
         daemon_version: health.daemon_version,
-        binary_path: daemon_binary_path.display().to_string(),
-        binary_origin,
-        binary_sha256,
+        binary_path: started.daemon_binary_path.display().to_string(),
+        binary_origin: started.binary_origin,
+        binary_sha256: started.binary_sha256.clone(),
         ipc,
-        pid,
-        semantic_home: semantic_home.display().to_string(),
-        fastembed_cache_dir: paths.fastembed_cache_dir.display().to_string(),
-        model_name: daemon_model_name,
-        bootstrap_client_name: config.bootstrap_client_name.clone(),
-        bootstrap_client_version: config.bootstrap_client_version.clone(),
+        pid: started.pid,
+        semantic_home: started.paths.root.display().to_string(),
+        fastembed_cache_dir: started.paths.fastembed_cache_dir.display().to_string(),
+        model_name: started.model_name.clone(),
+        bootstrap_client_name: started.config.bootstrap_client_name.clone(),
+        bootstrap_client_version: started.config.bootstrap_client_version.clone(),
     });
-    manifest::save_atomic(&paths.manifest_path, &runtime_manifest)?;
+    manifest::save_atomic(&started.paths.manifest_path, &runtime_manifest)?;
 
     Ok(BootstrapResult {
-        semantic_home,
-        endpoint,
-        daemon_binary_path,
+        semantic_home: started.paths.root.clone(),
+        endpoint: started.endpoint.clone(),
+        daemon_binary_path: started.daemon_binary_path.clone(),
         manifest: runtime_manifest,
         reused_existing: false,
     })
@@ -1532,6 +1666,228 @@ mod tests {
 
         shutdown_tx.send(()).expect("shutdown signal should send");
         server_task.await.expect("server task should join");
+    }
+
+    #[cfg(unix)]
+    struct SpawnFixture {
+        config: BootstrapConfig,
+        paths: SemanticHomePaths,
+        endpoint: IpcEndpoint,
+        pids: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl SpawnFixture {
+        fn new(directory: &Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let paths = SemanticHomePaths::new(directory.join("semantic"));
+            home::ensure_home_layout(&paths).unwrap();
+            let endpoint = IpcEndpoint::UnixSocket(directory.join("fixture.sock"));
+            let pids = directory.join("pids");
+            let binary = directory.join("fixture-daemon");
+            std::fs::write(
+                &binary,
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" >> \"${0%/*}/pids\"\nexec /bin/sleep 60\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let config = BootstrapConfig {
+                semantic_home_override: Some(paths.root.clone()),
+                daemon_path_override: Some(binary),
+                model_name: "fixture-model".into(),
+                download_url_override: None,
+                bootstrap_client_name: "test".into(),
+                bootstrap_client_version: "1".into(),
+            };
+            Self {
+                config,
+                paths,
+                endpoint,
+                pids,
+            }
+        }
+
+        fn spawned_pids(&self) -> Vec<u32> {
+            std::fs::read_to_string(&self.pids)
+                .unwrap_or_default()
+                .lines()
+                .map(|line| line.parse().unwrap())
+                .collect()
+        }
+
+        fn socket(&self) -> &Path {
+            let IpcEndpoint::UnixSocket(path) = &self.endpoint;
+            path
+        }
+
+        fn save_manifest(&self) {
+            let saved = RuntimeManifest::from_input(RuntimeManifestInput {
+                daemon_api_version: DAEMON_API_VERSION,
+                daemon_version: env!("CARGO_PKG_VERSION").into(),
+                binary_path: self
+                    .config
+                    .daemon_path_override
+                    .as_ref()
+                    .unwrap()
+                    .display()
+                    .to_string(),
+                binary_origin: BinaryOrigin::Override,
+                binary_sha256: None,
+                ipc: ManifestIpc {
+                    transport: "unix_socket".into(),
+                    endpoint: self.endpoint.endpoint_string(),
+                },
+                pid: 1,
+                semantic_home: self.paths.root.display().to_string(),
+                fastembed_cache_dir: self.paths.fastembed_cache_dir.display().to_string(),
+                model_name: self.config.model_name.clone(),
+                bootstrap_client_name: "test".into(),
+                bootstrap_client_version: "1".into(),
+            });
+            manifest::save_atomic(&self.paths.manifest_path, &saved).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for SpawnFixture {
+        fn drop(&mut self) {
+            for pid in self.spawned_pids() {
+                let _ = std::process::Command::new("/bin/kill")
+                    .arg(pid.to_string())
+                    .status();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    async fn answer_health(listener: &tokio::net::UnixListener, pid: u32) {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut line = String::new();
+        BufReader::new(read).read_line(&mut line).await.unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], "health");
+        let result = json!({"daemon_version":"3.1.0", "daemon_api_version":2, "pid":pid, "status":"ok", "uptime_ms":1, "model_name":"fixture-model", "semantic_home":"/tmp/test"});
+        write
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"jsonrpc":"2.0", "id":request["id"], "result":result})
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn new_daemon_health_timeout_retains_started_process_without_respawning() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut fixture = SpawnFixture::new(directory.path());
+        // With no manifest, bootstrap selects the semantic home's default endpoint.
+        fixture.endpoint = home::default_ipc_endpoint(&fixture.paths);
+        let listener = tokio::net::UnixListener::bind(fixture.socket()).unwrap();
+        let silent = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut line = String::new();
+            let mut reader = BufReader::new(stream);
+            reader.read_line(&mut line).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let BootstrapAttempt::Pending(mut pending) =
+            begin_daemon_bootstrap(&fixture.config).await.unwrap()
+        else {
+            panic!("expected pending startup")
+        };
+        assert!(matches!(
+            pending.context,
+            PendingBootstrapContext::Started(_)
+        ));
+        assert!(!fixture.paths.manifest_path.exists());
+        let pids = fixture.spawned_pids();
+        assert_eq!(pids.len(), 1);
+        silent.abort();
+        let _ = silent.await;
+        std::fs::remove_file(fixture.socket()).unwrap();
+        let listener = tokio::net::UnixListener::bind(fixture.socket()).unwrap();
+        let server = tokio::spawn(async move { answer_health(&listener, pids[0]).await });
+        let completed = pending.resume().await.unwrap();
+        server.await.unwrap();
+        assert_eq!(fixture.spawned_pids(), [completed.manifest.pid]);
+        assert_eq!(completed.manifest.model_name, "fixture-model");
+        assert!(fixture.paths.manifest_path.is_file());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_manifest_retry_retains_child_and_validates_pid_under_install_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = SpawnFixture::new(directory.path());
+        fixture.save_manifest();
+        let original_manifest = std::fs::read(&fixture.paths.manifest_path).unwrap();
+        let listener = tokio::net::UnixListener::bind(fixture.socket()).unwrap();
+        let silent = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut line = String::new();
+            let mut reader = BufReader::new(stream);
+            reader.read_line(&mut line).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let BootstrapAttempt::Pending(mut pending) =
+            begin_daemon_bootstrap(&fixture.config).await.unwrap()
+        else {
+            panic!("expected pending startup")
+        };
+        assert!(matches!(
+            pending.context,
+            PendingBootstrapContext::Manifest(_)
+        ));
+        silent.abort();
+        let _ = silent.await;
+        std::fs::remove_file(fixture.socket()).unwrap();
+        {
+            let resume = pending.resume();
+            tokio::pin!(resume);
+            tokio::select! {
+                result = &mut resume => panic!("startup finished before cancellation: {result:?}"),
+                _ = async {
+                    while fixture.spawned_pids().is_empty() {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                } => {}
+            }
+        }
+        let pid = fixture.spawned_pids()[0];
+        assert!(
+            matches!(&pending.context, PendingBootstrapContext::Started(started) if started.pid == pid)
+        );
+        let listener = tokio::net::UnixListener::bind(fixture.socket()).unwrap();
+        let server = tokio::spawn(async move {
+            answer_health(&listener, pid + 1).await;
+            answer_health(&listener, pid).await;
+        });
+        let error = pending.resume().await.unwrap_err();
+        assert!(
+            matches!(error, VaultError::DaemonBootstrap(message) if message.contains("expected started PID"))
+        );
+        assert_eq!(
+            std::fs::read(&fixture.paths.manifest_path).unwrap(),
+            original_manifest
+        );
+        let install_lock = InstallLock::acquire_async(&fixture.paths).await.unwrap();
+        let resume = pending.resume();
+        tokio::pin!(resume);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut resume)
+                .await
+                .is_err()
+        );
+        drop(install_lock);
+        let completed = resume.await.unwrap();
+        server.await.unwrap();
+        assert_eq!(fixture.spawned_pids(), [pid]);
+        assert_eq!(completed.manifest.pid, pid);
     }
 
     #[cfg(unix)]

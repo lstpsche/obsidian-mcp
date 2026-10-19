@@ -10,10 +10,10 @@ use obsidian_mcp::client::semantic_daemon::{DaemonConnectPolicy, SemanticDaemonC
 use obsidian_mcp::config::{
     Config, SemanticMode, SemanticRuntimeConfig, ToolFilter, Transport, parse_cli_args,
 };
-use obsidian_mcp::daemon::bootstrap::{BootstrapConfig, ensure_daemon};
+use obsidian_mcp::daemon::bootstrap::{BootstrapAttempt, BootstrapConfig, begin_daemon_bootstrap};
 use obsidian_mcp::daemon::server::IpcEndpoint;
 use obsidian_mcp::error::VaultError;
-use obsidian_mcp::tools::{ObsidianMcp, SemanticRuntime};
+use obsidian_mcp::tools::{ObsidianMcp, PendingDaemonBootstrap, SemanticRuntime};
 use obsidian_mcp::upgrade::BuildIdentity;
 use obsidian_mcp::upgrade::orchestrator::{self, UpgradeOptions, UpgradeRunOutcome};
 use obsidian_mcp::vault::Vault;
@@ -227,9 +227,15 @@ async fn shutdown_signal() {
     }
 }
 
-struct InitializedDaemonClient {
-    client: SemanticDaemonClient,
-    health_pending: bool,
+enum InitializedDaemonClient {
+    Resolved {
+        client: SemanticDaemonClient,
+        health_pending: bool,
+    },
+    BootstrapPending {
+        bootstrap: Arc<PendingDaemonBootstrap>,
+        reason: String,
+    },
 }
 
 async fn init_semantic_runtime(
@@ -238,6 +244,7 @@ async fn init_semantic_runtime(
 ) -> SemanticRuntime {
     let mut runtime = SemanticRuntime {
         mode: runtime_cfg.mode,
+        pending_daemon_bootstrap: None,
         daemon_client: None,
         daemon_unavailable_reason: None,
         prefetch_count: runtime_cfg.prefetch_count,
@@ -261,12 +268,19 @@ async fn init_semantic_runtime(
     }
 
     match initialize_daemon_client(runtime_cfg).await {
-        Ok(initialized) => {
-            runtime.daemon_health_pending.store(
-                initialized.health_pending,
-                std::sync::atomic::Ordering::Release,
-            );
-            runtime.daemon_client = Some(initialized.client);
+        Ok(InitializedDaemonClient::Resolved {
+            client,
+            health_pending,
+        }) => {
+            runtime
+                .daemon_health_pending
+                .store(health_pending, std::sync::atomic::Ordering::Release);
+            runtime.daemon_client = Some(client);
+        }
+        Ok(InitializedDaemonClient::BootstrapPending { bootstrap, reason }) => {
+            tracing::warn!(error = %reason, "semantic daemon bootstrap timed out; semantic search will resume startup");
+            runtime.pending_daemon_bootstrap = Some(bootstrap);
+            runtime.daemon_unavailable_reason = Some(reason);
         }
         Err(err) => {
             let reason = err.to_string();
@@ -303,7 +317,7 @@ async fn initialize_daemon_client(
     let endpoint = if let Some(raw_endpoint) = runtime_cfg.daemon_endpoint_override.as_deref() {
         endpoint_from_override(raw_endpoint)
     } else {
-        ensure_daemon(&BootstrapConfig {
+        match begin_daemon_bootstrap(&BootstrapConfig {
             semantic_home_override: runtime_cfg.semantic_home_override.clone(),
             daemon_path_override: runtime_cfg.daemon_path_override.clone(),
             model_name: runtime_cfg.model_name.clone(),
@@ -312,23 +326,30 @@ async fn initialize_daemon_client(
             bootstrap_client_version: env!("CARGO_PKG_VERSION").to_string(),
         })
         .await?
-        .endpoint
+        {
+            BootstrapAttempt::Ready(initialized) => initialized.endpoint,
+            BootstrapAttempt::Pending(pending) => {
+                let reason = pending.timeout_error().to_string();
+                return Ok(InitializedDaemonClient::BootstrapPending {
+                    bootstrap: Arc::new(PendingDaemonBootstrap::new(pending, policy)),
+                    reason,
+                });
+            }
+        }
     };
-    let mut initialized = InitializedDaemonClient {
-        client: SemanticDaemonClient::new(endpoint, policy),
-        health_pending: false,
-    };
+    let client = SemanticDaemonClient::new(endpoint, policy);
 
-    let health = match initialized
-        .client
+    let health = match client
         .health("obsidian-mcp", env!("CARGO_PKG_VERSION"))
         .await
     {
         Ok(health) => health,
         Err(error @ VaultError::DaemonTimeout { .. }) => {
             tracing::warn!(error = %error, "daemon health probe timed out; later calls will retry the handshake");
-            initialized.health_pending = true;
-            return Ok(initialized);
+            return Ok(InitializedDaemonClient::Resolved {
+                client,
+                health_pending: true,
+            });
         }
         Err(error) => return Err(error),
     };
@@ -339,7 +360,10 @@ async fn initialize_daemon_client(
         daemon_semantic_home = %health.semantic_home,
         "semantic daemon connection established"
     );
-    Ok(initialized)
+    Ok(InitializedDaemonClient::Resolved {
+        client,
+        health_pending: false,
+    })
 }
 
 async fn handle_cli_flags() -> Option<i32> {
@@ -973,6 +997,141 @@ mod tests {
         assert_eq!(
             runtime.daemon_unavailable_reason.as_deref(),
             Some(DAEMON_DISABLED_BY_WATCH_REASON)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manifest_health_timeout_resumes_once_on_search_and_status_stays_passive() {
+        use obsidian_mcp::daemon::{home, manifest};
+        use obsidian_mcp::tools::{search, utility};
+        use serde_json::{Value, json};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let directory = tempfile::tempdir().unwrap();
+        let endpoint = directory.path().join("daemon.sock");
+        let paths = home::SemanticHomePaths::new(directory.path().join("semantic"));
+        home::ensure_home_layout(&paths).unwrap();
+        let saved = manifest::RuntimeManifest::from_input(manifest::RuntimeManifestInput {
+            daemon_api_version: 2,
+            daemon_version: env!("CARGO_PKG_VERSION").into(),
+            binary_path: directory
+                .path()
+                .join("external-daemon")
+                .display()
+                .to_string(),
+            binary_origin: manifest::BinaryOrigin::Override,
+            binary_sha256: None,
+            ipc: manifest::ManifestIpc {
+                transport: "unix_socket".into(),
+                endpoint: endpoint.display().to_string(),
+            },
+            pid: 1,
+            semantic_home: paths.root.display().to_string(),
+            fastembed_cache_dir: paths.fastembed_cache_dir.display().to_string(),
+            model_name: "probe".into(),
+            bootstrap_client_name: "test".into(),
+            bootstrap_client_version: "1".into(),
+        });
+        manifest::save_atomic(&paths.manifest_path, &saved).unwrap();
+        let listener = tokio::net::UnixListener::bind(&endpoint).unwrap();
+        let recovered = Arc::new(tokio::sync::Notify::new());
+        let server_recovered = Arc::clone(&recovered);
+        let methods = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_methods = Arc::clone(&methods);
+        let server = tokio::spawn(async move {
+            for request_index in 0..6 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(read).read_line(&mut line).await.unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let method = request["method"].as_str().unwrap();
+                server_methods.lock().unwrap().push(method.to_string());
+                if request_index == 0 {
+                    server_recovered.notified().await;
+                    continue;
+                }
+                let result = match method {
+                    "health" => {
+                        json!({"daemon_version":"3.1.0", "daemon_api_version":2, "pid":1, "status":"ok", "uptime_ms":1, "model_name":"probe", "semantic_home":"/tmp/test"})
+                    }
+                    "vault_status" => {
+                        json!({"phase":"ready", "ready":true, "indexed_notes":0, "total_notes":0, "pending_notes":0})
+                    }
+                    "ensure_vault" => {
+                        json!({"vault_id":"test", "ready":true, "watch_enabled":true, "model_name":"probe"})
+                    }
+                    "search_semantic" => json!({"results":[]}),
+                    other => panic!("unexpected request {other}"),
+                };
+                let response = json!({"jsonrpc":"2.0", "id":request["id"], "result":result});
+                write
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut config = test_config();
+        config.vault_path = directory.path().join("vault");
+        std::fs::create_dir_all(config.vault_path.join(".obsidian")).unwrap();
+        config.watch = true;
+        config.embeddings = true;
+        config.embeddings_model = "not-a-local-model".into();
+        let mut runtime_config = runtime_config(SemanticMode::Auto);
+        runtime_config.semantic_home_override = Some(paths.root);
+        runtime_config.daemon_endpoint_override = None;
+        let runtime = init_semantic_runtime(&config, &runtime_config).await;
+        assert!(runtime.daemon_client.is_none());
+        assert!(runtime.pending_daemon_bootstrap.is_some());
+        assert!(!runtime.uses_local_backend());
+        let vault = Vault::open_deferred_embeddings(&config).await.unwrap();
+        let info = utility::vault_info(&vault, &runtime, utility::VaultInfoParams {})
+            .await
+            .unwrap();
+        assert_eq!(
+            info.structured_content.unwrap()["embeddings"]["availability"],
+            "unavailable"
+        );
+        assert_eq!(*methods.lock().unwrap(), ["health"]);
+        recovered.notify_one();
+        let clone = runtime.clone();
+        let (first, second) = tokio::join!(
+            runtime.resolve_daemon_client(),
+            clone.resolve_daemon_client()
+        );
+        assert!(std::ptr::eq(first.unwrap(), second.unwrap()));
+        let info = utility::vault_info(&vault, &runtime, utility::VaultInfoParams {})
+            .await
+            .unwrap();
+        assert_eq!(
+            info.structured_content.unwrap()["embeddings"]["availability"],
+            "available"
+        );
+        search::search_semantic(
+            &vault,
+            search::SearchSemanticParams {
+                query: "probe".into(),
+                ..Default::default()
+            },
+            0.25,
+            &runtime,
+        )
+        .await
+        .unwrap();
+        assert!(!runtime.uses_local_backend());
+        assert!(!vault.embeddings_active());
+        server.await.unwrap();
+        assert_eq!(
+            *methods.lock().unwrap(),
+            [
+                "health",
+                "health",
+                "health",
+                "vault_status",
+                "ensure_vault",
+                "search_semantic"
+            ]
         );
     }
 

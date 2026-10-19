@@ -1115,6 +1115,55 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn periodic_templates_follow_native_case_matching() {
+        for period in PERIODIC_PERIODS {
+            for template in ["templates/daily", "templates/daily.md"] {
+                let (_directory, root, _canary) = periodic_template_fixture();
+                std::fs::create_dir(root.join("Templates")).unwrap();
+                std::fs::write(root.join("Templates/Daily.md"), "Created {{title}}").unwrap();
+                let native_match = root.join("templates/daily.md").is_file();
+                configure_periodic_template(&root, &period, Path::new(template));
+                let vault = Vault::open(&test_config(&root)).await.unwrap();
+                let date = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+
+                let note = vault
+                    .create_periodic_note(&period, Some(date), None)
+                    .unwrap();
+
+                assert_eq!(
+                    vault.read_note(&note).unwrap(),
+                    if native_match {
+                        "Created 2026-01-02"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn periodic_templates_reject_native_case_matched_symlinks_outside_the_vault() {
+        for period in PERIODIC_PERIODS {
+            let (_directory, root, canary) = periodic_template_fixture();
+            std::fs::create_dir(root.join("Templates")).unwrap();
+            std::os::unix::fs::symlink(&canary, root.join("Templates/Linked.md")).unwrap();
+            if !root.join("templates/linked.md").is_file() {
+                continue;
+            }
+
+            assert_periodic_template_rejected(
+                &root,
+                &canary,
+                &period,
+                Path::new("templates/linked"),
+            )
+            .await;
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn periodic_templates_allow_symlinks_to_templates_inside_the_vault() {

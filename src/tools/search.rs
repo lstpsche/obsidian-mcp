@@ -297,7 +297,7 @@ pub async fn search_semantic(
         )
         .await;
         let use_local = runtime.uses_local_backend()
-            || (runtime.daemon_client.is_some()
+            || ((runtime.daemon_client.is_some() || runtime.pending_daemon_bootstrap.is_some())
                 && local_backend_available(vault)
                 && result
                     .as_ref()
@@ -335,15 +335,13 @@ async fn search_semantic_daemon(
             "local fallback is already selected".into(),
         ));
     }
-    let Some(client) = runtime.daemon_client.as_ref() else {
-        let reason = runtime
-            .daemon_unavailable_reason
-            .as_deref()
-            .unwrap_or("semantic daemon client is not initialized");
-        return Err(VaultError::DaemonUnavailable(reason.to_string()));
-    };
-
+    let client = runtime.resolve_daemon_client().await?;
     runtime.ensure_daemon_health().await?;
+    if runtime.uses_local_backend() {
+        return Err(VaultError::DaemonUnavailable(
+            "local fallback is already selected".into(),
+        ));
+    }
     if !runtime
         .vault_ensured
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -1432,6 +1430,7 @@ mod tests {
 
         let runtime = SemanticRuntime {
             mode: SemanticMode::Daemon,
+            pending_daemon_bootstrap: None,
             daemon_client: Some(SemanticDaemonClient::new(
                 IpcEndpoint::UnixSocket(socket_path),
                 DaemonConnectPolicy::default(),
@@ -1479,6 +1478,7 @@ mod tests {
 
         let runtime = SemanticRuntime {
             mode: SemanticMode::Daemon,
+            pending_daemon_bootstrap: None,
             daemon_client: Some(SemanticDaemonClient::new(
                 IpcEndpoint::UnixSocket(socket_path),
                 DaemonConnectPolicy::default(),
@@ -1524,6 +1524,7 @@ mod tests {
 
         let runtime = SemanticRuntime {
             mode: SemanticMode::Daemon,
+            pending_daemon_bootstrap: None,
             daemon_client: Some(SemanticDaemonClient::new(
                 IpcEndpoint::UnixSocket(socket_path),
                 DaemonConnectPolicy::default(),
@@ -1575,6 +1576,7 @@ mod tests {
         let server = start_semantic_not_ready_server(socket_path.clone());
         let runtime = SemanticRuntime {
             mode: SemanticMode::Auto,
+            pending_daemon_bootstrap: None,
             daemon_client: Some(SemanticDaemonClient::new(
                 IpcEndpoint::UnixSocket(socket_path),
                 DaemonConnectPolicy::default(),
@@ -1639,6 +1641,7 @@ mod tests {
         let ensured = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let runtime = SemanticRuntime {
             mode: SemanticMode::Auto,
+            pending_daemon_bootstrap: None,
             daemon_client: None,
             daemon_unavailable_reason: Some("semantic daemon is offline".into()),
             prefetch_count: 50,

@@ -532,6 +532,7 @@ async fn daemon_binary_filters_before_ranking_and_recovers_existing_clients() {
     );
     let runtime = SemanticRuntime {
         mode: SemanticMode::Daemon,
+        pending_daemon_bootstrap: None,
         daemon_client: Some(client.clone()),
         daemon_unavailable_reason: None,
         prefetch_count: 1,
