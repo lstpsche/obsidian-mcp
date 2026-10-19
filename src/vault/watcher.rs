@@ -521,6 +521,9 @@ mod tests {
     #[test]
     fn watcher_reads_do_not_trigger_more_events() {
         use std::sync::mpsc;
+        use std::time::Instant;
+
+        use notify_debouncer_mini::DebouncedEventKind;
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
@@ -533,7 +536,7 @@ mod tests {
                     if event.path.file_name().is_some_and(|name| name == "test.md") {
                         let content = std::fs::read_to_string(&event.path).unwrap();
                         let parsed = super::super::frontmatter::parse_frontmatter(&content);
-                        tx.send(parsed.is_ok()).unwrap();
+                        tx.send((event.kind, parsed.is_ok())).unwrap();
                     }
                 }
             },
@@ -544,9 +547,24 @@ mod tests {
             .watch(&root, RecursiveMode::Recursive)
             .unwrap();
 
+        let expect_settled_edit = |expected_parse_result| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .expect("the edit should settle before the deadline");
+                let (kind, parsed) = rx.recv_timeout(remaining).unwrap();
+                // An ongoing edit can emit AnyContinuous before its final Any.
+                if kind == DebouncedEventKind::Any {
+                    assert_eq!(parsed, expected_parse_result);
+                    break;
+                }
+            }
+        };
+
         // A parse failure must not turn the indexing read into a retry loop.
         std::fs::write(&path, "---\ntags: [unfinished\n---\n").unwrap();
-        assert!(!rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        expect_settled_edit(false);
         assert_eq!(
             rx.recv_timeout(Duration::from_secs(1)),
             Err(mpsc::RecvTimeoutError::Timeout),
@@ -559,7 +577,7 @@ mod tests {
             "---\ntitle: \"Test Document\"\nauthor: \"Jane Doe\"\ntags:\n  - documentation\n  - yaml-test\n---\n\n# Hello\n\nSome content here.\n",
         )
         .unwrap();
-        assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        expect_settled_edit(true);
         assert_eq!(
             rx.recv_timeout(Duration::from_secs(1)),
             Err(mpsc::RecvTimeoutError::Timeout),
