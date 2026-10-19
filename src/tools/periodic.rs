@@ -193,6 +193,98 @@ mod tests {
         assert!(items.is_empty());
     }
 
+    async fn assert_list_rejects_folder(dir: &std::path::Path, period: NotePeriod) {
+        let vault = Vault::open(&test_config(dir)).await.unwrap();
+        let err = periodic(
+            &vault,
+            PeriodicParams {
+                action: "list".into(),
+                period,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn list_rejects_outside_core_daily_folder() {
+        let parent = tempfile::tempdir().unwrap();
+        let vault_dir = parent.path().join("vault");
+        let outside = parent.path().join("outside");
+        create_test_vault(&vault_dir);
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("2026-01-15.md"), "outside note").unwrap();
+
+        for folder in ["../outside".to_string(), outside.to_str().unwrap().into()] {
+            fs::write(
+                vault_dir.join(".obsidian/daily-notes.json"),
+                serde_json::json!({"format": "YYYY-MM-DD", "folder": folder}).to_string(),
+            )
+            .unwrap();
+            assert_list_rejects_folder(&vault_dir, NotePeriod::Daily).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn list_rejects_outside_plugin_folders_for_every_period() {
+        let parent = tempfile::tempdir().unwrap();
+        let vault_dir = parent.path().join("vault");
+        let outside = parent.path().join("outside");
+        create_test_vault(&vault_dir);
+        fs::create_dir(&outside).unwrap();
+        for filename in [
+            "2026-01-15.md",
+            "2026-W03.md",
+            "2026-01.md",
+            "2026-Q1.md",
+            "2026.md",
+        ] {
+            fs::write(outside.join(filename), "outside note").unwrap();
+        }
+        let plugin_dir = vault_dir.join(".obsidian/plugins/periodic-notes");
+        fs::create_dir_all(&plugin_dir).unwrap();
+
+        for (period, legacy_key, calendar_key) in [
+            (NotePeriod::Daily, "daily", "day"),
+            (NotePeriod::Weekly, "weekly", "week"),
+            (NotePeriod::Monthly, "monthly", "month"),
+            (NotePeriod::Quarterly, "quarterly", "quarter"),
+            (NotePeriod::Yearly, "yearly", "year"),
+        ] {
+            for folder in ["../outside".to_string(), outside.to_str().unwrap().into()] {
+                let entry = serde_json::json!({"enabled": true, "folder": folder});
+                for config in [
+                    serde_json::json!({(legacy_key): entry.clone()}),
+                    serde_json::json!({"calendarSets": [{(calendar_key): entry.clone()}]}),
+                ] {
+                    fs::write(plugin_dir.join("data.json"), config.to_string()).unwrap();
+                    assert_list_rejects_folder(&vault_dir, period.clone()).await;
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_rejects_configured_folder_symlink_outside_vault() {
+        let parent = tempfile::tempdir().unwrap();
+        let vault_dir = parent.path().join("vault");
+        let outside = parent.path().join("outside");
+        create_test_vault(&vault_dir);
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("2026-01-15.md"), "outside note").unwrap();
+        std::os::unix::fs::symlink(&outside, vault_dir.join("Daily")).unwrap();
+        fs::write(
+            vault_dir.join(".obsidian/daily-notes.json"),
+            r#"{"format":"YYYY-MM-DD","folder":"Daily"}"#,
+        )
+        .unwrap();
+
+        assert_list_rejects_folder(&vault_dir, NotePeriod::Daily).await;
+    }
+
     #[tokio::test]
     async fn create_then_get() {
         let dir = tempfile::tempdir().unwrap();

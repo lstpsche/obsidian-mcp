@@ -369,7 +369,13 @@ pub fn list_recent_periodic_notes(
     limit: usize,
 ) -> VaultResult<Vec<PathBuf>> {
     let scan_dir = match &config.folder {
-        Some(folder) if !folder.is_empty() => vault_root.join(folder),
+        Some(folder) if !folder.is_empty() => {
+            match resolve_config_path(vault_root, Path::new(folder)) {
+                Ok(path) => path,
+                Err(VaultError::NoteNotFound(_)) => return Ok(Vec::new()),
+                Err(error) => return Err(error),
+            }
+        }
         _ => vault_root.to_path_buf(),
     };
 
@@ -501,6 +507,23 @@ fn try_parse_quarter_date(stem: &str, chrono_fmt: &str) -> Option<NaiveDate> {
     NaiveDate::from_ymd_opt(y, month, 1)
 }
 
+/// Resolve an untrusted periodic configuration path within the vault while
+/// preserving native filesystem matching before trying Unicode normalization.
+fn resolve_config_path(vault_root: &Path, path: &Path) -> VaultResult<PathBuf> {
+    let relative_path = super::path::normalize_relative(path)?;
+    let canonical_root = vault_root.canonicalize()?;
+    match canonical_root.join(&relative_path).canonicalize() {
+        Ok(full_path) => {
+            super::path::relative_from_absolute(&canonical_root, &full_path)?;
+            Ok(full_path)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(super::path::resolve_existing(&canonical_root, &relative_path)?.absolute)
+        }
+        Err(error) => Err(VaultError::Io(error)),
+    }
+}
+
 // ── Template expansion ─────────────────────────────────────────────────
 
 /// Read a template file and expand template variables:
@@ -518,18 +541,7 @@ pub fn expand_template(
     } else {
         template_path.to_path_buf()
     };
-    let relative_path = super::path::normalize_relative(&relative_path)?;
-    let canonical_root = vault_root.canonicalize()?;
-    let full_path = match canonical_root.join(&relative_path).canonicalize() {
-        Ok(full_path) => {
-            super::path::relative_from_absolute(&canonical_root, &full_path)?;
-            full_path
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            super::path::resolve_existing(&canonical_root, &relative_path)?.absolute
-        }
-        Err(error) => return Err(VaultError::Io(error)),
-    };
+    let full_path = resolve_config_path(vault_root, &relative_path)?;
 
     let content = std::fs::read_to_string(&full_path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => VaultError::NoteNotFound(template_path.to_path_buf()),
@@ -978,6 +990,116 @@ mod tests {
         };
         let result = list_recent_periodic_notes(tmp.path(), &config, 10).unwrap();
         assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn list_rejects_folders_outside_vault() {
+        let tmp = TempDir::new().unwrap();
+        let vault = tmp.path().join("vault");
+        let outside = tmp.path().join("outside/Daily");
+        fs::create_dir_all(vault.join("Daily")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("2026-03-19.md"), "outside note").unwrap();
+
+        for folder in [
+            "../outside/Daily",
+            "Daily/../../outside/Daily",
+            "../missing",
+        ] {
+            let mut config = default_config(&NotePeriod::Daily);
+            config.folder = Some(folder.into());
+            for limit in [0, 10] {
+                assert!(matches!(
+                    list_recent_periodic_notes(&vault, &config, limit),
+                    Err(VaultError::OutsideVault(_))
+                ));
+            }
+        }
+
+        let mut config = default_config(&NotePeriod::Daily);
+        config.folder = Some(outside.to_string_lossy().into_owned());
+        assert!(matches!(
+            list_recent_periodic_notes(&vault, &config, 10),
+            Err(VaultError::InvalidPath(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_rejects_outside_folder_symlinks() {
+        let tmp = TempDir::new().unwrap();
+        let vault = tmp.path().join("vault");
+        let outside = tmp.path().join("vault-other/Daily");
+        fs::create_dir_all(&vault).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("2026-03-19.md"), "outside note").unwrap();
+        std::os::unix::fs::symlink(&outside, vault.join("Daily")).unwrap();
+        std::os::unix::fs::symlink(outside.parent().unwrap(), vault.join("Alias")).unwrap();
+
+        for folder in ["Daily", "Alias/Daily", "Alias/Missing"] {
+            let mut config = default_config(&NotePeriod::Daily);
+            config.folder = Some(folder.into());
+            assert!(matches!(
+                list_recent_periodic_notes(&vault, &config, 10),
+                Err(VaultError::OutsideVault(_))
+            ));
+        }
+
+        if vault.join("daily").is_dir() {
+            let mut config = default_config(&NotePeriod::Daily);
+            config.folder = Some("daily".into());
+            assert!(matches!(
+                list_recent_periodic_notes(&vault, &config, 10),
+                Err(VaultError::OutsideVault(_))
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_allows_in_vault_folder_symlinks() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("Journal")).unwrap();
+        fs::write(tmp.path().join("Journal/2026-03-19.md"), "note").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("Journal"), tmp.path().join("Daily")).unwrap();
+        let mut config = default_config(&NotePeriod::Daily);
+        config.folder = Some("Daily".into());
+
+        assert_eq!(
+            list_recent_periodic_notes(tmp.path(), &config, 10).unwrap(),
+            vec![PathBuf::from("Daily/2026-03-19.md")]
+        );
+    }
+
+    #[test]
+    fn list_preserves_native_folder_case_matching() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("Daily")).unwrap();
+        fs::write(tmp.path().join("Daily/2026-03-19.md"), "note").unwrap();
+        let mut config = default_config(&NotePeriod::Daily);
+        config.folder = Some("daily".into());
+
+        let result = list_recent_periodic_notes(tmp.path(), &config, 10).unwrap();
+        if tmp.path().join("daily").is_dir() {
+            assert_eq!(result, vec![PathBuf::from("daily/2026-03-19.md")]);
+        } else {
+            assert!(result.is_empty());
+        }
+    }
+
+    #[test]
+    fn list_resolves_unicode_equivalent_folder_names() {
+        let tmp = TempDir::new().unwrap();
+        let decomposed = "Cafe\u{301}";
+        fs::create_dir(tmp.path().join(decomposed)).unwrap();
+        fs::write(tmp.path().join(decomposed).join("2026-03-19.md"), "note").unwrap();
+        let mut config = default_config(&NotePeriod::Daily);
+        config.folder = Some("Caf\u{e9}".into());
+
+        assert_eq!(
+            list_recent_periodic_notes(tmp.path(), &config, 10).unwrap(),
+            vec![PathBuf::from("Caf\u{e9}/2026-03-19.md")]
+        );
     }
 
     // ── expand_template ────────────────────────────────────────────────
