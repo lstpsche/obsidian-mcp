@@ -49,11 +49,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let semantic_runtime = init_semantic_runtime(&config, &semantic_runtime_config).await;
     tracing::info!(
         semantic_mode = semantic_runtime.mode.as_str(),
-        daemon_ready = semantic_runtime.daemon_client.is_some(),
+        daemon_client_configured = semantic_runtime.daemon_client.is_some(),
         "semantic runtime configured"
     );
 
-    let vault = Vault::open(&config).await?;
+    let vault = if semantic_runtime.uses_local_backend() {
+        Vault::open(&config).await?
+    } else {
+        Vault::open_deferred_embeddings(&config).await?
+    };
     let disabled_tools = config.tool_filter.disabled_tools();
 
     match config.transport {
@@ -225,6 +229,7 @@ async fn shutdown_signal() {
 
 struct InitializedDaemonClient {
     client: SemanticDaemonClient,
+    health_pending: bool,
 }
 
 async fn init_semantic_runtime(
@@ -237,6 +242,8 @@ async fn init_semantic_runtime(
         daemon_unavailable_reason: None,
         prefetch_count: runtime_cfg.prefetch_count,
         vault_ensured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        local_fallback_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        daemon_health_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     if runtime_cfg.mode == SemanticMode::Local {
@@ -244,17 +251,30 @@ async fn init_semantic_runtime(
     }
     if !config.watch {
         runtime.daemon_unavailable_reason = Some(DAEMON_DISABLED_BY_WATCH_REASON.to_string());
+        if cfg!(has_embeddings) && config.embeddings {
+            runtime.activate_local_fallback(&VaultError::DaemonUnavailable(
+                DAEMON_DISABLED_BY_WATCH_REASON.to_string(),
+            ));
+        }
         tracing::info!("semantic daemon disabled because OBSIDIAN_WATCH=false");
         return runtime;
     }
 
     match initialize_daemon_client(runtime_cfg).await {
         Ok(initialized) => {
+            runtime.daemon_health_pending.store(
+                initialized.health_pending,
+                std::sync::atomic::Ordering::Release,
+            );
             runtime.daemon_client = Some(initialized.client);
         }
         Err(err) => {
             let reason = err.to_string();
             runtime.daemon_unavailable_reason = Some(reason.clone());
+            // Classify before retaining the display reason. Later tool calls must
+            // not reinterpret a startup timeout as proof of a daemon outage.
+            let local_selected =
+                cfg!(has_embeddings) && config.embeddings && runtime.activate_local_fallback(&err);
             match runtime_cfg.mode {
                 SemanticMode::Daemon => {
                     tracing::error!(
@@ -262,13 +282,13 @@ async fn init_semantic_runtime(
                         "semantic daemon mode requested but daemon is unavailable"
                     );
                 }
-                SemanticMode::Auto => {
+                SemanticMode::Auto if !local_selected => {
                     tracing::warn!(
                         error = %reason,
-                        "semantic daemon unavailable; auto mode may fall back to local backend"
+                        "semantic daemon initialization failed; local indexing remains dormant"
                     );
                 }
-                SemanticMode::Local => {}
+                SemanticMode::Auto | SemanticMode::Local => {}
             }
         }
     }
@@ -280,12 +300,10 @@ async fn initialize_daemon_client(
     runtime_cfg: &SemanticRuntimeConfig,
 ) -> Result<InitializedDaemonClient, VaultError> {
     let policy = DaemonConnectPolicy::from_runtime_config(runtime_cfg);
-    let initialized = if let Some(raw_endpoint) = runtime_cfg.daemon_endpoint_override.as_deref() {
-        InitializedDaemonClient {
-            client: SemanticDaemonClient::new(endpoint_from_override(raw_endpoint), policy),
-        }
+    let endpoint = if let Some(raw_endpoint) = runtime_cfg.daemon_endpoint_override.as_deref() {
+        endpoint_from_override(raw_endpoint)
     } else {
-        let bootstrap_result = ensure_daemon(&BootstrapConfig {
+        ensure_daemon(&BootstrapConfig {
             semantic_home_override: runtime_cfg.semantic_home_override.clone(),
             daemon_path_override: runtime_cfg.daemon_path_override.clone(),
             model_name: runtime_cfg.model_name.clone(),
@@ -293,16 +311,27 @@ async fn initialize_daemon_client(
             bootstrap_client_name: "obsidian-mcp".to_string(),
             bootstrap_client_version: env!("CARGO_PKG_VERSION").to_string(),
         })
-        .await?;
-        InitializedDaemonClient {
-            client: SemanticDaemonClient::new(bootstrap_result.endpoint, policy),
-        }
+        .await?
+        .endpoint
+    };
+    let mut initialized = InitializedDaemonClient {
+        client: SemanticDaemonClient::new(endpoint, policy),
+        health_pending: false,
     };
 
-    let health = initialized
+    let health = match initialized
         .client
         .health("obsidian-mcp", env!("CARGO_PKG_VERSION"))
-        .await?;
+        .await
+    {
+        Ok(health) => health,
+        Err(error @ VaultError::DaemonTimeout { .. }) => {
+            tracing::warn!(error = %error, "daemon health probe timed out; later calls will retry the handshake");
+            initialized.health_pending = true;
+            return Ok(initialized);
+        }
+        Err(error) => return Err(error),
+    };
     tracing::info!(
         daemon_version = %health.daemon_version,
         daemon_api_version = health.daemon_api_version,
@@ -917,9 +946,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn watch_disabled_skips_daemon_initialization() {
-        let config = Config {
+    fn test_config() -> Config {
+        Config {
             vault_path: PathBuf::from("/tmp/test-vault"),
             watch: false,
             log_level: "error".to_string(),
@@ -934,12 +962,118 @@ mod tests {
             tool_filter: obsidian_mcp::config::ToolFilter::Full,
             mcp_data_dir: None,
             exclude_patterns: vec![],
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_disabled_skips_daemon_initialization() {
+        let config = test_config();
         let runtime = init_semantic_runtime(&config, &runtime_config(SemanticMode::Daemon)).await;
         assert!(runtime.daemon_client.is_none());
         assert_eq!(
             runtime.daemon_unavailable_reason.as_deref(),
             Some(DAEMON_DISABLED_BY_WATCH_REASON)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_health_timeout_recovers_without_local_indexing() {
+        use obsidian_mcp::tools::{search, utility};
+        use serde_json::{Value, json};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let directory = tempfile::tempdir().unwrap();
+        let endpoint = directory.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&endpoint).unwrap();
+        let recovered = Arc::new(tokio::sync::Notify::new());
+        let server_recovered = Arc::clone(&recovered);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut line = String::new();
+            let mut reader = BufReader::new(stream);
+            reader.read_line(&mut line).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            drop(reader);
+            server_recovered.notify_one();
+            let mut methods = Vec::new();
+            for _ in 0..4 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(read).read_line(&mut line).await.unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let method = request["method"].as_str().unwrap();
+                let result = match method {
+                    "health" => {
+                        json!({"daemon_version":"3.1.0", "daemon_api_version":2, "pid":1, "status":"ok", "uptime_ms":1, "model_name":"probe", "semantic_home":"/tmp/test"})
+                    }
+                    "vault_status" => {
+                        json!({"phase":"ready", "ready":true, "indexed_notes":0, "total_notes":0, "pending_notes":0})
+                    }
+                    "ensure_vault" => {
+                        json!({"vault_id":"test", "ready":true, "watch_enabled":true, "model_name":"probe"})
+                    }
+                    "search_semantic" => json!({"results":[]}),
+                    other => panic!("unexpected request {other}"),
+                };
+                methods.push(method.to_string());
+                let response = json!({"jsonrpc":"2.0", "id":request["id"], "result":result});
+                write
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            methods
+        });
+        let mut config = test_config();
+        config.vault_path = directory.path().join("vault");
+        std::fs::create_dir_all(config.vault_path.join(".obsidian")).unwrap();
+        config.watch = true;
+        config.embeddings = true;
+        config.embeddings_model = "not-a-local-model".into();
+        let mut runtime_config = runtime_config(SemanticMode::Auto);
+        runtime_config.daemon_endpoint_override = Some(endpoint.display().to_string());
+        runtime_config.connect_timeout_ms = 50;
+        runtime_config.connect_retries = 0;
+        let runtime = init_semantic_runtime(&config, &runtime_config).await;
+        assert!(runtime.daemon_client.is_some());
+        assert!(
+            runtime
+                .daemon_health_pending
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert!(!runtime.uses_local_backend());
+        let vault = Vault::open_deferred_embeddings(&config).await.unwrap();
+        recovered.notified().await;
+        let info = utility::vault_info(&vault, &runtime, utility::VaultInfoParams {})
+            .await
+            .unwrap();
+        assert_eq!(
+            info.structured_content.unwrap()["embeddings"]["availability"],
+            "available"
+        );
+        let result = search::search_semantic(
+            &vault,
+            search::SearchSemanticParams {
+                query: "probe".into(),
+                ..Default::default()
+            },
+            0.25,
+            &runtime,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.structured_content.unwrap()["results"], json!([]));
+        assert!(!runtime.uses_local_backend());
+        assert!(!vault.embeddings_active());
+        assert!(
+            !runtime
+                .daemon_health_pending
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert_eq!(
+            server.await.unwrap(),
+            ["health", "vault_status", "ensure_vault", "search_semantic"]
         );
     }
 }

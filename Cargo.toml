@@ -9,7 +9,7 @@ keywords = ["mcp", "obsidian", "vault", "ai"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
-rmcp = { version = "3.2", features = ["server", "transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "3.5.1", features = ["server", "transport-io", "transport-streamable-http-server"] }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -36,7 +36,7 @@ semver = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 flate2 = "1"
 tar = ">=0.4.45, <0.5"
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 zeroize = "1"
 tempfile = { version = "3", optional = true }
 

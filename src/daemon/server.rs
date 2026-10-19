@@ -321,6 +321,17 @@ async fn route_request_with_control(request: RpcRequest, state: Arc<ServerState>
             };
             route_health(request.id, params, &state)
         }
+        "vault_status" => {
+            let params: protocol::VaultStatusParams =
+                match parse_params(request.params, request.id.clone()) {
+                    Ok(params) => params,
+                    Err(err) => return RouteOutcome::response(*err),
+                };
+            match query::vault_status(&state.registry, params).await {
+                Ok(result) => response_from_result(request.id, &result),
+                Err(err) => response_from_query_error(request.id, err),
+            }
+        }
         "ensure_vault" => {
             let params: EnsureVaultParams = match parse_params(request.params, request.id.clone()) {
                 Ok(params) => params,
@@ -584,6 +595,44 @@ mod tests {
             .send(())
             .expect("shutdown signal should be delivered");
         server.await.expect("server task should join");
+    }
+
+    #[tokio::test]
+    async fn route_vault_status_does_not_attach_an_unseen_vault() {
+        let tmp = tempfile::tempdir().expect("tempdir should be created");
+        let vault_root = tmp.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        let state = make_state(&tmp.path().join("semantic-home"));
+        let response = route_request(
+            RpcRequest {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: Some(json!(1)),
+                method: "vault_status".to_string(),
+                params: json!({"vault_root": vault_root}),
+            },
+            Arc::clone(&state),
+        )
+        .await;
+        assert_eq!(
+            response.error.expect("unattached error expected").code,
+            protocol::ERR_VAULT_NOT_ATTACHED
+        );
+        assert!(
+            state
+                .registry
+                .get_context_by_root(&vault_root)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            tmp.path()
+                .join("semantic-home/vaults")
+                .read_dir()
+                .unwrap()
+                .next()
+                .is_none()
+        );
     }
 
     #[tokio::test]

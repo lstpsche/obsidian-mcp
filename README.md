@@ -84,6 +84,10 @@ OBSIDIAN_EMBEDDING_PROVIDER=api
 OBSIDIAN_EMBEDDING_API_BASE=http://localhost:11434/v1
 OBSIDIAN_EMBEDDING_API_MODEL=nomic-embed-text
 OBSIDIAN_EMBEDDING_API_KEY=unused
+# Optional tuning for a slow CPU-only embedding server
+OBSIDIAN_EMBEDDING_BATCH_SIZE=8
+OBSIDIAN_EMBEDDING_API_TIMEOUT_SECS=300
+OBSIDIAN_SEMANTIC_CONNECT_TIMEOUT_MS=310000
 
 # vLLM / LM Studio
 OBSIDIAN_EMBEDDINGS=true
@@ -99,6 +103,18 @@ OBSIDIAN_EMBEDDING_API_BASE=https://openrouter.ai/api/v1
 OBSIDIAN_EMBEDDING_API_MODEL=openai/text-embedding-3-small
 OBSIDIAN_EMBEDDING_API_KEY=sk-or-v1-...
 ```
+
+Smaller batches reduce the work in each embedding request. Increase the API
+timeout when a batch can take longer than the default 30 seconds. In daemon mode,
+the separate `OBSIDIAN_SEMANTIC_CONNECT_TIMEOUT_MS` deadline covers the complete
+daemon call, including query embedding; allow enough time for that request too.
+These values are examples, not throughput guarantees.
+
+The shared daemon uses the embedding configuration from its launch environment.
+Connecting another MCP server does not replace a running daemon's provider,
+endpoint, model, batch size, or timeout settings. Apply changes to the daemon's
+launcher and restart it. Use separate semantic homes for different daemon backend
+profiles, or `OBSIDIAN_SEMANTIC_MODE=local` for per-process configuration.
 
 ### Pre-built binaries
 
@@ -189,6 +205,10 @@ The `serve` command daemonizes the server and redirects logs to a platform-speci
 Default: `http://127.0.0.1:37842`. MCP tools are served at `/mcp`, health check at `/health`.
 
 The same MCP endpoint supports `server/discover` and stateless tool requests with protocol `2026-07-28`, plus the legacy `initialize` and session flow used by `2025-11-25` clients. Modern requests carry the protocol version and client metadata on each call. Reverse proxies must preserve MCP headers and forward an allowed loopback `Host` to the local server.
+
+A stdio client may probe `server/discover` and then select the legacy lifecycle
+with `initialize` on the same connection. Discovery alone does not require later
+legacy requests to carry modern per-request metadata.
 
 Benefits over stdio for multi-agent setups:
 - **Shared index** — one in-memory BM25/embedding index instead of N copies
@@ -424,9 +444,14 @@ Uses the shared local semantic daemon by default (`OBSIDIAN_SEMANTIC_MODE=auto`)
 
 Semantic runtime modes:
 
-- `auto` (default): prefer daemon, fallback to local in-process embeddings only when the daemon is genuinely unavailable and local embeddings are enabled. A daemon that is attached but warming does not start a competing local index.
-- `daemon`: daemon-only path; semantic calls fail clearly if daemon is unavailable.
+- `auto` (default): prefer daemon, fallback to local in-process embeddings only when the daemon is genuinely unavailable and local embeddings are enabled. The local runtime remains dormant while the daemon is healthy or warming. Once activated, local fallback remains selected until the MCP server restarts.
+- `daemon`: daemon-only path; semantic calls fail clearly if daemon is unavailable. No local embedding runtime is activated.
 - `local`: force the in-process embedding runtime.
+
+A slow daemon query or a warming index does not establish that the daemon stopped
+working. Those errors remain visible and do not activate a competing local index.
+If the initial health probe times out after resolving a daemon client, later
+requests retry the health handshake before using that daemon.
 
 Daemon startup policy:
 
@@ -443,6 +468,26 @@ Embedding lifecycle:
 | `degraded` | Yes or no | Some work failed. Verified last-known-good/partial vectors remain usable when any exist. Note-read, inference, and persistence failures retry; a model-load/configuration failure requires correction and restart. |
 
 Core note, graph, BM25, write, and MCP initialization behavior stays available in every phase. Repeated note changes are coalesced by path, and the newest write or removal wins over in-flight inference.
+
+Use `vault_info` to inspect semantic progress without submitting an embedding
+query. Its `embeddings` object identifies `source` (`local` or `daemon`) and
+`availability` (`available`, `disabled`, `unavailable`, `unattached`, or
+`unsupported`). When a runtime snapshot is available, `status` contains `phase`,
+`queryable`, `indexed_notes`, `total_notes`, `pending_notes`, and an optional
+`last_error`. Otherwise, the snapshot is omitted and an error can explain the
+unavailable state. `available` identifies a status snapshot; check `queryable` to
+determine whether it can serve semantic queries. Inspection never attaches a daemon vault or activates local
+fallback. Older API v2 daemons without passive status support report `unsupported`.
+
+Existing vectors can remain indexed while awaiting refresh. The counts describe
+the current store and pending work, not a completed percentage or ETA. HTTP
+`/health` continues to describe the local runtime; use `vault_info` for the selected
+semantic backend.
+
+While loading or reconciling, info-level logs report counts and in-flight timing
+at most once every 30 seconds in addition to lifecycle changes. Debug-level batch
+logs include request size, duration, outcome, and sanitized failures. Ready and
+dormant runtimes do not emit idle progress logs.
 
 Embedding caches are versioned and atomically replaced. A cache is reusable only when its backend, canonical model, vector dimension, embedding-input version, and—for API backends—the normalized endpoint fingerprint all match. Legacy payloads, incomplete first-pass checkpoints, corrupt data, and mismatched identities are never published; they trigger a one-time background rebuild. Cache locations do not change: local mode uses `{mcp_data}/embeddings/embeddings.bin`, while the daemon uses `<semantic-home>/vaults/<vault_id>/embeddings.bin`. Legacy-location relocation is non-destructive, runs behind the background coordinator, and publishes through the same atomic no-partial-file boundary.
 
@@ -478,7 +523,7 @@ Always available. Full regex syntax for pattern matching across all notes.
 | Tool | Parameters | Description |
 |------|-----------|-------------|
 | `vault_list` | `path?`, `recursive?`, `glob?`, `format?`, `max_depth?`, `include_metadata?` | List files (`format: "list"`) or tree view (`format: "tree"`) |
-| `vault_info` | — | Aggregate vault statistics |
+| `vault_info` | — | Aggregate vault statistics and passive semantic backend status |
 
 `vault_list` keeps its default JSON string-array response. With `include_metadata: true` in list mode, each indexed Markdown note instead includes `path`, filename-stem `title`, `tags`, `size`, and available filesystem timestamps from the existing index without loading note bodies. Directories, non-Markdown files, and unindexed or excluded notes remain path-only objects. Metadata is not supported in tree mode.
 
@@ -579,6 +624,8 @@ The `read` profile exposes frontmatter as part of the raw Markdown returned by `
 | `OBSIDIAN_EMBEDDING_API_BASE` | No | `https://api.openai.com/v1` | Embedding API base URL (fallback: `OPENAI_BASE_URL`) |
 | `OBSIDIAN_EMBEDDING_API_MODEL` | When api | Fallback: `OPENAI_MODEL` | Model name for embedding API |
 | `OBSIDIAN_EMBEDDING_DIM` | No | *(probed)* | Override embedding dimension (skips API probe) |
+| `OBSIDIAN_EMBEDDING_API_TIMEOUT_SECS` | No | `30` | Embedding API request timeout in seconds; integer from 1 to 86400 |
+| `OBSIDIAN_EMBEDDING_BATCH_SIZE` | No | `32` | Maximum notes processed per background reconciliation batch; positive integer, for either embedding backend |
 | `OBSIDIAN_EMBEDDING_CA_CERT` | No | — | Path to PEM CA certificate for API TLS |
 | `OBSIDIAN_EMBEDDING_TLS_VERIFY` | No | `true` | Set to `false` to skip TLS verification |
 | `OBSIDIAN_SEMANTIC_MODE` | No | `auto` | Semantic backend mode: `auto`, `daemon`, `local` |
@@ -587,7 +634,7 @@ The `read` profile exposes frontmatter as part of the raw Markdown returned by `
 | `OBSIDIAN_SEMANTIC_DAEMON_DOWNLOAD_URL` | No | `https://github.com/lstpsche/obsidian-mcp/releases/download/v<version>/obsidian-semanticd-<version>-<target>.<ext>` | Override daemon download URL when binary is missing |
 | `OBSIDIAN_SEMANTIC_MODEL` | No | `BAAI/bge-small-en-v1.5` | Default model used by semantic daemon runtime |
 | `OBSIDIAN_SEMANTIC_ENDPOINT` | No | `<semantic-home>/ipc/...` | Daemon-only endpoint override (internal/runtime use) |
-| `OBSIDIAN_SEMANTIC_CONNECT_TIMEOUT_MS` | No | `2000` | Per-call daemon timeout in milliseconds |
+| `OBSIDIAN_SEMANTIC_CONNECT_TIMEOUT_MS` | No | `2000` | Whole daemon-call timeout, including query embedding, in milliseconds; clamped to 100–86400000. Separate from the embedding API timeout |
 | `OBSIDIAN_SEMANTIC_CONNECT_RETRIES` | No | `2` | Daemon retry attempts after the first failed call |
 | `OBSIDIAN_SEMANTIC_RETRY_BACKOFF_MS` | No | `250` | Base retry backoff in milliseconds |
 | `OBSIDIAN_SEMANTIC_PREFETCH` | No | `50` | Default lexical prefetch candidate count for hybrid daemon queries |
@@ -596,6 +643,10 @@ The `read` profile exposes frontmatter as part of the raw Markdown returned by `
 | `FASTEMBED_CACHE_DIR` | No | `<semantic-home>/model/fastembed-cache` | Daemon-internal shared fastembed cache root |
 
 \* Also accepted as the first CLI argument: `obsidian-mcp /path/to/vault`
+
+Invalid explicit embedding API timeout or batch-size settings are reported as
+configuration errors. Both binaries read their own process environment; a running
+shared daemon keeps its launch settings until it is restarted.
 
 ## Architecture
 
@@ -647,3 +698,5 @@ npx @modelcontextprotocol/inspector cargo run   # interactive testing (stdio)
 ## License
 
 [MIT](LICENSE)
+
+For suspected vulnerabilities, follow the [security reporting policy](SECURITY.md).

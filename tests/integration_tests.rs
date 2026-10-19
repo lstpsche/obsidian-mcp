@@ -877,6 +877,8 @@ mod tool_filtering {
             daemon_unavailable_reason: None,
             prefetch_count: 50,
             vault_ensured: Arc::new(AtomicBool::new(false)),
+            local_fallback_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            daemon_health_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -1757,6 +1759,8 @@ mod semantic_tool_runtime_modes {
             )),
             daemon_unavailable_reason: None,
             vault_ensured: Arc::new(AtomicBool::new(false)),
+            local_fallback_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            daemon_health_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             prefetch_count: 50,
         };
 
@@ -1814,9 +1818,14 @@ mod semantic_tool_runtime_modes {
             daemon_client: None,
             daemon_unavailable_reason: Some("daemon socket unavailable".to_string()),
             vault_ensured: Arc::new(AtomicBool::new(false)),
+            local_fallback_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            daemon_health_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             prefetch_count: 50,
         };
 
+        assert!(runtime.activate_local_fallback(
+            &obsidian_mcp::error::VaultError::DaemonUnavailable("daemon socket unavailable".into(),)
+        ));
         let parsed = wait_for_local_tool_hit(&vault, &runtime, "memory safety", "local.md").await;
         assert!(!parsed.is_empty());
         assert!(
@@ -1842,6 +1851,8 @@ mod semantic_tool_runtime_modes {
             daemon_client: None,
             daemon_unavailable_reason: Some("not connected".to_string()),
             vault_ensured: Arc::new(AtomicBool::new(false)),
+            local_fallback_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            daemon_health_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             prefetch_count: 50,
         };
 

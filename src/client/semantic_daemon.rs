@@ -122,6 +122,17 @@ impl SemanticDaemonClient {
         .await
     }
 
+    /// Inspect existing daemon state without attaching or activating the vault.
+    pub async fn vault_status(&self, vault_root: &Path) -> VaultResult<protocol::SemanticStatus> {
+        self.call(
+            "vault_status",
+            protocol::VaultStatusParams {
+                vault_root: vault_root.display().to_string(),
+            },
+        )
+        .await
+    }
+
     pub async fn search_semantic(
         &self,
         vault_root: &Path,

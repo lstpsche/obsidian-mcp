@@ -161,6 +161,41 @@ Rules:
 - `vault_id` derivation follows `README.md` in this directory.
 - Multiple clients calling `ensure_vault` for same vault must converge to the same runtime context.
 
+## `vault_status`
+
+Reads the semantic status of an already attached vault without opening it or
+starting indexing or watching.
+
+Request params:
+
+```json
+{
+  "vault_root": "/abs/path/to/vault"
+}
+```
+
+Response result:
+
+```json
+{
+  "phase": "warming",
+  "ready": false,
+  "indexed_notes": 32,
+  "total_notes": 100,
+  "pending_notes": 68
+}
+```
+
+The response may include `last_error`. `ready` means a compatible snapshot is
+queryable; `phase` independently describes reconciliation as `warming`, `ready`,
+or `degraded`. Existing vectors may still need refresh, so `indexed_notes` is not
+a completed-work counter.
+
+An unattached vault returns `-32031`; callers inspecting status must not attach it
+as a recovery action. This method is additive within API v2. Older v2 daemons can
+return `-32601`; clients should surface status as unsupported rather than
+substitute a different runtime's progress.
+
 ## `shutdown`
 
 Gracefully terminates the shared daemon for an ownership-verified lifecycle operation.

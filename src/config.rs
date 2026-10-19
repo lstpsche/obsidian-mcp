@@ -63,6 +63,54 @@ impl EmbeddingProvider {
     }
 }
 
+/// Maximum number of notes submitted in one embedding reconciliation batch.
+pub fn embedding_batch_size_from_env() -> Result<usize, String> {
+    let raw = optional_numeric_setting("OBSIDIAN_EMBEDDING_BATCH_SIZE")?;
+    parse_embedding_batch_size(raw.as_deref())
+}
+
+fn parse_embedding_batch_size(raw: Option<&str>) -> Result<usize, String> {
+    let Some(raw) = raw else {
+        return Ok(32);
+    };
+    raw.trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            "invalid OBSIDIAN_EMBEDDING_BATCH_SIZE: expected a positive integer".to_string()
+        })
+}
+
+/// Timeout shared by embedding API dimension probes and embedding requests.
+pub fn embedding_api_timeout_from_env() -> Result<std::time::Duration, String> {
+    let raw = optional_numeric_setting("OBSIDIAN_EMBEDDING_API_TIMEOUT_SECS")?;
+    parse_embedding_api_timeout(raw.as_deref())
+}
+
+fn parse_embedding_api_timeout(raw: Option<&str>) -> Result<std::time::Duration, String> {
+    let Some(raw) = raw else {
+        return Ok(std::time::Duration::from_secs(30));
+    };
+    raw.trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| (1..=86_400).contains(seconds))
+        .map(std::time::Duration::from_secs)
+        .ok_or_else(|| {
+            "invalid OBSIDIAN_EMBEDDING_API_TIMEOUT_SECS: expected an integer between 1 and 86400"
+                .to_string()
+        })
+}
+
+fn optional_numeric_setting(name: &str) -> Result<Option<String>, String> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(format!("cannot read {name}: {error}")),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub vault_path: PathBuf,
@@ -559,7 +607,7 @@ impl SemanticRuntimeConfig {
                 .unwrap_or_else(|| DEFAULT_MODEL_NAME.to_string()),
             connect_timeout_ms: parse_u64_env("OBSIDIAN_SEMANTIC_CONNECT_TIMEOUT_MS")
                 .unwrap_or(DEFAULT_SEMANTIC_CONNECT_TIMEOUT_MS)
-                .clamp(100, 60_000),
+                .clamp(100, 86_400_000),
             connect_retries: parse_u32_env("OBSIDIAN_SEMANTIC_CONNECT_RETRIES")
                 .unwrap_or(DEFAULT_SEMANTIC_CONNECT_RETRIES)
                 .clamp(0, 10),
@@ -663,6 +711,61 @@ mod tests {
     fn semantic_runtime_config_defaults_model() {
         let cfg = SemanticRuntimeConfig::load_from_env();
         assert!(!cfg.model_name.is_empty());
+    }
+
+    #[test]
+    fn embedding_batch_size_defaults_and_accepts_positive_usize() {
+        assert_eq!(parse_embedding_batch_size(None).unwrap(), 32);
+        assert_eq!(parse_embedding_batch_size(Some(" 1 ")).unwrap(), 1);
+        assert_eq!(parse_embedding_batch_size(Some("256")).unwrap(), 256);
+        assert_eq!(
+            parse_embedding_batch_size(Some(&usize::MAX.to_string())).unwrap(),
+            usize::MAX
+        );
+    }
+
+    #[test]
+    fn embedding_batch_size_rejects_invalid_explicit_values() {
+        for raw in ["", "  ", "0", "-1", "1.5", "many", "184467440737095516160"] {
+            let error = parse_embedding_batch_size(Some(raw)).unwrap_err();
+            assert!(error.contains("OBSIDIAN_EMBEDDING_BATCH_SIZE"), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn embedding_api_timeout_defaults_and_accepts_supported_range() {
+        use std::time::Duration;
+
+        assert_eq!(
+            parse_embedding_api_timeout(None).unwrap(),
+            Duration::from_secs(30)
+        );
+        for seconds in [1, 120, 86_400] {
+            assert_eq!(
+                parse_embedding_api_timeout(Some(&format!(" {seconds} "))).unwrap(),
+                Duration::from_secs(seconds)
+            );
+        }
+    }
+
+    #[test]
+    fn embedding_api_timeout_rejects_invalid_explicit_values() {
+        for raw in [
+            "",
+            "  ",
+            "0",
+            "86401",
+            "-1",
+            "1.5",
+            "slow",
+            "184467440737095516160",
+        ] {
+            let error = parse_embedding_api_timeout(Some(raw)).unwrap_err();
+            assert!(
+                error.contains("OBSIDIAN_EMBEDDING_API_TIMEOUT_SECS"),
+                "{raw:?}"
+            );
+        }
     }
 
     #[test]

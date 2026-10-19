@@ -87,12 +87,27 @@ pub(crate) struct NoteListMetadata {
 impl Vault {
     /// Open a vault: validate the path, build the index, and optionally start the watcher.
     pub async fn open(config: &Config) -> VaultResult<Self> {
-        Self::open_with_embedding_loader(config, None).await
+        Self::open_inner(config, None, true).await
     }
 
+    /// Open a vault with a dormant local embedding coordinator.
+    /// Mutations remain queued until `activate_embeddings` selects local ownership.
+    pub async fn open_deferred_embeddings(config: &Config) -> VaultResult<Self> {
+        Self::open_inner(config, None, false).await
+    }
+
+    #[cfg(all(test, has_embeddings))]
     async fn open_with_embedding_loader(
         config: &Config,
+        embedding_loader: Option<EmbeddingLoaderFuture>,
+    ) -> VaultResult<Self> {
+        Self::open_inner(config, embedding_loader, true).await
+    }
+
+    async fn open_inner(
+        config: &Config,
         _embedding_loader: Option<EmbeddingLoaderFuture>,
+        _embeddings_active: bool,
     ) -> VaultResult<Self> {
         let root = config.vault_path.canonicalize().map_err(|_| {
             VaultError::InvalidPath(format!(
@@ -186,6 +201,8 @@ impl Vault {
 
         #[cfg(has_embeddings)]
         let embedding_runtime = if config.embeddings {
+            let batch_size =
+                crate::config::embedding_batch_size_from_env().map_err(VaultError::Embedding)?;
             let model_name = config.embeddings_model.clone();
             let provider = config.embedding_provider;
             let cache_path = Self::embedding_cache_path(&mcp_data);
@@ -206,6 +223,8 @@ impl Vault {
                     Arc::clone(&index),
                     cache_path,
                     cache_migration_sources,
+                    batch_size,
+                    _embeddings_active,
                     loader,
                 ),
             )
@@ -248,6 +267,36 @@ impl Vault {
                 _watcher: Mutex::new(watcher_handle),
             }),
         })
+    }
+
+    /// Activate local embeddings once without replacing the watcher submission handle.
+    pub fn activate_embeddings(&self) -> bool {
+        #[cfg(has_embeddings)]
+        {
+            self.inner
+                .embedding_runtime
+                .as_ref()
+                .is_some_and(embedding_runtime::EmbeddingRuntime::activate)
+        }
+        #[cfg(not(has_embeddings))]
+        {
+            false
+        }
+    }
+
+    /// Whether the local coordinator has been activated, independently of readiness.
+    pub fn embeddings_active(&self) -> bool {
+        #[cfg(has_embeddings)]
+        {
+            self.inner
+                .embedding_runtime
+                .as_ref()
+                .is_some_and(embedding_runtime::EmbeddingRuntime::is_active)
+        }
+        #[cfg(not(has_embeddings))]
+        {
+            false
+        }
     }
 
     /// Vault root path (canonicalized).
@@ -916,9 +965,180 @@ mod tests {
     use crate::test_helpers::{create_test_vault, tantivy_config, test_config};
     use unicode_normalization::UnicodeNormalization;
 
+    const PERIODIC_PERIODS: [NotePeriod; 5] = [
+        NotePeriod::Daily,
+        NotePeriod::Weekly,
+        NotePeriod::Monthly,
+        NotePeriod::Quarterly,
+        NotePeriod::Yearly,
+    ];
+
+    fn configure_periodic_template(root: &Path, period: &NotePeriod, template: &Path) {
+        let key = match period {
+            NotePeriod::Daily => "daily",
+            NotePeriod::Weekly => "weekly",
+            NotePeriod::Monthly => "monthly",
+            NotePeriod::Quarterly => "quarterly",
+            NotePeriod::Yearly => "yearly",
+        };
+        let entry = serde_json::json!({
+            "enabled": true,
+            "format": "YYYY-MM-DD",
+            "folder": "Periodic",
+            "template": template,
+        });
+        let (config_path, config) = match period {
+            NotePeriod::Daily => (root.join(".obsidian/daily-notes.json"), entry),
+            _ => (
+                root.join(".obsidian/plugins/periodic-notes/data.json"),
+                serde_json::json!({(key): entry}),
+            ),
+        };
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    }
+
+    fn periodic_template_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("vault");
+        create_test_vault(&root);
+        let canary = directory.path().join("canary.md");
+        std::fs::write(&canary, "outside template canary").unwrap();
+        (directory, root, canary)
+    }
+
+    async fn assert_periodic_template_rejected(
+        root: &Path,
+        canary: &Path,
+        period: &NotePeriod,
+        template: &Path,
+    ) {
+        configure_periodic_template(root, period, template);
+        let vault = Vault::open(&test_config(root)).await.unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+
+        let result = vault.create_periodic_note(period, Some(date), None);
+
+        assert!(
+            matches!(
+                result,
+                Err(VaultError::OutsideVault(_) | VaultError::InvalidPath(_))
+            ),
+            "{period:?}: {result:?}"
+        );
+        assert!(!root.join("Periodic").exists());
+        assert_eq!(
+            std::fs::read_to_string(canary).unwrap(),
+            "outside template canary"
+        );
+    }
+
+    #[tokio::test]
+    async fn periodic_templates_reject_parent_directory_escape() {
+        for period in PERIODIC_PERIODS {
+            let (_directory, root, canary) = periodic_template_fixture();
+            assert_periodic_template_rejected(&root, &canary, &period, Path::new("../canary"))
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn periodic_templates_reject_absolute_paths() {
+        for period in PERIODIC_PERIODS {
+            let (_directory, root, canary) = periodic_template_fixture();
+            assert_periodic_template_rejected(&root, &canary, &period, &canary).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn periodic_templates_allow_missing_vault_relative_templates() {
+        for period in PERIODIC_PERIODS {
+            let (_directory, root, _canary) = periodic_template_fixture();
+            configure_periodic_template(&root, &period, Path::new("Templates/missing"));
+            let vault = Vault::open(&test_config(&root)).await.unwrap();
+            let date = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+
+            let note = vault
+                .create_periodic_note(&period, Some(date), None)
+                .unwrap();
+
+            assert!(vault.read_note(&note).unwrap().is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn periodic_templates_reject_symlinks_outside_the_vault() {
+        for period in PERIODIC_PERIODS {
+            let (_directory, root, canary) = periodic_template_fixture();
+            std::fs::create_dir(root.join("Templates")).unwrap();
+            std::os::unix::fs::symlink(&canary, root.join("Templates/linked.md")).unwrap();
+            assert_periodic_template_rejected(
+                &root,
+                &canary,
+                &period,
+                Path::new("Templates/linked"),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn periodic_templates_resolve_vault_relative_unicode_paths_with_optional_extension() {
+        for period in PERIODIC_PERIODS {
+            for template in [
+                "Templates/Élan",
+                "Templates/Élan.md",
+                "Templates/E\u{301}lan",
+            ] {
+                let (_directory, root, _canary) = periodic_template_fixture();
+                std::fs::create_dir(root.join("Templates")).unwrap();
+                std::fs::write(
+                    root.join("Templates/E\u{301}lan.md"),
+                    "Created {{date:YYYY-MM-DD}} {{title}}",
+                )
+                .unwrap();
+                configure_periodic_template(&root, &period, Path::new(template));
+                let vault = Vault::open(&test_config(&root)).await.unwrap();
+                let date = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+
+                let note = vault
+                    .create_periodic_note(&period, Some(date), None)
+                    .unwrap();
+
+                assert_eq!(note, Path::new("Periodic/2026-01-02.md"));
+                assert_eq!(
+                    vault.read_note(&note).unwrap(),
+                    "Created 2026-01-02 2026-01-02"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn periodic_templates_allow_symlinks_to_templates_inside_the_vault() {
+        for period in PERIODIC_PERIODS {
+            let (_directory, root, _canary) = periodic_template_fixture();
+            std::fs::create_dir(root.join("Templates")).unwrap();
+            std::fs::write(root.join("Templates/inside.md"), "Inside {{title}}").unwrap();
+            std::os::unix::fs::symlink("inside.md", root.join("Templates/linked.md")).unwrap();
+            configure_periodic_template(&root, &period, Path::new("Templates/linked"));
+            let vault = Vault::open(&test_config(&root)).await.unwrap();
+            let date = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+
+            let note = vault
+                .create_periodic_note(&period, Some(date), None)
+                .unwrap();
+
+            assert_eq!(vault.read_note(&note).unwrap(), "Inside 2026-01-02");
+        }
+    }
+
     #[cfg(has_embeddings)]
     struct TestEmbedder {
         identity: embeddings::EmbeddingSpaceIdentity,
+        inputs: Mutex<Vec<String>>,
     }
 
     #[cfg(has_embeddings)]
@@ -932,6 +1152,7 @@ mod tests {
                     dimension: 2,
                     input_version: embeddings::EMBEDDING_INPUT_VERSION,
                 },
+                inputs: Mutex::new(Vec::new()),
             }
         }
     }
@@ -947,6 +1168,10 @@ mod tests {
         }
 
         fn embed_batch(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>> {
+            self.inputs
+                .lock()
+                .unwrap()
+                .extend(texts.iter().map(|text| (*text).to_string()));
             Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
         }
     }
@@ -1637,6 +1862,92 @@ mod tests {
             results[0].score.is_none(),
             "regex fallback should not populate BM25 scores"
         );
+    }
+
+    #[cfg(has_embeddings)]
+    #[tokio::test]
+    async fn deferred_embeddings_reconcile_final_mutations_and_watcher_events() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".obsidian")).unwrap();
+        std::fs::write(dir.path().join("edit.md"), "OUTDATED_MARKER").unwrap();
+        std::fs::write(dir.path().join("delete.md"), "DELETED_MARKER").unwrap();
+        let mut config = embedding_config(dir.path());
+        config.watch = true;
+        config.exclude_patterns = vec!["Hidden/".into()];
+        let model = Arc::new(TestEmbedder::new());
+        let loader_model = Arc::clone(&model);
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_polls = Arc::clone(&polls);
+        let loader: EmbeddingLoaderFuture = Box::pin(async move {
+            loader_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(loader_model as Arc<dyn embeddings::Embedder>)
+        });
+        let vault = Vault::open_inner(&config, Some(loader), false)
+            .await
+            .unwrap();
+        let submitter = vault.inner.embedding_runtime.as_ref().unwrap().downgrade();
+        vault
+            .write_note(Path::new("edit.md"), "FINAL_EDIT_MARKER")
+            .unwrap();
+        vault.delete_note(Path::new("delete.md")).unwrap();
+        vault
+            .create_note(Path::new("created.md"), "FINAL_MOVED_MARKER", None)
+            .unwrap();
+        vault
+            .move_note(Path::new("created.md"), Path::new("moved.md"))
+            .unwrap();
+        vault
+            .write_note(Path::new("Hidden/secret.md"), "EXCLUDED_MARKER")
+            .unwrap();
+        std::fs::write(dir.path().join("external.md"), "FINAL_EXTERNAL_MARKER").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while vault.get_note_metadata(Path::new("external.md")).is_err() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!vault.embeddings_active());
+        assert!(model.inputs.lock().unwrap().is_empty());
+        assert!(vault.clone().activate_embeddings());
+        assert!(!vault.activate_embeddings());
+        // A previously captured watcher handle still reaches the activated coordinator.
+        submitter.submit_upsert(Path::new("edit.md"));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !vault
+                .embedding_status()
+                .is_some_and(|status| status.phase == embedding_runtime::EmbeddingPhase::Ready)
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(vault.embeddings_active());
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let inputs = model.inputs.lock().unwrap();
+        assert_eq!(
+            inputs.len(),
+            3,
+            "only final visible notes require embedding: {inputs:?}"
+        );
+        for marker in [
+            "FINAL_EDIT_MARKER",
+            "FINAL_MOVED_MARKER",
+            "FINAL_EXTERNAL_MARKER",
+        ] {
+            assert!(
+                inputs.iter().any(|text| text.contains(marker)),
+                "missing {marker}: {inputs:?}"
+            );
+        }
+        for marker in ["OUTDATED_MARKER", "DELETED_MARKER", "EXCLUDED_MARKER"] {
+            assert!(
+                !inputs.iter().any(|text| text.contains(marker)),
+                "unexpected {marker}: {inputs:?}"
+            );
+        }
     }
 
     #[cfg(has_embeddings)]

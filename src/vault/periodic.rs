@@ -513,12 +513,12 @@ pub fn expand_template(
     date: &NaiveDate,
     title: &str,
 ) -> VaultResult<String> {
-    let full_path = vault_root.join(template_path);
-    let full_path = if full_path.extension().is_none() {
-        full_path.with_extension("md")
+    let relative_path = if template_path.extension().is_none() {
+        template_path.with_extension("md")
     } else {
-        full_path
+        template_path.to_path_buf()
     };
+    let full_path = super::path::resolve_existing(vault_root, &relative_path)?.absolute;
 
     let content = std::fs::read_to_string(&full_path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => VaultError::NoteNotFound(template_path.to_path_buf()),

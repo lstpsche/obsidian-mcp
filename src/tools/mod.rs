@@ -11,16 +11,18 @@ pub mod utility;
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::schema_for_output;
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::model::{CallToolResult, ErrorData, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ErrorData, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 
 use crate::client::semantic_daemon::SemanticDaemonClient;
 use crate::config::SemanticMode;
+use crate::daemon::protocol;
+use crate::error::VaultError;
 use crate::vault::Vault;
 
 /// JSON Schema for a value that may be any JSON type.
@@ -79,6 +81,59 @@ pub struct SemanticRuntime {
     pub daemon_unavailable_reason: Option<String>,
     pub prefetch_count: usize,
     pub vault_ensured: Arc<AtomicBool>,
+    pub local_fallback_active: Arc<AtomicBool>,
+    pub daemon_health_pending: Arc<AtomicBool>,
+}
+
+impl SemanticRuntime {
+    /// Retry a deferred startup handshake before using the resolved daemon.
+    pub async fn ensure_daemon_health(&self) -> crate::error::VaultResult<()> {
+        if self.daemon_health_pending.load(Ordering::Acquire) {
+            let client = self.daemon_client.as_ref().ok_or_else(|| {
+                VaultError::DaemonUnavailable("semantic daemon client is not initialized".into())
+            })?;
+            client
+                .health("obsidian-mcp", env!("CARGO_PKG_VERSION"))
+                .await?;
+            self.daemon_health_pending.store(false, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    pub fn uses_local_backend(&self) -> bool {
+        self.mode == SemanticMode::Local
+            || (self.mode == SemanticMode::Auto
+                && self.local_fallback_active.load(Ordering::Acquire))
+    }
+
+    /// Select local ownership for this MCP lifetime after a daemon outage.
+    /// A timeout or a warming index does not establish that the daemon stopped.
+    pub fn activate_local_fallback(&self, error: &VaultError) -> bool {
+        let unavailable = match error {
+            VaultError::DaemonUnavailable(_)
+            | VaultError::DaemonIpc(_)
+            | VaultError::DaemonBootstrap(_) => true,
+            VaultError::DaemonRpc { code, .. } => matches!(
+                *code,
+                protocol::ERR_DAEMON_UNAVAILABLE
+                    | protocol::ERR_BOOTSTRAP_REQUIRED
+                    | protocol::ERR_INCOMPATIBLE_API_VERSION
+            ),
+            _ => false,
+        };
+        if self.mode != SemanticMode::Auto || !unavailable {
+            return false;
+        }
+        if self
+            .local_fallback_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.vault_ensured.store(false, Ordering::Release);
+            tracing::warn!(error = %error, "semantic daemon unavailable; local fallback selected until MCP restarts");
+        }
+        true
+    }
 }
 
 pub struct ObsidianMcp {
@@ -368,13 +423,13 @@ impl ObsidianMcp {
         name = "vault_info",
         annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
         output_schema = schema_for_output::<utility::VaultInfo>(),
-        description = "Return aggregate vault statistics: total notes, files, tags, links, and vault size in bytes."
+        description = "Return aggregate vault statistics and passive semantic backend status. Inspecting status does not start indexing or attach a daemon vault."
     )]
     async fn vault_info(
         &self,
         Parameters(params): Parameters<utility::VaultInfoParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        utility::vault_info(&self.vault, params).await
+        utility::vault_info(&self.vault, &self.semantic_runtime, params).await
     }
 
     #[tool(
@@ -393,8 +448,8 @@ impl ObsidianMcp {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for ObsidianMcp {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 env!("CARGO_PKG_NAME"),
                 env!("CARGO_PKG_VERSION"),
@@ -422,7 +477,49 @@ mod tests {
             daemon_unavailable_reason: None,
             prefetch_count: 50,
             vault_ensured: Arc::new(AtomicBool::new(false)),
+            local_fallback_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            daemon_health_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    #[test]
+    fn local_fallback_selection_is_shared_and_survives_later_requests() {
+        let mut runtime = test_runtime();
+        runtime.mode = SemanticMode::Auto;
+        let next_handler = runtime.clone();
+        assert!(!next_handler.uses_local_backend());
+        assert!(runtime.activate_local_fallback(&VaultError::DaemonUnavailable("offline".into())));
+        assert!(next_handler.uses_local_backend());
+        assert!(
+            !next_handler.activate_local_fallback(&VaultError::DaemonTimeout {
+                operation: "query".into(),
+                timeout_ms: 100,
+            })
+        );
+        assert!(runtime.uses_local_backend());
+    }
+
+    #[test]
+    fn slow_or_warming_daemon_never_selects_local_fallback() {
+        let mut runtime = test_runtime();
+        runtime.mode = SemanticMode::Auto;
+        for error in [
+            VaultError::DaemonTimeout {
+                operation: "health".into(),
+                timeout_ms: 100,
+            },
+            VaultError::DaemonRpc {
+                code: protocol::ERR_VAULT_NOT_READY,
+                message: "warming".into(),
+                data: None,
+            },
+        ] {
+            assert!(!runtime.activate_local_fallback(&error));
+            assert!(!runtime.uses_local_backend());
+        }
+        runtime.mode = SemanticMode::Daemon;
+        assert!(!runtime.activate_local_fallback(&VaultError::DaemonUnavailable("offline".into())));
+        assert!(!runtime.uses_local_backend());
     }
 
     async fn call_tool_raw(

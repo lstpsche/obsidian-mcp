@@ -59,6 +59,8 @@ impl VaultContext {
 
         #[cfg(has_embeddings)]
         let embedding_runtime = {
+            let batch_size =
+                crate::config::embedding_batch_size_from_env().map_err(VaultError::Embedding)?;
             let cache_migration_sources = vec![
                 vault_root
                     .join(".obsidian-mcp")
@@ -74,6 +76,8 @@ impl VaultContext {
                 Arc::clone(&index),
                 state_dir.join("embeddings.bin"),
                 cache_migration_sources,
+                batch_size,
+                true,
                 embedding_loader,
             )
         };

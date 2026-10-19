@@ -740,7 +740,10 @@ fn extract_zip_binary(archive_bytes: &[u8], destination: &Path) -> VaultResult<(
         let mut file = archive.by_index(idx).map_err(|err| {
             VaultError::DaemonBootstrap(format!("failed to read zip entry: {err}"))
         })?;
-        let Some(file_name) = std::path::Path::new(file.name())
+        let entry_name = file.name().map_err(|err| {
+            VaultError::DaemonBootstrap(format!("failed to decode zip entry name: {err}"))
+        })?;
+        let Some(file_name) = std::path::Path::new(entry_name.as_ref())
             .file_name()
             .and_then(|name| name.to_str())
         else {
@@ -750,13 +753,13 @@ fn extract_zip_binary(archive_bytes: &[u8], destination: &Path) -> VaultResult<(
             if file.is_dir() {
                 return Err(VaultError::DaemonBootstrap(format!(
                     "zip entry '{}' is a directory; refusing to extract",
-                    file.name()
+                    entry_name
                 )));
             }
-            if file.name().contains("..") {
+            if entry_name.contains("..") {
                 return Err(VaultError::DaemonBootstrap(format!(
                     "zip entry '{}' contains path traversal sequence; refusing to extract",
-                    file.name()
+                    entry_name
                 )));
             }
             let mut out = std::fs::File::create(destination)?;
@@ -858,10 +861,13 @@ async fn wait_for_health(
         }
 
         if started.elapsed() >= timeout {
-            return Err(VaultError::DaemonBootstrap(format!(
-                "timed out waiting for daemon health on endpoint '{}'",
-                endpoint.endpoint_string()
-            )));
+            return Err(VaultError::DaemonTimeout {
+                operation: format!(
+                    "waiting for daemon health on {}",
+                    endpoint.endpoint_string()
+                ),
+                timeout_ms: timeout.as_millis().min(u64::MAX as u128) as u64,
+            });
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -1275,6 +1281,98 @@ fn endpoint_from_manifest(manifest: &RuntimeManifest) -> Option<IpcEndpoint> {
 mod tests {
     use super::*;
     use crate::daemon::server;
+
+    fn zip_bytes(entries: &[(&str, &[u8])], compression: zip::CompressionMethod) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default().compression_method(compression);
+        for (name, content) in entries {
+            if name.ends_with('/') {
+                archive.add_directory(*name, options).unwrap();
+            } else {
+                archive.start_file(*name, options).unwrap();
+                archive.write_all(content).unwrap();
+            }
+        }
+        archive.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn zip_archive_extracts_only_the_daemon_binary_to_the_selected_path() {
+        for compression in [
+            zip::CompressionMethod::Stored,
+            zip::CompressionMethod::Deflated,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let destination = directory.path().join("installed-daemon");
+            let entry_name = format!("payload/{}", home::daemon_binary_name());
+            let bytes = zip_bytes(
+                &[
+                    ("README.txt", b"release notes"),
+                    (&entry_name, b"daemon payload"),
+                ],
+                compression,
+            );
+
+            extract_zip_binary(&bytes, &destination).unwrap();
+
+            assert_eq!(std::fs::read(destination).unwrap(), b"daemon payload");
+            assert!(!directory.path().join("README.txt").exists());
+            assert!(!directory.path().join("payload").exists());
+        }
+    }
+
+    #[test]
+    fn zip_archive_rejects_missing_binary_without_replacing_the_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("installed-daemon");
+        std::fs::write(&destination, b"existing binary").unwrap();
+        let bytes = zip_bytes(
+            &[("README.txt", b"release notes")],
+            zip::CompressionMethod::Stored,
+        );
+
+        let error = extract_zip_binary(&bytes, &destination).unwrap_err();
+
+        assert!(error.to_string().contains("does not contain"));
+        assert_eq!(std::fs::read(destination).unwrap(), b"existing binary");
+    }
+
+    #[test]
+    fn zip_archive_rejects_traversal_and_directory_entries_before_writing() {
+        for (entry_name, expected) in [
+            (
+                format!("../{}", home::daemon_binary_name()),
+                "path traversal",
+            ),
+            (format!("{}/", home::daemon_binary_name()), "is a directory"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let destination = directory.path().join("installed-daemon");
+            std::fs::write(&destination, b"existing binary").unwrap();
+            let bytes = zip_bytes(
+                &[(&entry_name, b"untrusted")],
+                zip::CompressionMethod::Stored,
+            );
+
+            let error = extract_zip_binary(&bytes, &destination).unwrap_err();
+
+            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(std::fs::read(destination).unwrap(), b"existing binary");
+        }
+    }
+
+    #[test]
+    fn zip_archive_rejects_invalid_bytes_without_creating_the_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("installed-daemon");
+
+        let error = extract_zip_binary(b"not a ZIP archive", &destination).unwrap_err();
+
+        assert!(error.to_string().contains("failed to open zip archive"));
+        assert!(!destination.exists());
+    }
 
     #[test]
     fn resolve_download_url_uses_override() {

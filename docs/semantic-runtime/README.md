@@ -8,6 +8,21 @@ This directory defines the shared local semantic-search runtime contract used by
 
 The goal is one local runtime, one model cache, and isolated per-vault semantic state.
 
+The daemon shares one embedding provider/model across its vault contexts. Its
+launch environment controls the API endpoint, credentials, model, request timeout
+(`OBSIDIAN_EMBEDDING_API_TIMEOUT_SECS`, default 30 seconds), and reconciliation
+batch size (`OBSIDIAN_EMBEDDING_BATCH_SIZE`, default 32 notes). Later clients reuse
+that configuration; their environment does not reconfigure a running daemon.
+Restart the daemon after changing its launcher settings. Separate semantic homes
+provide separate daemon/backend profiles.
+
+MCP `auto` and `daemon` modes keep local inference dormant while using the daemon.
+In `auto`, genuine daemon unavailability may activate a configured local backend;
+that fallback stays selected until MCP restarts. Warming and query timeouts do
+not activate local inference. `local` mode starts the in-process backend directly.
+The existing daemon-call timeout is separate from the provider's API timeout and
+must accommodate slow query embedding when using a self-hosted endpoint.
+
 ## Runtime Topology
 
 ```text

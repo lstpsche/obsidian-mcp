@@ -764,6 +764,8 @@ impl EmbeddingModel {
     #[cfg(feature = "embeddings-api")]
     async fn load_api(model_name: &str) -> VaultResult<Self> {
         let model_name = model_name.to_owned();
+        let timeout =
+            crate::config::embedding_api_timeout_from_env().map_err(VaultError::Embedding)?;
 
         tokio::task::spawn_blocking(move || {
             let api_key = zeroize::Zeroizing::new(
@@ -783,7 +785,7 @@ impl EmbeddingModel {
             let model = read_env_with_fallback("OBSIDIAN_EMBEDDING_API_MODEL", "OPENAI_MODEL")
                 .unwrap_or(model_name);
 
-            let client = build_api_client()?;
+            let client = build_api_client(timeout)?;
             let api_client =
                 ApiEmbeddingClient::start(client, base_url.clone(), model.clone(), api_key)?;
 
@@ -933,9 +935,8 @@ fn resolve_provider(explicit: Option<EmbeddingProvider>) -> EmbeddingProvider {
 // ── API client helpers ─────────────────────────────────────────────────
 
 #[cfg(feature = "embeddings-api")]
-fn build_api_client() -> Result<reqwest::blocking::Client, VaultError> {
-    let mut builder =
-        reqwest::blocking::ClientBuilder::new().timeout(std::time::Duration::from_secs(30));
+fn build_api_client(timeout: std::time::Duration) -> Result<reqwest::blocking::Client, VaultError> {
+    let mut builder = reqwest::blocking::ClientBuilder::new().timeout(timeout);
 
     if let Ok(cert_path) = std::env::var("OBSIDIAN_EMBEDDING_CA_CERT") {
         let cert_pem = std::fs::read(&cert_path).map_err(|e| {
@@ -2296,7 +2297,7 @@ mod tests {
                 stream.write_all(response.as_bytes()).unwrap();
             });
             let base_url = format!("http://{address}/secret-url-component");
-            let client = build_api_client().unwrap();
+            let client = build_api_client(std::time::Duration::from_secs(30)).unwrap();
 
             let error = embed_batch_api(
                 &client,
@@ -2324,7 +2325,7 @@ mod tests {
                 drop(stream);
             });
             let base_url = format!("http://{address}/secret-url-component");
-            let client = build_api_client().unwrap();
+            let client = build_api_client(std::time::Duration::from_secs(30)).unwrap();
 
             let error = embed_batch_api(
                 &client,
@@ -2340,6 +2341,57 @@ mod tests {
             assert!(!error.contains("secret-url-component"));
             assert!(!error.contains("api-secret"));
             assert!(!error.contains("sensitive note body"));
+            server.join().unwrap();
+        }
+
+        #[test]
+        fn api_configured_timeout_applies_to_probe_and_embedding_requests() {
+            use std::io::Write as _;
+            use std::time::Duration;
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    crate::test_helpers::read_http_request_headers(&mut stream);
+                    serde_json::Deserializer::from_reader(&mut stream)
+                        .into_iter::<serde_json::Value>()
+                        .next()
+                        .unwrap()
+                        .unwrap();
+                    std::thread::sleep(Duration::from_millis(150));
+                    let body = r#"{"data":[{"embedding":[1.0,0.0]}]}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    // A timed-out client may have closed its connection already.
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            });
+            let base_url = format!("http://{address}/v1");
+            let short_client = ApiEmbeddingClient::start(
+                build_api_client(Duration::from_millis(50)).unwrap(),
+                base_url.clone(),
+                "test-model".to_string(),
+                zeroize::Zeroizing::new("test-key".to_string()),
+            )
+            .unwrap();
+            let error = probe_api_dimension(&short_client).unwrap_err();
+            assert!(error.to_string().contains("request timed out"));
+
+            let patient_client = ApiEmbeddingClient::start(
+                build_api_client(Duration::from_secs(2)).unwrap(),
+                base_url,
+                "test-model".to_string(),
+                zeroize::Zeroizing::new("test-key".to_string()),
+            )
+            .unwrap();
+            assert_eq!(
+                patient_client.embed_batch(&["note body"]).unwrap(),
+                vec![vec![1.0, 0.0]]
+            );
             server.join().unwrap();
         }
 

@@ -155,6 +155,12 @@ pub struct SemanticStatus {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VaultStatusParams {
+    pub vault_root: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct EnsureVaultResult {
     pub vault_id: String,
     pub ready: bool,

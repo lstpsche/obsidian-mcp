@@ -381,7 +381,7 @@ async fn stateless_filters_are_isolated_and_cannot_enable_server_disabled_tools(
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::OK);
         let denied: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
         assert_eq!(denied["error"]["code"], -32602);
     }
@@ -426,8 +426,7 @@ async fn http_rejects_invalid_routing_headers_and_untrusted_hosts() {
     server.stop().await;
 }
 
-#[tokio::test]
-async fn stdio_keeps_the_legacy_initialize_and_tool_call_flow() {
+async fn exchange_stdio_messages(messages: &[Value], pipelined: bool) -> Vec<Value> {
     let vault = temporary_vault();
     let mut child = server_command(&vault)
         .stdin(Stdio::piped())
@@ -436,34 +435,22 @@ async fn stdio_keeps_the_legacy_initialize_and_tool_call_flow() {
         .unwrap();
     let mut input = child.stdin.take().unwrap();
     let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
-    for message in [
-        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-            "protocolVersion": LEGACY, "capabilities": {}, "clientInfo": {"name": "stdio-test", "version": "1"}
-        }}),
-        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
-            "name": "note_read", "arguments": {"path": "note.md"}
-        }}),
-    ] {
-        input
-            .write_all(format!("{message}\n").as_bytes())
-            .await
-            .unwrap();
-        if message.get("id").is_some() {
+    let mut responses = Vec::new();
+    let group_size = if pipelined { messages.len() } else { 1 };
+    for group in messages.chunks(group_size) {
+        for message in group {
+            input
+                .write_all(format!("{message}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        for _ in group.iter().filter(|message| message.get("id").is_some()) {
             let line = timeout(Duration::from_secs(10), output.next_line())
                 .await
                 .unwrap()
                 .unwrap()
                 .unwrap();
-            let response: Value = serde_json::from_str(&line).unwrap();
-            assert_eq!(response["id"], message["id"]);
-            assert!(response.get("error").is_none(), "{response}");
-            assert!(response["result"].get("resultType").is_none());
-            if message["id"] == 1 {
-                assert_eq!(response["result"]["protocolVersion"], LEGACY);
-            } else {
-                assert_eq!(response["result"]["content"][0]["text"], NOTE);
-            }
+            responses.push(serde_json::from_str(&line).unwrap());
         }
     }
     drop(input);
@@ -473,6 +460,142 @@ async fn stdio_keeps_the_legacy_initialize_and_tool_call_flow() {
             .unwrap()
             .unwrap()
             .success()
+    );
+    responses
+}
+
+fn legacy_stdio_messages() -> [Value; 4] {
+    [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": LEGACY, "capabilities": {}, "clientInfo": {"name": "stdio-test", "version": "1"}
+        }}),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+            "name": "note_read", "arguments": {"path": "note.md"}
+        }}),
+    ]
+}
+
+fn modern_stdio_request(id: u64, method: &str, mut params: Value) -> Value {
+    params["_meta"] = json!({
+        "io.modelcontextprotocol/protocolVersion": MODERN,
+        "io.modelcontextprotocol/clientInfo": {"name": "stdio-test", "version": "1"},
+        "io.modelcontextprotocol/clientCapabilities": {}
+    });
+    json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+}
+
+fn stdio_response(responses: &[Value], id: u64) -> &Value {
+    let response = responses
+        .iter()
+        .find(|response| response["id"] == id)
+        .unwrap_or_else(|| panic!("missing response {id}: {responses:?}"));
+    assert_eq!(response["jsonrpc"], "2.0");
+    response
+}
+
+fn assert_legacy_stdio_results(responses: &[Value]) {
+    for id in 1..=3 {
+        let response = stdio_response(responses, id);
+        assert!(response.get("error").is_none(), "{response}");
+        assert!(response["result"].get("resultType").is_none());
+    }
+    assert_eq!(
+        stdio_response(responses, 1)["result"]["protocolVersion"],
+        LEGACY
+    );
+    assert_eq!(
+        tool_names(stdio_response(responses, 2)).len(),
+        obsidian_mcp::config::ALL_TOOL_NAMES.len()
+    );
+    assert_eq!(
+        stdio_response(responses, 3)["result"]["content"][0]["text"],
+        NOTE
+    );
+}
+
+#[tokio::test]
+async fn stdio_keeps_the_legacy_initialize_and_tool_call_flow() {
+    let responses = exchange_stdio_messages(&legacy_stdio_messages(), false).await;
+    assert_legacy_stdio_results(&responses);
+}
+
+async fn assert_stdio_discovery_then_legacy(pipelined: bool) {
+    let mut messages = vec![modern_stdio_request(0, "server/discover", json!({}))];
+    messages.extend(legacy_stdio_messages());
+    let responses = exchange_stdio_messages(&messages, pipelined).await;
+    assert_eq!(
+        stdio_response(&responses, 0)["result"]["resultType"],
+        "complete"
+    );
+    assert_legacy_stdio_results(&responses);
+}
+
+#[tokio::test]
+async fn stdio_discovery_then_legacy_handshake_works_sequentially() {
+    assert_stdio_discovery_then_legacy(false).await;
+}
+
+#[tokio::test]
+async fn stdio_discovery_then_legacy_handshake_works_when_pipelined() {
+    assert_stdio_discovery_then_legacy(true).await;
+}
+
+#[tokio::test]
+async fn stdio_discovery_and_inline_tools_work_without_initialization() {
+    let responses = exchange_stdio_messages(
+        &[
+            modern_stdio_request(0, "server/discover", json!({})),
+            modern_stdio_request(2, "tools/list", json!({})),
+            modern_stdio_request(
+                3,
+                "tools/call",
+                json!({
+                    "name": "note_read", "arguments": {"path": "note.md"}
+                }),
+            ),
+        ],
+        false,
+    )
+    .await;
+    for response in &responses {
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(response["result"]["resultType"], "complete");
+    }
+    assert_eq!(
+        tool_names(stdio_response(&responses, 2)).len(),
+        obsidian_mcp::config::ALL_TOOL_NAMES.len()
+    );
+    assert_eq!(
+        stdio_response(&responses, 3)["result"]["content"][0]["text"],
+        NOTE
+    );
+}
+
+#[tokio::test]
+async fn stdio_inline_lifecycle_keeps_requiring_request_metadata() {
+    let responses = exchange_stdio_messages(
+        &[
+            modern_stdio_request(0, "server/discover", json!({})),
+            modern_stdio_request(2, "tools/list", json!({})),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}),
+        ],
+        false,
+    )
+    .await;
+    assert_eq!(
+        stdio_response(&responses, 0)["result"]["resultType"],
+        "complete"
+    );
+    assert!(stdio_response(&responses, 2)["result"]["tools"].is_array());
+    let rejected = stdio_response(&responses, 3);
+    assert_eq!(rejected["error"]["code"], -32602);
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("request _meta")
     );
 }
 

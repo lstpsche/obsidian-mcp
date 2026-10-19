@@ -8,6 +8,7 @@ use serde_json::Value;
 use super::protocol::{
     self, EnsureVaultParams, EnsureVaultResult, OpenHintParams, OpenHintResult, SearchHybridParams,
     SearchResult, SearchSemanticParams, SemanticHit, SemanticPhase, SemanticStatus,
+    VaultStatusParams,
 };
 use super::vault_context::VaultContext;
 use super::vault_registry::VaultRegistry;
@@ -38,6 +39,15 @@ impl QueryError {
 }
 
 pub type QueryResult<T> = Result<T, QueryError>;
+
+/// Inspect an attached vault without opening it or starting background work.
+pub async fn vault_status(
+    registry: &VaultRegistry,
+    params: VaultStatusParams,
+) -> QueryResult<SemanticStatus> {
+    let context = require_context(registry, &params.vault_root).await?;
+    Ok(semantic_status(&context))
+}
 
 pub async fn ensure_vault(
     registry: &VaultRegistry,

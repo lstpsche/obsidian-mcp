@@ -247,6 +247,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn passive_status_does_not_start_a_loader_or_attach_a_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault_root = dir.path().join("vault");
+        create_vault(&vault_root);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let loader_calls = Arc::clone(&calls);
+        let loader: EmbeddingLoaderFactory = Arc::new(move || {
+            loader_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        });
+        let registry = VaultRegistry::new_with_loader(
+            dir.path().join("semantic-home"),
+            "blocked-test-model".into(),
+            loader,
+        )
+        .unwrap();
+        let params = || super::super::protocol::VaultStatusParams {
+            vault_root: vault_root.display().to_string(),
+        };
+        for _ in 0..2 {
+            let error = query::vault_status(&registry, params()).await.unwrap_err();
+            assert_eq!(error.code, super::super::protocol::ERR_VAULT_NOT_ATTACHED);
+        }
+        assert!(registry.contexts.read().await.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        query::ensure_vault(&registry, ensure_params(&vault_root))
+            .await
+            .unwrap();
+        let status = query::vault_status(&registry, params()).await.unwrap();
+        assert_eq!(status.phase, SemanticPhase::Warming);
+        assert!(!status.ready);
+        assert_eq!(status.total_notes, 1);
+        assert_eq!(status.pending_notes, 1);
+        assert_eq!(registry.contexts.read().await.len(), 1);
+    }
+
+    #[tokio::test]
     async fn concurrent_ensure_returns_one_context_while_shared_loader_is_blocked() {
         let dir = tempfile::tempdir().unwrap();
         let vault_root = dir.path().join("vault");
