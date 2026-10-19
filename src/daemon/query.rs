@@ -91,10 +91,19 @@ pub async fn search_semantic(
     let top_k = params.top_k.unwrap_or(DEFAULT_TOP_K);
     let include_content = params.include_content.unwrap_or(false);
 
-    let scores = context
-        .search_semantic_scores(&params.query, top_k, params.allowed_paths.as_deref())
-        .map_err(map_vault_error)?;
-    build_hits(&context, scores, &params.query, include_content)
+    tokio::task::spawn_blocking(move || {
+        let scores = context
+            .search_semantic_scores(&params.query, top_k, params.allowed_paths.as_deref())
+            .map_err(map_vault_error)?;
+        build_hits(&context, scores, &params.query, include_content)
+    })
+    .await
+    .map_err(|error| {
+        QueryError::new(
+            protocol::ERR_INTERNAL,
+            format!("semantic search worker failed: {error}"),
+        )
+    })?
 }
 
 pub async fn search_hybrid(
@@ -114,20 +123,29 @@ pub async fn search_hybrid(
     let prefetch = params.prefetch.unwrap_or(DEFAULT_PREFETCH_COUNT).max(top_k);
     let alpha = params.alpha.unwrap_or(DEFAULT_ALPHA).clamp(0.0, 1.0);
 
-    let bm25_hits = context
-        .search_bm25(&params.query, prefetch, params.allowed_paths.as_deref())
-        .map_err(map_vault_error)?;
-    if bm25_hits.is_empty() {
-        return Ok(SearchResult {
-            results: Vec::new(),
-        });
-    }
+    tokio::task::spawn_blocking(move || {
+        let bm25_hits = context
+            .search_bm25(&params.query, prefetch, params.allowed_paths.as_deref())
+            .map_err(map_vault_error)?;
+        if bm25_hits.is_empty() {
+            return Ok(SearchResult {
+                results: Vec::new(),
+            });
+        }
 
-    let combined = context
-        .search_hybrid_scores(&params.query, &bm25_hits, alpha, top_k)
-        .map_err(map_vault_error)?;
+        let combined = context
+            .search_hybrid_scores(&params.query, &bm25_hits, alpha, top_k)
+            .map_err(map_vault_error)?;
 
-    build_hits(&context, combined, &params.query, include_content)
+        build_hits(&context, combined, &params.query, include_content)
+    })
+    .await
+    .map_err(|error| {
+        QueryError::new(
+            protocol::ERR_INTERNAL,
+            format!("hybrid search worker failed: {error}"),
+        )
+    })?
 }
 
 pub async fn open_hint(

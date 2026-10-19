@@ -285,6 +285,7 @@ pub async fn search_semantic(
             lexical_prefetch,
             alpha,
         )
+        .await
     } else {
         let result = search_semantic_daemon(
             vault,
@@ -312,6 +313,7 @@ pub async fn search_semantic(
                 lexical_prefetch,
                 alpha,
             )
+            .await
         } else {
             result
         }
@@ -426,8 +428,32 @@ async fn search_semantic_daemon(
         .collect())
 }
 
+async fn search_semantic_local(
+    vault: &Vault,
+    query: &str,
+    top_k: usize,
+    include_content: bool,
+    lexical_prefetch: bool,
+    alpha: f32,
+) -> Result<Vec<SemanticSearchResult>, VaultError> {
+    let vault = vault.clone();
+    let query = query.to_owned();
+    tokio::task::spawn_blocking(move || {
+        search_semantic_local_blocking(
+            &vault,
+            &query,
+            top_k,
+            include_content,
+            lexical_prefetch,
+            alpha,
+        )
+    })
+    .await
+    .map_err(|error| VaultError::Other(format!("local semantic search worker failed: {error}")))?
+}
+
 #[cfg(has_embeddings)]
-fn search_semantic_local(
+fn search_semantic_local_blocking(
     vault: &Vault,
     query: &str,
     top_k: usize,
@@ -495,7 +521,7 @@ fn search_semantic_local(
 }
 
 #[cfg(not(has_embeddings))]
-fn search_semantic_local(
+fn search_semantic_local_blocking(
     _vault: &Vault,
     _query: &str,
     _top_k: usize,

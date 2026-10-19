@@ -67,6 +67,7 @@ fn spawn_daemon(home: &Path, endpoint: &IpcEndpoint, api_port: u16) -> Child {
         .env("OBSIDIAN_EMBEDDING_API_MODEL", "probe")
         .env("OBSIDIAN_EMBEDDING_DIM", "2")
         .env("OBSIDIAN_LOG_LEVEL", "error")
+        .env("TOKIO_WORKER_THREADS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -209,6 +210,7 @@ impl StdioServer {
             .env("OBSIDIAN_EMBEDDING_DIM", "2")
             .env("OBSIDIAN_WATCH", "true")
             .env("OBSIDIAN_LOG_LEVEL", "error")
+            .env("TOKIO_WORKER_THREADS", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -241,6 +243,11 @@ impl StdioServer {
     }
 
     async fn call(&mut self, method: &str, params: Value) -> Value {
+        let id = self.send_request(method, params).await;
+        self.receive_response(id).await
+    }
+
+    async fn send_request(&mut self, method: &str, params: Value) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         let mut request =
@@ -248,6 +255,10 @@ impl StdioServer {
         request.push('\n');
         self.input.write_all(request.as_bytes()).await.unwrap();
         self.input.flush().await.unwrap();
+        id
+    }
+
+    async fn receive_response(&mut self, id: u64) -> Value {
         timeout(Duration::from_secs(15), async {
             loop {
                 let line = self.output.next_line().await.unwrap().expect("MCP exited");
@@ -479,6 +490,40 @@ async fn daemon_mode_defers_local_indexing_and_exposes_passive_progress() {
 #[tokio::test]
 async fn auto_mode_retains_daemon_ownership_until_unavailable_then_keeps_local_fallback() {
     verify_daemon_indexing_ownership("auto").await;
+}
+
+#[tokio::test]
+async fn local_semantic_queries_keep_progress_responsive_on_one_worker() {
+    for lexical_prefetch in [false, true] {
+        let provider = ControlledProvider::start(false).await;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("vault");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("note.md"), "# Marker\nVISIBLE quokka\n").unwrap();
+        let endpoint = isolated_endpoint(directory.path());
+        let mut server =
+            StdioServer::start(&root, directory.path(), &endpoint, "local", provider.port).await;
+        server.wait_for_ready("local").await;
+        assert_eq!(provider.requests().len(), 1);
+
+        provider.hold_requests(true);
+        let query_id = server
+            .send_request(
+                "tools/call",
+                json!({
+                    "name": "search_semantic",
+                    "arguments": {"query": "quokka", "top_k": 1, "lexical_prefetch": lexical_prefetch}
+                }),
+            )
+            .await;
+        provider.wait_for_requests(2).await;
+        let info = server.embedding_info().await;
+        assert_eq!(info["source"], "local", "{info}");
+        assert_eq!(info["status"]["phase"], "ready", "{info}");
+        provider.hold_requests(false);
+        assert_note_found(&server.receive_response(query_id).await);
+        server.stop().await;
+    }
 }
 
 #[tokio::test]
