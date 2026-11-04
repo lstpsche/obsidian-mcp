@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use notify_debouncer_mini::Debouncer;
 
 use crate::error::{VaultError, VaultResult};
-use crate::models::NoteMetadata;
 use crate::vault::exclude::ExcludeSet;
 use crate::vault::index::VaultIndex;
 use crate::vault::tantivy_index::TantivyIndex;
@@ -151,36 +150,12 @@ impl VaultContext {
         Ok(true)
     }
 
-    pub fn note_metadata(&self, path: &Path) -> VaultResult<Option<NoteMetadata>> {
-        let actual_path = match self.canonical_existing_relative_path(path) {
-            Ok(path) => path,
-            Err(VaultError::NoteNotFound(_)) => return Ok(None),
-            Err(err) => return Err(err),
-        };
-        let guard = self
-            .index
-            .read()
-            .map_err(|err| VaultError::Other(format!("daemon index lock poisoned: {err}")))?;
-        Ok(guard.get_note(&actual_path).cloned())
-    }
-
     pub fn read_note(&self, path: &Path) -> VaultResult<String> {
         crate::vault::fs::read_file(&self.vault_root, path)
     }
 
     pub fn canonical_existing_relative_path(&self, path: &Path) -> VaultResult<PathBuf> {
         Ok(crate::vault::path::resolve_existing(&self.vault_root, path)?.relative)
-    }
-
-    pub fn search_bm25(
-        &self,
-        query: &str,
-        top_k: usize,
-        allowed_paths: Option<&[String]>,
-    ) -> VaultResult<Vec<(PathBuf, f32)>> {
-        let allowed = allowed_paths.map(|paths| paths.iter().map(PathBuf::from).collect());
-        self.tantivy
-            .search_for_paths(query, top_k, allowed.as_ref())
     }
 
     #[cfg(has_embeddings)]
@@ -216,56 +191,6 @@ impl VaultContext {
     }
 
     #[cfg(has_embeddings)]
-    pub fn search_semantic_scores(
-        &self,
-        query: &str,
-        top_k: usize,
-        allowed_paths: Option<&[String]>,
-    ) -> VaultResult<Vec<(PathBuf, f32)>> {
-        if query.is_empty() || top_k == 0 {
-            return Ok(Vec::new());
-        }
-        let (snapshot, entries) = self.captured_semantic_entries(allowed_paths)?;
-        let query_vector = snapshot.embed_query(query)?;
-        Ok(
-            crate::vault::semantic_results::rank_semantic(entries, &query_vector, top_k)?
-                .into_iter()
-                .map(|hit| (hit.path, hit.score))
-                .collect(),
-        )
-    }
-
-    #[cfg(has_embeddings)]
-    pub fn search_hybrid_scores(
-        &self,
-        query: &str,
-        bm25_hits: &[(PathBuf, f32)],
-        alpha: f32,
-        top_k: usize,
-    ) -> VaultResult<Vec<(PathBuf, f32)>> {
-        if query.is_empty() || top_k == 0 {
-            return Ok(Vec::new());
-        }
-        let (snapshot, entries) = self.captured_semantic_entries(None)?;
-        let lexical = bm25_hits
-            .iter()
-            .filter(|(path, _)| entries.contains_key(path))
-            .cloned()
-            .collect::<Vec<_>>();
-        let query_vector = snapshot.embed_query(query)?;
-        Ok(crate::vault::semantic_results::rank_hybrid(
-            &entries,
-            &lexical,
-            &query_vector,
-            alpha.clamp(0.0, 1.0),
-            top_k,
-        )?
-        .into_iter()
-        .map(|hit| (hit.path, hit.score))
-        .collect())
-    }
-
-    #[cfg(has_embeddings)]
     pub(crate) fn search_semantic_results(
         &self,
         query: &str,
@@ -277,6 +202,10 @@ impl VaultContext {
             return Ok(Vec::new());
         }
         let (snapshot, entries) = self.captured_semantic_entries(allowed_paths)?;
+        if entries.is_empty() {
+            snapshot.validate_query(query)?;
+            return Ok(Vec::new());
+        }
         let query_vector = snapshot.embed_query(query)?;
         let hits = crate::vault::semantic_results::rank_semantic(entries, &query_vector, top_k)?;
         Ok(hits
@@ -306,6 +235,10 @@ impl VaultContext {
             return Ok(Vec::new());
         }
         let (snapshot, entries) = self.captured_semantic_entries(allowed_paths)?;
+        snapshot.validate_query(query)?;
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
         let allowed = crate::vault::semantic_results::paths(&entries);
         let lexical = self
             .tantivy
@@ -365,30 +298,5 @@ impl VaultContext {
     #[cfg(has_embeddings)]
     pub fn embedding_status(&self) -> EmbeddingRuntimeStatus {
         self.embedding_runtime.status()
-    }
-
-    #[cfg(not(has_embeddings))]
-    pub fn search_semantic_scores(
-        &self,
-        _query: &str,
-        _top_k: usize,
-        _allowed_paths: Option<&[String]>,
-    ) -> VaultResult<Vec<(PathBuf, f32)>> {
-        Err(VaultError::Embedding(
-            "daemon binary compiled without embeddings feature".to_string(),
-        ))
-    }
-
-    #[cfg(not(has_embeddings))]
-    pub fn search_hybrid_scores(
-        &self,
-        _query: &str,
-        _bm25_hits: &[(PathBuf, f32)],
-        _alpha: f32,
-        _top_k: usize,
-    ) -> VaultResult<Vec<(PathBuf, f32)>> {
-        Err(VaultError::Embedding(
-            "daemon binary compiled without embeddings feature".to_string(),
-        ))
     }
 }

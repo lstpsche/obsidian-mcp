@@ -17,6 +17,22 @@ use super::{frontmatter, parser};
 
 pub(crate) const MAX_CHUNKS_PER_NOTE: usize = 4096;
 pub(crate) const MAX_CONTEXT_BYTES: usize = 16 * 1024;
+
+pub(crate) fn context_prefix_bytes(
+    title: &str,
+    heading_bytes: usize,
+    heading_count: usize,
+) -> usize {
+    let title_bytes = title.len().saturating_add(1);
+    if heading_count == 0 {
+        title_bytes
+    } else {
+        title_bytes
+            .saturating_add(heading_bytes)
+            .saturating_add(heading_count.saturating_sub(1).saturating_mul(3))
+            .saturating_add(1)
+    }
+}
 #[cfg(test)]
 const DEFAULT_PREPARATION_BUDGET: usize = 64 * 1024 * 1024;
 const OVERLAP_TOKENS: usize = 32;
@@ -228,13 +244,16 @@ fn prepare_budgeted(
     let title = title.to_owned();
     let inline_bytes = parser::inline_tag_allocation_bound(raw);
     let tags = source_tags(path, raw, inline_bytes, &preparation)?;
+    super::embeddings::validate_note_metadata(&title, &tags)?;
     let body_start = frontmatter::extract_raw_frontmatter(raw).map_or(0, |(_, start)| start);
     let body_range = SourceRange {
         start_byte: body_start,
         end_byte: raw.len(),
     };
-    let prefix_reservation = preparation.memory.reserve(title.len() + 1)?;
-    let mut prefix = String::with_capacity(title.len() + 1);
+    let context_bytes = context_prefix_bytes(&title, 0, 0);
+    check_limit("embedding context bytes", context_bytes, MAX_CONTEXT_BYTES)?;
+    let prefix_reservation = preparation.memory.reserve(context_bytes)?;
+    let mut prefix = String::with_capacity(context_bytes);
     prefix.push_str(&title);
     prefix.push('\n');
     let full_input = preparation.compose(&prefix, raw, None, body_range)?;
@@ -613,27 +632,11 @@ fn prepare_section(
     preparation: &Preparation<'_>,
     chunks: &mut Vec<PreparedChunk>,
 ) -> VaultResult<()> {
-    let context_bytes =
-        title
-            .len()
-            .saturating_add(1)
-            .saturating_add(if section.heading_path.is_empty() {
-                0
-            } else {
-                section
-                    .heading_path
-                    .iter()
-                    .map(|text| text.len())
-                    .sum::<usize>()
-                    .saturating_add(
-                        section
-                            .heading_path
-                            .len()
-                            .saturating_sub(1)
-                            .saturating_mul(3),
-                    )
-                    .saturating_add(1)
-            });
+    let context_bytes = context_prefix_bytes(
+        title,
+        section.heading_path.iter().map(|text| text.len()).sum(),
+        section.heading_path.len(),
+    );
     check_limit("embedding context bytes", context_bytes, MAX_CONTEXT_BYTES)?;
     let _prefix_reservation = preparation.memory.reserve(context_bytes)?;
     let mut prefix = String::with_capacity(context_bytes);
@@ -1085,6 +1088,147 @@ mod tests {
                 .all(|chunk| chunk.scope == EvidenceScope::Passage)
         );
         assert_complete(&format!("{raw}b"), &overflow, 24);
+    }
+
+    #[test]
+    fn exact_context_prefix_round_trips_split_block_evidence() {
+        use super::super::embeddings::{
+            ChunkEmbedding, EMBEDDING_INPUT_VERSION, EmbeddingBackendKind, EmbeddingSpaceIdentity,
+            EmbeddingStore, NoteEmbeddingEntry,
+        };
+        for headings in [
+            format!("# {}\n\n", "h".repeat(MAX_CONTEXT_BYTES - 3)),
+            format!("# P\n\n## {}\n\n", "h".repeat(MAX_CONTEXT_BYTES - 7)),
+        ] {
+            let raw = format!("{headings}{}", "body ".repeat(20_000));
+            let prepared = prepare_with_counter(Path::new("n.md"), &raw, 40_000, &count).unwrap();
+            assert!(
+                prepared
+                    .chunks
+                    .iter()
+                    .any(|chunk| chunk.block_kind.as_deref() == Some("paragraph"))
+            );
+            let identity = EmbeddingSpaceIdentity {
+                backend: EmbeddingBackendKind::Local,
+                model: "context-test".into(),
+                endpoint_fingerprint: None,
+                dimension: 1,
+                input_version: EMBEDDING_INPUT_VERSION,
+                tokenizer_fingerprint: [1; 32],
+                max_input_tokens: 40_000,
+                chunking_version: super::super::embedding_input::CHUNKING_VERSION,
+            };
+            let entry = NoteEmbeddingEntry {
+                source_revision: prepared.source_revision,
+                source_bytes: prepared.source_bytes,
+                body_range: prepared.body_range,
+                title: prepared.title,
+                tags: prepared.tags,
+                chunks: prepared
+                    .chunks
+                    .into_iter()
+                    .map(|chunk| ChunkEmbedding {
+                        input_hash: chunk.input_hash,
+                        vector: vec![1.0],
+                        scope: chunk.scope,
+                        range: chunk.range,
+                        overlap_range: chunk.overlap_range,
+                        heading_path: chunk.heading_path,
+                        section_range: chunk.section_range,
+                        block_kind: chunk.block_kind,
+                    })
+                    .collect(),
+            };
+            let expected_chunks = entry.chunks.len();
+            let mut store = EmbeddingStore::new_with_identity(identity.clone());
+            store.insert_note("n.md".into(), entry).unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("cache.bin");
+            store.save(&path).unwrap();
+            let loaded = EmbeddingStore::load_for_space(&path, &identity, 1).unwrap();
+            let entry = loaded.note(Path::new("n.md")).unwrap();
+            assert_eq!(entry.chunks.len(), expected_chunks);
+            assert!(
+                entry
+                    .chunks
+                    .iter()
+                    .any(|chunk| chunk.block_kind.as_deref() == Some("paragraph"))
+            );
+        }
+    }
+
+    #[test]
+    fn context_prefix_overflow_fails_before_chunk_preparation() {
+        let raw = format!(
+            "# {}\n\n{}",
+            "h".repeat(MAX_CONTEXT_BYTES - 2),
+            "body ".repeat(20_000)
+        );
+        let calls = Cell::new(0usize);
+        let error = prepare_with_counter(Path::new("n.md"), &raw, 40_000, &|text| {
+            calls.set(calls.get() + 1);
+            count(text)
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error,VaultError::SemanticResourceLimit {resource,actual,limit}
+            if resource == "embedding context bytes" && actual == MAX_CONTEXT_BYTES+1 && limit==MAX_CONTEXT_BYTES)
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "only the full-note fit trial may be tokenized"
+        );
+
+        let fitting_name = format!("{}.md", "n".repeat(MAX_CONTEXT_BYTES - 1));
+        let note = prepare_with_counter(Path::new(&fitting_name), "body", 40_000, &count).unwrap();
+        assert_eq!(note.chunks.len(), 1);
+        assert_eq!(note.chunks[0].scope, EvidenceScope::Note);
+        let oversized_name = format!("{}.md", "n".repeat(MAX_CONTEXT_BYTES));
+        let calls = Cell::new(0usize);
+        let error = prepare_with_counter(Path::new(&oversized_name), "body", 40_000, &|text| {
+            calls.set(calls.get() + 1);
+            count(text)
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error,VaultError::SemanticResourceLimit {resource,actual,limit}
+            if resource == "embedding context bytes" && actual == MAX_CONTEXT_BYTES+1 && limit==MAX_CONTEXT_BYTES)
+        );
+        assert_eq!(
+            calls.get(),
+            0,
+            "oversized title context must fail before tokenization"
+        );
+    }
+
+    #[test]
+    fn unsupported_note_metadata_is_rejected_before_tokenization() {
+        let too_many_tags = format!(
+            "---\ntags: [{}]\n---\nbody",
+            (0..4097)
+                .map(|index| format!("tag{index}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let too_many_bytes = format!("---\ntags: [{}]\n---\nbody", "a".repeat(64 * 1024));
+        for raw in [too_many_tags, too_many_bytes] {
+            let calls = Cell::new(0usize);
+            let error = prepare_with_counter(Path::new("n.md"), &raw, 512, &|text| {
+                calls.set(calls.get() + 1);
+                count(text)
+            })
+            .unwrap_err();
+            assert!(
+                matches!(error, VaultError::SemanticResourceLimit { .. }),
+                "{error}"
+            );
+            assert_eq!(
+                calls.get(),
+                0,
+                "unsupported metadata must fail before tokenization or inference"
+            );
+        }
     }
 
     #[test]

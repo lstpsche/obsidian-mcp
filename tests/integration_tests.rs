@@ -2717,7 +2717,20 @@ mod background_embedding_runtime {
         .await;
         assert_eq!(degraded.indexed_notes, 0);
         assert_eq!(degraded.total_notes, 1);
+        assert_eq!(degraded.pending_notes, 0);
         assert!(degraded.last_error.is_some());
+
+        std::fs::write(
+            vault_dir.path().join("note.md"),
+            "# Note\nvalid without an index event\n",
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert_eq!(
+            vault.embedding_status().unwrap().phase,
+            EmbeddingPhase::Degraded
+        );
+        assert_eq!(vault.embedding_status().unwrap().pending_notes, 0);
 
         vault
             .write_note(

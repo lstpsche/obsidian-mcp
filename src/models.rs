@@ -21,7 +21,7 @@ pub enum EvidenceScope {
     Passage,
 }
 
-/// The exact source region represented by the winning semantic vector.
+/// The primary source span anchored by the winning semantic vector.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SemanticEvidence {
     pub scope: EvidenceScope,

@@ -26,6 +26,7 @@ pub(crate) const EMBEDDING_INPUT_VERSION: u16 = 2;
 const MAX_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_CACHE_ENTRIES: usize = 1_000_000;
 const MAX_CACHE_PATH_BYTES: usize = 16 * 1024;
+const MAX_NOTE_TAGS: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum EmbeddingBackendKind {
@@ -93,6 +94,31 @@ pub(crate) trait Embedder: Send + Sync {
         )
     }
     fn embed_batch(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>>;
+    fn embed_next_batch(&self, texts: &[&str]) -> (usize, VaultResult<Vec<Vec<f32>>>) {
+        let count = match self.plan_batch(texts) {
+            Ok(count) if count > 0 && count <= texts.len() => count,
+            Ok(_) => {
+                return (
+                    1,
+                    Err(VaultError::Embedding(
+                        "embedding request planner did not make progress".into(),
+                    )),
+                );
+            }
+            Err(error) => return (1, Err(error)),
+        };
+        (count, self.embed_batch(&texts[..count]))
+    }
+    fn embed_query(&self, query: &str) -> VaultResult<Vec<f32>> {
+        embedding_input::validate_input(query, self.input_policy(), |text| {
+            self.count_tokens(text)
+        })?;
+        let mut vectors =
+            validate_embedding_batch(self.embed_batch(&[query])?, 1, self.dimension())?;
+        vectors
+            .pop()
+            .ok_or_else(|| VaultError::Embedding("embedding query returned no vector".into()))
+    }
 }
 
 // ── Cosine similarity ──────────────────────────────────────────────────
@@ -139,7 +165,9 @@ impl<'a> CosineQuery<'a> {
 use crate::models::{EvidenceScope, SourceRange};
 use std::sync::Arc as NoteArc;
 
-use super::embedding_chunks::{MAX_CHUNKS_PER_NOTE as MAX_NOTE_CHUNKS, MAX_CONTEXT_BYTES};
+use super::embedding_chunks::{
+    MAX_CHUNKS_PER_NOTE as MAX_NOTE_CHUNKS, MAX_CONTEXT_BYTES, context_prefix_bytes,
+};
 use super::source::MAX_SOURCE_BYTES as MAX_NOTE_SOURCE_BYTES;
 const MAX_NOTE_METADATA_BYTES: usize = 64 * 1024;
 const MAX_CACHE_DIMENSION: usize = 65_536;
@@ -333,18 +361,26 @@ impl EmbeddingStore {
             .sum();
     }
 
-    pub fn remove(&mut self, path: &Path) -> bool {
-        if let Some(old) = self.embeddings.remove(path) {
-            self.total_chunks = self.total_chunks.saturating_sub(old.chunks.len());
-            if let Some(path) = path.to_str() {
-                self.encoded_entries_bytes = self
-                    .encoded_entries_bytes
-                    .saturating_sub(encoded_entry_len(path, &old).unwrap_or(0));
-            }
-            true
-        } else {
-            false
-        }
+    pub fn remove(&mut self, path: &Path) -> VaultResult<bool> {
+        let Some(old) = self.embeddings.get(path) else {
+            return Ok(false);
+        };
+        let path_text = path
+            .to_str()
+            .ok_or_else(|| cache_error("cache path is not UTF-8"))?;
+        let old_bytes = encoded_entry_len(path_text, old)?;
+        let total_chunks = self
+            .total_chunks
+            .checked_sub(old.chunks.len())
+            .ok_or_else(|| cache_error("embedding chunk accounting underflow"))?;
+        let encoded_entries_bytes = self
+            .encoded_entries_bytes
+            .checked_sub(old_bytes)
+            .ok_or_else(|| cache_error("embedding cache size accounting underflow"))?;
+        self.embeddings.remove(path);
+        self.total_chunks = total_chunks;
+        self.encoded_entries_bytes = encoded_entries_bytes;
+        Ok(true)
     }
 
     /// Returns the first vector for callers checking entry availability.
@@ -383,7 +419,7 @@ impl EmbeddingStore {
         self.first_pass_complete = complete;
     }
 
-    pub(crate) fn retain_paths(&mut self, paths: &HashSet<PathBuf>) -> bool {
+    pub(crate) fn retain_paths(&mut self, paths: &HashSet<PathBuf>) -> VaultResult<bool> {
         let removed = self
             .embeddings
             .keys()
@@ -391,9 +427,9 @@ impl EmbeddingStore {
             .cloned()
             .collect::<Vec<_>>();
         for path in &removed {
-            self.remove(path);
+            self.remove(path)?;
         }
-        !removed.is_empty()
+        Ok(!removed.is_empty())
     }
 
     pub fn query(&self, query_vec: &[f32], top_k: usize) -> Vec<(PathBuf, f32)> {
@@ -637,15 +673,7 @@ fn validate_note_entry(entry: &NoteEmbeddingEntry, dim: usize) -> VaultResult<()
     if entry.body_range.end_byte != entry.source_bytes {
         return Err(cache_error("embedding body range must end at source EOF"));
     }
-    let metadata_bytes = entry
-        .title
-        .len()
-        .saturating_add(entry.tags.iter().map(String::len).sum::<usize>());
-    if metadata_bytes > MAX_NOTE_METADATA_BYTES || entry.tags.len() > MAX_NOTE_CHUNKS {
-        return Err(cache_error(
-            "embedding note metadata exceeds supported limit",
-        ));
-    }
+    validate_note_metadata(&entry.title, &entry.tags)?;
     if entry.chunks.is_empty() || entry.chunks.len() > MAX_NOTE_CHUNKS {
         return Err(cache_error("embedding note has an invalid chunk count"));
     }
@@ -688,11 +716,23 @@ fn validate_note_entry(entry: &NoteEmbeddingEntry, dim: usize) -> VaultResult<()
                 return Err(cache_error("embedding chunk is outside its section"));
             }
         }
-        let context_bytes = chunk.heading_path.iter().map(String::len).sum::<usize>()
-            + chunk.block_kind.as_ref().map_or(0, String::len);
+        let context_bytes = context_prefix_bytes(
+            &entry.title,
+            chunk.heading_path.iter().map(String::len).sum(),
+            chunk.heading_path.len(),
+        );
         if chunk.heading_path.len() > 6 || context_bytes > MAX_CONTEXT_BYTES {
             return Err(cache_error(
                 "embedding chunk context exceeds supported limit",
+            ));
+        }
+        if chunk
+            .block_kind
+            .as_ref()
+            .is_some_and(|kind| kind.len() > MAX_CONTEXT_BYTES)
+        {
+            return Err(cache_error(
+                "embedding block metadata exceeds supported limit",
             ));
         }
         if matches!(chunk.scope, EvidenceScope::Note)
@@ -708,6 +748,27 @@ fn validate_note_entry(entry: &NoteEmbeddingEntry, dim: usize) -> VaultResult<()
     }
     if next_byte != entry.body_range.end_byte {
         return Err(cache_error("embedding chunks omit body content"));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_note_metadata(title: &str, tags: &[String]) -> VaultResult<()> {
+    if tags.len() > MAX_NOTE_TAGS {
+        return Err(VaultError::SemanticResourceLimit {
+            resource: "embedding note tags".into(),
+            actual: tags.len(),
+            limit: MAX_NOTE_TAGS,
+        });
+    }
+    let metadata_bytes = tags
+        .iter()
+        .fold(title.len(), |total, tag| total.saturating_add(tag.len()));
+    if metadata_bytes > MAX_NOTE_METADATA_BYTES {
+        return Err(VaultError::SemanticResourceLimit {
+            resource: "embedding note metadata bytes".into(),
+            actual: metadata_bytes,
+            limit: MAX_NOTE_METADATA_BYTES,
+        });
     }
     Ok(())
 }
@@ -933,7 +994,7 @@ fn read_entry<R: Read>(
     let source_bytes = input.count(MAX_NOTE_SOURCE_BYTES, "source bytes")?;
     let body_range = input.range()?;
     let title = input.string(MAX_NOTE_METADATA_BYTES)?;
-    let tag_count = input.count(MAX_NOTE_CHUNKS, "tags")?;
+    let tag_count = input.count(MAX_NOTE_TAGS, "tags")?;
     let mut metadata_bytes = title.len();
     let mut tags = Vec::new();
     for _ in 0..tag_count {
@@ -957,7 +1018,12 @@ fn read_entry<R: Read>(
         let overlap_range = input.optional_range()?;
         let headings = input.count(6, "ancestor headings")?;
         let mut heading_path = Vec::new();
-        let mut context_bytes = 0;
+        let mut context_bytes = context_prefix_bytes(&title, 0, headings);
+        if context_bytes > MAX_CONTEXT_BYTES {
+            return Err(cache_error(
+                "embedding chunk context exceeds supported limit",
+            ));
+        }
         for _ in 0..headings {
             let heading = input.string(MAX_CONTEXT_BYTES - context_bytes)?;
             context_bytes += heading.len();
@@ -965,7 +1031,7 @@ fn read_entry<R: Read>(
         }
         let section_range = input.optional_range()?;
         let block_kind = if input.flag()? {
-            Some(input.string(MAX_CONTEXT_BYTES - context_bytes)?)
+            Some(input.string(MAX_CONTEXT_BYTES)?)
         } else {
             None
         };
@@ -1039,9 +1105,9 @@ fn fixture_note(path: &Path, hash: [u8; 32], vector: Vec<f32>) -> NoteEmbeddingE
 
 fn validate_space_identity(identity: &EmbeddingSpaceIdentity) -> VaultResult<()> {
     if identity.dimension == 0 || identity.dimension > MAX_CACHE_DIMENSION {
-        return Err(VaultError::Embedding(
-            "embedding cache dimension is outside supported bounds".into(),
-        ));
+        return Err(VaultError::Embedding(format!(
+            "embedding dimension is outside supported bounds (1..={MAX_CACHE_DIMENSION})"
+        )));
     }
     if identity.model.trim().is_empty() || identity.model.len() > MAX_CACHE_PATH_BYTES {
         return Err(VaultError::Embedding(
@@ -1049,17 +1115,19 @@ fn validate_space_identity(identity: &EmbeddingSpaceIdentity) -> VaultResult<()>
         ));
     }
     if identity.input_version != EMBEDDING_INPUT_VERSION {
-        return Err(VaultError::Embedding(format!(
+        return Err(VaultError::EmbeddingCacheIncompatible(format!(
             "unsupported embedding input version {}",
             identity.input_version
         )));
     }
-    if identity.max_input_tokens == 0
-        || identity.chunking_version != embedding_input::CHUNKING_VERSION
-    {
-        return Err(cache_error(
-            "unsupported embedding input capacity or chunking version",
-        ));
+    if identity.max_input_tokens == 0 {
+        return Err(cache_error("embedding input capacity must be positive"));
+    }
+    if identity.chunking_version != embedding_input::CHUNKING_VERSION {
+        return Err(VaultError::EmbeddingCacheIncompatible(format!(
+            "unsupported embedding chunking version {}",
+            identity.chunking_version,
+        )));
     }
     match (identity.backend, identity.endpoint_fingerprint) {
         (EmbeddingBackendKind::Local, None) | (EmbeddingBackendKind::Api, Some(_)) => Ok(()),
@@ -1139,6 +1207,7 @@ enum EmbeddingBackend {
 #[cfg(feature = "embeddings-api")]
 struct ApiEmbeddingRequest {
     texts: Vec<String>,
+    retry_deadline: Option<std::time::Instant>,
     response: std::sync::mpsc::Sender<VaultResult<Vec<Vec<f32>>>>,
 }
 
@@ -1146,6 +1215,7 @@ struct ApiEmbeddingRequest {
 struct ApiEmbeddingClient {
     sender: Option<std::sync::mpsc::SyncSender<ApiEmbeddingRequest>>,
     workers: Vec<std::thread::JoinHandle<()>>,
+    timeout: std::time::Duration,
 }
 
 #[cfg(feature = "embeddings-api")]
@@ -1158,6 +1228,7 @@ impl ApiEmbeddingClient {
         base_url: String,
         model: String,
         api_key: zeroize::Zeroizing<String>,
+        timeout: std::time::Duration,
     ) -> VaultResult<Self> {
         let (sender, receiver) =
             std::sync::mpsc::sync_channel::<ApiEmbeddingRequest>(Self::QUEUE_CAPACITY);
@@ -1184,13 +1255,24 @@ impl ApiEmbeddingClient {
                             break;
                         };
                         let texts = request.texts.iter().map(String::as_str).collect::<Vec<_>>();
-                        let result = embed_batch_api(
-                            &client,
-                            base_url.as_str(),
-                            model.as_str(),
-                            api_key.as_str(),
-                            &texts,
-                        );
+                        let result = if request.retry_deadline.is_some() {
+                            embed_batch_api_with_policy(
+                                &client,
+                                base_url.as_str(),
+                                model.as_str(),
+                                api_key.as_str(),
+                                &texts,
+                                request.retry_deadline,
+                            )
+                        } else {
+                            embed_batch_api(
+                                &client,
+                                base_url.as_str(),
+                                model.as_str(),
+                                api_key.as_str(),
+                                &texts,
+                            )
+                        };
                         let _ = request.response.send(result);
                     }
                 }) {
@@ -1210,24 +1292,64 @@ impl ApiEmbeddingClient {
         Ok(Self {
             sender: Some(sender),
             workers,
+            timeout,
         })
     }
 
     fn embed_batch(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>> {
+        self.request(texts, false)
+    }
+
+    fn embed_with_retry(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>> {
+        self.request(texts, true)
+    }
+
+    fn request(&self, texts: &[&str], retry_transient: bool) -> VaultResult<Vec<Vec<f32>>> {
         let sender = self
             .sender
             .as_ref()
             .ok_or_else(|| VaultError::Embedding("embedding API worker unavailable".into()))?;
+        let retry_deadline = retry_transient.then(|| std::time::Instant::now() + self.timeout);
         let (response, receiver) = std::sync::mpsc::channel();
-        sender
-            .send(ApiEmbeddingRequest {
-                texts: texts.iter().map(|text| (*text).to_string()).collect(),
-                response,
-            })
-            .map_err(|_| VaultError::Embedding("embedding API worker stopped".into()))?;
-        receiver
-            .recv()
-            .map_err(|_| VaultError::Embedding("embedding API worker stopped".into()))?
+        let mut request = ApiEmbeddingRequest {
+            texts: texts.iter().map(|text| (*text).to_string()).collect(),
+            retry_deadline,
+            response,
+        };
+        if let Some(deadline) = retry_deadline {
+            loop {
+                match sender.try_send(request) {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::TrySendError::Full(pending)) => {
+                        request = pending;
+                        let remaining =
+                            deadline.saturating_duration_since(std::time::Instant::now());
+                        if remaining.is_zero() {
+                            return Err(api_retry_timeout());
+                        }
+                        std::thread::sleep(remaining.min(std::time::Duration::from_millis(1)));
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                        return Err(VaultError::Embedding("embedding API worker stopped".into()));
+                    }
+                }
+            }
+            receiver
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .map_err(|error| match error {
+                    std::sync::mpsc::RecvTimeoutError::Timeout => api_retry_timeout(),
+                    std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                        VaultError::Embedding("embedding API worker stopped".into())
+                    }
+                })?
+        } else {
+            sender
+                .send(request)
+                .map_err(|_| VaultError::Embedding("embedding API worker stopped".into()))?;
+            receiver
+                .recv()
+                .map_err(|_| VaultError::Embedding("embedding API worker stopped".into()))?
+        }
     }
 }
 
@@ -1287,6 +1409,55 @@ impl EmbeddingModel {
         self.dim
     }
 
+    fn embed_with_policy(
+        &self,
+        texts: &[&str],
+        _retry_transient: bool,
+    ) -> VaultResult<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        embedding_input::validate_batch(
+            texts,
+            &self.input_policy,
+            self.request_limits,
+            self.request_overhead,
+            |text| self.counter.count(text),
+        )?;
+        self.dispatch_validated(texts, _retry_transient)
+    }
+
+    fn dispatch_validated(
+        &self,
+        texts: &[&str],
+        _retry_transient: bool,
+    ) -> VaultResult<Vec<Vec<f32>>> {
+        let vectors = match &self.backend {
+            #[cfg(feature = "embeddings")]
+            EmbeddingBackend::Local(inner) => {
+                let mut model = inner
+                    .lock()
+                    .map_err(|e| VaultError::Embedding(format!("model lock poisoned: {e}")))?;
+                model
+                    .embed(texts, Some(LOCAL_MAX_REQUEST_INPUTS))
+                    .map_err(|error| VaultError::EmbeddingRequest {
+                        message: format!("local embedding inference failed: {error}"),
+                        retryable: true,
+                        retry_after: None,
+                    })?
+            }
+            #[cfg(feature = "embeddings-api")]
+            EmbeddingBackend::Api(client) => {
+                if _retry_transient {
+                    client.embed_with_retry(texts)?
+                } else {
+                    client.embed_batch(texts)?
+                }
+            }
+        };
+        validate_embedding_batch(vectors, texts.len(), self.dim)
+    }
+
     // ── Local backend (fastembed) ──────────────────────────────────────
 
     #[cfg(feature = "embeddings")]
@@ -1320,6 +1491,7 @@ impl EmbeddingModel {
                 tokenizer_fingerprint,
             };
             let identity = EmbeddingSpaceIdentity::local(canonical_model, dim, &input_policy);
+            validate_space_identity(&identity)?;
             let request_limits = local_request_limits(max_input_tokens)?;
 
             Ok(Self {
@@ -1371,67 +1543,88 @@ impl EmbeddingModel {
             let model = read_env_with_fallback("OBSIDIAN_EMBEDDING_API_MODEL", "OPENAI_MODEL")
                 .unwrap_or(model_name);
             let contract = embedding_input::ApiInputContract::from_env(&base_url, &model)?;
-            let request_overhead = serde_json::to_vec(
-                &serde_json::json!({"model":model,"input":[],"encoding_format":"float"}),
-            )
-            .map_err(|error| {
-                VaultError::Embedding(format!("cannot encode embedding request: {error}"))
-            })?
-            .len();
-            embedding_input::validate_batch(
-                &["dim"],
-                &contract.policy,
-                contract.limits,
-                request_overhead,
-                |text| contract.counter.count(text),
-            )?;
-
             let client = build_api_client(timeout)?;
-            let api_client =
-                ApiEmbeddingClient::start(client, base_url.clone(), model.clone(), api_key)?;
-
-            let dim = match parse_usize_env("OBSIDIAN_EMBEDDING_DIM") {
-                Some(0) => {
-                    return Err(VaultError::Embedding(
-                        "OBSIDIAN_EMBEDDING_DIM must be greater than zero".into(),
-                    ));
-                }
-                Some(d) => {
-                    tracing::info!(dim = d, "using explicit embedding dimension");
-                    d
-                }
-                None => {
-                    tracing::info!("probing embedding API for dimension…");
-                    probe_api_dimension(&api_client)?
-                }
-            };
-            let identity =
-                EmbeddingSpaceIdentity::api(model.clone(), &base_url, dim, &contract.policy);
-            let endpoint = identity
-                .endpoint_fingerprint
-                .as_ref()
-                .map(short_fingerprint)
-                .unwrap_or_default();
-
-            tracing::info!(
-                endpoint_fingerprint = %endpoint,
-                model = %model,
-                dim,
-                "API embedding backend ready"
-            );
-
-            Ok(Self {
-                backend: EmbeddingBackend::Api(api_client),
-                dim,
-                identity,
-                input_policy: contract.policy,
-                request_limits: contract.limits,
-                counter: contract.counter,
-                request_overhead,
-            })
+            let api_client = ApiEmbeddingClient::start(
+                client,
+                base_url.clone(),
+                model.clone(),
+                api_key,
+                timeout,
+            )?;
+            Self::from_api_client(
+                api_client,
+                base_url,
+                model,
+                contract,
+                parse_usize_env("OBSIDIAN_EMBEDDING_DIM"),
+            )
         })
         .await
         .map_err(|e| VaultError::Embedding(format!("spawn_blocking join error: {e}")))?
+    }
+
+    #[cfg(feature = "embeddings-api")]
+    fn from_api_client(
+        api_client: ApiEmbeddingClient,
+        base_url: String,
+        model: String,
+        contract: embedding_input::ApiInputContract,
+        configured_dimension: Option<usize>,
+    ) -> VaultResult<Self> {
+        let request_overhead = serde_json::to_vec(
+            &serde_json::json!({"model":model,"input":[],"encoding_format":"float"}),
+        )
+        .map_err(|error| {
+            VaultError::Embedding(format!("cannot encode embedding request: {error}"))
+        })?
+        .len();
+        embedding_input::validate_batch(
+            &["dim"],
+            &contract.policy,
+            contract.limits,
+            request_overhead,
+            |text| contract.counter.count(text),
+        )?;
+
+        let dim = match configured_dimension {
+            Some(0) => {
+                return Err(VaultError::Embedding(
+                    "OBSIDIAN_EMBEDDING_DIM must be greater than zero".into(),
+                ));
+            }
+            Some(d) => {
+                tracing::info!(dim = d, "using explicit embedding dimension");
+                d
+            }
+            None => {
+                tracing::info!("probing embedding API for dimension…");
+                probe_api_dimension(&api_client)?
+            }
+        };
+        let identity = EmbeddingSpaceIdentity::api(model.clone(), &base_url, dim, &contract.policy);
+        validate_space_identity(&identity)?;
+        let endpoint = identity
+            .endpoint_fingerprint
+            .as_ref()
+            .map(short_fingerprint)
+            .unwrap_or_default();
+
+        tracing::info!(
+            endpoint_fingerprint = %endpoint,
+            model = %model,
+            dim,
+            "API embedding backend ready"
+        );
+
+        Ok(Self {
+            backend: EmbeddingBackend::Api(api_client),
+            dim,
+            identity,
+            input_policy: contract.policy,
+            request_limits: contract.limits,
+            counter: contract.counter,
+            request_overhead,
+        })
     }
 
     #[cfg(not(feature = "embeddings-api"))]
@@ -1474,30 +1667,30 @@ impl Embedder for EmbeddingModel {
     }
 
     fn embed_batch(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-        embedding_input::validate_batch(
-            texts,
-            &self.input_policy,
-            self.request_limits,
-            self.request_overhead,
-            |text| self.counter.count(text),
-        )?;
-        let vectors = match &self.backend {
-            #[cfg(feature = "embeddings")]
-            EmbeddingBackend::Local(inner) => {
-                let mut model = inner
-                    .lock()
-                    .map_err(|e| VaultError::Embedding(format!("model lock poisoned: {e}")))?;
-                model
-                    .embed(texts, Some(LOCAL_MAX_REQUEST_INPUTS))
-                    .map_err(|e| VaultError::Embedding(format!("embed failed: {e}")))?
+        self.embed_with_policy(texts, false)
+    }
+
+    fn embed_next_batch(&self, texts: &[&str]) -> (usize, VaultResult<Vec<Vec<f32>>>) {
+        let count = match self.plan_batch(texts) {
+            Ok(count) if count > 0 && count <= texts.len() => count,
+            Ok(_) => {
+                return (
+                    1,
+                    Err(VaultError::Embedding(
+                        "embedding request planner did not make progress".into(),
+                    )),
+                );
             }
-            #[cfg(feature = "embeddings-api")]
-            EmbeddingBackend::Api(client) => client.embed_batch(texts)?,
+            Err(error) => return (1, Err(error)),
         };
-        validate_embedding_batch(vectors, texts.len(), self.dim)
+        (count, self.dispatch_validated(&texts[..count], false))
+    }
+
+    fn embed_query(&self, query: &str) -> VaultResult<Vec<f32>> {
+        let mut vectors = self.embed_with_policy(&[query], true)?;
+        vectors
+            .pop()
+            .ok_or_else(|| VaultError::Embedding("embedding query returned no vector".into()))
     }
 }
 
@@ -1616,7 +1809,7 @@ fn build_api_client(timeout: std::time::Duration) -> Result<reqwest::blocking::C
 
 #[cfg(feature = "embeddings-api")]
 fn probe_api_dimension(client: &ApiEmbeddingClient) -> Result<usize, VaultError> {
-    let vecs = client.embed_batch(&["dim"])?;
+    let vecs = client.embed_with_retry(&["dim"])?;
     let first = vecs
         .first()
         .ok_or_else(|| VaultError::Embedding("dimension probe returned empty result".into()))?;
@@ -1636,6 +1829,27 @@ fn embed_batch_api(
     api_key: &str,
     texts: &[&str],
 ) -> Result<Vec<Vec<f32>>, VaultError> {
+    embed_batch_api_with_policy(client, base_url, model, api_key, texts, None)
+}
+
+#[cfg(feature = "embeddings-api")]
+fn api_retry_timeout() -> VaultError {
+    VaultError::EmbeddingRequest {
+        message: "embedding API request timed out within its retry budget".into(),
+        retryable: true,
+        retry_after: None,
+    }
+}
+
+#[cfg(feature = "embeddings-api")]
+fn embed_batch_api_with_policy(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+    texts: &[&str],
+    retry_deadline: Option<std::time::Instant>,
+) -> Result<Vec<Vec<f32>>, VaultError> {
     let url = format!("{}/embeddings", base_url.trim_end_matches('/'));
     let body = serde_json::json!({
         "model": model,
@@ -1643,37 +1857,92 @@ fn embed_batch_api(
         "encoding_format": "float",
     });
 
-    let response = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {api_key}"))
-        .json(&body)
-        .send()
-        .map_err(|error| {
-            let detail = if error.is_timeout() {
-                "request timed out"
-            } else if error.is_connect() {
-                "connection failed"
-            } else if error.is_builder() {
-                "request could not be constructed"
-            } else {
-                "request failed"
-            };
-            VaultError::EmbeddingRequest {
-                message: format!("embedding API {detail}"),
-                retryable: !error.is_builder(),
+    let mut attempts = 0;
+    loop {
+        let mut request = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .json(&body);
+        if let Some(deadline) = retry_deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(api_retry_timeout());
             }
-        })?;
-    let status = response.status();
-    if !status.is_success() {
+            request = request.timeout(remaining);
+        }
+        attempts += 1;
+        let (mut message, retryable, retry_after) = match request.send() {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() {
+                    match response.bytes() {
+                        Ok(bytes) => {
+                            let resp: serde_json::Value =
+                                serde_json::from_slice(&bytes).map_err(|_| {
+                                    VaultError::Embedding(
+                                        "embedding API returned invalid JSON".into(),
+                                    )
+                                })?;
+                            return parse_embedding_response(&resp, texts.len());
+                        }
+                        Err(error) => {
+                            let detail = if error.is_timeout() {
+                                "response body timed out"
+                            } else {
+                                "response body read failed"
+                            };
+                            (format!("embedding API {detail}"), true, None)
+                        }
+                    }
+                } else {
+                    let retry_after = response
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .map(std::time::Duration::from_secs);
+                    (
+                        format!("embedding API returned HTTP status {status}"),
+                        status.as_u16() == 429 || status.is_server_error(),
+                        retry_after,
+                    )
+                }
+            }
+            Err(error) => {
+                let detail = if error.is_timeout() {
+                    "request timed out"
+                } else if error.is_connect() {
+                    "connection failed"
+                } else if error.is_builder() {
+                    "request could not be constructed"
+                } else {
+                    "request failed"
+                };
+                (format!("embedding API {detail}"), !error.is_builder(), None)
+            }
+        };
+        if retryable
+            && attempts <= 3
+            && let Some(deadline) = retry_deadline
+        {
+            let wait =
+                retry_after.unwrap_or_else(|| std::time::Duration::from_secs(1 << (attempts - 1)));
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if wait < remaining {
+                std::thread::sleep(wait);
+                continue;
+            }
+            message.push_str("; retry deadline cannot accommodate another attempt");
+        }
+        if attempts > 1 {
+            message.push_str(&format!(" after {attempts} attempts"));
+        }
         return Err(VaultError::EmbeddingRequest {
-            message: format!("embedding API returned HTTP status {status}"),
-            retryable: status.as_u16() == 429 || status.is_server_error(),
+            message,
+            retryable,
+            retry_after,
         });
     }
-    let resp: serde_json::Value = response
-        .json()
-        .map_err(|_| VaultError::Embedding("embedding API returned invalid JSON".to_string()))?;
-    parse_embedding_response(&resp, texts.len())
 }
 
 /// Parse an OpenAI-compatible embedding API response into embedding vectors.
@@ -2042,7 +2311,7 @@ mod tests {
         let mut store = make_store();
         assert_eq!(store.len(), 3);
 
-        store.remove(Path::new("a.md"));
+        store.remove(Path::new("a.md")).unwrap();
         assert_eq!(store.len(), 2);
         assert!(store.get(Path::new("a.md")).is_none());
 
@@ -2210,6 +2479,37 @@ mod tests {
         write_cache_data(&cache_path, &data);
         let error = EmbeddingStore::load(&cache_path).err().unwrap();
         assert!(error.to_string().contains("dimension mismatch"));
+    }
+
+    #[test]
+    fn cache_policy_versions_require_a_rebuild_while_invalid_dimensions_remain_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.bin");
+        let expected = test_identity(3);
+        let mut input = expected.clone();
+        input.input_version += 1;
+        let mut chunking = expected.clone();
+        chunking.chunking_version += 1;
+        for identity in [input, chunking] {
+            write_cache_data(&path, &single_entry_cache(identity, "one.md", vec![1.0; 3]));
+            assert!(matches!(
+                EmbeddingStore::load_for_space(&path, &expected, 1),
+                Err(VaultError::EmbeddingCacheIncompatible(_))
+            ));
+            assert!(matches!(
+                EmbeddingStore::load(&path),
+                Err(VaultError::EmbeddingCacheIncompatible(_))
+            ));
+        }
+        let invalid = EmbeddingSpaceIdentity {
+            dimension: 0,
+            ..expected.clone()
+        };
+        write_cache_data(&path, &single_entry_cache(invalid, "one.md", vec![1.0; 3]));
+        assert!(matches!(
+            EmbeddingStore::load_for_space(&path, &expected, 1),
+            Err(VaultError::Embedding(_))
+        ));
     }
 
     #[test]
@@ -2557,6 +2857,76 @@ mod tests {
     }
 
     #[test]
+    fn cache_context_admission_includes_title_separators_and_bounds_block_metadata_independently() {
+        let identity = test_identity(3);
+        let mut entry = passage_note();
+        entry.chunks[0].heading_path = vec!["h".repeat(MAX_CONTEXT_BYTES - 6)];
+        entry.chunks[0].block_kind = Some("paragraph".into());
+        let mut store = EmbeddingStore::new_with_identity(identity.clone());
+        store.insert_note("long.md".into(), entry.clone()).unwrap();
+        entry.title.push('x');
+        assert!(store.insert_note("long.md".into(), entry.clone()).is_err());
+        assert_eq!(store.note(Path::new("long.md")).unwrap().title, "long");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.bin");
+        let mut writer = CacheWriter::default();
+        write_header(
+            &mut writer,
+            CACHE_MAGIC,
+            CACHE_SCHEMA_VERSION,
+            &identity,
+            false,
+            1,
+        )
+        .unwrap();
+        write_entry(&mut writer, "long.md", &entry).unwrap();
+        std::fs::write(&path, writer.bytes).unwrap();
+        let error = EmbeddingStore::load_for_space(&path, &identity, 1)
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Embedding error: embedding cache contains too many field bytes: {} (limit {})",
+                MAX_CONTEXT_BYTES - 6,
+                MAX_CONTEXT_BYTES - 7
+            )
+        );
+
+        entry.title.pop();
+        entry.chunks[0].block_kind = Some("m".repeat(MAX_CONTEXT_BYTES));
+        store.insert_note("long.md".into(), entry.clone()).unwrap();
+        store.save(&path).unwrap();
+        assert_eq!(
+            EmbeddingStore::load_for_space(&path, &identity, 1)
+                .unwrap()
+                .note(Path::new("long.md"))
+                .unwrap()
+                .chunks[0]
+                .block_kind
+                .as_ref()
+                .unwrap()
+                .len(),
+            MAX_CONTEXT_BYTES
+        );
+        entry.chunks[0].block_kind.as_mut().unwrap().push('m');
+        assert!(store.insert_note("long.md".into(), entry.clone()).is_err());
+        let mut writer = CacheWriter::default();
+        write_header(
+            &mut writer,
+            CACHE_MAGIC,
+            CACHE_SCHEMA_VERSION,
+            &identity,
+            false,
+            1,
+        )
+        .unwrap();
+        write_entry(&mut writer, "long.md", &entry).unwrap();
+        std::fs::write(&path, writer.bytes).unwrap();
+        assert!(EmbeddingStore::load_for_space(&path, &identity, 1).is_err());
+    }
+
+    #[test]
     fn captured_entries_survive_complete_generation_replacement() {
         let mut store = EmbeddingStore::new_with_identity(test_identity(3));
         store.insert_note("long.md".into(), passage_note()).unwrap();
@@ -2566,7 +2936,7 @@ mod tests {
         replacement.source_revision = "a".repeat(64);
         replacement.chunks[1].vector = vec![0.0, 0.0, 1.0];
         store.insert_note("long.md".into(), replacement).unwrap();
-        store.remove(Path::new("long.md"));
+        store.remove(Path::new("long.md")).unwrap();
         assert_eq!(captured[Path::new("long.md")].source_revision, old_revision);
         assert_eq!(
             captured[Path::new("long.md")].best_chunk(&[0.0, 1.0, 0.0]),
@@ -2596,6 +2966,44 @@ mod tests {
                 .unwrap()
                 .best_chunk(&[0.0, 1.0, 0.0]),
             Some((1, 1.0))
+        );
+    }
+
+    #[test]
+    fn remove_reports_accounting_failure_without_removing_the_note() {
+        let mut store = EmbeddingStore::new_with_identity(test_identity(3));
+        store.insert_note("long.md".into(), passage_note()).unwrap();
+        let chunks = store.total_chunks;
+        store.encoded_entries_bytes = 0;
+        let error = store.remove(Path::new("long.md")).unwrap_err();
+        assert!(error.to_string().contains("accounting underflow"));
+        assert!(store.note(Path::new("long.md")).is_some());
+        assert_eq!(store.total_chunks, chunks);
+        assert_eq!(store.encoded_entries_bytes, 0);
+    }
+
+    #[test]
+    fn removed_and_retained_notes_preserve_exact_cache_size_accounting() {
+        let mut store = EmbeddingStore::new_with_identity(test_identity(3));
+        for path in ["first.md", "second.md", "third.md"] {
+            store.insert_note(path.into(), passage_note()).unwrap();
+        }
+        assert!(store.remove(Path::new("first.md")).unwrap());
+        assert!(!store.remove(Path::new("missing.md")).unwrap());
+        assert!(
+            store
+                .retain_paths(&HashSet::from([PathBuf::from("third.md")]))
+                .unwrap()
+        );
+        assert_eq!(store.total_chunks, 2);
+        assert_eq!(
+            store.encoded_entries_bytes,
+            encoded_entry_len("third.md", &passage_note()).unwrap()
+        );
+        assert_eq!(
+            store.encode_cache().unwrap().len(),
+            store.encoded_entries_bytes
+                + cache_header_len(store.identity.as_ref().unwrap()).unwrap()
         );
     }
 
@@ -2942,6 +3350,310 @@ mod tests {
             f();
         }
 
+        fn api_fixture(
+            responses: Vec<(u16, &'static str, String)>,
+        ) -> (String, std::thread::JoinHandle<Vec<serde_json::Value>>) {
+            api_fixture_with_content_lengths(
+                responses
+                    .into_iter()
+                    .map(|(status, retry_after, body)| (status, retry_after, body, None))
+                    .collect(),
+            )
+        }
+
+        fn api_fixture_with_content_lengths(
+            responses: Vec<(u16, &'static str, String, Option<usize>)>,
+        ) -> (String, std::thread::JoinHandle<Vec<serde_json::Value>>) {
+            use std::io::Write as _;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}/v1", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let mut requests = Vec::new();
+                for (status, retry_after, body, declared_bytes) in responses {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    crate::test_helpers::read_http_request_headers(&mut stream);
+                    let request = serde_json::Deserializer::from_reader(&mut stream)
+                        .into_iter::<serde_json::Value>()
+                        .next()
+                        .unwrap()
+                        .unwrap();
+                    requests.push(request);
+                    let response = format!(
+                        "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: {retry_after}\r\nConnection: close\r\n\r\n{body}",
+                        declared_bytes.unwrap_or(body.len()),
+                    );
+                    stream.write_all(response.as_bytes()).unwrap();
+                }
+                requests
+            });
+            (base, server)
+        }
+
+        fn api_fixture_model(
+            base: &str,
+            dimension: Option<usize>,
+            timeout: std::time::Duration,
+        ) -> VaultResult<EmbeddingModel> {
+            let directory = tempfile::tempdir().unwrap();
+            let profile = directory.path().join("profile.json");
+            std::fs::write(
+                &profile,
+                serde_json::to_vec(&serde_json::json!({
+                    "version": 1,
+                    "profile_revision": "synthetic-v1",
+                    "api_base": base,
+                    "model": "test-model",
+                    "tokenizer": {"kind":"cl100k_base"},
+                    "max_input_tokens": 512,
+                    "max_batch_inputs": 32,
+                    "max_batch_tokens": 16384
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let contract =
+                embedding_input::ApiInputContract::load(base, "test-model", Some(&profile))?;
+            let client = ApiEmbeddingClient::start(
+                build_api_client(timeout)?,
+                base.to_string(),
+                "test-model".into(),
+                zeroize::Zeroizing::new("test-key".into()),
+                timeout,
+            )?;
+            EmbeddingModel::from_api_client(
+                client,
+                base.to_string(),
+                "test-model".into(),
+                contract,
+                dimension,
+            )
+        }
+
+        #[test]
+        fn api_initialization_rejects_explicit_and_probed_unsupported_dimensions() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let base = format!("http://{}/v1", listener.local_addr().unwrap());
+            for dimension in [0, MAX_CACHE_DIMENSION + 1] {
+                let error =
+                    api_fixture_model(&base, Some(dimension), std::time::Duration::from_secs(2))
+                        .err()
+                        .unwrap();
+                let expected = if dimension == 0 {
+                    "OBSIDIAN_EMBEDDING_DIM must be greater than zero"
+                } else {
+                    "embedding dimension is outside supported bounds (1..=65536)"
+                };
+                assert!(error.to_string().contains(expected), "{error}");
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+            }
+            let model = api_fixture_model(
+                &base,
+                Some(MAX_CACHE_DIMENSION),
+                std::time::Duration::from_secs(2),
+            )
+            .unwrap();
+            assert_eq!(model.dim(), MAX_CACHE_DIMENSION);
+            let store = EmbeddingStore::new_with_identity(model.identity.clone());
+            assert!(store.encode_cache().is_ok());
+
+            let body =
+                serde_json::json!({"data":[{"embedding":vec![0.0; MAX_CACHE_DIMENSION + 1]}]})
+                    .to_string();
+            let (base, server) = api_fixture(vec![(200, "0", body)]);
+            let error = api_fixture_model(&base, None, std::time::Duration::from_secs(2))
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("outside supported bounds"));
+            assert_eq!(
+                server.join().unwrap()[0]["input"],
+                serde_json::json!(["dim"])
+            );
+        }
+
+        #[test]
+        fn api_dimension_probe_and_query_recover_transient_rate_limits() {
+            let valid = r#"{"data":[{"embedding":[1.0,0.0]}]}"#.to_string();
+            let (base, server) = api_fixture(vec![
+                (429, "0", String::new()),
+                (200, "0", valid.clone()),
+                (429, "0", String::new()),
+                (503, "0", String::new()),
+                (200, "0", valid),
+            ]);
+            let model = api_fixture_model(&base, None, std::time::Duration::from_secs(2)).unwrap();
+            assert_eq!(model.dim(), 2);
+            assert_eq!(
+                Embedder::embed_query(&model, "query body").unwrap(),
+                vec![1.0, 0.0]
+            );
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), 5);
+            assert!(
+                requests[..2]
+                    .iter()
+                    .all(|request| request["input"] == serde_json::json!(["dim"]))
+            );
+            assert!(
+                requests[2..]
+                    .iter()
+                    .all(|request| request["input"] == serde_json::json!(["query body"]))
+            );
+        }
+
+        #[test]
+        fn api_probe_and_query_retry_incomplete_successful_response_bodies() {
+            let valid = r#"{"data":[{"embedding":[1.0,0.0]}]}"#.to_string();
+            let (base, server) = api_fixture_with_content_lengths(vec![
+                (200, "0", "{".into(), Some(100)),
+                (200, "0", valid.clone(), None),
+                (200, "0", "{".into(), Some(100)),
+                (200, "0", valid, None),
+            ]);
+            let model = api_fixture_model(&base, None, std::time::Duration::from_secs(3)).unwrap();
+            assert_eq!(model.dim(), 2);
+            assert_eq!(
+                Embedder::embed_query(&model, "query body").unwrap(),
+                vec![1.0, 0.0]
+            );
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), 4);
+            assert!(
+                requests[..2]
+                    .iter()
+                    .all(|request| request["input"] == serde_json::json!(["dim"]))
+            );
+            assert!(
+                requests[2..]
+                    .iter()
+                    .all(|request| request["input"] == serde_json::json!(["query body"]))
+            );
+        }
+
+        #[test]
+        fn incomplete_successful_document_response_leaves_retry_to_the_coordinator() {
+            let (base, server) =
+                api_fixture_with_content_lengths(vec![(200, "0", "{".into(), Some(100))]);
+            let model =
+                api_fixture_model(&base, Some(2), std::time::Duration::from_secs(2)).unwrap();
+            let (count, result) = Embedder::embed_next_batch(&model, &["document body"]);
+            assert_eq!(count, 1);
+            let error = result.unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    VaultError::EmbeddingRequest {
+                        retryable: true,
+                        ..
+                    }
+                ),
+                "{error}"
+            );
+            assert!(error.to_string().contains("response body"));
+            assert_eq!(server.join().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn api_query_retry_attempts_are_bounded_and_document_requests_stay_single_attempt() {
+            let (base, server) = api_fixture((0..4).map(|_| (429, "0", String::new())).collect());
+            let model =
+                api_fixture_model(&base, Some(2), std::time::Duration::from_secs(2)).unwrap();
+            let error = Embedder::embed_query(&model, "query body").unwrap_err();
+            assert!(error.to_string().contains("429"));
+            assert!(error.to_string().contains("after 4 attempts"));
+            assert_eq!(server.join().unwrap().len(), 4);
+
+            for status in [429, 503] {
+                let (base, server) = api_fixture(vec![(status, "0", String::new())]);
+                let model =
+                    api_fixture_model(&base, Some(2), std::time::Duration::from_secs(2)).unwrap();
+                let (count, result) = Embedder::embed_next_batch(&model, &["document body"]);
+                assert_eq!(count, 1);
+                let error = result.unwrap_err();
+                assert!(matches!(
+                    error,
+                    VaultError::EmbeddingRequest {
+                        retryable: true,
+                        ..
+                    }
+                ));
+                assert_eq!(server.join().unwrap().len(), 1);
+            }
+        }
+
+        #[test]
+        fn document_rate_limit_preserves_the_full_provider_retry_delay() {
+            let (base, server) = api_fixture(vec![(429, "120", String::new())]);
+            let model =
+                api_fixture_model(&base, Some(2), std::time::Duration::from_secs(2)).unwrap();
+            let started = std::time::Instant::now();
+            let (count, result) = Embedder::embed_next_batch(&model, &["document body"]);
+            assert_eq!(count, 1);
+            let error = result.unwrap_err();
+            assert!(matches!(error, VaultError::EmbeddingRequest {
+                retryable:true, retry_after:Some(delay), ..
+            } if delay == std::time::Duration::from_secs(120)));
+            assert!(started.elapsed() < std::time::Duration::from_secs(1));
+            assert_eq!(server.join().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn planned_document_dispatch_sends_only_the_validated_prefix() {
+            let body = serde_json::json!({"data":(0..32).map(|index| {
+                serde_json::json!({"index":index,"embedding":[1.0,0.0]})
+            }).collect::<Vec<_>>()})
+            .to_string();
+            let (base, server) = api_fixture(vec![(200, "0", body)]);
+            let model =
+                api_fixture_model(&base, Some(2), std::time::Duration::from_secs(2)).unwrap();
+            let (count, result) = Embedder::embed_next_batch(&model, &["body"; 33]);
+            assert_eq!(count, 32);
+            assert_eq!(result.unwrap(), vec![vec![1.0, 0.0]; 32]);
+            assert_eq!(
+                server.join().unwrap()[0]["input"].as_array().unwrap().len(),
+                32
+            );
+
+            let oversized = "body ".repeat(600);
+            let (count, result) = Embedder::embed_next_batch(&model, &[oversized.as_str()]);
+            assert_eq!(count, 1);
+            assert!(matches!(
+                result,
+                Err(VaultError::EmbeddingInputTooLong { .. })
+            ));
+            assert!(matches!(
+                model.embed_batch(&[oversized.as_str()]),
+                Err(VaultError::EmbeddingInputTooLong { .. })
+            ));
+        }
+
+        #[test]
+        fn api_query_does_not_retry_permanent_errors_and_respects_retry_deadline() {
+            for (status, body) in [
+                (401, String::new()),
+                (200, "invalid JSON".into()),
+                (200, r#"{"data":[{"embedding":[1.0]}]}"#.into()),
+            ] {
+                let (base, server) = api_fixture(vec![(status, "0", body)]);
+                let model =
+                    api_fixture_model(&base, Some(2), std::time::Duration::from_secs(2)).unwrap();
+                assert!(Embedder::embed_query(&model, "query body").is_err());
+                assert_eq!(server.join().unwrap().len(), 1);
+            }
+            let (base, server) = api_fixture(vec![(429, "1000", String::new())]);
+            let model =
+                api_fixture_model(&base, Some(2), std::time::Duration::from_millis(100)).unwrap();
+            let start = std::time::Instant::now();
+            let error = Embedder::embed_query(&model, "query body").unwrap_err();
+            assert!(error.to_string().contains("429"));
+            assert!(error.to_string().contains("retry deadline"));
+            assert!(start.elapsed() < std::time::Duration::from_secs(1));
+            assert_eq!(server.join().unwrap().len(), 1);
+        }
+
         #[test]
         fn parse_valid_single_embedding() {
             let resp = serde_json::json!({
@@ -3250,6 +3962,7 @@ mod tests {
                 base_url.clone(),
                 "test-model".to_string(),
                 zeroize::Zeroizing::new("test-key".to_string()),
+                Duration::from_millis(50),
             )
             .unwrap();
             let error = probe_api_dimension(&short_client).unwrap_err();
@@ -3260,6 +3973,7 @@ mod tests {
                 base_url,
                 "test-model".to_string(),
                 zeroize::Zeroizing::new("test-key".to_string()),
+                Duration::from_secs(2),
             )
             .unwrap();
             assert_eq!(

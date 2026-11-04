@@ -2,6 +2,7 @@ use tracing_subscriber::EnvFilter;
 
 use obsidian_mcp::config::DEFAULT_MODEL_NAME;
 use obsidian_mcp::daemon::home::{self, semantic_home_paths};
+use obsidian_mcp::daemon::protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY;
 use obsidian_mcp::daemon::server::{self, DaemonServerConfig, IpcEndpoint};
 use obsidian_mcp::upgrade::BuildIdentity;
 
@@ -45,7 +46,7 @@ fn handle_cli_flags() -> Option<i32> {
     let arg = std::env::args().nth(1)?;
     match arg.as_str() {
         "--__build-info" => {
-            match BuildIdentity::embedded().to_json() {
+            match daemon_build_info() {
                 Ok(identity) => println!("{identity}"),
                 Err(err) => {
                     eprintln!("error: {err}");
@@ -93,6 +94,19 @@ fn handle_cli_flags() -> Option<i32> {
     }
 }
 
+fn daemon_build_info() -> Result<String, serde_json::Error> {
+    #[derive(serde::Serialize)]
+    struct DaemonBuildInfo {
+        #[serde(flatten)]
+        identity: BuildIdentity,
+        capabilities: [&'static str; 1],
+    }
+    serde_json::to_string(&DaemonBuildInfo {
+        identity: BuildIdentity::embedded(),
+        capabilities: [SEMANTIC_SOURCE_EVIDENCE_CAPABILITY],
+    })
+}
+
 fn resolve_endpoint_from_env() -> Option<IpcEndpoint> {
     let raw = std::env::var("OBSIDIAN_SEMANTIC_ENDPOINT").ok()?;
     if raw.trim().is_empty() {
@@ -105,5 +119,24 @@ fn resolve_endpoint_from_env() -> Option<IpcEndpoint> {
     #[cfg(windows)]
     {
         Some(IpcEndpoint::NamedPipe(raw))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_capabilities_preserve_legacy_build_identity_parsing() {
+        let encoded = daemon_build_info().unwrap();
+        assert_eq!(
+            BuildIdentity::from_json(encoded.as_bytes()).unwrap(),
+            BuildIdentity::embedded()
+        );
+        let info: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            info["capabilities"],
+            serde_json::json!([SEMANTIC_SOURCE_EVIDENCE_CAPABILITY])
+        );
     }
 }

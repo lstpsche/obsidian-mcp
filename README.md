@@ -152,6 +152,8 @@ Current semantic daemon API version: `2` (`DAEMON_API_VERSION` in `src/daemon/pr
 
 Semantic search additionally requires the health capability `semantic_source_evidence_v1`. New clients verify it after any ownership-verified daemon reconciliation. Older v2 clients can still perform their existing health/activation handshake; new clients report an unsupported contract when an external daemon lacks the capability. Restart or upgrade that daemon through its owner. A capability mismatch does not activate a competing local index.
 
+For an owned daemon at the same version, bootstrap may activate an installed sibling that advertises the missing capability through `--__build-info`. A sibling without the capability leaves the running daemon intact and remains explicitly unsupported; newer running versions and external owners are preserved.
+
 | Component | Compatibility contract | Enforcement |
 |----------|-------------------------|-------------|
 | `obsidian-mcp` | Daemon API version must match exactly | MCP daemon `health` handshake validates `min_api_version`/`max_api_version` against current API version and fails fast on mismatch |
@@ -453,6 +455,8 @@ The local backend uses its loaded tokenizer's effective input capacity, normally
 
 Only the official `https://api.openai.com/v1` endpoint and exact model IDs `text-embedding-3-small`, `text-embedding-3-large`, and `text-embedding-ada-002` resolve automatically to `cl100k_base` and the documented limits of 8,192 tokens per input, 2,048 inputs and 300,000 aggregate tokens per request. Other endpoints, including OpenRouter and local servers, require `OBSIDIAN_EMBEDDING_API_PROFILE`. Model aliases and generic provider tokenizer labels are not sufficient to infer an exact tokenizer.
 
+API base URLs must use HTTP(S) with a host and optional path, without embedded credentials, query strings or fragments. Authentication is supplied through `OBSIDIAN_EMBEDDING_API_KEY` or `OPENAI_API_KEY`; profiles contain no credentials.
+
 A profile is strict JSON tied to the exact endpoint and outgoing model. For example, a deployment using OpenRouter's OpenAI model can supply a deliberately single-input request profile after verifying that model contract:
 
 ```json
@@ -471,6 +475,8 @@ A profile is strict JSON tied to the exact endpoint and outgoing model. For exam
 For a HuggingFace tokenizer, replace `tokenizer` with `{"kind":"huggingface","path":"tokenizer.json","sha256":"<actual lowercase SHA-256>","add_special_tokens":true}`. The file must export the fully initialized tokenizer, including normalization, added tokens and postprocessing; its special-token behavior must match the provider. Relative paths resolve against the profile directory. Profiles are limited to 1 MiB and tokenizer files to 64 MiB. Unknown fields, mismatched endpoint/model, invalid limits and digest mismatches are configuration errors before inference. `profile_revision` identifies the reviewed deployment contract; it cannot detect a provider secretly replacing model weights under the same alias.
 
 Request item, token and serialized-byte limits are enforced independently. Local inference dispatches at most 32 prepared inputs per request, with an aggregate token ceiling of 32 times the loaded per-input capacity. Reconciliation batch size continues to count notes; a note producing many chunks does not multiply the local inference request size. The daemon reads its own provider/profile environment at startup; later client attachments do not change it. Restart that owner after changing the profile or tokenizer. API-only builds include tokenizer support and use the external model without bundling ONNX or downloading model weights.
+
+API dimension probes and search queries retry transient transport failures, HTTP 429 and server errors for at most four attempts within one `OBSIDIAN_EMBEDDING_API_TIMEOUT_SECS` budget, including queueing, waits and requests. Numeric `Retry-After` delays are honored only when another attempt fits that budget; otherwise the request fails with its cause. Permanent HTTP errors and complete invalid responses are not retried; an incomplete response body remains a transport failure. Document requests make one attempt per dispatch; the indexing coordinator owns their backoff and retained progress, waiting at least as long as any numeric provider retry delay. Transient source-read and validated local-inference failures also use managed backoff. Invalid source, configuration and resource failures remain explicit until the source or owner configuration changes. Provider query failures do not select a competing local owner.
 
 Semantic runtime modes:
 
@@ -545,7 +551,7 @@ Source/page budgets count UTF-8 bytes, not tokens. Projection byte budgets count
 
 Each result's `source_revision` is the lowercase SHA-256 of the complete raw note, including frontmatter. `source_bytes` and every half-open UTF-8 byte range refer to that exact raw revision. `evidence.scope` is `note` for a fitting whole-body embedding or `passage` for a matching chunk; `evidence.range`, `heading_path` and optional `section_range` locate it. Pure semantic scores use the winning cosine; hybrid `score` blends lexical and semantic values while `evidence.cosine_similarity` retains the actual cosine. `top_k` counts distinct notes after grouping their embeddings.
 
-`snippet` is a preview capped at 300 characters, with its exact source span in `preview.range`. `preview.complete_evidence` describes whether that preview contains the full scored region; it does not claim that every relevant rule or exception in the note was included. A fitting multi-topic note has note-level evidence and cannot truthfully identify a semantically winning section from its one vector. `include_content:true` returns the complete raw note instead of a snippet.
+`snippet` is a preview capped at 300 characters, with its exact source span in `preview.range`. `evidence.range` identifies the primary source span; contextual title, headings and bounded same-block overlap do not expand that anchor. `preview.complete_evidence` describes whether the preview contains that complete primary span; it does not claim that every relevant rule or exception in the note was included. A fitting multi-topic note has note-level evidence and cannot truthfully identify a semantically winning section from its one vector. `include_content:true` returns the complete raw note instead of a snippet.
 
 The server reads current source once and checks its revision before building a preview or full content. If the source changed or is unreadable, the ranked note remains in results with `source_status:"changed"` or `"unavailable"` and a typed `context_error`; content fields are omitted. It never applies old offsets to newer text or substitutes unrelated content. Last-known-good scores may therefore remain available while their context needs refresh. With watching disabled, external edits require an explicit source/index refresh or service restart; status inspection does not start it.
 

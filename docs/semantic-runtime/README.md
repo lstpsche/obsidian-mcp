@@ -101,6 +101,7 @@ Compatibility policy:
 - If daemon API is outside client-supported range, daemon returns a version mismatch error.
 - Clients must not proceed with `ensure_vault` or search calls after mismatch.
 - New semantic clients also require the additive health capability `semantic_source_evidence_v1`. Validate it against the final daemon after ownership-aware reconciliation; old API2 activation clients remain compatible with the version handshake.
+- An owned equal-version daemon missing that capability can be replaced only after the installed sibling advertises support in its additive `--__build-info` capabilities. An old sibling without support is not restarted repeatedly; newer running versions and external owners remain preserved.
 - A missing capability on an external/override daemon is an unsupported semantic contract, not evidence of an outage and not permission to start competing local inference.
 
 Embedding cache schema 2 records complete per-note collections, exact source revisions, prepared-input hashes, tokenizer fingerprints and effective capacity/preparation/partition identity. Old schema-1 prefix vectors rebuild automatically; relocation alone does not make them complete. The new cache replaces its predecessor atomically after a durable checkpoint. During the first rebuild, status is warming and API deployments can send substantially more source text than before. No vault files, provider settings, models or launcher definitions are rewritten by cache rebuilding.
@@ -122,7 +123,7 @@ Bootstrap is idempotent and shared by all clients.
 5. If healthy:
    - reuse external/override runtimes when the API is compatible
    - for locally owned runtimes, compare the running version with the installed sibling
-   - activate a newer sibling after an interrupted package upgrade
+   - activate a newer sibling after an interrupted package upgrade, or a same-version sibling that advertises a capability missing from the owned running daemon
    - never replace a newer running daemon with an older sibling
 6. If unhealthy, missing, or locally owned and older:
    - ensure daemon binary exists

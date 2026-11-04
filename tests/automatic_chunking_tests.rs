@@ -383,7 +383,14 @@ mod local_retrieval {
             let source = std::fs::read_to_string(directory.path().join(expected)).unwrap();
             let start = hit["evidence"]["range"]["start_byte"].as_u64().unwrap() as usize;
             let end = hit["evidence"]["range"]["end_byte"].as_u64().unwrap() as usize;
-            assert!(source.get(start..end).unwrap().contains("Apple trees"));
+            assert!(
+                source
+                    .get(start..end)
+                    .unwrap()
+                    .to_ascii_lowercase()
+                    .contains("apple trees"),
+                "wrong boundary evidence for {expected}: {hit}"
+            );
             if scope == "note" {
                 assert_eq!((start, end), (0, source.len()));
             }

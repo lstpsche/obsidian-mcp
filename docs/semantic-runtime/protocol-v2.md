@@ -113,9 +113,9 @@ Field rules:
 - `source_status`: `current`, `changed` or `unavailable`, after validating the single source buffer used to construct returned context
 - `evidence.scope`: `note` for one fitting whole-body embedding, `passage` for an overflowing note's winning chunk
 - `evidence.cosine_similarity`: the raw winning cosine; hybrid `score` can be a blended value
-- `evidence.range`: exact primary scored source region; offsets are raw-note UTF-8 bytes with inclusive start and exclusive end
+- `evidence.range`: exact primary source span; offsets are raw-note UTF-8 bytes with inclusive start and exclusive end. Contextual title, headings and same-block overlap do not expand this anchor
 - `evidence.heading_path` and optional `section_range`: passage ancestry and enclosing section locators; whole-note evidence does not invent a winning heading
-- `preview`: optional exact `snippet` span and whether it contains the complete scored region; it is not a promise that every relevant rule in the note was returned
+- `preview`: optional exact `snippet` span and whether it contains the complete primary evidence span; it is not a promise that every relevant rule in the note was returned
 
 The example illustrates field shape rather than the literal contents of a fixture. `snippet` is at most 300 characters and maps exactly to `preview.range`. A matching chunk is a retrieval location; surrounding or distant context can be read through revision-checked MCP note/heading operations. `include_content:true` retains its full raw-note meaning and omits the snippet/preview.
 

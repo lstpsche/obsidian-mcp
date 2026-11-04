@@ -42,7 +42,11 @@ pub enum VaultError {
     EmbeddingCacheIncompatible(String),
 
     #[error("Embedding request failed: {message}")]
-    EmbeddingRequest { message: String, retryable: bool },
+    EmbeddingRequest {
+        message: String,
+        retryable: bool,
+        retry_after: Option<std::time::Duration>,
+    },
 
     #[error("Frontmatter parse error in {path}: {source}")]
     FrontmatterParse {

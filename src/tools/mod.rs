@@ -104,18 +104,21 @@ impl PendingDaemonBootstrap {
     }
 
     async fn resolve(&self) -> crate::error::VaultResult<&SemanticDaemonClient> {
-        self.client
+        let client = self
+            .client
             .get_or_try_init(|| async {
                 let initialized = self.bootstrap.lock().await.resume().await?;
-                let client = SemanticDaemonClient::with_health(
+                Ok::<_, VaultError>(SemanticDaemonClient::with_health(
                     initialized.endpoint,
                     self.policy,
                     initialized.health,
-                );
-                client.require_source_evidence().await?;
-                Ok(client)
+                ))
             })
-            .await
+            .await?;
+        // Bootstrap completion and semantic support have different lifetimes.
+        // Keep the inspected owner so health can recover without bootstrapping again.
+        client.require_source_evidence().await?;
+        Ok(client)
     }
 }
 

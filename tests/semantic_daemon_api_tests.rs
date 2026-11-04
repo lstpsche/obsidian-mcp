@@ -115,11 +115,18 @@ fn isolated_endpoint(directory: &Path) -> IpcEndpoint {
     }
 }
 
+#[derive(Clone, Copy)]
+enum InvalidEmbeddingResponse {
+    WrongDimension,
+    MissingEmbedding,
+}
+
 #[derive(Clone)]
 struct ProviderState {
     requests: Arc<Mutex<Vec<Value>>>,
     received: Arc<Notify>,
     hold: watch::Receiver<bool>,
+    invalid_response: Arc<Mutex<Option<InvalidEmbeddingResponse>>>,
 }
 
 struct ControlledProvider {
@@ -138,6 +145,7 @@ impl ControlledProvider {
             requests: Arc::new(Mutex::new(Vec::new())),
             received: Arc::new(Notify::new()),
             hold: receiver,
+            invalid_response: Arc::new(Mutex::new(None)),
         };
         let app = Router::new()
             .route("/v1/embeddings", post(controlled_embeddings))
@@ -157,6 +165,10 @@ impl ControlledProvider {
 
     fn hold_requests(&self, hold: bool) {
         self.hold.send(hold).unwrap();
+    }
+
+    fn invalid_response(&self, response: Option<InvalidEmbeddingResponse>) {
+        *self.state.invalid_response.lock().unwrap() = response;
     }
 
     async fn wait_for_requests(&self, count: usize) {
@@ -187,6 +199,15 @@ async fn controlled_embeddings(
     state.requests.lock().unwrap().push(input.clone());
     state.received.notify_one();
     state.hold.wait_for(|hold| !*hold).await.unwrap();
+    match *state.invalid_response.lock().unwrap() {
+        Some(InvalidEmbeddingResponse::WrongDimension) => {
+            return Json(json!({"data": [{"index": 0, "embedding": [1.0]}]}));
+        }
+        Some(InvalidEmbeddingResponse::MissingEmbedding) => {
+            return Json(json!({"data": []}));
+        }
+        None => {}
+    }
     embeddings(Json(input)).await
 }
 
@@ -538,6 +559,74 @@ async fn auto_mode_retains_daemon_ownership_until_unavailable_then_keeps_local_f
 }
 
 #[tokio::test]
+async fn invalid_query_vectors_preserve_daemon_ownership_in_auto_mode() {
+    let daemon_api = ControlledProvider::start(false).await;
+    let local_api = ControlledProvider::start(false).await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("vault");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("note.md"), "# Marker\nVISIBLE quokka\n").unwrap();
+    let endpoint = isolated_endpoint(directory.path());
+    let client = SemanticDaemonClient::new(endpoint.clone(), DaemonConnectPolicy::default());
+    let mut daemon = spawn_daemon(
+        &directory.path().join("semantic"),
+        &endpoint,
+        daemon_api.port,
+    );
+    wait_for_health(&mut daemon, &client).await;
+    let mut server =
+        StdioServer::start(&root, directory.path(), &endpoint, "auto", local_api.port).await;
+    let first = server
+        .tool("search_semantic", json!({"query":"quokka","top_k":1}))
+        .await;
+    if first.get("error").is_some() {
+        assert_warming(&first);
+    }
+    server.wait_for_ready("daemon").await;
+    assert!(local_api.requests().is_empty());
+    let mut expected_requests = daemon_api.requests().len();
+
+    for invalid in [
+        InvalidEmbeddingResponse::WrongDimension,
+        InvalidEmbeddingResponse::MissingEmbedding,
+    ] {
+        daemon_api.invalid_response(Some(invalid));
+        for lexical_prefetch in [false, true] {
+            let response = server
+                .tool(
+                    "search_semantic",
+                    json!({"query":"quokka","top_k":1,"lexical_prefetch":lexical_prefetch}),
+                )
+                .await;
+            assert_eq!(response["error"]["code"], -32603, "{response}");
+            expected_requests += 1;
+            assert_eq!(daemon_api.requests().len(), expected_requests);
+            assert!(local_api.requests().is_empty());
+            let info = server.embedding_info().await;
+            assert_eq!(info["source"], "daemon", "{info}");
+            assert_eq!(info["status"]["phase"], "ready", "{info}");
+        }
+    }
+    daemon_api.invalid_response(None);
+    assert_note_found(
+        &server
+            .tool("search_semantic", json!({"query":"quokka","top_k":1}))
+            .await,
+    );
+    assert!(local_api.requests().is_empty());
+    assert!(
+        daemon_api
+            .requests()
+            .iter()
+            .all(|request| request["model"] == "probe")
+    );
+    assert_eq!(server.embedding_info().await["source"], "daemon");
+    server.stop().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+#[tokio::test]
 async fn local_semantic_queries_keep_progress_responsive_on_one_worker() {
     for lexical_prefetch in [false, true] {
         let provider = ControlledProvider::start(false).await;
@@ -677,6 +766,132 @@ fn oversized_note() -> String {
         "---\ntags: [retention]\n---\n# Operations\n\n## Weather\n\n{}\n\n## Recovery procedure\n\nTAIL_SIGNAL Keep the encrypted backup until an incident is closed.\n",
         "The coastal station records ordinary weather observations. ".repeat(120)
     )
+}
+
+#[tokio::test]
+async fn hybrid_query_capacity_is_checked_before_empty_lexical_results() {
+    let query = "missing ".repeat(200);
+    let measured_tokens = tiktoken_rs::cl100k_base()
+        .unwrap()
+        .encode_ordinary(&query)
+        .len();
+    let max_input_tokens = 96;
+    assert!(measured_tokens > max_input_tokens);
+
+    for mode in ["local", "daemon"] {
+        let provider = ControlledProvider::start(false).await;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("vault");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(
+            root.join("policy.md"),
+            "# Policy\nKeep backups for thirty days.\n",
+        )
+        .unwrap();
+        let endpoint = isolated_endpoint(directory.path());
+        let mut daemon = if mode == "daemon" {
+            let client =
+                SemanticDaemonClient::new(endpoint.clone(), DaemonConnectPolicy::default());
+            let mut child = spawn_daemon_with_limits(
+                &directory.path().join("semantic"),
+                &endpoint,
+                provider.port,
+                max_input_tokens,
+                2,
+            );
+            wait_for_health(&mut child, &client).await;
+            Some(child)
+        } else {
+            None
+        };
+        let mut server = StdioServer::start_with_options(
+            &root,
+            directory.path(),
+            &endpoint,
+            mode,
+            provider.port,
+            max_input_tokens,
+            true,
+        )
+        .await;
+        let first = server
+            .tool("search_semantic", json!({"query":"Policy","top_k":1}))
+            .await;
+        if first.get("error").is_some() {
+            assert_warming(&first);
+        }
+        server.wait_for_ready(mode).await;
+        let initial_requests = provider.requests().len();
+
+        for lexical_prefetch in [false, true] {
+            let response = server
+                .tool(
+                    "search_semantic",
+                    json!({"query":query,"top_k":1,"lexical_prefetch":lexical_prefetch}),
+                )
+                .await;
+            assert_eq!(response["error"]["code"], -32602, "{mode}: {response}");
+            assert!(
+                response["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!(
+                        "{measured_tokens} tokens (maximum {max_input_tokens})"
+                    )),
+                "{mode}: {response}"
+            );
+        }
+        let valid = server
+            .tool(
+                "search_semantic",
+                json!({"query":"missing","top_k":1,"lexical_prefetch":true}),
+            )
+            .await;
+        assert!(
+            structured_result(&valid)["results"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{mode}: {valid}"
+        );
+
+        let removed = server
+            .tool("note_delete", json!({"path":"policy.md", "confirm":true}))
+            .await;
+        assert!(removed.get("error").is_none(), "{mode}: {removed}");
+        for lexical_prefetch in [false, true] {
+            let empty_scope = server
+                .tool(
+                    "search_semantic",
+                    json!({"query":"missing","top_k":1,"lexical_prefetch":lexical_prefetch}),
+                )
+                .await;
+            assert!(
+                structured_result(&empty_scope)["results"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty(),
+                "{mode}: {empty_scope}"
+            );
+            let overlong = server
+                .tool(
+                    "search_semantic",
+                    json!({"query":query,"top_k":1,"lexical_prefetch":lexical_prefetch}),
+                )
+                .await;
+            assert_eq!(overlong["error"]["code"], -32602, "{mode}: {overlong}");
+        }
+        assert_eq!(
+            provider.requests().len(),
+            initial_requests,
+            "{mode}: invalid queries and empty semantic or lexical scopes must not reach the provider"
+        );
+        server.stop().await;
+        if let Some(child) = daemon.as_mut() {
+            child.kill().await.unwrap();
+            child.wait().await.unwrap();
+        }
+    }
 }
 
 /// This suite is also run against both extracted native release binaries.

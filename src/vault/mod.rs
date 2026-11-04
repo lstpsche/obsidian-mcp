@@ -620,6 +620,10 @@ impl Vault {
             .cloned()
             .collect::<std::collections::HashSet<_>>();
         let entries = snapshot.capture_entries(&current_paths);
+        if entries.is_empty() {
+            snapshot.validate_query(query)?;
+            return Ok(Vec::new());
+        }
         let query_vector = snapshot.embed_query(query)?;
         semantic_results::rank_semantic(entries, &query_vector, top_k)
     }
@@ -703,8 +707,12 @@ impl Vault {
             VaultError::Embedding("embeddings not enabled (OBSIDIAN_EMBEDDINGS=false)".into())
         })?;
         let snapshot = runtime.query_snapshot()?;
+        snapshot.validate_query(query)?;
         let current_paths = self.read_index().notes().keys().cloned().collect();
         let entries = snapshot.capture_entries(&current_paths);
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
         let allowed = semantic_results::paths(&entries);
         let prefetch = prefetch_count.max(top_k);
         let bm25_hits = tv.search_for_paths(query, prefetch, Some(&allowed))?;

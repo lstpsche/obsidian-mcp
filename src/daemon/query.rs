@@ -294,7 +294,40 @@ fn map_vault_error(err: VaultError) -> QueryError {
         | VaultError::InvalidSourceRange(_) => {
             QueryError::new(protocol::ERR_INVALID_PARAMS, message)
         }
-        VaultError::Embedding(_) => QueryError::new(protocol::ERR_BOOTSTRAP_REQUIRED, message),
         _ => QueryError::new(protocol::ERR_INTERNAL, message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_inference_errors_do_not_request_daemon_bootstrap() {
+        let error = map_vault_error(VaultError::Embedding(
+            "embedding API returned an invalid vector".into(),
+        ));
+        assert_eq!(error.code, protocol::ERR_INTERNAL);
+        assert!(error.message.contains("invalid vector"));
+    }
+
+    #[cfg(not(has_embeddings))]
+    #[tokio::test]
+    async fn daemon_without_embedding_backend_requires_bootstrap() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault_root = directory.path().join("vault");
+        std::fs::create_dir(&vault_root).unwrap();
+        let context = VaultContext::open(
+            "test-vault".into(),
+            vault_root,
+            "test-model".into(),
+            directory.path().join("state"),
+            false,
+        )
+        .await
+        .unwrap();
+        let error = require_semantic_ready(&context).unwrap_err();
+        assert_eq!(error.code, protocol::ERR_BOOTSTRAP_REQUIRED);
+        assert!(error.message.contains("no embedding backend"));
     }
 }

@@ -221,16 +221,17 @@ impl EmbeddingQuerySnapshot {
             .capture_entries(allowed_paths)
     }
 
-    pub(crate) fn embed_query(&self, query: &str) -> VaultResult<Vec<f32>> {
+    pub(crate) fn validate_query(&self, query: &str) -> VaultResult<()> {
         let tokens = self.model.count_tokens(query)?;
         let max_tokens = self.model.input_policy().max_input_tokens;
         if tokens > max_tokens {
             return Err(VaultError::EmbeddingInputTooLong { tokens, max_tokens });
         }
-        let mut vectors = self.model.embed_batch(&[query])?;
-        vectors
-            .pop()
-            .ok_or_else(|| VaultError::Embedding("embedding query returned no vector".into()))
+        Ok(())
+    }
+
+    pub(crate) fn embed_query(&self, query: &str) -> VaultResult<Vec<f32>> {
+        self.model.embed_query(query)
     }
 
     #[cfg(test)]
@@ -527,25 +528,7 @@ where
     let model = match loader.await {
         Ok(model) => model,
         Err(error) => {
-            let message = error.to_string();
-            let _ = shared.first_load_error.set(message.clone());
-            let total_notes = current_paths(&shared.index).len();
-            let mut state = shared
-                .state
-                .lock()
-                .unwrap_or_else(|lock_error| lock_error.into_inner());
-            let pending_notes = distinct_pending_count(&state);
-            replace_status(
-                &mut state,
-                EmbeddingRuntimeStatus {
-                    phase: EmbeddingPhase::Degraded,
-                    queryable: false,
-                    indexed_notes: 0,
-                    total_notes,
-                    pending_notes,
-                    last_error: Some(message),
-                },
-            );
+            record_initialization_failure(&shared, error);
             return;
         }
     };
@@ -560,10 +543,14 @@ where
     let live = Arc::clone(&shared.live);
     let lifecycle_gate = Arc::clone(&shared.lifecycle_gate);
     let current_count = current_paths.len();
-    let loaded = tokio::task::spawn_blocking(move || -> VaultResult<Option<EmbeddingStore>> {
+    let load_cache = move || -> VaultResult<Option<EmbeddingStore>> {
         if !cache_migration_sources.is_empty() {
-            let _guard = lifecycle_gate.lock().unwrap_or_else(|error| error.into_inner());
-            if !live.load(Ordering::Acquire) { return Ok(None); }
+            let _guard = lifecycle_gate
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if !live.load(Ordering::Acquire) {
+                return Ok(None);
+            }
             match migrate_cache_candidates_to_path(&cache_migration_sources, &cache_path)? {
                 LegacyCacheMigration::Migrated(path) => {
                     tracing::info!(path = %path.display(), "relocated embedding cache in background");
@@ -571,14 +558,27 @@ where
                 LegacyCacheMigration::AlreadyPresent(_) | LegacyCacheMigration::NotFound => {}
             }
         }
-        if !live.load(Ordering::Acquire) { return Ok(None); }
+        if !live.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         match std::fs::metadata(&cache_path) {
-            Ok(metadata) if metadata.is_file() => EmbeddingStore::load_for_space(&cache_path, &expected_identity, current_count).map(Some),
-            Ok(_) => Err(VaultError::Embedding(format!("embedding cache is not a regular file: {}", cache_path.display()))),
+            Ok(metadata) if metadata.is_file() => {
+                let store =
+                    EmbeddingStore::load_for_space(&cache_path, &expected_identity, current_count)?;
+                Ok(Some(store))
+            }
+            Ok(_) => {
+                let message = format!(
+                    "embedding cache is not a regular file: {}",
+                    cache_path.display()
+                );
+                Err(VaultError::Embedding(message))
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(VaultError::Io(error)),
         }
-    }).await;
+    };
+    let loaded = tokio::task::spawn_blocking(load_cache).await;
     let (loaded, cache_error) = match loaded {
         Ok(Ok(store)) => (store, None),
         Ok(Err(VaultError::EmbeddingCacheIncompatible(reason))) => {
@@ -603,7 +603,13 @@ where
     let mut store =
         loaded.unwrap_or_else(|| EmbeddingStore::new_with_identity(model.space_identity().clone()));
     let previously_publishable = store.first_pass_complete();
-    let mut dirty = store.retain_paths(&current_paths);
+    let mut dirty = match store.retain_paths(&current_paths) {
+        Ok(dirty) => dirty,
+        Err(error) => {
+            record_initialization_failure(&shared, error);
+            return;
+        }
+    };
     let has_cached_vectors = !store.is_empty();
     let store = Arc::new(RwLock::new(store));
 
@@ -721,6 +727,28 @@ where
             notified.await;
         }
     }
+}
+
+fn record_initialization_failure(shared: &RuntimeShared, error: VaultError) {
+    let message = error.to_string();
+    let _ = shared.first_load_error.set(message.clone());
+    let total_notes = current_paths(&shared.index).len();
+    let mut state = shared
+        .state
+        .lock()
+        .unwrap_or_else(|lock_error| lock_error.into_inner());
+    let pending_notes = distinct_pending_count(&state);
+    replace_status(
+        &mut state,
+        EmbeddingRuntimeStatus {
+            phase: EmbeddingPhase::Degraded,
+            queryable: false,
+            indexed_notes: 0,
+            total_notes,
+            pending_notes,
+            last_error: Some(message),
+        },
+    );
 }
 
 async fn persist_dirty(
@@ -980,20 +1008,9 @@ async fn process_batch(
                         .iter()
                         .map(|(prepared, chunk)| prepared.chunks[*chunk].text.as_str())
                         .collect::<Vec<_>>();
-                    let count = match embedder.plan_batch(&texts) {
-                        Ok(count) if count > 0 && count <= texts.len() => count,
-                        Ok(_) => {
-                            return (
-                                1,
-                                Err(VaultError::Embedding(
-                                    "embedding request planner did not make progress".into(),
-                                )),
-                            );
-                        }
-                        Err(error) => return (1, Err(error)),
-                    };
-                    tracing::debug!(batch_size = count, "embedding batch started");
-                    let result = embedder.embed_batch(&texts[..count]).and_then(|vectors| {
+                    tracing::debug!(pending_inputs = texts.len(), "embedding batch started");
+                    let (count, result) = embedder.embed_next_batch(&texts);
+                    let result = result.and_then(|vectors| {
                         validate_embedding_batch(vectors, count, embedder.dimension())
                     });
                     (count, result)
@@ -1005,9 +1022,11 @@ async fn process_batch(
             Ok(result) => result,
             Err(error) => (
                 jobs.len(),
-                Err(VaultError::Embedding(format!(
-                    "embedding inference task failed: {error}"
-                ))),
+                Err(VaultError::EmbeddingRequest {
+                    message: format!("embedding inference task failed: {error}"),
+                    retryable: true,
+                    retry_after: None,
+                }),
             ),
         };
         match result {
@@ -1055,7 +1074,7 @@ async fn process_batch(
                     .take(count)
                     .map(|(note, _)| *note)
                     .collect::<HashSet<_>>();
-                let retryable = is_retryable(&error);
+                let retry_after = retry_hint(&error);
                 let message = error.to_string();
                 for (index, slot) in active.iter_mut().enumerate() {
                     if let Some(draft) = slot.take() {
@@ -1064,7 +1083,7 @@ async fn process_batch(
                                 shared,
                                 draft.work.clone(),
                                 message.clone(),
-                                retryable,
+                                retry_after,
                                 Some(draft),
                             );
                         } else {
@@ -1103,19 +1122,6 @@ fn available_staging(shared: &RuntimeShared, active_bytes: usize) -> usize {
         .map(|draft| draft.memory_bytes)
         .sum::<usize>();
     MAX_STAGING_BYTES.saturating_sub(active_bytes.saturating_add(paused))
-}
-
-fn evict_paused_staging(shared: &RuntimeShared) -> bool {
-    let mut state = shared
-        .state
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let oldest = state
-        .staged
-        .iter()
-        .min_by_key(|(_, draft)| draft.last_used)
-        .map(|(path, _)| path.clone());
-    oldest.is_some_and(|path| state.staged.remove(&path).is_some())
 }
 
 async fn prepare_work(
@@ -1158,29 +1164,57 @@ async fn prepare_work(
                 }) {
                     return Ok(PreparationOutcome::Unchanged);
                 }
-                let budget = available.saturating_sub(overhead.saturating_add(raw.capacity()));
+                let reserved = overhead.saturating_add(raw.capacity());
+                let budget = available.saturating_sub(reserved);
                 prepare_note_with_budget(&path, &raw, embedder.as_ref(), budget)
                     .map(PreparationOutcome::Prepared)
+                    .map_err(|error| match error {
+                        VaultError::SemanticResourceLimit {
+                            resource, actual, ..
+                        } if resource == "embedding preparation budget" => {
+                            VaultError::SemanticResourceLimit {
+                                resource,
+                                actual: reserved.saturating_add(actual),
+                                limit: available,
+                            }
+                        }
+                        other => other,
+                    })
             })
             .await
-            .map_err(|error| {
-                VaultError::Embedding(format!("embedding preparation task failed: {error}"))
+            .map_err(|error| VaultError::EmbeddingRequest {
+                message: format!("embedding preparation task failed: {error}"),
+                retryable: true,
+                retry_after: None,
             })?
         };
         match prepared {
-            Err(ref error)
-                if matches!(error,
-                VaultError::SemanticResourceLimit { resource, limit, .. }
-                if resource == "embedding preparation budget" ||
-                    (resource.starts_with("source bytes for ") && *limit < super::source::MAX_SOURCE_BYTES)) =>
+            Err(VaultError::SemanticResourceLimit {
+                resource,
+                actual,
+                limit,
+            }) if resource == "embedding preparation budget"
+                || (resource.starts_with("source bytes for ")
+                    && limit < super::source::MAX_SOURCE_BYTES) =>
             {
-                if evict_paused_staging(shared) {
+                // A failed allocation measures only the work observed so far.
+                // Convert it to the whole reservation before freeing retry progress.
+                let required = if resource == "embedding preparation budget" {
+                    actual
+                } else {
+                    overhead.saturating_add(actual).saturating_add(1)
+                };
+                if admit_staging(shared, active_bytes, required) {
                     continue;
                 }
                 if active_bytes > 0 {
                     return Ok(PreparationOutcome::Deferred);
                 }
-                return prepared;
+                return Err(VaultError::SemanticResourceLimit {
+                    resource: "embedding preparation budget".into(),
+                    actual: required,
+                    limit: MAX_STAGING_BYTES,
+                });
             }
             result => return result,
         }
@@ -1220,6 +1254,10 @@ fn defer_pending(shared: &RuntimeShared, work: &PendingWork) {
 }
 
 fn admit_staging(shared: &RuntimeShared, active_bytes: usize, required: usize) -> bool {
+    // Paused progress cannot help when active work alone prevents admission.
+    if active_bytes.saturating_add(required) > MAX_STAGING_BYTES {
+        return false;
+    }
     let mut state = shared
         .state
         .lock()
@@ -1316,8 +1354,17 @@ fn commit_remove(
         .write()
         .unwrap_or_else(|error| error.into_inner())
         .remove(&work.path);
-    finish_success(&mut state, work);
-    removed
+    match removed {
+        Ok(removed) => {
+            finish_success(&mut state, work);
+            removed
+        }
+        Err(error) => {
+            drop(state);
+            record_failure(shared, work.clone(), error, None);
+            false
+        }
+    }
 }
 
 fn commit_note(
@@ -1389,13 +1436,38 @@ fn finish_success(state: &mut RuntimeState, work: &PendingWork) {
     update_pending_status(state);
 }
 
-fn is_retryable(error: &VaultError) -> bool {
-    matches!(
-        error,
+/// A minimum retry delay; zero keeps ordinary backoff, and None means terminal.
+fn retry_hint(error: &VaultError) -> Option<Duration> {
+    match error {
         VaultError::EmbeddingRequest {
             retryable: true,
+            retry_after,
             ..
-        }
+        } => Some(retry_after.unwrap_or(Duration::ZERO)),
+        VaultError::Io(error) if transient_source_io(error) => Some(Duration::ZERO),
+        _ => None,
+    }
+}
+
+fn transient_source_io(error: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(32 | 33)) {
+        return true;
+    }
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(5) {
+        return true;
+    }
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::ResourceBusy
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::BrokenPipe
     )
 }
 
@@ -1405,15 +1477,15 @@ fn record_failure(
     error: VaultError,
     staged: Option<StagedNote>,
 ) {
-    let retryable = is_retryable(&error);
-    record_failure_message(shared, work, error.to_string(), retryable, staged);
+    let retry_after = retry_hint(&error);
+    record_failure_message(shared, work, error.to_string(), retry_after, staged);
 }
 
 fn record_failure_message(
     shared: &RuntimeShared,
     mut work: PendingWork,
-    error: String,
-    retryable: bool,
+    mut error: String,
+    retry_after: Option<Duration>,
     staged: Option<StagedNote>,
 ) {
     let mut state = shared
@@ -1425,6 +1497,15 @@ fn record_failure_message(
         state.inflight.remove(&work.path);
     }
     if is_current {
+        let retry_at = retry_after.and_then(|minimum| {
+            work.attempt = work.attempt.saturating_add(1);
+            let delay = retry_delay(work.attempt).max(minimum);
+            let deadline = Instant::now().checked_add(delay);
+            if deadline.is_none() {
+                error.push_str("; retry delay cannot be represented by the runtime clock");
+            }
+            deadline
+        });
         state.initial_remaining.remove(&work.path);
         state.failures.insert(
             work.path.clone(),
@@ -1433,9 +1514,8 @@ fn record_failure_message(
                 work.path.display()
             ),
         );
-        if retryable {
-            work.attempt = work.attempt.saturating_add(1);
-            work.not_before = Instant::now() + retry_delay(work.attempt);
+        if let Some(deadline) = retry_at {
+            work.not_before = deadline;
             state.pending.insert(work.path.clone(), work.clone());
             if let Some(mut draft) = staged {
                 draft.work = work;
@@ -1970,6 +2050,7 @@ mod tests {
                 return Err(VaultError::EmbeddingRequest {
                     message: "injected inference failure".into(),
                     retryable: true,
+                    retry_after: None,
                 });
             }
             Ok(texts
@@ -2910,6 +2991,7 @@ mod tests {
         identity: EmbeddingSpaceIdentity,
         calls: AtomicUsize,
         fail_on_call: AtomicUsize,
+        panic_on_call: AtomicUsize,
         transient: AtomicBool,
         inputs: Mutex<Vec<String>>,
     }
@@ -2920,6 +3002,7 @@ mod tests {
                 identity: FakeEmbedder::new().identity,
                 calls: AtomicUsize::new(0),
                 fail_on_call: AtomicUsize::new(usize::MAX),
+                panic_on_call: AtomicUsize::new(usize::MAX),
                 transient: AtomicBool::new(true),
                 inputs: Mutex::new(Vec::new()),
             }
@@ -2950,10 +3033,16 @@ mod tests {
             assert_eq!(texts.len(), 1);
             let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
             self.inputs.lock().unwrap().push(texts[0].to_string());
+            assert_ne!(
+                self.panic_on_call.load(AtomicOrdering::SeqCst),
+                call,
+                "injected inference task failure"
+            );
             if self.fail_on_call.load(AtomicOrdering::SeqCst) == call {
                 return Err(VaultError::EmbeddingRequest {
                     message: "provider rejected this request".into(),
                     retryable: self.transient.load(AtomicOrdering::SeqCst),
+                    retry_after: None,
                 });
             }
             Ok(vec![vec![texts[0].len() as f32, 1.0, 0.0]])
@@ -3065,6 +3154,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transient_source_read_failure_recovers_the_same_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = Path::new("one.md");
+        std::fs::write(directory.path().join(path), "# One\nold body").unwrap();
+        let index = test_index(directory.path()).await;
+        let model = Arc::new(FakeEmbedder::new());
+        let loaded = Arc::clone(&model);
+        let runtime = EmbeddingRuntime::spawn(
+            directory.path().to_path_buf(),
+            index,
+            directory.path().join("cache.bin"),
+            async move { Ok(loaded as Arc<dyn Embedder>) },
+        );
+        wait_for_status(&runtime, |status| status.phase == EmbeddingPhase::Ready).await;
+        let before = runtime
+            .query_snapshot()
+            .unwrap()
+            .capture_entries(&HashSet::from([path.to_path_buf()]))[path]
+            .clone();
+        let changed = "# One\nrecovered without another event";
+        std::fs::write(directory.path().join(path), changed).unwrap();
+        let work = {
+            let mut state = runtime.control.shared.state.lock().unwrap();
+            let generation = next_generation(&mut state);
+            state.inflight.insert(path.to_path_buf(), generation);
+            PendingWork {
+                path: path.to_path_buf(),
+                generation,
+                kind: PendingKind::Upsert,
+                attempt: 0,
+                not_before: Instant::now(),
+            }
+        };
+        record_failure(
+            &runtime.control.shared,
+            work.clone(),
+            VaultError::Io(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+            None,
+        );
+        {
+            let state = runtime.control.shared.state.lock().unwrap();
+            assert_eq!(state.pending[path].generation, work.generation);
+            assert_eq!(state.next_generation, work.generation);
+        }
+        assert_eq!(runtime.status().phase, EmbeddingPhase::Degraded);
+        let during = runtime
+            .query_snapshot()
+            .unwrap()
+            .capture_entries(&HashSet::from([path.to_path_buf()]))[path]
+            .clone();
+        assert_eq!(during.source_revision, before.source_revision);
+
+        wait_for_status(&runtime, |status| status.phase == EmbeddingPhase::Ready).await;
+        let after = runtime
+            .query_snapshot()
+            .unwrap()
+            .capture_entries(&HashSet::from([path.to_path_buf()]))[path]
+            .clone();
+        assert_eq!(
+            after.source_revision,
+            super::super::source::source_revision(changed)
+        );
+        assert_eq!(
+            runtime.control.shared.state.lock().unwrap().next_generation,
+            work.generation
+        );
+        assert_eq!(model.calls.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[test]
+    fn source_retry_classification_preserves_terminal_input_failures() {
+        for kind in [
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::ResourceBusy,
+            std::io::ErrorKind::ConnectionReset,
+        ] {
+            assert_eq!(
+                retry_hint(&VaultError::Io(std::io::Error::from(kind))),
+                Some(Duration::ZERO),
+                "{kind:?}"
+            );
+        }
+        #[cfg(unix)]
+        assert_eq!(
+            retry_hint(&VaultError::Io(std::io::Error::from_raw_os_error(5))),
+            Some(Duration::ZERO)
+        );
+        #[cfg(windows)]
+        for code in [32, 33] {
+            assert_eq!(
+                retry_hint(&VaultError::Io(std::io::Error::from_raw_os_error(code))),
+                Some(Duration::ZERO)
+            );
+        }
+        for kind in [
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotFound,
+        ] {
+            assert_eq!(
+                retry_hint(&VaultError::Io(std::io::Error::from(kind))),
+                None
+            );
+        }
+        assert_eq!(
+            retry_hint(&VaultError::EmbeddingConfiguration(
+                "invalid profile".into()
+            )),
+            None
+        );
+        assert_eq!(
+            retry_hint(&VaultError::Embedding("invalid response".into())),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn inference_task_failure_recovers_without_a_new_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("one.md"), "# One\nbody").unwrap();
+        let index = test_index(directory.path()).await;
+        let model = Arc::new(RequestControlledEmbedder::new());
+        model.panic_on_call.store(0, AtomicOrdering::SeqCst);
+        let loaded = Arc::clone(&model);
+        let runtime = EmbeddingRuntime::spawn(
+            directory.path().to_path_buf(),
+            index,
+            directory.path().join("cache.bin"),
+            async move { Ok(loaded as Arc<dyn Embedder>) },
+        );
+        wait_for_status(&runtime, |status| {
+            status.phase == EmbeddingPhase::Degraded && status.pending_notes == 1
+        })
+        .await;
+        let generation = runtime.control.shared.state.lock().unwrap().next_generation;
+        wait_for_status(&runtime, |status| status.phase == EmbeddingPhase::Ready).await;
+        assert_eq!(
+            runtime.control.shared.state.lock().unwrap().next_generation,
+            generation
+        );
+        assert_eq!(model.calls.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_schedule_honors_provider_minimum_and_rejects_unrepresentable_deadlines() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("one.md"), "# One\nbody").unwrap();
+        let index = test_index(directory.path()).await;
+        for (attempt, hint, expected) in [
+            (0, Duration::from_secs(45), Some(Duration::from_secs(45))),
+            (5, Duration::from_secs(3), Some(Duration::from_secs(30))),
+            (0, Duration::MAX, None),
+        ] {
+            let runtime = EmbeddingRuntime::spawn_with_cache_sources(
+                directory.path().to_path_buf(),
+                Arc::clone(&index),
+                directory.path().join("cache.bin"),
+                Vec::new(),
+                32,
+                false,
+                async { Ok(Arc::new(FakeEmbedder::new()) as Arc<dyn Embedder>) },
+            );
+            let (batch, _, _) = take_due_batch(&runtime.control.shared);
+            let mut work = batch.into_iter().next().unwrap();
+            work.attempt = attempt;
+            let before = Instant::now();
+            record_failure(
+                &runtime.control.shared,
+                work,
+                VaultError::EmbeddingRequest {
+                    message: "provider rate limit".into(),
+                    retryable: true,
+                    retry_after: Some(hint),
+                },
+                None,
+            );
+            let state = runtime.control.shared.state.lock().unwrap();
+            if let Some(expected) = expected {
+                assert!(state.pending[Path::new("one.md")].not_before >= before + expected);
+            } else {
+                assert!(state.pending.is_empty());
+                assert!(state.failures[Path::new("one.md")].contains("runtime clock"));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn source_revision_metadata_and_ranges_come_from_one_observation() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("one.md"), "# Old\n#oldtag").unwrap();
@@ -3134,6 +3412,116 @@ mod tests {
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].path, Path::new("z.md"));
         assert_eq!(batch[0].kind, PendingKind::Remove);
+    }
+
+    #[tokio::test]
+    async fn impossible_admission_preserves_retry_progress_and_evicts_only_the_known_shortfall() {
+        let directory = tempfile::tempdir().unwrap();
+        let raw = format!("# Section\n{}", "word ".repeat(120));
+        for name in ["a.md", "b.md", "c.md"] {
+            std::fs::write(directory.path().join(name), &raw).unwrap();
+        }
+        let index = test_index(directory.path()).await;
+        let runtime = EmbeddingRuntime::spawn_with_cache_sources(
+            directory.path().to_path_buf(),
+            index,
+            directory.path().join("cache.bin"),
+            Vec::new(),
+            32,
+            false,
+            async { Ok(Arc::new(FakeEmbedder::new()) as Arc<dyn Embedder>) },
+        );
+        let shared = &runtime.control.shared;
+        let now = Instant::now();
+        {
+            let mut state = shared.state.lock().unwrap();
+            for (ordinal, name) in ["a.md", "b.md", "c.md"].into_iter().enumerate() {
+                let work = state.pending[Path::new(name)].clone();
+                let prepared = prepare_note(Path::new(name), &raw, &FakeEmbedder::new()).unwrap();
+                assert!(prepared.chunks.len() > 1);
+                assert!(prepared.staging_bytes(3) <= 4096);
+                let mut vectors = vec![None; prepared.chunks.len()];
+                vectors[0] = Some(vec![1.0, 0.0, 0.0]);
+                state.staged.insert(
+                    work.path.clone(),
+                    StagedNote {
+                        work,
+                        vectors,
+                        hash_order: (0..prepared.chunks.len()).collect(),
+                        prepared: Arc::new(prepared),
+                        memory_bytes: 4096,
+                        last_used: now + Duration::from_millis(ordinal as u64),
+                    },
+                );
+            }
+        }
+        let active = MAX_STAGING_BYTES - 16_384;
+        assert!(!admit_staging(shared, active, 16_385));
+        assert_eq!(shared.state.lock().unwrap().staged.len(), 3);
+        assert!(admit_staging(shared, active, 11_200));
+        let state = shared.state.lock().unwrap();
+        assert_eq!(state.staged.len(), 1);
+        assert!(state.staged[Path::new("c.md")].vectors[0].is_some());
+    }
+
+    #[tokio::test]
+    async fn preparation_that_cannot_fit_active_work_preserves_paused_progress() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = Path::new("one.md");
+        std::fs::write(directory.path().join(path), "# One\nbody").unwrap();
+        let paused_raw = format!("# Paused\n{}", "word ".repeat(120));
+        std::fs::write(directory.path().join("paused.md"), &paused_raw).unwrap();
+        let index = test_index(directory.path()).await;
+        let model: Arc<dyn Embedder> = Arc::new(FakeEmbedder::new());
+        let loaded = Arc::clone(&model);
+        let runtime = EmbeddingRuntime::spawn_with_cache_sources(
+            directory.path().to_path_buf(),
+            index,
+            directory.path().join("cache.bin"),
+            Vec::new(),
+            1,
+            false,
+            async move { Ok(loaded) },
+        );
+        let shared = &runtime.control.shared;
+        {
+            let prepared =
+                prepare_note(Path::new("paused.md"), &paused_raw, model.as_ref()).unwrap();
+            assert!(prepared.chunks.len() > 1);
+            assert!(prepared.staging_bytes(3) <= 4096);
+            let mut vectors = vec![None; prepared.chunks.len()];
+            vectors[0] = Some(vec![1.0, 0.0, 0.0]);
+            let mut state = shared.state.lock().unwrap();
+            let work = state.pending[Path::new("paused.md")].clone();
+            state.staged.insert(
+                work.path.clone(),
+                StagedNote {
+                    work,
+                    vectors,
+                    hash_order: (0..prepared.chunks.len()).collect(),
+                    prepared: Arc::new(prepared),
+                    memory_bytes: 4096,
+                    last_used: Instant::now(),
+                },
+            );
+        }
+        let (batch, _, _) = take_due_batch(shared);
+        assert_eq!(batch[0].path, path);
+        std::fs::remove_file(directory.path().join(path)).unwrap();
+        assert!(matches!(
+            prepare_work(
+                shared,
+                &model,
+                &batch[0],
+                MAX_STAGING_BYTES - 8192,
+                8192,
+                None
+            )
+            .await
+            .unwrap(),
+            PreparationOutcome::Deferred
+        ));
+        assert!(shared.state.lock().unwrap().staged[Path::new("paused.md")].vectors[0].is_some());
     }
 
     #[tokio::test]
