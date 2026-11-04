@@ -29,7 +29,8 @@ chrono = { version = "0.4", features = ["serde"] }
 unicode-normalization = "0.1.25"
 tantivy = "0.26"
 fastembed = { version = "6.0.3", optional = true }
-bincode = { version = "2", optional = true, features = ["serde"] }
+tokenizers = { version = "=0.23.2", optional = true, default-features = false, features = ["fancy-regex"] }
+tiktoken-rs = { version = "=0.12.1", optional = true, default-features = false }
 fs2 = "0.4"
 sha2 = "0.11"
 semver = "1"
@@ -42,10 +43,11 @@ tempfile = { version = "3", optional = true }
 
 [features]
 default = []
-embeddings = ["dep:fastembed", "dep:bincode", "dep:tempfile"]
-embeddings-api = ["dep:bincode", "dep:tempfile", "reqwest/blocking", "reqwest/json"]
+embeddings = ["dep:fastembed", "dep:tempfile", "dep:tokenizers"]
+embeddings-api = ["dep:tempfile", "dep:tokenizers", "dep:tiktoken-rs", "reqwest/blocking", "reqwest/json"]
 
 [dev-dependencies]
+bincode = { version = "2", features = ["serde"] }
 jsonschema = { version = "0.33", default-features = false }
 tempfile = "3"
 

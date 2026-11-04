@@ -156,7 +156,12 @@ async fn embedding_info(vault: &Vault, runtime: &SemanticRuntime) -> EmbeddingIn
                 VaultError::DaemonRpc { code, .. } if *code == protocol::ERR_VAULT_NOT_ATTACHED => {
                     EmbeddingAvailability::Unattached
                 }
-                VaultError::DaemonRpc { code, .. } if *code == protocol::ERR_METHOD_NOT_FOUND => {
+                VaultError::DaemonRpc { code, .. }
+                    if matches!(
+                        *code,
+                        protocol::ERR_METHOD_NOT_FOUND | protocol::ERR_UNSUPPORTED_CAPABILITY
+                    ) =>
+                {
                     EmbeddingAvailability::Unsupported
                 }
                 _ => EmbeddingAvailability::Unavailable,
@@ -294,6 +299,20 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn test_daemon_health(capabilities: Vec<String>) -> protocol::HealthResult {
+        protocol::HealthResult {
+            daemon_version: env!("CARGO_PKG_VERSION").into(),
+            daemon_api_version: protocol::DAEMON_API_VERSION,
+            pid: 1,
+            status: "ok".into(),
+            uptime_ms: 1,
+            model_name: "test-model".into(),
+            semantic_home: "/tmp/semantic".into(),
+            capabilities,
+        }
+    }
+
     fn assert_info_schema(result: &CallToolResult) -> serde_json::Value {
         let structured = result.structured_content.as_ref().unwrap();
         let schema = serde_json::to_value(schemars::schema_for!(VaultInfo)).unwrap();
@@ -420,12 +439,13 @@ mod tests {
                     .unwrap();
             });
             let mut runtime = test_runtime(SemanticMode::Auto);
-            runtime.daemon_client = Some(SemanticDaemonClient::new(
+            runtime.daemon_client = Some(SemanticDaemonClient::with_health(
                 IpcEndpoint::UnixSocket(socket_path),
                 DaemonConnectPolicy {
                     retries: 0,
                     ..Default::default()
                 },
+                test_daemon_health(vec![protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY.into()]),
             ));
             let result = vault_info(&vault, &runtime, VaultInfoParams {})
                 .await
@@ -450,6 +470,70 @@ mod tests {
             assert!(!runtime.uses_local_backend());
             server.await.unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn vault_info_rechecks_unsupported_evidence_without_attaching() {
+        use crate::client::semantic_daemon::{DaemonConnectPolicy, SemanticDaemonClient};
+        use crate::daemon::server::IpcEndpoint;
+        use serde_json::json;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+        let socket_path = dir.path().join("semantic.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(reader).read_line(&mut line).await.unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "health");
+            let response = json!({
+                "jsonrpc": "2.0", "id": request["id"],
+                "result": test_daemon_health(Vec::new())
+            });
+            writer
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+        let mut runtime = test_runtime(SemanticMode::Auto);
+        runtime.daemon_client = Some(SemanticDaemonClient::with_health(
+            IpcEndpoint::UnixSocket(socket_path),
+            DaemonConnectPolicy {
+                retries: 0,
+                ..Default::default()
+            },
+            test_daemon_health(Vec::new()),
+        ));
+
+        let result = vault_info(&vault, &runtime, VaultInfoParams {})
+            .await
+            .unwrap();
+        let info = assert_info_schema(&result);
+        assert_eq!(info["embeddings"]["source"], "daemon");
+        assert_eq!(info["embeddings"]["availability"], "unsupported");
+        assert!(info["embeddings"].get("status").is_none());
+        assert!(
+            info["embeddings"]["error"]
+                .as_str()
+                .unwrap()
+                .contains(protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY)
+        );
+        assert!(
+            !runtime
+                .vault_ensured
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        assert!(!runtime.uses_local_backend());
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("passive inspection must recheck daemon health")
+            .unwrap();
     }
 
     #[tokio::test]

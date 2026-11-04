@@ -73,7 +73,14 @@ fn handle_cli_flags() -> Option<i32> {
                      OBSIDIAN_LOG_LEVEL          Tracing log level           [default: info]\n    \
                      OBSIDIAN_SEMANTIC_HOME      Override semantic home dir\n    \
                      OBSIDIAN_SEMANTIC_ENDPOINT  Override IPC endpoint\n    \
-                     OBSIDIAN_SEMANTIC_MODEL     Embedding model name        [default: {model}]",
+                     OBSIDIAN_SEMANTIC_MODEL     Embedding model name        [default: {model}]\n    \
+                     OBSIDIAN_EMBEDDING_PROVIDER Backend: local | api\n    \
+                     OBSIDIAN_EMBEDDING_API_BASE Embedding API base URL\n    \
+                     OBSIDIAN_EMBEDDING_API_MODEL Exact outgoing API model name\n    \
+                     OBSIDIAN_EMBEDDING_API_KEY  API authentication key (or OPENAI_API_KEY)\n    \
+                     OBSIDIAN_EMBEDDING_API_PROFILE Verified tokenizer/capacity JSON for custom APIs\n    \
+                     OBSIDIAN_EMBEDDING_API_TIMEOUT_SECS API request timeout [default: 30]\n    \
+                     OBSIDIAN_EMBEDDING_BATCH_SIZE Reconciliation notes per batch [default: 32]",
                 version = env!("CARGO_PKG_VERSION"),
                 model = DEFAULT_MODEL_NAME,
             );

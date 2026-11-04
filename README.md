@@ -84,6 +84,7 @@ OBSIDIAN_EMBEDDING_PROVIDER=api
 OBSIDIAN_EMBEDDING_API_BASE=http://localhost:11434/v1
 OBSIDIAN_EMBEDDING_API_MODEL=nomic-embed-text
 OBSIDIAN_EMBEDDING_API_KEY=unused
+OBSIDIAN_EMBEDDING_API_PROFILE=/absolute/path/nomic-profile.json
 # Optional tuning for a slow CPU-only embedding server
 OBSIDIAN_EMBEDDING_BATCH_SIZE=8
 OBSIDIAN_EMBEDDING_API_TIMEOUT_SECS=300
@@ -95,6 +96,7 @@ OBSIDIAN_EMBEDDING_PROVIDER=api
 OBSIDIAN_EMBEDDING_API_BASE=http://localhost:8000/v1
 OBSIDIAN_EMBEDDING_API_MODEL=BAAI/bge-small-en-v1.5
 OBSIDIAN_EMBEDDING_API_KEY=unused
+OBSIDIAN_EMBEDDING_API_PROFILE=/absolute/path/bge-profile.json
 
 # OpenRouter (25+ embedding models from multiple providers)
 OBSIDIAN_EMBEDDINGS=true
@@ -102,6 +104,7 @@ OBSIDIAN_EMBEDDING_PROVIDER=api
 OBSIDIAN_EMBEDDING_API_BASE=https://openrouter.ai/api/v1
 OBSIDIAN_EMBEDDING_API_MODEL=openai/text-embedding-3-small
 OBSIDIAN_EMBEDDING_API_KEY=sk-or-v1-...
+OBSIDIAN_EMBEDDING_API_PROFILE=/absolute/path/openrouter-profile.json
 ```
 
 Smaller batches reduce the work in each embedding request. Increase the API
@@ -146,6 +149,8 @@ This pulls the latest `main` and runs `cargo install --path . --features embeddi
 ## Semantic Runtime Compatibility
 
 Current semantic daemon API version: `2` (`DAEMON_API_VERSION` in `src/daemon/protocol.rs`).
+
+Semantic search additionally requires the health capability `semantic_source_evidence_v1`. New clients verify it after any ownership-verified daemon reconciliation. Older v2 clients can still perform their existing health/activation handshake; new clients report an unsupported contract when an external daemon lacks the capability. Restart or upgrade that daemon through its owner. A capability mismatch does not activate a competing local index.
 
 | Component | Compatibility contract | Enforcement |
 |----------|-------------------------|-------------|
@@ -440,7 +445,32 @@ On by default. Powered by [Tantivy](https://github.com/quickwit-oss/tantivy), re
 
 ### Semantic — `search_semantic`
 
-Uses the shared local semantic daemon by default (`OBSIDIAN_SEMANTIC_MODE=auto`). Results keep the same MCP schema while backend execution can run through daemon or local compatibility mode.
+Uses the shared local semantic daemon by default (`OBSIDIAN_SEMANTIC_MODE=auto`). Search returns distinct notes with revision-bound semantic evidence through either the daemon or local backend.
+
+Automatic chunking applies to both embedding backends. The server prepares the complete Markdown body after YAML frontmatter, together with its filename title, and counts the final input using the backend's exact tokenizer. A fitting note uses one embedding. An overflowing note is partitioned along Markdown headings and blocks, with further UTF-8-safe splitting where required. Every piece includes its title and ancestor-heading context. No chunking setting or search mode is needed, and note files are never rewritten.
+
+The local backend uses its loaded tokenizer's effective input capacity, normally 512 tokens. That configured boundary is distinct from a model's theoretical maximum. API budgets come from a verified endpoint/model profile. Word counts and vector dimensions cannot establish either budget. Overlong search queries return an invalid-parameter error with the measured and supported token counts rather than silently losing query content.
+
+Only the official `https://api.openai.com/v1` endpoint and exact model IDs `text-embedding-3-small`, `text-embedding-3-large`, and `text-embedding-ada-002` resolve automatically to `cl100k_base` and the documented limits of 8,192 tokens per input, 2,048 inputs and 300,000 aggregate tokens per request. Other endpoints, including OpenRouter and local servers, require `OBSIDIAN_EMBEDDING_API_PROFILE`. Model aliases and generic provider tokenizer labels are not sufficient to infer an exact tokenizer.
+
+A profile is strict JSON tied to the exact endpoint and outgoing model. For example, a deployment using OpenRouter's OpenAI model can supply a deliberately single-input request profile after verifying that model contract:
+
+```json
+{
+  "version": 1,
+  "profile_revision": "openrouter-openai-text-embedding-3-small-v1",
+  "api_base": "https://openrouter.ai/api/v1",
+  "model": "openai/text-embedding-3-small",
+  "tokenizer": { "kind": "cl100k_base" },
+  "max_input_tokens": 8192,
+  "max_batch_inputs": 1,
+  "max_batch_tokens": 8192
+}
+```
+
+For a HuggingFace tokenizer, replace `tokenizer` with `{"kind":"huggingface","path":"tokenizer.json","sha256":"<actual lowercase SHA-256>","add_special_tokens":true}`. The file must export the fully initialized tokenizer, including normalization, added tokens and postprocessing; its special-token behavior must match the provider. Relative paths resolve against the profile directory. Profiles are limited to 1 MiB and tokenizer files to 64 MiB. Unknown fields, mismatched endpoint/model, invalid limits and digest mismatches are configuration errors before inference. `profile_revision` identifies the reviewed deployment contract; it cannot detect a provider secretly replacing model weights under the same alias.
+
+Request item, token and serialized-byte limits are enforced independently. Local inference dispatches at most 32 prepared inputs per request, with an aggregate token ceiling of 32 times the loaded per-input capacity. Reconciliation batch size continues to count notes; a note producing many chunks does not multiply the local inference request size. The daemon reads its own provider/profile environment at startup; later client attachments do not change it. Restart that owner after changing the profile or tokenizer. API-only builds include tokenizer support and use the external model without bundling ONNX or downloading model weights.
 
 Semantic runtime modes:
 
@@ -467,7 +497,7 @@ Embedding lifecycle:
 | `warming` | No | The model is loading or the first verified index is being built. A semantic query returns an explicit retryable not-ready error. |
 | `warming` | Yes | A same-space last-known-good cache is serving queries while changed notes reconcile in the background. |
 | `ready` | Yes | Every currently indexed note has completed reconciliation. An empty vault is also ready. |
-| `degraded` | Yes or no | Some work failed. Verified last-known-good/partial vectors remain usable when any exist. Note-read, inference, and persistence failures retry; a model-load/configuration failure requires correction and restart. |
+| `degraded` | Yes or no | Some work failed. Complete last-known-good note projections can remain usable. Transient provider and persistence failures retry; invalid source, configuration and supported-resource failures require a new source generation or corrected owner configuration. |
 
 Core note, graph, BM25, write, and MCP initialization behavior stays available in every phase. Repeated note changes are coalesced by path, and the newest write or removal wins over in-flight inference.
 
@@ -491,12 +521,38 @@ at most once every 30 seconds in addition to lifecycle changes. Debug-level batc
 logs include request size, duration, outcome, and sanitized failures. Ready and
 dormant runtimes do not emit idle progress logs.
 
-Embedding caches are versioned and atomically replaced. A cache is reusable only when its backend, canonical model, vector dimension, embedding-input version, and—for API backends—the normalized endpoint fingerprint all match. Legacy payloads, incomplete first-pass checkpoints, corrupt data, and mismatched identities are never published; they trigger a one-time background rebuild. Cache locations do not change: local mode uses `{mcp_data}/embeddings/embeddings.bin`, while the daemon uses `<semantic-home>/vaults/<vault_id>/embeddings.bin`. Legacy-location relocation is non-destructive, runs behind the background coordinator, and publishes through the same atomic no-partial-file boundary.
+Embedding cache schema 2 stores complete per-note chunk collections and is atomically replaced. Reuse requires matching backend, canonical model, vector dimension, tokenizer fingerprint, effective input capacity, preparation/partition policy, and—for API backends—the endpoint fingerprint. Schema-1 prefix embeddings are rebuilt automatically from notes rather than relabeled as complete coverage. The first rebuild embeds more text and may increase API requests, token use and cache size; progress remains visible as warming/degraded until the current reconciliation completes. Cache locations do not change: local runtime uses `{mcp_data}/embeddings/embeddings.bin`, while the daemon uses `<semantic-home>/vaults/<vault_id>/embeddings.bin`. Legacy-location relocation remains non-destructive; copying a file is not a schema conversion. Checkpoints contain complete note collections, including when the whole vault is still reconciling.
+
+Compatible cached notes whose complete raw source revision is unchanged skip preparation, tokenization and inference. Changed notes reuse exact unchanged chunk inputs while refreshing source revisions and ranges. A later request failure preserves the previous complete note collection. Supported resource limits produce explicit failures and preserve the prior complete note collection; they never turn oversized input into a partially complete success.
+
+<a id="semantic-limits"></a>
+
+| Resource | Supported ceiling |
+|----------|-------------------|
+| Raw source for semantic preparation or revision-bound reads | 16 MiB, enforced during reading; deliberate legacy `note_read({path})` remains unbounded |
+| Structure collected for a note that requires partitioning | 4,096 headings and 65,536 parsed Markdown blocks |
+| Chunks per note | 4,096 |
+| Prepared title/heading context prefix per chunk | 16 KiB; mandatory context that leaves no model capacity is an error |
+| Advancing-boundary search when an initial split cannot fit | 4,096 candidate probes; failure is explicit rather than dropping source |
+| Serialized embedding request | 16 MiB, in addition to the backend's input/item/aggregate-token limits |
+| Coordinator-owned unpublished preparation and staging | 64 MiB per runtime for owned source/prepared/staged/output buffers, vectors and parser-output collections, including preparation/publication reservations; paused drafts may be evicted and rebuilt to admit other work |
+| Serialized embedding cache | 1 GiB; at most 1,000,000 notes and 1,000,000 total chunks; loading also limits notes to the current visible count plus 1,024 reconciliation entries |
+| Cached note path, note metadata and vectors | 16 KiB path; 64 KiB title/tag UTF-8 text and 4,096 tags per note; vector dimension at most 65,536 |
+| Bounded source page | 64 KiB returned content by default, at most 256 KiB |
+| Heading projection | 100 headings/64 KiB serialized projection by default; at most 1,000 headings/256 KiB per page; heading display previews at most 256 characters |
+
+Source/page budgets count UTF-8 bytes, not tokens. Projection byte budgets count the compact projection object. Neither is a total MCP wire-size guarantee because text and structured output can duplicate and escape content. The staging bound covers application-owned coordinator allocations. Private pulldown-cmark, YAML and tokenizer temporary arenas receive bounded inputs/structure, but their APIs do not expose an allocator budget; those internals and ONNX workspaces are outside this cap. It is not a total process-RSS limit. API-profile files are separately capped at 1 MiB and tokenizer exports at 64 MiB. These fixed resource ceilings do not select a chunking mode or override the selected model's exact token capacity.
+
+Each result's `source_revision` is the lowercase SHA-256 of the complete raw note, including frontmatter. `source_bytes` and every half-open UTF-8 byte range refer to that exact raw revision. `evidence.scope` is `note` for a fitting whole-body embedding or `passage` for a matching chunk; `evidence.range`, `heading_path` and optional `section_range` locate it. Pure semantic scores use the winning cosine; hybrid `score` blends lexical and semantic values while `evidence.cosine_similarity` retains the actual cosine. `top_k` counts distinct notes after grouping their embeddings.
+
+`snippet` is a preview capped at 300 characters, with its exact source span in `preview.range`. `preview.complete_evidence` describes whether that preview contains the full scored region; it does not claim that every relevant rule or exception in the note was included. A fitting multi-topic note has note-level evidence and cannot truthfully identify a semantically winning section from its one vector. `include_content:true` returns the complete raw note instead of a snippet.
+
+The server reads current source once and checks its revision before building a preview or full content. If the source changed or is unreadable, the ranked note remains in results with `source_status:"changed"` or `"unavailable"` and a typed `context_error`; content fields are omitted. It never applies old offsets to newer text or substitutes unrelated content. Last-known-good scores may therefore remain available while their context needs refresh. With watching disabled, external edits require an explicit source/index refresh or service restart; status inspection does not start it.
 
 For a remote API, the identity can prove the configured endpoint and model name, but it cannot detect a provider silently replacing model weights behind the same name. Change the configured model identifier (or remove the derived cache) when a provider makes such a revision.
 
 - Finds notes by **meaning**, not keywords — "making money from software" surfaces notes about monetization
-- **Hybrid mode** — `lexical_prefetch: true` combines BM25 candidate retrieval with semantic re-ranking
+- **Hybrid search** — `lexical_prefetch: true` selects eligible BM25 candidate notes and reranks their actual winning embedding. It cannot retrieve a note absent from lexical preselection.
 - **Tunable blending** — `alpha` controls the weight between lexical and semantic scores (default 0.25)
 - Daemon cache-location migration is one-way and non-destructive: the active local cache is preferred, then legacy `.obsidian/obsidian-mcp/embeddings.bin`; relocation runs in the background, never overwrites an existing daemon cache, and an old payload format is rebuilt rather than trusted
 
@@ -511,7 +567,7 @@ Always available. Full regex syntax for pattern matching across all notes.
 | Known keyword or phrase | `search_text` |
 | Keyword with possible typo | `search_text` + `fuzzy: true` |
 | Conceptual — "notes about X" | `search_semantic` |
-| Best precision + recall | `search_semantic` + `lexical_prefetch: true` |
+| Lexical candidates with semantic reranking | `search_semantic` + `lexical_prefetch: true` |
 | Structural pattern (URLs, IDs) | `search_regex` |
 | By tag or metadata | `search_metadata` |
 
@@ -533,7 +589,7 @@ Always available. Full regex syntax for pattern matching across all notes.
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `note_read` | `path` | Read full note content |
+| `note_read` | `path`, `expected_revision?`, `range?`, `max_bytes?` | Read full content or a revision-checked source page |
 | `note_read_many` | exactly one of `paths` or `dir`; `recursive?`, `glob?`, `max_files?`, `max_bytes?` | Read a bounded batch with per-path skip reasons |
 | `note_create` | `path`, `content?`, `frontmatter?` | Create a new note |
 | `note_write` | `path`, `content` | Overwrite note content |
@@ -542,13 +598,19 @@ Always available. Full regex syntax for pattern matching across all notes.
 | `note_delete` | `path`, `confirm` | Delete a note (requires `confirm: true`) |
 | `note_move` | `from`, `to` | Move or rename a note |
 
-Every tool advertises an object-shaped `outputSchema` and returns matching `structuredContent`. Text responses retain their existing format: Markdown for note reads, JSON arrays for searches and listings, and confirmation messages for writes. Structured results use `content` for text, `results` for collections, and `message` for confirmations. `vault_info`, `note_inspect`, and `note_read_many` retain their domain-specific fields; `periodic` includes an `action` discriminator.
+Every tool advertises an object-shaped `outputSchema` and returns matching `structuredContent`. Existing calls retain their text format: Markdown for full note reads, JSON arrays for searches and listings, and confirmation messages for writes. Extended revision/range reads emit their typed page as JSON text as well so text-only clients see revision and continuation metadata. Structured results use `content` for text, `results` for collections, and `message` for confirmations. `vault_info`, `note_inspect`, and `note_read_many` retain their domain-specific fields; `periodic` includes an `action` discriminator.
 
 For `frontmatter`, structured results use `{ "action": "get", "frontmatter": ... }`, with `null` when frontmatter is absent, or `{ "action": "set" | "remove", "message": ... }`. Clients consuming the previous bare structured frontmatter object must read `structuredContent.frontmatter`; the JSON text response is unchanged.
 
 Tools explicitly advertise read-only, destructive, idempotent, and open-world annotations. Mixed-action tools use conservative annotations covering every action: `frontmatter` is destructive, while `periodic` can create notes. Semantic search is open-world because it may use a configured external embedding API. These annotations describe behavior; tool filtering and vault path validation enforce access. After upgrading, refresh the connected app in ChatGPT to reload tool schemas and annotations.
 
 `note_read_many` preserves explicit path order or uses sorted directory order; directory reads are non-recursive by default. It inspects 20 files and returns up to 65,536 content bytes by default, with hard caps of 100 files and 262,144 content bytes. `max_bytes` counts only the UTF-8 bytes in returned note content. The response includes `notes`, bounded `skipped` details (at most 100), total `skipped_count`, and `content_bytes`. Oversized notes are skipped—even when first—and can be fetched deliberately with `note_read`. The typed MCP result is emitted as both `structuredContent` and compatibility JSON text.
+
+To expand a semantic hit, set `note_read.expected_revision` to the hit's `source_revision`, and set `note_read.range` to its `evidence.section_range` (or `evidence.range`). A range is `{ "start_byte": 100, "end_byte": 500 }` and requires the expected revision. The result contains `content`, `source_revision`, `source_bytes`, `requested_range`, `returned_range` and, if unfinished, `next_range`. Continue with the same revision and `next_range`. A mismatch is an explicit source-changed error, never an offset adjustment.
+
+Ranged reads default to 65,536 returned content bytes and allow at most 262,144. `max_bytes` alone starts a bounded full-note read and establishes its revision; `expected_revision` alone performs a deliberate complete checked read. Original `{path}` reads still return the complete raw Markdown with structured `{content}`. Extended snapshots support raw notes up to 16 MiB. Budgets refer to content bytes, not the duplicated/escaped total MCP response size.
+
+For other sections, call `note_inspect` with `fields:["headings"]` and the source revision. Its bounded projection returns heading/parent ordinals, display text, raw heading and section ranges, the revision and `next_heading_offset`. Initial pages can establish the revision; nonzero offsets require it. Defaults are 100 headings and 65,536 serialized projection bytes, capped at 1,000 headings and 262,144 bytes. A giant heading has an explicitly truncated display preview while retaining complete source locators. Whole-section or full-note reading remains necessary when an answer depends on surrounding rules or distant exceptions.
 
 For `note_patch` heading targets, bare heading text such as `"Log"` is canonical. ATX marker-prefixed targets such as `"## Log"` are also accepted, so headings copied from `note_inspect` with `view: "targets"` can be used directly.
 
@@ -565,7 +627,7 @@ For `note_patch` heading targets, bare heading text such as `"Log"` is canonical
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `note_inspect` | `path`, `view?` | Metadata (`"metadata"`, default) or patchable targets (`"targets"`) |
+| `note_inspect` | `path`, `view?`, `fields?`, `expected_revision?`, `heading_offset?`, `max_headings?`, `max_bytes?` | Metadata, patchable targets, or a bounded revision-checked heading projection |
 | `frontmatter` | `action`, `path`, `key?`, `value?` | Get (`"get"`), set (`"set"`), or remove (`"remove"`) frontmatter fields |
 
 ### Graph & Links
@@ -625,6 +687,7 @@ The `read` profile exposes frontmatter as part of the raw Markdown returned by `
 | `OBSIDIAN_EMBEDDING_API_KEY` | When api | Fallback: `OPENAI_API_KEY` | API authentication key |
 | `OBSIDIAN_EMBEDDING_API_BASE` | No | `https://api.openai.com/v1` | Embedding API base URL (fallback: `OPENAI_BASE_URL`) |
 | `OBSIDIAN_EMBEDDING_API_MODEL` | When api | Fallback: `OPENAI_MODEL` | Model name for embedding API |
+| `OBSIDIAN_EMBEDDING_API_PROFILE` | For custom api | — | Strict JSON tokenizer/capacity profile for the exact endpoint/model; official OpenAI models resolve automatically |
 | `OBSIDIAN_EMBEDDING_DIM` | No | *(probed)* | Override embedding dimension (skips API probe) |
 | `OBSIDIAN_EMBEDDING_API_TIMEOUT_SECS` | No | `30` | Embedding API request timeout in seconds; integer from 1 to 86400 |
 | `OBSIDIAN_EMBEDDING_BATCH_SIZE` | No | `32` | Maximum notes processed per background reconciliation batch; positive integer, for either embedding backend |

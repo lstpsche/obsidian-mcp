@@ -148,6 +148,11 @@ async fn reconcile_restarts_owned_daemon_and_preserves_runtime_state() {
             retry_backoff: Duration::ZERO,
         },
     );
+    // The old upgrader's exact API-v2 handshake must still accept the new daemon.
+    let health = client.health("previous-upgrader", "3.2.1").await.unwrap();
+    assert_eq!(health.daemon_api_version, 2);
+    assert!(health.supports_source_evidence());
+    client.require_source_evidence().await.unwrap();
     assert!(
         client
             .shutdown()
@@ -347,7 +352,64 @@ async fn normal_bootstrap_completes_interrupted_owned_daemon_activation() {
     assert!(!result.reused_existing);
     assert_eq!(result.manifest.daemon_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(result.manifest.model_name, "preserved-model");
+    assert!(result.health.supports_source_evidence());
+    let client = SemanticDaemonClient::with_health(
+        result.endpoint.clone(),
+        DaemonConnectPolicy::default(),
+        result.health,
+    );
+    client.require_source_evidence().await.unwrap();
     shutdown(result.endpoint).await;
+}
+
+#[tokio::test]
+async fn external_old_daemon_is_inspected_before_rejecting_semantic_capability() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = SemanticHomePaths::new(temp.path().join("semantic-home"));
+    home::ensure_home_layout(&paths).unwrap();
+    let socket = paths.ipc_dir.join("external-old.sock");
+    let endpoint = IpcEndpoint::UnixSocket(socket.clone());
+    let server = tokio::spawn({
+        let socket = socket.clone();
+        async move { run_fake_daemon(&socket, "0.0.1").await }
+    });
+    wait_for_socket(&socket).await;
+    let external = Path::new("/external/obsidian-semanticd");
+    save_manifest(
+        &paths,
+        &endpoint,
+        "0.0.1",
+        BinaryOrigin::Override,
+        external,
+        4242,
+    );
+    let mut config = test_config(&paths);
+    config.daemon_path_override = Some(external.into());
+    let result = bootstrap::ensure_daemon(&config).await.unwrap();
+    assert!(result.reused_existing);
+    assert!(!result.health.supports_source_evidence());
+    let client = SemanticDaemonClient::with_health(
+        result.endpoint,
+        DaemonConnectPolicy::default(),
+        result.health,
+    );
+    let error = client
+        .search_semantic(Path::new("/tmp/vault"), "query", 10, false)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        obsidian_mcp::error::VaultError::DaemonRpc {
+            code: obsidian_mcp::daemon::protocol::ERR_UNSUPPORTED_CAPABILITY,
+            ..
+        }
+    ));
+    assert!(
+        socket.exists(),
+        "unsupported external daemon must remain running"
+    );
+    client.shutdown().await.unwrap();
+    server.await.unwrap();
 }
 
 async fn wait_for_socket(socket: &Path) {

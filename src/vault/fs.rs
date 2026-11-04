@@ -1,7 +1,7 @@
 //! Filesystem operations: read, write, list, delete, and rename notes.
 
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use globset::Glob;
@@ -68,6 +68,65 @@ pub fn file_stat(vault_root: &Path, path: &Path) -> VaultResult<FileStat> {
 pub fn read_file(vault_root: &Path, path: &Path) -> VaultResult<String> {
     let abs = vault_path::resolve_existing(vault_root, path)?.absolute;
     fs::read_to_string(&abs).map_err(map_not_found(path))
+}
+
+/// Read a confined UTF-8 note without allocating an arbitrarily large source.
+pub fn read_file_bounded(vault_root: &Path, path: &Path, max_bytes: usize) -> VaultResult<String> {
+    let abs = vault_path::resolve_existing(vault_root, path)?.absolute;
+    let mut file = fs::File::open(abs).map_err(map_not_found(path))?;
+    let read_limit = max_bytes
+        .checked_add(1)
+        .ok_or_else(|| VaultError::InvalidSourceRange("source byte limit is too large".into()))?;
+    let hint = file.metadata().map_err(map_not_found(path))?.len();
+    let hint = hint.min(read_limit as u64).min(64 * 1024) as usize;
+    let bytes = read_bounded_bytes(&mut file, hint, read_limit).map_err(map_not_found(path))?;
+    if bytes.len() > max_bytes {
+        return Err(VaultError::SemanticResourceLimit {
+            resource: format!("source bytes for {}", path.display()),
+            actual: bytes.len(),
+            limit: max_bytes,
+        });
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        VaultError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    })
+}
+
+fn read_bounded_bytes(
+    reader: &mut impl Read,
+    initial_capacity: usize,
+    read_limit: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(initial_capacity.min(read_limit))
+        .map_err(std::io::Error::other)?;
+    let mut buffer = [0; 8192];
+    while bytes.len() < read_limit {
+        let remaining = (read_limit - bytes.len()).min(buffer.len());
+        let count = match reader.read(&mut buffer[..remaining]) {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if count == 0 {
+            break;
+        }
+        let needed = bytes.len() + count;
+        if needed > bytes.capacity() {
+            let capacity = bytes
+                .capacity()
+                .saturating_mul(2)
+                .max(buffer.len())
+                .max(needed)
+                .min(read_limit);
+            bytes
+                .try_reserve_exact(capacity - bytes.len())
+                .map_err(std::io::Error::other)?;
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    Ok(bytes)
 }
 
 /// Write content to a file (creates parent dirs if needed). Overwrites if exists.
@@ -237,6 +296,39 @@ mod tests {
         .unwrap();
         fs::write(dir.path().join(".hidden_file"), "secret").unwrap();
         dir
+    }
+
+    #[test]
+    fn bounded_reader_growth_never_reserves_past_the_probe_limit() {
+        for read_limit in [0, 1, 8191, 8192, 8193, 16_385, 65_537] {
+            let data = vec![b'x'; read_limit + 31];
+            for hint in [0, 1, read_limit.saturating_add(100)] {
+                let mut reader = std::io::Cursor::new(&data);
+                let bytes = read_bounded_bytes(&mut reader, hint, read_limit).unwrap();
+                assert_eq!(bytes, data[..read_limit]);
+                assert!(bytes.capacity() <= read_limit);
+                assert_eq!(reader.position(), read_limit as u64);
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_source_read_handles_exact_capacity_and_one_byte_over() {
+        let dir = TempDir::new().unwrap();
+        let path = Path::new("bounded.md");
+        for size in [0, 1, 8191, 8192, 8193, 65_537] {
+            fs::write(dir.path().join(path), vec![b'x'; size]).unwrap();
+            let text = read_file_bounded(dir.path(), path, size).unwrap();
+            assert_eq!(text.len(), size);
+            assert!(text.capacity() <= size + 1);
+            if size > 0 {
+                assert!(matches!(
+                    read_file_bounded(dir.path(), path, size - 1),
+                    Err(VaultError::SemanticResourceLimit { actual, limit, .. })
+                        if actual == size && limit == size - 1
+                ));
+            }
+        }
     }
 
     // ── resolve_path ──

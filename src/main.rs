@@ -272,6 +272,12 @@ async fn init_semantic_runtime(
             client,
             health_pending,
         }) => {
+            if !health_pending && let Err(error) = client.require_source_evidence().await {
+                // Retain the inspected client so a later semantic call preserves
+                // this contract error rather than classifying it as an outage.
+                runtime.daemon_unavailable_reason = Some(error.to_string());
+                tracing::warn!(error = %error, "semantic daemon contract is unsupported");
+            }
             runtime
                 .daemon_health_pending
                 .store(health_pending, std::sync::atomic::Ordering::Release);
@@ -314,8 +320,13 @@ async fn initialize_daemon_client(
     runtime_cfg: &SemanticRuntimeConfig,
 ) -> Result<InitializedDaemonClient, VaultError> {
     let policy = DaemonConnectPolicy::from_runtime_config(runtime_cfg);
-    let endpoint = if let Some(raw_endpoint) = runtime_cfg.daemon_endpoint_override.as_deref() {
-        endpoint_from_override(raw_endpoint)
+    let (client, finalized_health) = if let Some(raw_endpoint) =
+        runtime_cfg.daemon_endpoint_override.as_deref()
+    {
+        (
+            SemanticDaemonClient::new(endpoint_from_override(raw_endpoint), policy),
+            None,
+        )
     } else {
         match begin_daemon_bootstrap(&BootstrapConfig {
             semantic_home_override: runtime_cfg.semantic_home_override.clone(),
@@ -327,7 +338,13 @@ async fn initialize_daemon_client(
         })
         .await?
         {
-            BootstrapAttempt::Ready(initialized) => initialized.endpoint,
+            BootstrapAttempt::Ready(initialized) => {
+                let health = initialized.health;
+                (
+                    SemanticDaemonClient::with_health(initialized.endpoint, policy, health.clone()),
+                    Some(health),
+                )
+            }
             BootstrapAttempt::Pending(pending) => {
                 let reason = pending.timeout_error().to_string();
                 return Ok(InitializedDaemonClient::BootstrapPending {
@@ -337,12 +354,15 @@ async fn initialize_daemon_client(
             }
         }
     };
-    let client = SemanticDaemonClient::new(endpoint, policy);
-
-    let health = match client
-        .health("obsidian-mcp", env!("CARGO_PKG_VERSION"))
-        .await
-    {
+    let health_result = match finalized_health {
+        Some(health) => Ok(health),
+        None => {
+            client
+                .health("obsidian-mcp", env!("CARGO_PKG_VERSION"))
+                .await
+        }
+    };
+    let health = match health_result {
         Ok(health) => health,
         Err(error @ VaultError::DaemonTimeout { .. }) => {
             tracing::warn!(error = %error, "daemon health probe timed out; later calls will retry the handshake");
@@ -457,6 +477,9 @@ fn print_help() {
              OBSIDIAN_EMBEDDING_API_KEY   API auth key              (or OPENAI_API_KEY)\n    \
              OBSIDIAN_EMBEDDING_API_BASE  API base URL              [default: https://api.openai.com/v1]\n    \
              OBSIDIAN_EMBEDDING_API_MODEL API model name            (or OPENAI_MODEL)\n    \
+             OBSIDIAN_EMBEDDING_API_PROFILE Verified tokenizer/capacity JSON for custom APIs\n    \
+             OBSIDIAN_EMBEDDING_API_TIMEOUT_SECS API request timeout [default: 30]\n    \
+             OBSIDIAN_EMBEDDING_BATCH_SIZE Reconciliation notes per batch [default: 32]\n    \
              OBSIDIAN_EMBEDDING_DIM  Override embedding dimension   [default: probed from API]\n    \
              OBSIDIAN_EMBEDDING_CA_CERT   PEM CA cert path for API TLS\n    \
              OBSIDIAN_EMBEDDING_TLS_VERIFY  Verify API TLS certs    [default: true]\n    \
@@ -1002,6 +1025,72 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn unsupported_daemon_contract_retains_its_cause_without_local_fallback() {
+        use obsidian_mcp::daemon::protocol;
+        use serde_json::{Value, json};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let directory = tempfile::tempdir().unwrap();
+        let endpoint = directory.path().join("old-daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&endpoint).unwrap();
+        let server = tokio::spawn(async move {
+            // The initial handshake and both capability checks can inspect an
+            // unsupported owner without attaching a vault or selecting fallback.
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(read).read_line(&mut line).await.unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], "health");
+                let response = json!({
+                    "jsonrpc": "2.0", "id": request["id"], "result": {
+                        "daemon_version": "3.2.1", "daemon_api_version": 2,
+                        "status": "ok", "uptime_ms": 1,
+                        "model_name": "legacy-model", "semantic_home": "/tmp/old"
+                    }
+                });
+                write
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut config = test_config();
+        config.watch = true;
+        config.embeddings = true;
+        let mut runtime_config = runtime_config(SemanticMode::Auto);
+        runtime_config.daemon_endpoint_override = Some(endpoint.display().to_string());
+        runtime_config.connect_retries = 0;
+        let runtime = init_semantic_runtime(&config, &runtime_config).await;
+
+        assert!(runtime.daemon_client.is_some());
+        assert!(!runtime.uses_local_backend());
+        assert!(
+            runtime
+                .daemon_unavailable_reason
+                .as_ref()
+                .unwrap()
+                .contains(protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY)
+        );
+        let error = runtime.ensure_daemon_health().await.unwrap_err();
+        assert!(matches!(
+            error,
+            VaultError::DaemonRpc {
+                code: protocol::ERR_UNSUPPORTED_CAPABILITY,
+                ..
+            }
+        ));
+        assert!(!runtime.activate_local_fallback(&error));
+        assert!(!runtime.uses_local_backend());
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("unsupported owner must receive the health inspections")
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn manifest_health_timeout_resumes_once_on_search_and_status_stays_passive() {
         use obsidian_mcp::daemon::{home, manifest};
         use obsidian_mcp::tools::{search, utility};
@@ -1040,7 +1129,7 @@ mod tests {
         let methods = Arc::new(std::sync::Mutex::new(Vec::new()));
         let server_methods = Arc::clone(&methods);
         let server = tokio::spawn(async move {
-            for request_index in 0..6 {
+            for request_index in 0..5 {
                 let (stream, _) = listener.accept().await.unwrap();
                 let (read, mut write) = stream.into_split();
                 let mut line = String::new();
@@ -1054,7 +1143,7 @@ mod tests {
                 }
                 let result = match method {
                     "health" => {
-                        json!({"daemon_version":"3.1.0", "daemon_api_version":2, "pid":1, "status":"ok", "uptime_ms":1, "model_name":"probe", "semantic_home":"/tmp/test"})
+                        json!({"daemon_version":"3.1.0", "daemon_api_version":2, "pid":1, "status":"ok", "uptime_ms":1, "model_name":"probe", "semantic_home":"/tmp/test", "capabilities":["semantic_source_evidence_v1"]})
                     }
                     "vault_status" => {
                         json!({"phase":"ready", "ready":true, "indexed_notes":0, "total_notes":0, "pending_notes":0})
@@ -1127,7 +1216,6 @@ mod tests {
             [
                 "health",
                 "health",
-                "health",
                 "vault_status",
                 "ensure_vault",
                 "search_semantic"
@@ -1164,7 +1252,7 @@ mod tests {
                 let method = request["method"].as_str().unwrap();
                 let result = match method {
                     "health" => {
-                        json!({"daemon_version":"3.1.0", "daemon_api_version":2, "pid":1, "status":"ok", "uptime_ms":1, "model_name":"probe", "semantic_home":"/tmp/test"})
+                        json!({"daemon_version":"3.1.0", "daemon_api_version":2, "pid":1, "status":"ok", "uptime_ms":1, "model_name":"probe", "semantic_home":"/tmp/test", "capabilities":["semantic_source_evidence_v1"]})
                     }
                     "vault_status" => {
                         json!({"phase":"ready", "ready":true, "indexed_notes":0, "total_notes":0, "pending_notes":0})

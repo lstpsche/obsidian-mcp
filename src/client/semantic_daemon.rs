@@ -9,6 +9,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::Mutex;
 
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -62,6 +63,7 @@ struct ClientInner {
     endpoint: IpcEndpoint,
     policy: DaemonConnectPolicy,
     request_id: AtomicU64,
+    health: Mutex<Option<HealthResult>>,
 }
 
 impl SemanticDaemonClient {
@@ -71,8 +73,60 @@ impl SemanticDaemonClient {
                 endpoint,
                 policy,
                 request_id: AtomicU64::new(1),
+                health: Mutex::new(None),
             }),
         }
+    }
+
+    /// Reuse the authoritative handshake completed by owned-daemon bootstrap.
+    pub fn with_health(
+        endpoint: IpcEndpoint,
+        policy: DaemonConnectPolicy,
+        health: HealthResult,
+    ) -> Self {
+        Self {
+            inner: Arc::new(ClientInner {
+                endpoint,
+                policy,
+                request_id: AtomicU64::new(1),
+                health: Mutex::new(Some(health)),
+            }),
+        }
+    }
+
+    /// Verify semantic behavior after transport/ownership reconciliation.
+    ///
+    /// An API-compatible daemon can predate source evidence. Treat that as an
+    /// unsupported contract, never an outage that selects competing inference.
+    pub async fn require_source_evidence(&self) -> VaultResult<()> {
+        let mut observation = self.inner.health.lock().await;
+        if observation
+            .as_ref()
+            .is_some_and(HealthResult::supports_source_evidence)
+        {
+            return Ok(());
+        }
+        // Recheck unsupported daemons so replacing their owner can repair an
+        // existing client. Accepted observations remain shared by all clones.
+        let health = self
+            .fetch_health("obsidian-mcp", env!("CARGO_PKG_VERSION"))
+            .await?;
+        *observation = Some(health.clone());
+        if health.supports_source_evidence() {
+            return Ok(());
+        }
+        Err(VaultError::DaemonRpc {
+            code: protocol::ERR_UNSUPPORTED_CAPABILITY,
+            message: format!(
+                "semantic daemon does not support required capability '{}'; upgrade or restart its owner with a compatible daemon",
+                protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY
+            ),
+            data: Some(json!({
+                "required_capability": protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY,
+                "reported_capabilities": health.capabilities,
+                "daemon_version": health.daemon_version,
+            })),
+        })
     }
 
     pub fn endpoint(&self) -> &IpcEndpoint {
@@ -88,7 +142,20 @@ impl SemanticDaemonClient {
         client_name: &str,
         client_version: &str,
     ) -> VaultResult<HealthResult> {
-        self.call(
+        let mut observation = self.inner.health.lock().await;
+        let health = self.fetch_health(client_name, client_version).await?;
+        // Explicit reads replace the previous observation, including a daemon
+        // that lacked a capability before its owner was upgraded.
+        *observation = Some(health.clone());
+        Ok(health)
+    }
+
+    async fn fetch_health(
+        &self,
+        client_name: &str,
+        client_version: &str,
+    ) -> VaultResult<HealthResult> {
+        self.call_request(
             "health",
             protocol::HealthParams {
                 client_name: Some(client_name.to_string()),
@@ -178,6 +245,17 @@ impl SemanticDaemonClient {
     }
 
     pub(crate) async fn call<P, R>(&self, method: &str, params: P) -> VaultResult<R>
+    where
+        P: Serialize,
+        R: DeserializeOwned,
+    {
+        if matches!(method, "search_semantic" | "search_hybrid") {
+            self.require_source_evidence().await?;
+        }
+        self.call_request(method, params).await
+    }
+
+    async fn call_request<P, R>(&self, method: &str, params: P) -> VaultResult<R>
     where
         P: Serialize,
         R: DeserializeOwned,
@@ -402,6 +480,20 @@ mod tests {
     use tokio::net::UnixListener;
 
     #[cfg(unix)]
+    fn source_evidence_health() -> HealthResult {
+        HealthResult {
+            daemon_version: env!("CARGO_PKG_VERSION").into(),
+            daemon_api_version: DAEMON_API_VERSION,
+            pid: 1,
+            status: "ok".into(),
+            uptime_ms: 1,
+            model_name: "test-model".into(),
+            semantic_home: "/tmp/semantic".into(),
+            capabilities: vec![protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY.into()],
+        }
+    }
+
+    #[cfg(unix)]
     async fn start_unix_server_once(
         socket_path: PathBuf,
         response_fn: impl FnOnce(Value) -> Value + Send + 'static,
@@ -425,6 +517,31 @@ mod tests {
                 .await
                 .expect("write response");
             writer.flush().await.expect("flush response");
+        })
+    }
+
+    #[cfg(unix)]
+    fn start_unix_server_responses(
+        socket_path: &Path,
+        responses: Vec<(&'static str, Value)>,
+    ) -> tokio::task::JoinHandle<()> {
+        let listener = UnixListener::bind(socket_path).unwrap();
+        tokio::spawn(async move {
+            for (method, result) in responses {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], method);
+                let response = json!({
+                    "jsonrpc": "2.0", "id": request["id"], "result": result
+                });
+                writer
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
         })
     }
 
@@ -462,8 +579,182 @@ mod tests {
             .await
             .expect("health should succeed");
         assert_eq!(health.daemon_api_version, DAEMON_API_VERSION);
+        assert!(!health.supports_source_evidence());
 
         server.await.expect("server task should complete");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unsupported_capability_fails_before_search_without_rpc_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("semantic.sock");
+        let mut health = source_evidence_health();
+        health.capabilities.clear();
+        let server = start_unix_server_responses(
+            &socket,
+            vec![("health", serde_json::to_value(&health).unwrap())],
+        );
+        let client = SemanticDaemonClient::with_health(
+            IpcEndpoint::UnixSocket(socket),
+            DaemonConnectPolicy::default(),
+            health,
+        );
+        let error = client
+            .search_semantic(Path::new("/tmp/vault"), "query", 10, false)
+            .await
+            .unwrap_err();
+        assert!(!is_retryable_error(&error));
+        match error {
+            VaultError::DaemonRpc { code, data, .. } => {
+                assert_eq!(code, protocol::ERR_UNSUPPORTED_CAPABILITY);
+                assert_eq!(
+                    data.unwrap()["required_capability"],
+                    protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY
+                );
+            }
+            other => panic!("expected unsupported capability, got {other:?}"),
+        }
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("capability server must receive the expected requests")
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn semantic_client_recovers_after_daemon_gains_required_capability() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("semantic.sock");
+        let capable = source_evidence_health();
+        let mut unsupported = capable.clone();
+        unsupported.capabilities.clear();
+        let server = start_unix_server_responses(
+            &socket,
+            vec![
+                ("health", serde_json::to_value(unsupported).unwrap()),
+                ("health", serde_json::to_value(capable).unwrap()),
+                ("search_semantic", json!({"results": []})),
+            ],
+        );
+        let client = SemanticDaemonClient::new(
+            IpcEndpoint::UnixSocket(socket),
+            DaemonConnectPolicy::default(),
+        );
+        let error = client
+            .search_semantic(Path::new("/tmp/vault"), "query", 10, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            VaultError::DaemonRpc {
+                code: protocol::ERR_UNSUPPORTED_CAPABILITY,
+                ..
+            }
+        ));
+
+        let result = client
+            .clone()
+            .search_semantic(Path::new("/tmp/vault"), "query", 10, false)
+            .await
+            .unwrap();
+        assert!(result.results.is_empty());
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("capability server must receive the expected requests")
+            .unwrap();
+        client.require_source_evidence().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_health_replaces_an_unsupported_observation() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("semantic.sock");
+        let capable = source_evidence_health();
+        let mut unsupported = capable.clone();
+        unsupported.capabilities.clear();
+        let server = start_unix_server_responses(
+            &socket,
+            vec![("health", serde_json::to_value(capable).unwrap())],
+        );
+        let client = SemanticDaemonClient::with_health(
+            IpcEndpoint::UnixSocket(socket),
+            DaemonConnectPolicy::default(),
+            unsupported,
+        );
+
+        assert!(
+            client
+                .health("obsidian-mcp-test", "1.0.1")
+                .await
+                .unwrap()
+                .supports_source_evidence()
+        );
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("capability server must receive the expected requests")
+            .unwrap();
+        client.require_source_evidence().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_semantic_capability_checks_share_one_handshake() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("semantic.sock");
+        let server = start_unix_server_once(socket.clone(), |request| {
+            assert_eq!(request["method"], "health");
+            json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": source_evidence_health()
+            })
+        })
+        .await;
+        let client = SemanticDaemonClient::new(
+            IpcEndpoint::UnixSocket(socket),
+            DaemonConnectPolicy::default(),
+        );
+        let cloned = client.clone();
+        let (left, right) = tokio::join!(
+            client.require_source_evidence(),
+            cloned.require_source_evidence()
+        );
+        left.unwrap();
+        right.unwrap();
+        server.await.unwrap();
+        // The server is gone; the established contract remains shared by clones.
+        client.require_source_evidence().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capable_daemon_response_still_requires_source_evidence_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("semantic.sock");
+        let server = start_unix_server_once(socket.clone(), |request| {
+            assert_eq!(request["method"], "search_semantic");
+            json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {"results": [{
+                    "path":"note.md", "title":"note", "score":0.8, "tags":[]
+                }]}
+            })
+        })
+        .await;
+        let client = SemanticDaemonClient::with_health(
+            IpcEndpoint::UnixSocket(socket),
+            DaemonConnectPolicy::default(),
+            source_evidence_health(),
+        );
+        let error = client
+            .search_semantic(Path::new("/tmp/vault"), "query", 10, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, VaultError::DaemonProtocol(_)));
+        server.await.unwrap();
     }
 
     #[cfg(unix)]
@@ -625,9 +916,10 @@ mod tests {
         })
         .await;
 
-        let client = SemanticDaemonClient::new(
+        let client = SemanticDaemonClient::with_health(
             IpcEndpoint::UnixSocket(socket_path),
             DaemonConnectPolicy::default(),
+            source_evidence_health(),
         );
         let result = client
             .search_semantic(Path::new("/tmp/vault"), "query", 10, false)

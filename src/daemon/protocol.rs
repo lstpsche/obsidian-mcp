@@ -6,6 +6,7 @@ use serde_json::{Map, Value};
 
 pub const JSONRPC_VERSION: &str = "2.0";
 pub const DAEMON_API_VERSION: u32 = 2;
+pub const SEMANTIC_SOURCE_EVIDENCE_CAPABILITY: &str = "semantic_source_evidence_v1";
 
 pub const ERR_PARSE: i64 = -32700;
 pub const ERR_INVALID_REQUEST: i64 = -32600;
@@ -13,6 +14,7 @@ pub const ERR_METHOD_NOT_FOUND: i64 = -32601;
 pub const ERR_INVALID_PARAMS: i64 = -32602;
 pub const ERR_INTERNAL: i64 = -32603;
 pub const ERR_INCOMPATIBLE_API_VERSION: i64 = -32010;
+pub const ERR_UNSUPPORTED_CAPABILITY: i64 = -32011;
 pub const ERR_DAEMON_UNAVAILABLE: i64 = -32020;
 pub const ERR_VAULT_NOT_READY: i64 = -32030;
 pub const ERR_VAULT_NOT_ATTACHED: i64 = -32031;
@@ -115,6 +117,17 @@ pub struct HealthResult {
     pub uptime_ms: u64,
     pub model_name: String,
     pub semantic_home: String,
+    /// Additive features supported independently of the transport API version.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+impl HealthResult {
+    pub fn supports_source_evidence(&self) -> bool {
+        self.capabilities
+            .iter()
+            .any(|capability| capability == SEMANTIC_SOURCE_EVIDENCE_CAPABILITY)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
@@ -233,12 +246,59 @@ pub struct SemanticHit {
     pub title: String,
     pub score: f32,
     pub tags: Vec<String>,
+    pub source_revision: String,
+    pub source_bytes: usize,
+    pub source_status: crate::models::SourceStatus,
+    pub evidence: crate::models::SemanticEvidence,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subpath: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<crate::models::SemanticPreview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_error: Option<crate::models::SemanticContextError>,
+}
+
+impl From<crate::models::SemanticNoteResult> for SemanticHit {
+    fn from(hit: crate::models::SemanticNoteResult) -> Self {
+        Self {
+            path: hit.path.to_string_lossy().into_owned(),
+            title: hit.title,
+            score: hit.score,
+            tags: hit.tags,
+            source_revision: hit.source_revision,
+            source_bytes: hit.source_bytes,
+            source_status: hit.source_status,
+            evidence: hit.evidence,
+            snippet: hit.snippet,
+            content: hit.content,
+            subpath: None,
+            preview: hit.preview,
+            context_error: hit.context_error,
+        }
+    }
+}
+
+impl From<SemanticHit> for crate::models::SemanticNoteResult {
+    fn from(hit: SemanticHit) -> Self {
+        Self {
+            path: hit.path.into(),
+            title: hit.title,
+            score: hit.score,
+            tags: hit.tags,
+            source_revision: hit.source_revision,
+            source_bytes: hit.source_bytes,
+            source_status: hit.source_status,
+            evidence: hit.evidence,
+            snippet: hit.snippet,
+            content: hit.content,
+            preview: hit.preview,
+            context_error: hit.context_error,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -257,6 +317,35 @@ mod tests {
         let response = RpcResponse::error(Some(Value::from(1)), ERR_INVALID_PARAMS, "bad params");
         let value = serde_json::to_value(response).expect("response should serialize");
         assert_eq!(value["error"]["code"], Value::from(ERR_INVALID_PARAMS));
+    }
+
+    #[test]
+    fn old_v2_health_remains_decodable_without_advertising_new_semantics() {
+        let health: HealthResult = serde_json::from_value(serde_json::json!({
+            "daemon_version": "3.2.1",
+            "daemon_api_version": 2,
+            "status": "ok",
+            "uptime_ms": 1,
+            "model_name": "old-model",
+            "semantic_home": "/tmp/semantic"
+        }))
+        .unwrap();
+
+        assert_eq!(health.daemon_api_version, DAEMON_API_VERSION);
+        assert!(health.capabilities.is_empty());
+        assert!(!health.supports_source_evidence());
+    }
+
+    #[test]
+    fn semantic_hit_without_source_evidence_is_not_promoted() {
+        let legacy = serde_json::json!({
+            "path": "note.md",
+            "title": "note",
+            "score": 0.8,
+            "tags": [],
+            "snippet": "old preview"
+        });
+        assert!(serde_json::from_value::<SemanticHit>(legacy).is_err());
     }
 
     #[test]

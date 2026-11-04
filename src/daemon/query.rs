@@ -1,6 +1,6 @@
 //! Daemon query handlers: vault attach, semantic search, and hybrid search.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -13,13 +13,10 @@ use super::protocol::{
 use super::vault_context::VaultContext;
 use super::vault_registry::VaultRegistry;
 use crate::error::VaultError;
-use crate::vault::search_utils::{body_preview, compile_query_word_regex};
 
 const DEFAULT_TOP_K: usize = 10;
 const DEFAULT_PREFETCH_COUNT: usize = 50;
 const DEFAULT_ALPHA: f32 = 0.25;
-const SNIPPET_CONTEXT_LEN: usize = 150;
-const SNIPPET_FALLBACK_CHARS: usize = 300;
 
 #[derive(Debug)]
 pub struct QueryError {
@@ -92,10 +89,17 @@ pub async fn search_semantic(
     let include_content = params.include_content.unwrap_or(false);
 
     tokio::task::spawn_blocking(move || {
-        let scores = context
-            .search_semantic_scores(&params.query, top_k, params.allowed_paths.as_deref())
+        let results = context
+            .search_semantic_results(
+                &params.query,
+                top_k,
+                params.allowed_paths.as_deref(),
+                include_content,
+            )
             .map_err(map_vault_error)?;
-        build_hits(&context, scores, &params.query, include_content)
+        Ok(SearchResult {
+            results: results.into_iter().map(SemanticHit::from).collect(),
+        })
     })
     .await
     .map_err(|error| {
@@ -124,20 +128,19 @@ pub async fn search_hybrid(
     let alpha = params.alpha.unwrap_or(DEFAULT_ALPHA).clamp(0.0, 1.0);
 
     tokio::task::spawn_blocking(move || {
-        let bm25_hits = context
-            .search_bm25(&params.query, prefetch, params.allowed_paths.as_deref())
+        let results = context
+            .search_hybrid_results(
+                &params.query,
+                top_k,
+                prefetch,
+                alpha,
+                params.allowed_paths.as_deref(),
+                include_content,
+            )
             .map_err(map_vault_error)?;
-        if bm25_hits.is_empty() {
-            return Ok(SearchResult {
-                results: Vec::new(),
-            });
-        }
-
-        let combined = context
-            .search_hybrid_scores(&params.query, &bm25_hits, alpha, top_k)
-            .map_err(map_vault_error)?;
-
-        build_hits(&context, combined, &params.query, include_content)
+        Ok(SearchResult {
+            results: results.into_iter().map(SemanticHit::from).collect(),
+        })
     })
     .await
     .map_err(|error| {
@@ -197,61 +200,6 @@ async fn require_context(
             "vault not attached; call ensure_vault first",
         )),
     }
-}
-
-fn build_hits(
-    context: &VaultContext,
-    scores: Vec<(PathBuf, f32)>,
-    query: &str,
-    include_content: bool,
-) -> QueryResult<SearchResult> {
-    let word_re = if include_content {
-        None
-    } else {
-        compile_query_word_regex(query)
-    };
-
-    let mut results = Vec::with_capacity(scores.len());
-    for (path, score) in scores {
-        let Some(meta) = context.note_metadata(&path).map_err(map_vault_error)? else {
-            continue;
-        };
-        let title = meta.title;
-        let tags = meta.tags;
-
-        let (content, snippet) = if include_content {
-            (context.read_note(&path).ok(), None)
-        } else {
-            let snippet = context.read_note(&path).ok().map(|text| {
-                let body = crate::vault::frontmatter::get_body(&text);
-                if let Some(re) = word_re.as_ref()
-                    && let Some(matched) = re.find(body)
-                {
-                    let (context_text, _, _, _) = crate::vault::index::extract_match_context(
-                        body,
-                        matched.start(),
-                        matched.end(),
-                        SNIPPET_CONTEXT_LEN,
-                    );
-                    return context_text;
-                }
-                body_preview(&text, SNIPPET_FALLBACK_CHARS)
-            });
-            (None, snippet)
-        };
-
-        results.push(SemanticHit {
-            path: path.to_string_lossy().to_string(),
-            title,
-            score,
-            tags,
-            snippet,
-            content,
-            subpath: None,
-        });
-    }
-
-    Ok(SearchResult { results })
 }
 
 fn semantic_status(context: &VaultContext) -> SemanticStatus {
@@ -341,7 +289,11 @@ fn map_vault_error(err: VaultError) -> QueryError {
         | VaultError::OutsideVault(_)
         | VaultError::AlreadyExists(_)
         | VaultError::PatchTargetNotFound { .. }
-        | VaultError::InvalidRegex { .. } => QueryError::new(protocol::ERR_INVALID_PARAMS, message),
+        | VaultError::InvalidRegex { .. }
+        | VaultError::EmbeddingInputTooLong { .. }
+        | VaultError::InvalidSourceRange(_) => {
+            QueryError::new(protocol::ERR_INVALID_PARAMS, message)
+        }
         VaultError::Embedding(_) => QueryError::new(protocol::ERR_BOOTSTRAP_REQUIRED, message),
         _ => QueryError::new(protocol::ERR_INTERNAL, message),
     }

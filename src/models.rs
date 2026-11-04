@@ -6,6 +6,75 @@ use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Half-open UTF-8 byte offsets into an exact raw note revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SourceRange {
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceScope {
+    Note,
+    Passage,
+}
+
+/// The exact source region represented by the winning semantic vector.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SemanticEvidence {
+    pub scope: EvidenceScope,
+    pub cosine_similarity: f32,
+    pub range: SourceRange,
+    pub heading_path: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_range: Option<SourceRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SemanticPreview {
+    pub range: SourceRange,
+    pub complete_evidence: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceStatus {
+    Current,
+    Changed,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SemanticContextError {
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_revision: Option<String>,
+}
+
+/// A ranked note and the revision-bound semantic evidence behind its score.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SemanticNoteResult {
+    pub path: PathBuf,
+    pub title: String,
+    pub score: f32,
+    pub tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    pub source_revision: String,
+    pub source_bytes: usize,
+    pub source_status: SourceStatus,
+    pub evidence: SemanticEvidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<SemanticPreview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_error: Option<SemanticContextError>,
+}
+
 /// Metadata about a single note in the vault.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct NoteMetadata {

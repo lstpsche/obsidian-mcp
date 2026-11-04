@@ -16,6 +16,10 @@ that configuration; their environment does not reconfigure a running daemon.
 Restart the daemon after changing its launcher settings. Separate semantic homes
 provide separate daemon/backend profiles.
 
+Automatic chunking uses one model-owned tokenizer/capacity contract. A complete frontmatter-free note body that fits uses one vector; an overflowing note is partitioned by Markdown structure and further bounded source spans, each with its title/ancestor-heading context. Both backends validate the final input. The local runtime retains its loaded effective capacity, normally 512 tokens; API providers use verified profiles. Chunking has no mode or user-selected size. Distinct-note search results identify their scored source revision and note/passage scope, with revision-checked context expansion available through MCP.
+
+Set `OBSIDIAN_EMBEDDING_API_PROFILE` in the daemon's launch environment for custom API endpoints/models. Its strict JSON binds the exact endpoint and outgoing model to a tokenizer and input/request limits. The only automatic API profiles are exact official OpenAI embedding IDs at `https://api.openai.com/v1`; a proxy or alias requires its own reviewed profile. A profile may select ordinary `cl100k_base` or a digest-pinned, fully initialized HuggingFace tokenizer export with explicit special-token behavior. Profiles contain no credentials. Read the [configuration examples](../../README.md#search) before changing a deployment. Client attachments cannot replace the running daemon's profile, and passive status cannot load it.
+
 MCP `auto` and `daemon` modes keep local inference dormant while using the daemon.
 In `auto`, genuine daemon unavailability may activate a configured local backend;
 that fallback stays selected until MCP restarts. Warming and query timeouts do
@@ -96,6 +100,16 @@ Compatibility policy:
 - Same major API version is required.
 - If daemon API is outside client-supported range, daemon returns a version mismatch error.
 - Clients must not proceed with `ensure_vault` or search calls after mismatch.
+- New semantic clients also require the additive health capability `semantic_source_evidence_v1`. Validate it against the final daemon after ownership-aware reconciliation; old API2 activation clients remain compatible with the version handshake.
+- A missing capability on an external/override daemon is an unsupported semantic contract, not evidence of an outage and not permission to start competing local inference.
+
+Embedding cache schema 2 records complete per-note collections, exact source revisions, prepared-input hashes, tokenizer fingerprints and effective capacity/preparation/partition identity. Old schema-1 prefix vectors rebuild automatically; relocation alone does not make them complete. The new cache replaces its predecessor atomically after a durable checkpoint. During the first rebuild, status is warming and API deployments can send substantially more source text than before. No vault files, provider settings, models or launcher definitions are rewritten by cache rebuilding.
+
+Reconciliation publishes one complete note revision at a time. Changed pieces use bounded inference requests; exact unchanged inputs reuse vectors. A later request failure retains the prior complete note collection, and note-level status counters keep their original units. Inactive retry drafts are bounded so failed notes cannot prevent healthy notes/removes from progressing. Permanent profile/source/resource failures are visible and do not trigger an endless submission loop.
+
+The coordinator admits at most 64 MiB of application-owned unpublished source, prepared/staged/output buffers, vectors and parser-output collections per runtime, including preparation and publication reservations. It may evict inactive draft progress so other ready notes and removals can proceed; the committed complete note projection remains intact. Private pulldown-cmark/YAML/tokenizer temporary arenas receive bounded inputs and structure but do not expose allocator budgeting through their APIs. Those internals and ONNX workspaces are outside the owned-allocation cap, which is not a total process-RSS limit. Semantic source and revision-bound reads support 16 MiB of raw UTF-8 source; partitioning supports 4,096 headings, 65,536 Markdown blocks, 4,096 chunks per note and 16 KiB contextual prefixes. Requests support at most 16 MiB serialized bytes as well as their provider token/item budgets. Cache storage supports 1 GiB and 1,000,000 total chunks, with bounded paths, metadata and vector dimensions. See the [complete supported ceilings](../../README.md#semantic-limits) for paging, parser-progress and cache admission details. Unsupported resources fail visibly without silently cutting source or marking a partial note complete.
+
+Search evidence references the indexed revision. The renderer reads live source once, validates that buffer's revision, and returns a preview/full note only when it matches. A changed/unreadable source retains its ranked hit with explicit `source_status` and `context_error`, omitting mismatched context. This allows the established last-known-good score contract while distinguishing it from current content. With watching disabled, external changes require explicit refresh/restart; inspecting status does not reconcile them.
 
 ## Bootstrap State Machine
 

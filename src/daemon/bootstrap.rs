@@ -62,6 +62,8 @@ pub struct BootstrapResult {
     pub daemon_binary_path: PathBuf,
     pub manifest: RuntimeManifest,
     pub reused_existing: bool,
+    /// Finalized health observation after any owned-daemon replacement.
+    pub health: protocol::HealthResult,
 }
 
 /// A timeout preserves enough startup state to resume without spawning twice.
@@ -477,7 +479,7 @@ async fn ensure_daemon_inner(
                     );
                     shutdown_owned_daemon(&endpoint, current_manifest, health.pid).await?;
                 } else {
-                    current_manifest.daemon_version = health.daemon_version;
+                    current_manifest.daemon_version = health.daemon_version.clone();
                     current_manifest.daemon_api_version = health.daemon_api_version;
                     current_manifest.binary_origin = origin;
                     current_manifest.touch_health();
@@ -489,6 +491,7 @@ async fn ensure_daemon_inner(
                         daemon_binary_path,
                         manifest: current_manifest.clone(),
                         reused_existing: true,
+                        health,
                     })));
                 }
             }
@@ -632,7 +635,7 @@ async fn complete_started_daemon(started: &StartedDaemonBootstrap) -> VaultResul
 
     let runtime_manifest = RuntimeManifest::from_input(RuntimeManifestInput {
         daemon_api_version: health.daemon_api_version,
-        daemon_version: health.daemon_version,
+        daemon_version: health.daemon_version.clone(),
         binary_path: started.daemon_binary_path.display().to_string(),
         binary_origin: started.binary_origin,
         binary_sha256: started.binary_sha256.clone(),
@@ -652,6 +655,7 @@ async fn complete_started_daemon(started: &StartedDaemonBootstrap) -> VaultResul
         daemon_binary_path: started.daemon_binary_path.clone(),
         manifest: runtime_manifest,
         reused_existing: false,
+        health,
     })
 }
 
@@ -1663,6 +1667,7 @@ mod tests {
             .await
             .expect("bootstrap should reuse daemon");
         assert!(result.reused_existing, "expected reuse-existing path");
+        assert!(result.health.supports_source_evidence());
 
         shutdown_tx.send(()).expect("shutdown signal should send");
         server_task.await.expect("server task should join");

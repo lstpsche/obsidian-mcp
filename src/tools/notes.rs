@@ -4,12 +4,12 @@ use std::path::{Path, PathBuf};
 
 use rmcp::ErrorData;
 use rmcp::handler::server::wrapper::Json;
-use rmcp::model::ErrorCode;
+use rmcp::model::{CallToolResult, ErrorCode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::VaultError;
-use crate::models::{PatchOperation, PatchRequest, PatchTargetType};
+use crate::models::{PatchOperation, PatchRequest, PatchTargetType, SourceRange};
 use crate::vault::Vault;
 
 const DEFAULT_MAX_FILES: usize = 20;
@@ -24,6 +24,28 @@ const MAX_SKIPPED_DETAILS: usize = 100;
 pub struct NoteReadParams {
     /// Path to the note, relative to vault root (e.g. "folder/note.md").
     pub path: String,
+    /// Require the exact raw-note SHA-256 revision returned by search or an earlier read.
+    pub expected_revision: Option<String>,
+    /// Half-open raw-note UTF-8 byte range. Requires expected_revision.
+    pub range: Option<SourceRange>,
+    /// Returned content-byte budget. Starts a bounded full-note read when no range is given.
+    #[schemars(range(min = 1, max = 262144))]
+    pub max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct NoteReadOutput {
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_range: Option<SourceRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub returned_range: Option<SourceRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_range: Option<SourceRange>,
 }
 
 #[derive(Deserialize, JsonSchema, Default)]
@@ -160,8 +182,55 @@ pub struct NoteMoveParams {
 
 // ── Handler functions ───────────────────────────────────────────────
 
-pub async fn note_read(vault: &Vault, params: NoteReadParams) -> Result<String, ErrorData> {
-    Ok(vault.read_note(Path::new(&params.path))?)
+pub async fn note_read(vault: &Vault, params: NoteReadParams) -> Result<CallToolResult, ErrorData> {
+    if params.expected_revision.is_none() && params.range.is_none() && params.max_bytes.is_none() {
+        let content = vault.read_note(Path::new(&params.path))?;
+        return super::output::with_text(
+            &NoteReadOutput {
+                content: content.clone(),
+                source_revision: None,
+                source_bytes: None,
+                requested_range: None,
+                returned_range: None,
+                next_range: None,
+            },
+            content,
+        );
+    }
+    if let Some(revision) = params.expected_revision.as_deref() {
+        crate::vault::source::validate_revision(revision)?;
+    }
+    if params.range.is_some() && params.expected_revision.is_none() {
+        return Err(invalid_params("expected_revision is required with range"));
+    }
+    if let Some(max_bytes) = params.max_bytes {
+        validated_limit(
+            Some(max_bytes),
+            DEFAULT_MAX_BYTES,
+            MAX_BYTES_CAP,
+            "max_bytes",
+        )?;
+    }
+    let vault = vault.clone();
+    let page = tokio::task::spawn_blocking(move || {
+        let path = Path::new(&params.path);
+        vault.read_source_snapshot(path)?.page(
+            path,
+            params.expected_revision.as_deref(),
+            params.range,
+            params.max_bytes,
+        )
+    })
+    .await
+    .map_err(|error| VaultError::Other(format!("source read worker failed: {error}")))??;
+    super::output::json(&NoteReadOutput {
+        content: page.content,
+        source_revision: Some(page.source_revision),
+        source_bytes: Some(page.source_bytes),
+        requested_range: Some(page.requested_range),
+        returned_range: Some(page.returned_range),
+        next_range: page.next_range,
+    })
 }
 
 pub async fn note_read_many(
@@ -458,11 +527,19 @@ mod tests {
             &vault,
             NoteReadParams {
                 path: "hello.md".into(),
+                ..Default::default()
             },
         )
         .await
         .unwrap();
-        assert_eq!(content, "# Hello\nWorld");
+        assert_eq!(
+            crate::test_helpers::extract_text(&content),
+            "# Hello\nWorld"
+        );
+        assert_eq!(
+            content.structured_content.unwrap(),
+            serde_json::json!({"content":"# Hello\nWorld"})
+        );
     }
 
     #[tokio::test]
@@ -475,10 +552,74 @@ mod tests {
             &vault,
             NoteReadParams {
                 path: "missing.md".into(),
+                ..Default::default()
             },
         )
         .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_reads_expose_continuation_and_reject_changed_source() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+        vault.write_note(Path::new("page.md"), "αβ😀tail").unwrap();
+        let result = note_read(
+            &vault,
+            NoteReadParams {
+                path: "page.md".into(),
+                max_bytes: Some(4),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let text_value: serde_json::Value =
+            serde_json::from_str(crate::test_helpers::extract_text(&result)).unwrap();
+        let value = result.structured_content.unwrap();
+        assert_eq!(text_value, value);
+        assert_eq!(value["content"], "αβ");
+        assert_eq!(value["returned_range"]["end_byte"], 4);
+        let revision = value["source_revision"].as_str().unwrap().to_owned();
+        let range: SourceRange = serde_json::from_value(value["next_range"].clone()).unwrap();
+        vault
+            .write_note(Path::new("page.md"), "new source")
+            .unwrap();
+        let error = note_read(
+            &vault,
+            NoteReadParams {
+                path: "page.md".into(),
+                expected_revision: Some(revision.clone()),
+                range: Some(range),
+                max_bytes: Some(4),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+        assert_eq!(error.data.unwrap()["expected_revision"], revision);
+    }
+
+    #[tokio::test]
+    async fn ranged_reads_require_revision_before_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+        let error = note_read(
+            &vault,
+            NoteReadParams {
+                path: "missing.md".into(),
+                range: Some(SourceRange {
+                    start_byte: 0,
+                    end_byte: 1,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
     }
 
     // ── note_read_many ──────────────────────────────────────────────

@@ -6,6 +6,8 @@ use std::sync::LazyLock;
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use regex::Regex;
 
+#[cfg(has_embeddings)]
+use crate::error::{VaultError, VaultResult};
 use crate::models::{DocumentMap, Heading, WikiLink};
 use crate::vault::frontmatter;
 
@@ -35,12 +37,51 @@ static BLOCK_REF_RE: LazyLock<Regex> =
 // ---------------------------------------------------------------------------
 
 /// Heading with byte offset preserved for range-finding operations.
+#[derive(Debug, Clone)]
 pub(crate) struct HeadingPos {
     pub(crate) level: u8,
     pub(crate) text: String,
     pub(crate) line: usize,
     pub(crate) offset: usize,
     pub(crate) end: usize,
+}
+
+/// An outer Markdown block, retaining its original source representation.
+#[derive(Debug, Clone)]
+#[cfg_attr(not(has_embeddings), allow(dead_code))]
+pub(crate) struct MarkdownBlock {
+    pub(crate) range: Range<usize>,
+    pub(crate) kind: &'static str,
+}
+
+#[cfg(has_embeddings)]
+pub(crate) struct MarkdownStructure {
+    pub(crate) headings: Vec<HeadingPos>,
+    pub(crate) blocks: Vec<MarkdownBlock>,
+}
+
+const MAX_SEMANTIC_HEADINGS: usize = 4096;
+const MAX_SEMANTIC_BLOCKS: usize = 65_536;
+
+struct StructureExtraction {
+    headings: Vec<HeadingPos>,
+    blocks: Vec<MarkdownBlock>,
+    limit_exceeded: Option<(&'static str, usize)>,
+}
+
+impl StructureExtraction {
+    fn limit(
+        headings: Vec<HeadingPos>,
+        blocks: Vec<MarkdownBlock>,
+        resource: &'static str,
+        maximum: usize,
+    ) -> Self {
+        Self {
+            headings,
+            blocks,
+            limit_exceeded: Some((resource, maximum)),
+        }
+    }
 }
 
 fn heading_level_to_u8(level: HeadingLevel) -> u8 {
@@ -133,20 +174,208 @@ fn parse_wikilink_inner(raw: &str, inner: &str, line: usize) -> WikiLink {
 /// Shared implementation that returns headings with both line numbers and byte
 /// offsets.
 pub(crate) fn extract_headings_with_offsets(content: &str) -> Vec<HeadingPos> {
-    let parser = Parser::new_ext(content, parser_options());
+    let structure = extract_structure(content, false);
+    debug_assert!(structure.blocks.is_empty());
+    debug_assert!(structure.limit_exceeded.is_none());
+    structure.headings
+}
+
+#[cfg(has_embeddings)]
+pub(crate) fn markdown_structure(content: &str) -> VaultResult<MarkdownStructure> {
+    let structure = extract_structure(content, true);
+    if let Some((resource, limit)) = structure.limit_exceeded {
+        return Err(VaultError::SemanticResourceLimit {
+            resource: resource.to_string(),
+            actual: limit + 1,
+            limit,
+        });
+    }
+    Ok(MarkdownStructure {
+        headings: structure.headings,
+        blocks: structure.blocks,
+    })
+}
+
+/// Upper bounds for application-owned output collections, counted without
+/// materializing them. Private parser arenas remain bounded by source limits.
+#[cfg(has_embeddings)]
+pub(crate) fn semantic_structure_allocation_bound(content: &str) -> usize {
+    let mut headings = 0usize;
+    let mut heading_bytes = 0usize;
+    let mut in_heading = false;
+    let mut blocks = 0usize;
+    let mut depth = 0usize;
+    for (event, _) in
+        Parser::new_ext(content, parser_options() | Options::ENABLE_TABLES).into_offset_iter()
+    {
+        match &event {
+            Event::Start(tag) if is_block_tag(tag) => depth += 1,
+            Event::End(tag) if is_block_end(*tag) => {
+                depth -= 1;
+                if depth == 0 {
+                    blocks += 1;
+                }
+            }
+            Event::Rule if depth == 0 => blocks += 1,
+            _ => {}
+        }
+        match event {
+            Event::Start(Tag::Heading { .. }) => {
+                headings += 1;
+                in_heading = true;
+            }
+            Event::End(TagEnd::Heading(_)) => in_heading = false,
+            Event::Text(text) | Event::Code(text) if in_heading => heading_bytes += text.len(),
+            Event::SoftBreak if in_heading => heading_bytes += 1,
+            _ => {}
+        }
+    }
+    allocation_capacity_bound(headings)
+        .saturating_mul(std::mem::size_of::<HeadingPos>())
+        .saturating_add(
+            allocation_capacity_bound(blocks).saturating_mul(std::mem::size_of::<MarkdownBlock>()),
+        )
+        .saturating_add(heading_bytes.saturating_mul(3))
+}
+
+#[cfg(has_embeddings)]
+pub(crate) fn inline_tag_allocation_bound(content: &str) -> usize {
+    let mut exclusions = 0usize;
+    let mut block_start = None;
+    let mut tag_count = 0usize;
+    let mut tag_bytes = 0usize;
+    let mut tags = INLINE_TAG_RE
+        .captures_iter(content)
+        .filter_map(|capture| capture.get(1))
+        .peekable();
+    if tags.peek().is_none() {
+        return 0;
+    }
+    // This is intentionally the same dialect as code_block_ranges, including
+    // text in excess table cells that the table-enabled parser may discard.
+    for (event, range) in Parser::new_ext(content, parser_options()).into_offset_iter() {
+        let exclusion = match event {
+            Event::Start(Tag::CodeBlock(_) | Tag::MetadataBlock(_)) => {
+                block_start = Some(range.start);
+                None
+            }
+            Event::End(TagEnd::CodeBlock | TagEnd::MetadataBlock(_)) => {
+                block_start.take().map(|start| start..range.end)
+            }
+            Event::Code(_) => Some(range),
+            _ => None,
+        };
+        if let Some(range) = exclusion {
+            exclusions += 1;
+            while tags.peek().is_some_and(|tag| tag.start() < range.start) {
+                if let Some(tag) = tags.next() {
+                    tag_count += 1;
+                    tag_bytes += tag.as_str().len();
+                }
+            }
+            while tags.peek().is_some_and(|tag| tag.start() < range.end) {
+                tags.next();
+            }
+        }
+    }
+    for tag in tags {
+        tag_count += 1;
+        tag_bytes += tag.as_str().len();
+    }
+    allocation_capacity_bound(exclusions)
+        .saturating_mul(std::mem::size_of::<Range<usize>>())
+        .saturating_add(
+            allocation_capacity_bound(tag_count).saturating_mul(std::mem::size_of::<String>()),
+        )
+        .saturating_add(tag_bytes)
+}
+
+#[cfg(has_embeddings)]
+pub(crate) fn allocation_capacity_bound(length: usize) -> usize {
+    if length == 0 {
+        0
+    } else {
+        length
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX)
+            .max(4)
+    }
+}
+
+fn extract_structure(content: &str, collect_blocks: bool) -> StructureExtraction {
+    let options = if collect_blocks {
+        parser_options() | Options::ENABLE_TABLES
+    } else {
+        parser_options()
+    };
+    let parser = Parser::new_ext(content, options);
     let mut headings = Vec::new();
+    let mut blocks = Vec::new();
+    let mut block_depth = 0usize;
+    let mut block_start = 0usize;
+    let mut block_kind = "other";
     let mut in_heading = false;
     let mut current_level = 0u8;
     let mut current_text = String::new();
     let mut current_offset = 0usize;
+    let mut current_line = 0usize;
+    let mut line_scan_offset = 0usize;
 
     for (event, range) in parser.into_offset_iter() {
+        if collect_blocks {
+            match &event {
+                Event::Start(tag) if is_block_tag(tag) => {
+                    if block_depth == 0 {
+                        block_start = range.start;
+                        block_kind = markdown_block_kind(tag);
+                    }
+                    block_depth += 1;
+                }
+                Event::End(tag) if is_block_end(*tag) => {
+                    block_depth = block_depth.saturating_sub(1);
+                    if block_depth == 0 {
+                        if blocks.len() == MAX_SEMANTIC_BLOCKS {
+                            return StructureExtraction::limit(
+                                headings,
+                                blocks,
+                                "Markdown block count",
+                                MAX_SEMANTIC_BLOCKS,
+                            );
+                        }
+                        blocks.push(MarkdownBlock {
+                            range: block_start..range.end,
+                            kind: block_kind,
+                        });
+                    }
+                }
+                Event::Rule if block_depth == 0 => {
+                    if blocks.len() == MAX_SEMANTIC_BLOCKS {
+                        return StructureExtraction::limit(
+                            headings,
+                            blocks,
+                            "Markdown block count",
+                            MAX_SEMANTIC_BLOCKS,
+                        );
+                    }
+                    blocks.push(MarkdownBlock {
+                        range: range.clone(),
+                        kind: "rule",
+                    });
+                }
+                _ => {}
+            }
+        }
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
                 in_heading = true;
                 current_level = heading_level_to_u8(level);
                 current_text.clear();
                 current_offset = range.start;
+                current_line += content[line_scan_offset..current_offset]
+                    .bytes()
+                    .filter(|&byte| byte == b'\n')
+                    .count();
+                line_scan_offset = current_offset;
             }
             Event::Text(ref text) | Event::Code(ref text) if in_heading => {
                 current_text.push_str(text);
@@ -155,10 +384,18 @@ pub(crate) fn extract_headings_with_offsets(content: &str) -> Vec<HeadingPos> {
                 current_text.push(' ');
             }
             Event::End(TagEnd::Heading(_)) if in_heading => {
+                if collect_blocks && headings.len() == MAX_SEMANTIC_HEADINGS {
+                    return StructureExtraction::limit(
+                        headings,
+                        blocks,
+                        "Markdown heading count",
+                        MAX_SEMANTIC_HEADINGS,
+                    );
+                }
                 headings.push(HeadingPos {
                     level: current_level,
                     text: current_text.clone(),
-                    line: byte_offset_to_line(content, current_offset),
+                    line: current_line,
                     offset: current_offset,
                     end: range.end,
                 });
@@ -168,7 +405,69 @@ pub(crate) fn extract_headings_with_offsets(content: &str) -> Vec<HeadingPos> {
         }
     }
 
-    headings
+    StructureExtraction {
+        headings,
+        blocks,
+        limit_exceeded: None,
+    }
+}
+
+fn is_block_tag(tag: &Tag<'_>) -> bool {
+    matches!(
+        tag,
+        Tag::Paragraph
+            | Tag::Heading { .. }
+            | Tag::BlockQuote(_)
+            | Tag::CodeBlock(_)
+            | Tag::HtmlBlock
+            | Tag::List(_)
+            | Tag::Item
+            | Tag::FootnoteDefinition(_)
+            | Tag::DefinitionList
+            | Tag::DefinitionListTitle
+            | Tag::DefinitionListDefinition
+            | Tag::Table(_)
+            | Tag::TableHead
+            | Tag::TableRow
+            | Tag::TableCell
+            | Tag::MetadataBlock(_)
+    )
+}
+
+fn is_block_end(tag: TagEnd) -> bool {
+    matches!(
+        tag,
+        TagEnd::Paragraph
+            | TagEnd::Heading(_)
+            | TagEnd::BlockQuote(_)
+            | TagEnd::CodeBlock
+            | TagEnd::HtmlBlock
+            | TagEnd::List(_)
+            | TagEnd::Item
+            | TagEnd::FootnoteDefinition
+            | TagEnd::DefinitionList
+            | TagEnd::DefinitionListTitle
+            | TagEnd::DefinitionListDefinition
+            | TagEnd::Table
+            | TagEnd::TableHead
+            | TagEnd::TableRow
+            | TagEnd::TableCell
+            | TagEnd::MetadataBlock(_)
+    )
+}
+
+fn markdown_block_kind(tag: &Tag<'_>) -> &'static str {
+    match tag {
+        Tag::Paragraph => "paragraph",
+        Tag::Heading { .. } => "heading",
+        Tag::BlockQuote(_) => "quote",
+        Tag::CodeBlock(_) => "code",
+        Tag::HtmlBlock => "html",
+        Tag::List(_) => "list",
+        Tag::Table(_) => "table",
+        Tag::MetadataBlock(_) => "metadata",
+        _ => "other",
+    }
 }
 
 /// Extract top-level YAML frontmatter keys, delegating to
@@ -218,6 +517,9 @@ pub fn extract_headings(content: &str) -> Vec<Heading> {
 /// Does **not** include frontmatter tags. Skips tags inside code blocks and
 /// inline code spans. Returns sorted unique tags.
 pub fn extract_inline_tags(content: &str) -> Vec<String> {
+    if !INLINE_TAG_RE.is_match(content) {
+        return Vec::new();
+    }
     let exclusions = code_block_ranges(content);
     let mut tags: Vec<String> = INLINE_TAG_RE
         .captures_iter(content)
@@ -230,7 +532,7 @@ pub fn extract_inline_tags(content: &str) -> Vec<String> {
         })
         .collect();
 
-    tags.sort();
+    tags.sort_unstable();
     tags.dedup();
     tags
 }
@@ -382,6 +684,85 @@ mod tests {
     fn headings_empty_content() {
         assert!(extract_headings("").is_empty());
         assert!(extract_headings("No headings here.").is_empty());
+    }
+
+    #[test]
+    fn heading_offsets_and_lines_preserve_crlf_and_setext() {
+        let content = "---\r\ntags: [x]\r\n---\r\n\r\n# First\r\nbody\r\n\r\nSecond\r\n======\r\n";
+        let headings = extract_headings_with_offsets(content);
+        assert_eq!(headings.len(), 2);
+        assert_eq!(headings[0].line, 4);
+        assert_eq!(headings[1].line, 7);
+        assert_eq!(headings[0].offset, content.find("# First").unwrap());
+        assert_eq!(headings[1].offset, content.find("Second").unwrap());
+        assert!(content[headings[1].offset..headings[1].end].contains("======"));
+    }
+
+    #[cfg(has_embeddings)]
+    #[test]
+    fn semantic_structure_preserves_outer_blocks_and_ignores_code_headings() {
+        let content =
+            "# Real\n\n- first\n- second\n\n| A | B |\n| - | - |\n| 1 | 2 |\n\n```\n# fake\n```\n";
+        let structure = markdown_structure(content).unwrap();
+        assert_eq!(structure.headings.len(), 1);
+        assert!(structure.blocks.iter().any(|block| block.kind == "list"));
+        assert!(structure.blocks.iter().any(|block| block.kind == "table"));
+        assert!(structure.blocks.iter().any(|block| block.kind == "code"));
+        assert!(
+            structure
+                .blocks
+                .windows(2)
+                .all(|blocks| blocks[0].range.end <= blocks[1].range.start)
+        );
+    }
+
+    #[cfg(has_embeddings)]
+    #[test]
+    fn semantic_structure_limits_do_not_truncate_ordinary_heading_extraction() {
+        let content = "# Heading\n".repeat(MAX_SEMANTIC_HEADINGS + 1);
+        assert!(matches!(
+            markdown_structure(&content),
+            Err(VaultError::SemanticResourceLimit { .. })
+        ));
+        assert_eq!(extract_headings(&content).len(), MAX_SEMANTIC_HEADINGS + 1);
+        let blocks = "paragraph\n\n".repeat(MAX_SEMANTIC_BLOCKS + 1);
+        assert!(matches!(
+            markdown_structure(&blocks),
+            Err(VaultError::SemanticResourceLimit { .. })
+        ));
+    }
+
+    #[cfg(has_embeddings)]
+    #[test]
+    fn inline_allocation_preflight_matches_code_exclusion_dialect() {
+        let content = "| A | B |\n| --- | --- |\n| a | b | `text #hidden` |\n";
+        let exclusions = code_block_ranges(content);
+        assert!(!exclusions.is_empty());
+        let bound = inline_tag_allocation_bound(content);
+        let tags = extract_inline_tags(content);
+        let actual = exclusions.capacity() * std::mem::size_of::<Range<usize>>()
+            + tags.capacity() * std::mem::size_of::<String>()
+            + tags.iter().map(String::capacity).sum::<usize>();
+        assert!(bound >= actual, "{bound} < {actual}");
+    }
+
+    #[cfg(has_embeddings)]
+    #[test]
+    fn inline_preflight_does_not_allocate_tag_records_for_code() {
+        let content = format!("```\n{}\n```\n", "#tag ".repeat(10_000));
+        let bound = inline_tag_allocation_bound(&content);
+        assert_eq!(
+            bound,
+            allocation_capacity_bound(1) * std::mem::size_of::<Range<usize>>()
+        );
+    }
+
+    #[cfg(has_embeddings)]
+    #[test]
+    fn inline_tags_without_candidates_need_no_exclusion_storage() {
+        let content = "```\ncode without tags\n```\n\n`inline code` and ordinary prose.\n";
+        assert_eq!(inline_tag_allocation_bound(content), 0);
+        assert!(extract_inline_tags(content).is_empty());
     }
 
     // ── extract_wikilinks ────────────────────────────────────────────

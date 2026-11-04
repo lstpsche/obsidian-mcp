@@ -3,7 +3,7 @@
 //! Gated behind `#[cfg(has_embeddings)]` (either `embeddings` or `embeddings-api`
 //! Cargo feature). Provides:
 //! - `EmbeddingStore`: in-memory HashMap of note embeddings with brute-force
-//!   cosine similarity search and bincode persistence.
+//!   cosine similarity search and bounded versioned persistence.
 //! - `EmbeddingModel`: backend-agnostic wrapper supporting local fastembed
 //!   (`--features embeddings`) and OpenAI-compatible API (`--features embeddings-api`).
 
@@ -15,13 +15,14 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 #[cfg(feature = "embeddings-api")]
 use std::sync::Arc;
 
+use super::embedding_input::{self, EmbeddingInputPolicy, EmbeddingRequestLimits, TokenCounter};
 use crate::config::EmbeddingProvider;
 use crate::error::{VaultError, VaultResult};
 use sha2::{Digest, Sha256};
 
 const CACHE_MAGIC: [u8; 8] = *b"OBSMCPEM";
-const CACHE_SCHEMA_VERSION: u16 = 1;
-pub(crate) const EMBEDDING_INPUT_VERSION: u16 = 1;
+const CACHE_SCHEMA_VERSION: u16 = 2;
+pub(crate) const EMBEDDING_INPUT_VERSION: u16 = 2;
 const MAX_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_CACHE_ENTRIES: usize = 1_000_000;
 const MAX_CACHE_PATH_BYTES: usize = 16 * 1024;
@@ -40,28 +41,37 @@ pub(crate) struct EmbeddingSpaceIdentity {
     pub endpoint_fingerprint: Option<[u8; 32]>,
     pub dimension: usize,
     pub input_version: u16,
+    pub tokenizer_fingerprint: [u8; 32],
+    pub max_input_tokens: usize,
+    pub chunking_version: u16,
 }
 
 impl EmbeddingSpaceIdentity {
     #[cfg(feature = "embeddings")]
-    fn local(model: String, dimension: usize) -> Self {
+    fn local(model: String, dimension: usize, policy: &EmbeddingInputPolicy) -> Self {
         Self {
             backend: EmbeddingBackendKind::Local,
             model,
             endpoint_fingerprint: None,
             dimension,
             input_version: EMBEDDING_INPUT_VERSION,
+            tokenizer_fingerprint: policy.tokenizer_fingerprint,
+            max_input_tokens: policy.max_input_tokens,
+            chunking_version: embedding_input::CHUNKING_VERSION,
         }
     }
 
     #[cfg(feature = "embeddings-api")]
-    fn api(model: String, base_url: &str, dimension: usize) -> Self {
+    fn api(model: String, base_url: &str, dimension: usize, policy: &EmbeddingInputPolicy) -> Self {
         Self {
             backend: EmbeddingBackendKind::Api,
             model,
             endpoint_fingerprint: Some(endpoint_fingerprint(base_url)),
             dimension,
             input_version: EMBEDDING_INPUT_VERSION,
+            tokenizer_fingerprint: policy.tokenizer_fingerprint,
+            max_input_tokens: policy.max_input_tokens,
+            chunking_version: embedding_input::CHUNKING_VERSION,
         }
     }
 }
@@ -69,60 +79,121 @@ impl EmbeddingSpaceIdentity {
 pub(crate) trait Embedder: Send + Sync {
     fn dimension(&self) -> usize;
     fn space_identity(&self) -> &EmbeddingSpaceIdentity;
+    fn input_policy(&self) -> &EmbeddingInputPolicy;
+    fn count_tokens(&self, text: &str) -> VaultResult<usize>;
+    fn request_limits(&self) -> EmbeddingRequestLimits;
+    /// Plan a prefix that can be dispatched as one bounded request.
+    fn plan_batch(&self, texts: &[&str]) -> VaultResult<usize> {
+        embedding_input::plan_batch(
+            texts,
+            self.input_policy(),
+            self.request_limits(),
+            2,
+            |text| self.count_tokens(text),
+        )
+    }
     fn embed_batch(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>>;
 }
 
 // ── Cosine similarity ──────────────────────────────────────────────────
 
 pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let (dot, norm_a, norm_b) = a
-        .iter()
-        .zip(b)
-        .fold((0.0f32, 0.0f32, 0.0f32), |(d, na, nb), (&x, &y)| {
-            (d + x * y, na + x * x, nb + y * y)
+    CosineQuery::new(&a[..a.len().min(b.len())]).similarity(b)
+}
+
+/// A validated query's norm is shared by every scored chunk.
+pub(crate) struct CosineQuery<'a> {
+    vector: &'a [f32],
+    norm: f64,
+}
+
+impl<'a> CosineQuery<'a> {
+    pub(crate) fn new(vector: &'a [f32]) -> Self {
+        let squared_norm = vector.iter().fold(0.0f64, |sum, &value| {
+            let value = f64::from(value);
+            sum + value * value
         });
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
+        Self {
+            vector,
+            norm: squared_norm.sqrt(),
+        }
     }
-    dot / (norm_a.sqrt() * norm_b.sqrt())
+
+    pub(crate) fn similarity(&self, other: &[f32]) -> f32 {
+        let (dot, squared_norm) = self.vector.iter().zip(other).fold(
+            (0.0f64, 0.0f64),
+            |(dot, squared_norm), (&left, &right)| {
+                let (left, right) = (f64::from(left), f64::from(right));
+                (dot + left * right, squared_norm + right * right)
+            },
+        );
+        if self.norm == 0.0 || squared_norm == 0.0 {
+            return 0.0;
+        }
+        (dot / (self.norm * squared_norm.sqrt())).clamp(-1.0, 1.0) as f32
+    }
 }
 
 // ── EmbeddingStore ─────────────────────────────────────────────────────
 
-/// In-memory store mapping vault-relative note paths to embedding vectors.
-///
-/// Search is brute-force cosine similarity — O(n * dim). For dim=384 and
-/// n=5000 this is ~2M multiply-adds, well under 5ms on modern hardware.
+use crate::models::{EvidenceScope, SourceRange};
+use std::sync::Arc as NoteArc;
+
+use super::embedding_chunks::{MAX_CHUNKS_PER_NOTE as MAX_NOTE_CHUNKS, MAX_CONTEXT_BYTES};
+use super::source::MAX_SOURCE_BYTES as MAX_NOTE_SOURCE_BYTES;
+const MAX_NOTE_METADATA_BYTES: usize = 64 * 1024;
+const MAX_CACHE_DIMENSION: usize = 65_536;
+
+/// One validated vector and its exact source provenance.
+#[derive(Debug, Clone)]
+pub(crate) struct ChunkEmbedding {
+    pub input_hash: [u8; 32],
+    pub vector: Vec<f32>,
+    pub scope: EvidenceScope,
+    pub range: SourceRange,
+    pub overlap_range: Option<SourceRange>,
+    pub heading_path: Vec<String>,
+    pub section_range: Option<SourceRange>,
+    pub block_kind: Option<String>,
+}
+
+/// An immutable, complete semantic projection of one raw-note revision.
+#[derive(Debug, Clone)]
+pub(crate) struct NoteEmbeddingEntry {
+    pub source_revision: String,
+    pub source_bytes: usize,
+    pub body_range: SourceRange,
+    pub title: String,
+    pub tags: Vec<String>,
+    pub chunks: Vec<ChunkEmbedding>,
+}
+
+impl NoteEmbeddingEntry {
+    /// Tied vectors select the earliest source occurrence deterministically.
+    pub(crate) fn best_chunk(&self, query: &[f32]) -> Option<(usize, f32)> {
+        self.chunks
+            .iter()
+            .enumerate()
+            .map(|(index, chunk)| (index, cosine_similarity(query, &chunk.vector)))
+            .max_by(|(left_index, left), (right_index, right)| {
+                left.total_cmp(right)
+                    .then_with(|| right_index.cmp(left_index))
+            })
+    }
+}
+
+/// Complete note projections; snapshots clone immutable entry references.
 pub struct EmbeddingStore {
-    embeddings: HashMap<PathBuf, EmbeddingEntry>,
+    embeddings: HashMap<PathBuf, NoteArc<NoteEmbeddingEntry>>,
     dim: usize,
     identity: Option<EmbeddingSpaceIdentity>,
     first_pass_complete: bool,
+    encoded_entries_bytes: usize,
+    total_chunks: usize,
 }
 
-#[derive(Debug, Clone)]
-struct EmbeddingEntry {
-    vector: Vec<f32>,
-    content_hash: Option<[u8; 32]>,
-}
-
-#[derive(serde::Serialize)]
-struct EmbeddingCacheDataRef<'a> {
-    magic: [u8; 8],
-    schema_version: u16,
-    identity: &'a EmbeddingSpaceIdentity,
-    first_pass_complete: bool,
-    entries: Vec<EmbeddingCacheEntryRef<'a>>,
-}
-
-#[derive(serde::Serialize)]
-struct EmbeddingCacheEntryRef<'a> {
-    path: String,
-    content_hash: [u8; 32],
-    vector: &'a [f32],
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
+// Legacy fixture shapes are deliberately unavailable to production writes.
+#[cfg(test)]
 struct EmbeddingCacheData {
     magic: [u8; 8],
     schema_version: u16,
@@ -130,8 +201,7 @@ struct EmbeddingCacheData {
     first_pass_complete: bool,
     entries: Vec<EmbeddingCacheEntry>,
 }
-
-#[derive(serde::Serialize, serde::Deserialize)]
+#[cfg(test)]
 struct EmbeddingCacheEntry {
     path: String,
     content_hash: [u8; 32],
@@ -139,50 +209,101 @@ struct EmbeddingCacheEntry {
 }
 
 impl EmbeddingStore {
-    /// Create an empty store for embeddings of the given dimensionality.
     pub fn new(dim: usize) -> Self {
         Self {
             embeddings: HashMap::new(),
             dim,
             identity: None,
             first_pass_complete: false,
+            encoded_entries_bytes: 0,
+            total_chunks: 0,
         }
     }
 
     pub(crate) fn new_with_identity(identity: EmbeddingSpaceIdentity) -> Self {
         Self {
-            embeddings: HashMap::new(),
             dim: identity.dimension,
             identity: Some(identity),
-            first_pass_complete: false,
+            ..Self::new(0)
         }
     }
 
-    /// Insert or replace the embedding for a note.
-    ///
-    /// Vectors with a dimension mismatch are rejected (logged + skipped)
-    /// to prevent garbage cosine-similarity results from a misconfigured
-    /// API backend.
-    pub fn insert(&mut self, path: PathBuf, vec: Vec<f32>) {
-        if validate_vector(&vec, self.dim).is_err() {
-            tracing::warn!(
-                path = %path.display(),
-                expected = self.dim,
-                got = vec.len(),
-                "embedding dimension mismatch — skipping insert"
-            );
+    pub(crate) fn insert_note(
+        &mut self,
+        path: PathBuf,
+        entry: NoteEmbeddingEntry,
+    ) -> VaultResult<()> {
+        let path_text = path
+            .to_str()
+            .ok_or_else(|| cache_error("cache path is not UTF-8"))?;
+        validate_cache_path(path_text)?;
+        validate_note_entry(&entry, self.dim)?;
+        let entry_bytes = encoded_entry_len(path_text, &entry)?;
+        let old = self.embeddings.get(&path);
+        let old_bytes = old
+            .map(|old| encoded_entry_len(path_text, old))
+            .transpose()?
+            .unwrap_or(0);
+        let old_chunks = old.map_or(0, |old| old.chunks.len());
+        let chunks = self
+            .total_chunks
+            .saturating_sub(old_chunks)
+            .checked_add(entry.chunks.len())
+            .ok_or_else(|| cache_error("embedding chunk count overflow"))?;
+        let entries_bytes = self
+            .encoded_entries_bytes
+            .saturating_sub(old_bytes)
+            .checked_add(entry_bytes)
+            .ok_or_else(|| cache_error("embedding cache size overflow"))?;
+        let notes = self.embeddings.len() + usize::from(old.is_none());
+        if chunks > MAX_CACHE_ENTRIES || notes > MAX_CACHE_ENTRIES {
+            return Err(cache_error(
+                "embedding cache contains too many entries or chunks",
+            ));
+        }
+        let header_size = self
+            .identity
+            .as_ref()
+            .map(cache_header_len)
+            .transpose()?
+            .unwrap_or(MAX_NOTE_METADATA_BYTES);
+        if entries_bytes.saturating_add(header_size) as u64 > MAX_CACHE_BYTES {
+            return Err(cache_error("embedding cache is too large to persist"));
+        }
+        self.embeddings.insert(path, NoteArc::new(entry));
+        self.encoded_entries_bytes = entries_bytes;
+        self.total_chunks = chunks;
+        Ok(())
+    }
+
+    pub(crate) fn note(&self, path: &Path) -> Option<NoteArc<NoteEmbeddingEntry>> {
+        self.embeddings.get(path).map(NoteArc::clone)
+    }
+
+    pub(crate) fn capture_entries(
+        &self,
+        allowed: &HashSet<PathBuf>,
+    ) -> HashMap<PathBuf, NoteArc<NoteEmbeddingEntry>> {
+        self.embeddings
+            .iter()
+            .filter(|(path, _)| allowed.contains(*path))
+            .map(|(path, entry)| (path.clone(), NoteArc::clone(entry)))
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub fn insert(&mut self, path: PathBuf, vector: Vec<f32>) {
+        if validate_vector(&vector, self.dim).is_err() {
             return;
         }
-        self.embeddings.insert(
-            path,
-            EmbeddingEntry {
-                vector: vec,
-                content_hash: None,
-            },
-        );
+        let mut entry = fixture_note(&path, [0; 32], vector);
+        entry.source_revision.clear();
+        self.embeddings.insert(path, NoteArc::new(entry));
         self.first_pass_complete = false;
+        self.recount_fixture_entries();
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_hashed(
         &mut self,
         path: PathBuf,
@@ -191,163 +312,181 @@ impl EmbeddingStore {
     ) -> VaultResult<()> {
         validate_vector(&vector, self.dim)?;
         self.embeddings.insert(
-            path,
-            EmbeddingEntry {
-                vector,
-                content_hash: Some(content_hash),
-            },
+            path.clone(),
+            NoteArc::new(fixture_note(&path, content_hash, vector)),
         );
+        self.recount_fixture_entries();
         Ok(())
     }
 
-    /// Remove a note's embedding.
-    pub fn remove(&mut self, path: &Path) -> bool {
-        self.embeddings.remove(path).is_some()
+    #[cfg(test)]
+    fn recount_fixture_entries(&mut self) {
+        self.total_chunks = self
+            .embeddings
+            .values()
+            .map(|entry| entry.chunks.len())
+            .sum();
+        self.encoded_entries_bytes = self
+            .embeddings
+            .iter()
+            .filter_map(|(path, entry)| encoded_entry_len(&path.to_string_lossy(), entry).ok())
+            .sum();
     }
 
-    /// Retrieve a note's embedding vector.
+    pub fn remove(&mut self, path: &Path) -> bool {
+        if let Some(old) = self.embeddings.remove(path) {
+            self.total_chunks = self.total_chunks.saturating_sub(old.chunks.len());
+            if let Some(path) = path.to_str() {
+                self.encoded_entries_bytes = self
+                    .encoded_entries_bytes
+                    .saturating_sub(encoded_entry_len(path, &old).unwrap_or(0));
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns the first vector for callers checking entry availability.
     pub fn get(&self, path: &Path) -> Option<&[f32]> {
         self.embeddings
             .get(path)
-            .map(|entry| entry.vector.as_slice())
+            .and_then(|entry| entry.chunks.first())
+            .map(|chunk| chunk.vector.as_slice())
     }
 
+    #[cfg(test)]
     pub(crate) fn content_hash(&self, path: &Path) -> Option<&[u8; 32]> {
         self.embeddings
             .get(path)
-            .and_then(|entry| entry.content_hash.as_ref())
+            .and_then(|entry| entry.chunks.first())
+            .map(|chunk| &chunk.input_hash)
     }
 
     pub fn len(&self) -> usize {
         self.embeddings.len()
     }
-
     pub fn is_empty(&self) -> bool {
         self.embeddings.is_empty()
     }
-
     pub fn dim(&self) -> usize {
         self.dim
     }
-
     #[cfg(test)]
     pub(crate) fn identity(&self) -> Option<&EmbeddingSpaceIdentity> {
         self.identity.as_ref()
     }
-
     pub(crate) fn first_pass_complete(&self) -> bool {
         self.first_pass_complete
     }
-
     pub(crate) fn set_first_pass_complete(&mut self, complete: bool) {
         self.first_pass_complete = complete;
     }
 
     pub(crate) fn retain_paths(&mut self, paths: &HashSet<PathBuf>) -> bool {
-        let previous_len = self.embeddings.len();
-        self.embeddings.retain(|path, _| paths.contains(path));
-        self.embeddings.len() != previous_len
+        let removed = self
+            .embeddings
+            .keys()
+            .filter(|path| !paths.contains(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in &removed {
+            self.remove(path);
+        }
+        !removed.is_empty()
     }
 
-    /// Find the `top_k` most similar notes to `query_vec`, sorted by
-    /// descending cosine similarity.
     pub fn query(&self, query_vec: &[f32], top_k: usize) -> Vec<(PathBuf, f32)> {
         let scored = self
             .embeddings
             .iter()
-            .map(|(path, entry)| (path.clone(), cosine_similarity(query_vec, &entry.vector)))
+            .filter_map(|(path, entry)| {
+                entry
+                    .best_chunk(query_vec)
+                    .map(|(_, score)| (path.clone(), score))
+            })
             .collect();
         Self::rank_scores(scored, top_k)
     }
 
+    #[cfg(test)]
     pub(crate) fn query_paths(
         &self,
         query_vec: &[f32],
-        allowed_paths: &HashSet<PathBuf>,
+        allowed: &HashSet<PathBuf>,
         top_k: usize,
     ) -> Vec<(PathBuf, f32)> {
         let scored = self
             .embeddings
             .iter()
-            .filter(|(path, _)| allowed_paths.contains(*path))
-            .map(|(path, entry)| (path.clone(), cosine_similarity(query_vec, &entry.vector)))
+            .filter(|(path, _)| allowed.contains(*path))
+            .filter_map(|(path, entry)| {
+                entry
+                    .best_chunk(query_vec)
+                    .map(|(_, score)| (path.clone(), score))
+            })
             .collect();
         Self::rank_scores(scored, top_k)
     }
 
     fn rank_scores(mut scored: Vec<(PathBuf, f32)>, top_k: usize) -> Vec<(PathBuf, f32)> {
-        let cmp = |a: &(PathBuf, f32), b: &(PathBuf, f32)| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        let cmp = |left: &(PathBuf, f32), right: &(PathBuf, f32)| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
         };
-
+        if top_k == 0 {
+            return Vec::new();
+        }
         if top_k < scored.len() {
             scored.select_nth_unstable_by(top_k, cmp);
             scored.truncate(top_k);
-            scored.sort_unstable_by(cmp);
-        } else {
-            scored.sort_unstable_by(cmp);
         }
+        scored.sort_unstable_by(cmp);
         scored
     }
 
-    /// Serialize the store to a binary cache file.
     pub fn save(&self, path: &Path) -> VaultResult<()> {
-        let bytes = self.encode_cache()?;
-        Self::persist_cache_bytes(path, &bytes, None).map(|_| ())
+        Self::persist_cache_bytes(path, &self.encode_cache()?, None).map(|_| ())
     }
 
     pub(crate) fn encode_cache(&self) -> VaultResult<Vec<u8>> {
-        let identity = self.identity.as_ref().ok_or_else(|| {
-            VaultError::Embedding("embedding store has no vector-space identity".into())
-        })?;
+        let identity = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| cache_error("embedding store has no vector-space identity"))?;
         validate_space_identity(identity)?;
         if identity.dimension != self.dim {
-            return Err(VaultError::Embedding(
-                "embedding store identity has an invalid dimension".into(),
+            return Err(cache_error(
+                "embedding store identity has an invalid dimension",
             ));
         }
-
-        let mut entries = self
-            .embeddings
-            .iter()
-            .map(|(path, entry)| {
-                let path = path.to_str().ok_or_else(|| {
-                    VaultError::Embedding(format!(
-                        "embedding cache path is not valid UTF-8: '{}'",
-                        path.display()
-                    ))
-                })?;
-                validate_cache_path(path)?;
-                validate_vector(&entry.vector, self.dim)?;
-                let content_hash = entry.content_hash.ok_or_else(|| {
-                    VaultError::Embedding(format!(
-                        "embedding cache entry '{path}' has no prepared-text hash"
-                    ))
-                })?;
-                Ok(EmbeddingCacheEntryRef {
-                    path: path.to_string(),
-                    content_hash,
-                    vector: &entry.vector,
-                })
-            })
-            .collect::<VaultResult<Vec<_>>>()?;
-        entries.sort_unstable_by(|left, right| left.path.cmp(&right.path));
-        let data = EmbeddingCacheDataRef {
-            magic: CACHE_MAGIC,
-            schema_version: CACHE_SCHEMA_VERSION,
-            identity,
-            first_pass_complete: self.first_pass_complete,
-            entries,
-        };
-        let bytes = bincode::serde::encode_to_vec(&data, bincode::config::standard())
-            .map_err(|e| VaultError::Embedding(format!("cache serialize error: {e}")))?;
-        if bytes.len() as u64 > MAX_CACHE_BYTES {
-            return Err(VaultError::Embedding(format!(
-                "embedding cache is too large to persist: {} bytes (limit {MAX_CACHE_BYTES})",
-                bytes.len()
-            )));
+        if self.embeddings.len() > MAX_CACHE_ENTRIES || self.total_chunks > MAX_CACHE_ENTRIES {
+            return Err(cache_error(
+                "embedding cache contains too many entries or chunks",
+            ));
         }
-        Ok(bytes)
+        let mut entries = self.embeddings.iter().collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|(left, _)| *left);
+        let mut out = CacheWriter::default();
+        write_header(
+            &mut out,
+            CACHE_MAGIC,
+            CACHE_SCHEMA_VERSION,
+            identity,
+            self.first_pass_complete,
+            entries.len(),
+        )?;
+        for (path, entry) in entries {
+            let path = path
+                .to_str()
+                .ok_or_else(|| cache_error("cache path is not UTF-8"))?;
+            validate_cache_path(path)?;
+            validate_note_entry(entry, self.dim)?;
+            write_entry(&mut out, path, entry)?;
+        }
+        Ok(out.bytes)
     }
 
     pub(crate) fn persist_cache_bytes_if_live(
@@ -363,6 +502,9 @@ impl EmbeddingStore {
         bytes: &[u8],
         live: Option<&AtomicBool>,
     ) -> VaultResult<bool> {
+        if bytes.len() as u64 > MAX_CACHE_BYTES {
+            return Err(cache_error("embedding cache is too large to persist"));
+        }
         if live.is_some_and(|flag| !flag.load(AtomicOrdering::Acquire)) {
             return Ok(false);
         }
@@ -377,15 +519,12 @@ impl EmbeddingStore {
             }
             temp.persist(path)
                 .map_err(|error| VaultError::Io(error.error))?;
-            return Ok(true);
+            Ok(true)
+        } else {
+            Err(cache_error("embedding cache path has no parent"))
         }
-        Err(VaultError::Embedding(format!(
-            "embedding cache path has no parent: {}",
-            path.display()
-        )))
     }
 
-    /// Deserialize a store from a binary cache file.
     pub fn load(path: &Path) -> VaultResult<Self> {
         Self::load_bounded(path, None, MAX_CACHE_ENTRIES)
     }
@@ -398,7 +537,9 @@ impl EmbeddingStore {
         Self::load_bounded(
             path,
             Some(expected),
-            current_note_count.saturating_add(1024),
+            current_note_count
+                .saturating_add(1024)
+                .min(MAX_CACHE_ENTRIES),
         )
     }
 
@@ -407,97 +548,502 @@ impl EmbeddingStore {
         expected: Option<&EmbeddingSpaceIdentity>,
         max_entries: usize,
     ) -> VaultResult<Self> {
-        let metadata = std::fs::metadata(path)?;
-        let expected_dim = expected.map_or(384, |identity| identity.dimension.max(1));
-        let per_entry = MAX_CACHE_PATH_BYTES
-            .saturating_add(expected_dim.saturating_mul(std::mem::size_of::<f32>()))
-            .saturating_add(128);
-        let derived_limit = max_entries
-            .max(1)
-            .saturating_mul(per_entry)
-            .saturating_add(1024 * 1024) as u64;
-        let byte_limit = derived_limit.min(MAX_CACHE_BYTES);
-        if metadata.len() > byte_limit {
-            return Err(VaultError::Embedding(format!(
-                "embedding cache is too large: {} bytes (limit {byte_limit})",
-                metadata.len()
-            )));
+        let file = std::fs::File::open(path)?;
+        let size = file.metadata()?.len();
+        if size > MAX_CACHE_BYTES {
+            return Err(cache_error("embedding cache is too large"));
         }
-
-        let bytes = std::fs::read(path)?;
-        let config = bincode::config::standard().with_limit::<1073741824>();
-        let (data, consumed): (EmbeddingCacheData, usize) =
-            bincode::serde::decode_from_slice(&bytes, config)
-                .map_err(|e| VaultError::Embedding(format!("cache deserialize error: {e}")))?;
-        if consumed != bytes.len() {
-            return Err(VaultError::Embedding(
-                "embedding cache contains trailing bytes".into(),
+        let mut input = CacheReader {
+            reader: std::io::BufReader::new(file).take(MAX_CACHE_BYTES + 1),
+            remaining: size as usize,
+        };
+        if input.array::<8>()? != CACHE_MAGIC {
+            return Err(cache_error(
+                "unsupported legacy embedding cache format or invalid magic",
             ));
         }
-        if data.magic != CACHE_MAGIC {
-            return Err(VaultError::Embedding(
-                "unsupported legacy embedding cache format".into(),
-            ));
-        }
-        if data.schema_version != CACHE_SCHEMA_VERSION {
-            return Err(VaultError::Embedding(format!(
-                "unsupported embedding cache schema version {}",
-                data.schema_version
+        let schema = input.u16()?;
+        if schema != CACHE_SCHEMA_VERSION {
+            return Err(VaultError::EmbeddingCacheIncompatible(format!(
+                "unsupported embedding cache schema version {schema}; rebuilding required"
             )));
         }
-        validate_space_identity(&data.identity)?;
+        let identity_bytes = input.bytes(MAX_NOTE_METADATA_BYTES)?;
+        let identity: EmbeddingSpaceIdentity = serde_json::from_slice(&identity_bytes)
+            .map_err(|error| cache_error(format!("cache identity deserialize error: {error}")))?;
+        validate_space_identity(&identity)?;
         if let Some(expected) = expected
-            && &data.identity != expected
+            && &identity != expected
         {
-            return Err(VaultError::Embedding(
+            return Err(VaultError::EmbeddingCacheIncompatible(
                 "embedding cache vector-space identity mismatch".into(),
             ));
         }
-        if data.entries.len() > max_entries {
-            return Err(VaultError::Embedding(format!(
-                "embedding cache contains too many entries: {} (limit {max_entries})",
-                data.entries.len()
-            )));
-        }
-
-        let dim = data.identity.dimension;
-        let mut embeddings = HashMap::with_capacity(data.entries.len());
-        let mut canonical_paths = HashSet::with_capacity(data.entries.len());
-        for entry in data.entries {
-            let relative = validate_cache_path(&entry.path)?;
-            let canonical = super::path::canonical_unicode_key(&entry.path);
-            if !canonical_paths.insert(canonical) || embeddings.contains_key(&relative) {
-                return Err(VaultError::Embedding(format!(
-                    "embedding cache contains duplicate path '{}'",
-                    entry.path
+        let first_pass_complete = input.flag()?;
+        let count = input.count(max_entries, "entries")?;
+        let mut store = Self::new_with_identity(identity);
+        store.first_pass_complete = first_pass_complete;
+        for _ in 0..count {
+            let path_text = input.string(MAX_CACHE_PATH_BYTES)?;
+            let path = validate_cache_path(&path_text)?;
+            // Canonically equivalent spellings can identify distinct native files.
+            if store.embeddings.contains_key(&path) {
+                return Err(cache_error(format!(
+                    "embedding cache contains duplicate path '{path_text}'"
                 )));
             }
-            validate_vector(&entry.vector, dim)?;
-            embeddings.insert(
-                relative,
-                EmbeddingEntry {
-                    vector: entry.vector,
-                    content_hash: Some(entry.content_hash),
-                },
-            );
+            let entry = read_entry(&mut input, store.dim, store.total_chunks)?;
+            store.insert_note(path, entry)?;
         }
+        if input.remaining != 0 {
+            return Err(cache_error("embedding cache contains trailing bytes"));
+        }
+        let mut trailing = [0; 1];
+        if input.reader.read(&mut trailing)? != 0 {
+            return Err(cache_error("embedding cache contains trailing bytes"));
+        }
+        Ok(store)
+    }
+}
 
-        Ok(Self {
-            embeddings,
-            dim,
-            identity: Some(data.identity),
-            first_pass_complete: data.first_pass_complete,
+fn cache_error(message: impl Into<String>) -> VaultError {
+    VaultError::Embedding(message.into())
+}
+
+fn validate_range(range: &SourceRange, source_bytes: usize) -> VaultResult<()> {
+    if range.start_byte > range.end_byte || range.end_byte > source_bytes {
+        return Err(cache_error(
+            "embedding cache contains an invalid source range",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_note_entry(entry: &NoteEmbeddingEntry, dim: usize) -> VaultResult<()> {
+    if entry.source_revision.len() != 64
+        || !entry
+            .source_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(cache_error(
+            "embedding cache entry has an invalid source revision or prepared-text hash",
+        ));
+    }
+    if entry.source_bytes > MAX_NOTE_SOURCE_BYTES {
+        return Err(cache_error("embedding source exceeds supported byte limit"));
+    }
+    validate_range(&entry.body_range, entry.source_bytes)?;
+    if entry.body_range.end_byte != entry.source_bytes {
+        return Err(cache_error("embedding body range must end at source EOF"));
+    }
+    let metadata_bytes = entry
+        .title
+        .len()
+        .saturating_add(entry.tags.iter().map(String::len).sum::<usize>());
+    if metadata_bytes > MAX_NOTE_METADATA_BYTES || entry.tags.len() > MAX_NOTE_CHUNKS {
+        return Err(cache_error(
+            "embedding note metadata exceeds supported limit",
+        ));
+    }
+    if entry.chunks.is_empty() || entry.chunks.len() > MAX_NOTE_CHUNKS {
+        return Err(cache_error("embedding note has an invalid chunk count"));
+    }
+    if entry.body_range.start_byte == entry.body_range.end_byte
+        && (entry.chunks.len() != 1 || !matches!(entry.chunks[0].scope, EvidenceScope::Note))
+    {
+        return Err(cache_error(
+            "an empty note body requires one whole-note embedding",
+        ));
+    }
+    let mut next_byte = entry.body_range.start_byte;
+    for chunk in &entry.chunks {
+        validate_vector(&chunk.vector, dim)?;
+        validate_range(&chunk.range, entry.source_bytes)?;
+        if chunk.range.start_byte != next_byte
+            || chunk.range.end_byte < chunk.range.start_byte
+            || (chunk.range.start_byte == chunk.range.end_byte
+                && entry.body_range.start_byte != entry.body_range.end_byte)
+        {
+            return Err(cache_error(
+                "embedding chunk ranges do not cover the complete body exactly",
+            ));
+        }
+        next_byte = chunk.range.end_byte;
+        if let Some(overlap) = &chunk.overlap_range {
+            validate_range(overlap, entry.source_bytes)?;
+            if overlap.start_byte < entry.body_range.start_byte
+                || overlap.end_byte > chunk.range.start_byte
+            {
+                return Err(cache_error(
+                    "embedding overlap is outside its preceding source",
+                ));
+            }
+        }
+        if let Some(section) = &chunk.section_range {
+            validate_range(section, entry.source_bytes)?;
+            if section.start_byte > chunk.range.start_byte
+                || section.end_byte < chunk.range.end_byte
+            {
+                return Err(cache_error("embedding chunk is outside its section"));
+            }
+        }
+        let context_bytes = chunk.heading_path.iter().map(String::len).sum::<usize>()
+            + chunk.block_kind.as_ref().map_or(0, String::len);
+        if chunk.heading_path.len() > 6 || context_bytes > MAX_CONTEXT_BYTES {
+            return Err(cache_error(
+                "embedding chunk context exceeds supported limit",
+            ));
+        }
+        if matches!(chunk.scope, EvidenceScope::Note)
+            && (entry.chunks.len() != 1
+                || chunk.range != entry.body_range
+                || !chunk.heading_path.is_empty()
+                || chunk.section_range.is_some())
+        {
+            return Err(cache_error(
+                "whole-note embedding has invalid evidence metadata",
+            ));
+        }
+    }
+    if next_byte != entry.body_range.end_byte {
+        return Err(cache_error("embedding chunks omit body content"));
+    }
+    Ok(())
+}
+
+fn encoded_entry_len(path: &str, entry: &NoteEmbeddingEntry) -> VaultResult<usize> {
+    let mut writer = CacheWriter {
+        bytes: Vec::new(),
+        counting: true,
+        length: 0,
+    };
+    write_entry(&mut writer, path, entry)?;
+    Ok(writer.length)
+}
+
+fn cache_header_len(identity: &EmbeddingSpaceIdentity) -> VaultResult<usize> {
+    let mut writer = CacheWriter {
+        bytes: Vec::new(),
+        counting: true,
+        length: 0,
+    };
+    write_header(
+        &mut writer,
+        CACHE_MAGIC,
+        CACHE_SCHEMA_VERSION,
+        identity,
+        false,
+        0,
+    )?;
+    Ok(writer.length)
+}
+
+#[derive(Default)]
+struct CacheWriter {
+    bytes: Vec<u8>,
+    counting: bool,
+    length: usize,
+}
+impl CacheWriter {
+    fn put(&mut self, bytes: &[u8]) -> VaultResult<()> {
+        let needed = self
+            .length
+            .checked_add(bytes.len())
+            .ok_or_else(|| cache_error("embedding cache size overflow"))?;
+        if needed as u64 > MAX_CACHE_BYTES {
+            return Err(cache_error("embedding cache is too large to persist"));
+        }
+        if !self.counting {
+            if needed > self.bytes.capacity() {
+                let capacity = needed
+                    .max(self.bytes.capacity().saturating_mul(2).max(1024))
+                    .min(MAX_CACHE_BYTES as usize);
+                self.bytes
+                    .try_reserve_exact(capacity - self.bytes.len())
+                    .map_err(|error| {
+                        cache_error(format!("embedding cache allocation failed: {error}"))
+                    })?;
+            }
+            self.bytes.extend_from_slice(bytes);
+        }
+        self.length = needed;
+        Ok(())
+    }
+    fn number(&mut self, value: usize) -> VaultResult<()> {
+        let value = u32::try_from(value)
+            .map_err(|_| cache_error("cache length exceeds supported integer range"))?;
+        self.put(&value.to_le_bytes())
+    }
+    fn string(&mut self, text: &str) -> VaultResult<()> {
+        self.number(text.len())?;
+        self.put(text.as_bytes())
+    }
+    fn range(&mut self, range: &SourceRange) -> VaultResult<()> {
+        self.number(range.start_byte)?;
+        self.number(range.end_byte)
+    }
+    fn optional_range(&mut self, range: Option<&SourceRange>) -> VaultResult<()> {
+        self.put(&[u8::from(range.is_some())])?;
+        if let Some(range) = range {
+            self.range(range)?;
+        }
+        Ok(())
+    }
+}
+
+fn write_header(
+    out: &mut CacheWriter,
+    magic: [u8; 8],
+    schema: u16,
+    identity: &EmbeddingSpaceIdentity,
+    complete: bool,
+    count: usize,
+) -> VaultResult<()> {
+    out.put(&magic)?;
+    out.put(&schema.to_le_bytes())?;
+    let identity = serde_json::to_vec(identity)
+        .map_err(|error| cache_error(format!("cache identity serialization failed: {error}")))?;
+    if identity.len() > MAX_NOTE_METADATA_BYTES {
+        return Err(cache_error(
+            "embedding identity exceeds supported metadata limit",
+        ));
+    }
+    out.number(identity.len())?;
+    out.put(&identity)?;
+    out.put(&[u8::from(complete)])?;
+    out.number(count)
+}
+
+fn write_entry(out: &mut CacheWriter, path: &str, entry: &NoteEmbeddingEntry) -> VaultResult<()> {
+    out.string(path)?;
+    out.string(&entry.source_revision)?;
+    out.number(entry.source_bytes)?;
+    out.range(&entry.body_range)?;
+    out.string(&entry.title)?;
+    out.number(entry.tags.len())?;
+    for tag in &entry.tags {
+        out.string(tag)?;
+    }
+    out.number(entry.chunks.len())?;
+    for chunk in &entry.chunks {
+        out.put(&chunk.input_hash)?;
+        out.put(&[u8::from(matches!(chunk.scope, EvidenceScope::Passage))])?;
+        out.range(&chunk.range)?;
+        out.optional_range(chunk.overlap_range.as_ref())?;
+        out.number(chunk.heading_path.len())?;
+        for heading in &chunk.heading_path {
+            out.string(heading)?;
+        }
+        out.optional_range(chunk.section_range.as_ref())?;
+        out.put(&[u8::from(chunk.block_kind.is_some())])?;
+        if let Some(kind) = &chunk.block_kind {
+            out.string(kind)?;
+        }
+        out.number(chunk.vector.len())?;
+        for value in &chunk.vector {
+            out.put(&value.to_le_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+struct CacheReader<R> {
+    reader: R,
+    remaining: usize,
+}
+impl<R: Read> CacheReader<R> {
+    fn take(&mut self, length: usize) -> VaultResult<Vec<u8>> {
+        if length > self.remaining {
+            return Err(cache_error("cache deserialize error: truncated field"));
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|error| cache_error(format!("cache allocation failed: {error}")))?;
+        bytes.resize(length, 0);
+        self.reader
+            .read_exact(&mut bytes)
+            .map_err(|error| cache_error(format!("cache deserialize error: {error}")))?;
+        self.remaining -= length;
+        Ok(bytes)
+    }
+    fn array<const N: usize>(&mut self) -> VaultResult<[u8; N]> {
+        if N > self.remaining {
+            return Err(cache_error("cache deserialize error: truncated field"));
+        }
+        let mut bytes = [0; N];
+        self.reader
+            .read_exact(&mut bytes)
+            .map_err(|error| cache_error(format!("cache deserialize error: {error}")))?;
+        self.remaining -= N;
+        Ok(bytes)
+    }
+    fn u16(&mut self) -> VaultResult<u16> {
+        Ok(u16::from_le_bytes(self.array()?))
+    }
+    fn number(&mut self) -> VaultResult<usize> {
+        Ok(u32::from_le_bytes(self.array()?) as usize)
+    }
+    fn count(&mut self, maximum: usize, kind: &str) -> VaultResult<usize> {
+        let value = self.number()?;
+        if value > maximum {
+            return Err(cache_error(format!(
+                "embedding cache contains too many {kind}: {value} (limit {maximum})"
+            )));
+        }
+        Ok(value)
+    }
+    fn flag(&mut self) -> VaultResult<bool> {
+        match self.array::<1>()?[0] {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(cache_error("cache deserialize error: invalid flag")),
+        }
+    }
+    fn bytes(&mut self, maximum: usize) -> VaultResult<Vec<u8>> {
+        let length = self.count(maximum, "field bytes")?;
+        self.take(length)
+    }
+    fn string(&mut self, maximum: usize) -> VaultResult<String> {
+        String::from_utf8(self.bytes(maximum)?)
+            .map_err(|error| cache_error(format!("cache field is not UTF-8: {error}")))
+    }
+    fn range(&mut self) -> VaultResult<SourceRange> {
+        Ok(SourceRange {
+            start_byte: self.number()?,
+            end_byte: self.number()?,
         })
+    }
+    fn optional_range(&mut self) -> VaultResult<Option<SourceRange>> {
+        if self.flag()? {
+            self.range().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+fn read_entry<R: Read>(
+    input: &mut CacheReader<R>,
+    dim: usize,
+    stored_chunks: usize,
+) -> VaultResult<NoteEmbeddingEntry> {
+    let source_revision = input.string(64)?;
+    let source_bytes = input.count(MAX_NOTE_SOURCE_BYTES, "source bytes")?;
+    let body_range = input.range()?;
+    let title = input.string(MAX_NOTE_METADATA_BYTES)?;
+    let tag_count = input.count(MAX_NOTE_CHUNKS, "tags")?;
+    let mut metadata_bytes = title.len();
+    let mut tags = Vec::new();
+    for _ in 0..tag_count {
+        let tag = input.string(MAX_NOTE_METADATA_BYTES.saturating_sub(metadata_bytes))?;
+        metadata_bytes += tag.len();
+        tags.push(tag);
+    }
+    let count = input.count(
+        MAX_NOTE_CHUNKS.min(MAX_CACHE_ENTRIES.saturating_sub(stored_chunks)),
+        "chunks",
+    )?;
+    let mut chunks = Vec::new();
+    for _ in 0..count {
+        let input_hash = input.array()?;
+        let scope = if input.flag()? {
+            EvidenceScope::Passage
+        } else {
+            EvidenceScope::Note
+        };
+        let range = input.range()?;
+        let overlap_range = input.optional_range()?;
+        let headings = input.count(6, "ancestor headings")?;
+        let mut heading_path = Vec::new();
+        let mut context_bytes = 0;
+        for _ in 0..headings {
+            let heading = input.string(MAX_CONTEXT_BYTES - context_bytes)?;
+            context_bytes += heading.len();
+            heading_path.push(heading);
+        }
+        let section_range = input.optional_range()?;
+        let block_kind = if input.flag()? {
+            Some(input.string(MAX_CONTEXT_BYTES - context_bytes)?)
+        } else {
+            None
+        };
+        let vector_length = input.number()?;
+        if vector_length != dim {
+            return Err(cache_error(format!(
+                "embedding dimension mismatch: expected {dim}, got {vector_length}"
+            )));
+        }
+        if vector_length.saturating_mul(4) > input.remaining {
+            return Err(cache_error("cache deserialize error: truncated vector"));
+        }
+        let mut vector = Vec::new();
+        vector
+            .try_reserve_exact(vector_length)
+            .map_err(|error| cache_error(format!("cache vector allocation failed: {error}")))?;
+        for _ in 0..vector_length {
+            vector.push(f32::from_le_bytes(input.array()?));
+        }
+        chunks.push(ChunkEmbedding {
+            input_hash,
+            vector,
+            scope,
+            range,
+            overlap_range,
+            heading_path,
+            section_range,
+            block_kind,
+        });
+    }
+    Ok(NoteEmbeddingEntry {
+        source_revision,
+        source_bytes,
+        body_range,
+        title,
+        tags,
+        chunks,
+    })
+}
+
+#[cfg(test)]
+fn fixture_note(path: &Path, hash: [u8; 32], vector: Vec<f32>) -> NoteEmbeddingEntry {
+    NoteEmbeddingEntry {
+        source_revision: hash.iter().map(|byte| format!("{byte:02x}")).collect(),
+        source_bytes: 1,
+        body_range: SourceRange {
+            start_byte: 0,
+            end_byte: 1,
+        },
+        title: path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string(),
+        tags: Vec::new(),
+        chunks: vec![ChunkEmbedding {
+            input_hash: hash,
+            vector,
+            scope: EvidenceScope::Note,
+            range: SourceRange {
+                start_byte: 0,
+                end_byte: 1,
+            },
+            overlap_range: None,
+            heading_path: Vec::new(),
+            section_range: None,
+            block_kind: None,
+        }],
     }
 }
 
 fn validate_space_identity(identity: &EmbeddingSpaceIdentity) -> VaultResult<()> {
-    if identity.dimension == 0 {
+    if identity.dimension == 0 || identity.dimension > MAX_CACHE_DIMENSION {
         return Err(VaultError::Embedding(
-            "embedding cache dimension must be greater than zero".into(),
+            "embedding cache dimension is outside supported bounds".into(),
         ));
     }
-    if identity.model.trim().is_empty() {
+    if identity.model.trim().is_empty() || identity.model.len() > MAX_CACHE_PATH_BYTES {
         return Err(VaultError::Embedding(
             "embedding cache model identity must not be empty".into(),
         ));
@@ -507,6 +1053,13 @@ fn validate_space_identity(identity: &EmbeddingSpaceIdentity) -> VaultResult<()>
             "unsupported embedding input version {}",
             identity.input_version
         )));
+    }
+    if identity.max_input_tokens == 0
+        || identity.chunking_version != embedding_input::CHUNKING_VERSION
+    {
+        return Err(cache_error(
+            "unsupported embedding input capacity or chunking version",
+        ));
     }
     match (identity.backend, identity.endpoint_fingerprint) {
         (EmbeddingBackendKind::Local, None) | (EmbeddingBackendKind::Api, Some(_)) => Ok(()),
@@ -571,6 +1124,9 @@ fn short_fingerprint(fingerprint: &[u8; 32]) -> String {
 }
 
 // ── EmbeddingBackend ───────────────────────────────────────────────────
+
+#[cfg(feature = "embeddings")]
+const LOCAL_MAX_REQUEST_INPUTS: usize = 32;
 
 enum EmbeddingBackend {
     #[cfg(feature = "embeddings")]
@@ -695,6 +1251,10 @@ pub struct EmbeddingModel {
     backend: EmbeddingBackend,
     dim: usize,
     identity: EmbeddingSpaceIdentity,
+    input_policy: EmbeddingInputPolicy,
+    request_limits: EmbeddingRequestLimits,
+    counter: TokenCounter,
+    request_overhead: usize,
 }
 
 impl EmbeddingModel {
@@ -735,17 +1295,41 @@ impl EmbeddingModel {
 
         tokio::task::spawn_blocking(move || {
             let (model_enum, canonical_model, dim) = resolve_local_model(&model_name)?;
-            let identity = EmbeddingSpaceIdentity::local(canonical_model, dim);
-
             let options = fastembed::InitOptions::new(model_enum).with_show_download_progress(true);
 
-            let inner = fastembed::TextEmbedding::try_new(options)
+            let mut inner = fastembed::TextEmbedding::try_new(options)
                 .map_err(|e| VaultError::Embedding(format!("model load failed: {e}")))?;
+            let max_input_tokens = inner
+                .tokenizer
+                .get_truncation()
+                .map(|params| params.max_length)
+                .ok_or_else(|| {
+                    VaultError::EmbeddingConfiguration(
+                        "local embedding tokenizer has no verified input capacity".into(),
+                    )
+                })?;
+            let (counter, tokenizer_fingerprint) =
+                TokenCounter::hugging_face(inner.tokenizer.clone(), true)?;
+            inner.tokenizer.with_truncation(None).map_err(|error| {
+                VaultError::EmbeddingConfiguration(format!(
+                    "cannot disable inference truncation: {error}"
+                ))
+            })?;
+            let input_policy = EmbeddingInputPolicy {
+                max_input_tokens,
+                tokenizer_fingerprint,
+            };
+            let identity = EmbeddingSpaceIdentity::local(canonical_model, dim, &input_policy);
+            let request_limits = local_request_limits(max_input_tokens)?;
 
             Ok(Self {
                 backend: EmbeddingBackend::Local(Box::new(std::sync::Mutex::new(inner))),
                 dim,
                 identity,
+                input_policy,
+                request_limits,
+                counter,
+                request_overhead: 2,
             })
         })
         .await
@@ -779,11 +1363,28 @@ impl EmbeddingModel {
                 )?,
             );
 
-            let base_url = read_env_with_fallback("OBSIDIAN_EMBEDDING_API_BASE", "OPENAI_BASE_URL")
-                .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+            let base_url = embedding_input::normalize_api_base(
+                &read_env_with_fallback("OBSIDIAN_EMBEDDING_API_BASE", "OPENAI_BASE_URL")
+                    .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
+            )?;
 
             let model = read_env_with_fallback("OBSIDIAN_EMBEDDING_API_MODEL", "OPENAI_MODEL")
                 .unwrap_or(model_name);
+            let contract = embedding_input::ApiInputContract::from_env(&base_url, &model)?;
+            let request_overhead = serde_json::to_vec(
+                &serde_json::json!({"model":model,"input":[],"encoding_format":"float"}),
+            )
+            .map_err(|error| {
+                VaultError::Embedding(format!("cannot encode embedding request: {error}"))
+            })?
+            .len();
+            embedding_input::validate_batch(
+                &["dim"],
+                &contract.policy,
+                contract.limits,
+                request_overhead,
+                |text| contract.counter.count(text),
+            )?;
 
             let client = build_api_client(timeout)?;
             let api_client =
@@ -804,7 +1405,8 @@ impl EmbeddingModel {
                     probe_api_dimension(&api_client)?
                 }
             };
-            let identity = EmbeddingSpaceIdentity::api(model.clone(), &base_url, dim);
+            let identity =
+                EmbeddingSpaceIdentity::api(model.clone(), &base_url, dim, &contract.policy);
             let endpoint = identity
                 .endpoint_fingerprint
                 .as_ref()
@@ -822,6 +1424,10 @@ impl EmbeddingModel {
                 backend: EmbeddingBackend::Api(api_client),
                 dim,
                 identity,
+                input_policy: contract.policy,
+                request_limits: contract.limits,
+                counter: contract.counter,
+                request_overhead,
             })
         })
         .await
@@ -845,7 +1451,39 @@ impl Embedder for EmbeddingModel {
         &self.identity
     }
 
+    fn input_policy(&self) -> &EmbeddingInputPolicy {
+        &self.input_policy
+    }
+
+    fn count_tokens(&self, text: &str) -> VaultResult<usize> {
+        self.counter.count(text)
+    }
+
+    fn request_limits(&self) -> EmbeddingRequestLimits {
+        self.request_limits
+    }
+
+    fn plan_batch(&self, texts: &[&str]) -> VaultResult<usize> {
+        embedding_input::plan_batch(
+            texts,
+            &self.input_policy,
+            self.request_limits,
+            self.request_overhead,
+            |text| self.counter.count(text),
+        )
+    }
+
     fn embed_batch(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        embedding_input::validate_batch(
+            texts,
+            &self.input_policy,
+            self.request_limits,
+            self.request_overhead,
+            |text| self.counter.count(text),
+        )?;
         let vectors = match &self.backend {
             #[cfg(feature = "embeddings")]
             EmbeddingBackend::Local(inner) => {
@@ -853,7 +1491,7 @@ impl Embedder for EmbeddingModel {
                     .lock()
                     .map_err(|e| VaultError::Embedding(format!("model lock poisoned: {e}")))?;
                 model
-                    .embed(texts, Some(64))
+                    .embed(texts, Some(LOCAL_MAX_REQUEST_INPUTS))
                     .map_err(|e| VaultError::Embedding(format!("embed failed: {e}")))?
             }
             #[cfg(feature = "embeddings-api")]
@@ -861,6 +1499,20 @@ impl Embedder for EmbeddingModel {
         };
         validate_embedding_batch(vectors, texts.len(), self.dim)
     }
+}
+
+#[cfg(feature = "embeddings")]
+fn local_request_limits(max_input_tokens: usize) -> VaultResult<EmbeddingRequestLimits> {
+    let max_total_tokens = max_input_tokens
+        .checked_mul(LOCAL_MAX_REQUEST_INPUTS)
+        .ok_or_else(|| {
+            VaultError::EmbeddingConfiguration("local embedding batch capacity overflow".into())
+        })?;
+    Ok(EmbeddingRequestLimits {
+        max_inputs: LOCAL_MAX_REQUEST_INPUTS,
+        max_total_tokens,
+        max_request_bytes: embedding_input::MAX_EMBEDDING_REQUEST_BYTES,
+    })
 }
 
 #[cfg(feature = "embeddings")]
@@ -991,59 +1643,37 @@ fn embed_batch_api(
         "encoding_format": "float",
     });
 
-    const MAX_RETRIES: u8 = 3;
-    let mut attempt = 0u8;
-    loop {
-        let response = client
-            .post(&url)
-            .header("Authorization", format!("Bearer {api_key}"))
-            .json(&body)
-            .send()
-            .map_err(|error| {
-                let detail = if error.is_timeout() {
-                    "request timed out"
-                } else if error.is_connect() {
-                    "connection failed"
-                } else if error.is_builder() {
-                    "request could not be constructed"
-                } else {
-                    "request failed"
-                };
-                VaultError::Embedding(format!("embedding API {detail}"))
-            })?;
-
-        let status = response.status();
-        if status.as_u16() == 429 && attempt < MAX_RETRIES {
-            let wait = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(1u64 << attempt)
-                .min(30);
-            attempt += 1;
-            tracing::warn!(
-                retry_after_secs = wait,
-                attempt = attempt,
-                max_retries = MAX_RETRIES,
-                "embedding API rate limited (attempt {attempt}/{MAX_RETRIES})"
-            );
-            std::thread::sleep(std::time::Duration::from_secs(wait));
-            continue;
-        }
-
-        if !status.is_success() {
-            return Err(VaultError::Embedding(format!(
-                "embedding API returned HTTP status {status}"
-            )));
-        }
-
-        let resp: serde_json::Value = response.json().map_err(|_| {
-            VaultError::Embedding("embedding API returned invalid JSON".to_string())
+    let response = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .json(&body)
+        .send()
+        .map_err(|error| {
+            let detail = if error.is_timeout() {
+                "request timed out"
+            } else if error.is_connect() {
+                "connection failed"
+            } else if error.is_builder() {
+                "request could not be constructed"
+            } else {
+                "request failed"
+            };
+            VaultError::EmbeddingRequest {
+                message: format!("embedding API {detail}"),
+                retryable: !error.is_builder(),
+            }
         })?;
-
-        return parse_embedding_response(&resp, texts.len());
+    let status = response.status();
+    if !status.is_success() {
+        return Err(VaultError::EmbeddingRequest {
+            message: format!("embedding API returned HTTP status {status}"),
+            retryable: status.as_u16() == 429 || status.is_server_error(),
+        });
     }
+    let resp: serde_json::Value = response
+        .json()
+        .map_err(|_| VaultError::Embedding("embedding API returned invalid JSON".to_string()))?;
+    parse_embedding_response(&resp, texts.len())
 }
 
 /// Parse an OpenAI-compatible embedding API response into embedding vectors.
@@ -1160,9 +1790,7 @@ fn parse_usize_env(var_name: &str) -> Option<usize> {
     std::env::var(var_name).ok()?.trim().parse::<usize>().ok()
 }
 
-// ── Text preparation ───────────────────────────────────────────────────
-
-const MAX_BODY_WORDS: usize = 400;
+// ── Legacy cache relocation ────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LegacyCacheMigration {
@@ -1242,26 +1870,6 @@ pub(crate) fn migrate_cache_candidates_to_path(
     }
 }
 
-/// Prepare text for embedding from note components.
-///
-/// Format: `"{title}\n{headings joined with " | "}\n{body truncated to 400 words}"`.
-/// The body should already have frontmatter stripped.
-pub fn prepare_embed_text(title: &str, headings: &[String], body: &str) -> String {
-    let headings_line = headings.join(" | ");
-
-    let truncated_body: String = body
-        .split_whitespace()
-        .take(MAX_BODY_WORDS)
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    if headings_line.is_empty() {
-        format!("{title}\n{truncated_body}")
-    } else {
-        format!("{title}\n{headings_line}\n{truncated_body}")
-    }
-}
-
 // ── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1319,6 +1927,9 @@ mod tests {
             endpoint_fingerprint: None,
             dimension: dim,
             input_version: EMBEDDING_INPUT_VERSION,
+            tokenizer_fingerprint: [0; 32],
+            max_input_tokens: 512,
+            chunking_version: embedding_input::CHUNKING_VERSION,
         }
     }
 
@@ -1350,8 +1961,25 @@ mod tests {
     }
 
     fn write_cache_data(path: &Path, data: &EmbeddingCacheData) {
-        let bytes = bincode::serde::encode_to_vec(data, bincode::config::standard()).unwrap();
-        std::fs::write(path, bytes).unwrap();
+        let mut writer = CacheWriter::default();
+        write_header(
+            &mut writer,
+            data.magic,
+            data.schema_version,
+            &data.identity,
+            data.first_pass_complete,
+            data.entries.len(),
+        )
+        .unwrap();
+        for entry in &data.entries {
+            let note = fixture_note(
+                Path::new(&entry.path),
+                entry.content_hash,
+                entry.vector.clone(),
+            );
+            write_entry(&mut writer, &entry.path, &note).unwrap();
+        }
+        std::fs::write(path, writer.bytes).unwrap();
     }
 
     fn single_entry_cache(
@@ -1611,11 +2239,8 @@ mod tests {
             .unwrap();
         assert!(error.to_string().contains("too many entries"));
 
-        let per_entry =
-            MAX_CACHE_PATH_BYTES + identity.dimension * std::mem::size_of::<f32>() + 128;
-        let derived_limit = 1024usize * per_entry + 1024 * 1024;
         let file = std::fs::File::create(&cache_path).unwrap();
-        file.set_len((derived_limit + 1) as u64).unwrap();
+        file.set_len(MAX_CACHE_BYTES + 1).unwrap();
         let error = EmbeddingStore::load_for_space(&cache_path, &identity, 0)
             .err()
             .unwrap();
@@ -1738,12 +2363,24 @@ mod tests {
         let mut input = test_identity(3);
         input.input_version += 1;
         mismatches.push(input);
+        let mut tokenizer = test_identity(3);
+        tokenizer.tokenizer_fingerprint = [1; 32];
+        mismatches.push(tokenizer);
+        let mut capacity = test_identity(3);
+        capacity.max_input_tokens += 1;
+        mismatches.push(capacity);
+        let mut partition = test_identity(3);
+        partition.chunking_version += 1;
+        mismatches.push(partition);
         mismatches.push(EmbeddingSpaceIdentity {
             backend: EmbeddingBackendKind::Api,
             model: "test-model".to_string(),
             endpoint_fingerprint: Some([1; 32]),
             dimension: 3,
             input_version: EMBEDDING_INPUT_VERSION,
+            tokenizer_fingerprint: [0; 32],
+            max_input_tokens: 512,
+            chunking_version: embedding_input::CHUNKING_VERSION,
         });
 
         for expected in mismatches {
@@ -1755,7 +2392,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_rejects_duplicate_normalized_paths() {
+    fn cache_rejects_duplicate_exact_normalized_paths() {
         let dir = tempfile::tempdir().unwrap();
         let cache_path = dir.path().join("embeddings.bin");
         let data = EmbeddingCacheData {
@@ -1765,22 +2402,64 @@ mod tests {
             first_pass_complete: true,
             entries: vec![
                 EmbeddingCacheEntry {
-                    path: "Cafe\u{301}.md".to_string(),
+                    path: "note.md".to_string(),
                     content_hash: prepared_text_hash("one"),
                     vector: vec![1.0, 0.0, 0.0],
                 },
                 EmbeddingCacheEntry {
-                    path: "Caf\u{e9}.md".to_string(),
+                    path: "note.md".to_string(),
                     content_hash: prepared_text_hash("two"),
                     vector: vec![0.0, 1.0, 0.0],
                 },
             ],
         };
-        let bytes = bincode::serde::encode_to_vec(&data, bincode::config::standard()).unwrap();
-        std::fs::write(&cache_path, bytes).unwrap();
+        write_cache_data(&cache_path, &data);
 
         let error = EmbeddingStore::load(&cache_path).err().unwrap();
         assert!(error.to_string().contains("duplicate path"));
+    }
+
+    #[test]
+    fn admitted_native_unicode_spellings_round_trip_as_distinct_notes() {
+        let decomposed = PathBuf::from("Cafe\u{301}.md");
+        let composed = PathBuf::from("Caf\u{e9}.md");
+        assert_ne!(decomposed, composed);
+        let first_hash = prepared_text_hash("1");
+        let second_hash = prepared_text_hash("2");
+        let mut store = EmbeddingStore::new_with_identity(test_identity(3));
+        store
+            .insert_note(
+                decomposed.clone(),
+                fixture_note(&decomposed, first_hash, vec![1.0, 0.0, 0.0]),
+            )
+            .unwrap();
+        store
+            .insert_note(
+                composed.clone(),
+                fixture_note(&composed, second_hash, vec![0.0, 1.0, 0.0]),
+            )
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.bin");
+        store.save(&path).unwrap();
+
+        let loaded = EmbeddingStore::load_for_space(&path, &test_identity(3), 2).unwrap();
+        assert_eq!(loaded.len(), 2);
+        let first = loaded.note(&decomposed).unwrap();
+        let second = loaded.note(&composed).unwrap();
+        assert_eq!(
+            first.source_revision,
+            crate::vault::source::source_revision("1")
+        );
+        assert_eq!(
+            second.source_revision,
+            crate::vault::source::source_revision("2")
+        );
+        assert_ne!(first.source_revision, second.source_revision);
+        assert_eq!(first.chunks[0].vector, [1.0, 0.0, 0.0]);
+        assert_eq!(second.chunks[0].vector, [0.0, 1.0, 0.0]);
+        assert_eq!(loaded.query(&[1.0, 0.0, 0.0], 1)[0].0, decomposed);
+        assert_eq!(loaded.query(&[0.0, 1.0, 0.0], 1)[0].0, composed);
     }
 
     #[test]
@@ -1798,48 +2477,186 @@ mod tests {
                 vector: vec![1.0, f32::NAN, 0.0],
             }],
         };
-        let bytes = bincode::serde::encode_to_vec(&data, bincode::config::standard()).unwrap();
-        std::fs::write(&cache_path, bytes).unwrap();
+        write_cache_data(&cache_path, &data);
 
         let error = EmbeddingStore::load(&cache_path).err().unwrap();
         assert!(error.to_string().contains("non-finite"));
     }
 
-    // ── prepare_embed_text ─────────────────────────────────────────
-
     #[test]
-    fn prepare_embed_text_truncates_body() {
-        let long_body: String = (0..600)
-            .map(|i| format!("word{i}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let result = prepare_embed_text("Title", &[], &long_body);
+    fn cosine_similarity_large_finite_vectors_remains_finite() {
+        let vector = [f32::MAX, f32::MAX / 2.0, -f32::MAX];
+        assert_eq!(cosine_similarity(&vector, &vector), 1.0);
+        let opposite = vector.map(|value| -value);
+        assert_eq!(cosine_similarity(&vector, &opposite), -1.0);
+    }
 
-        let word_count = result.lines().last().unwrap().split_whitespace().count();
-        assert_eq!(word_count, MAX_BODY_WORDS);
+    fn passage_note() -> NoteEmbeddingEntry {
+        let mut entry = fixture_note(
+            Path::new("long.md"),
+            prepared_text_hash("revision"),
+            vec![1.0, 0.0, 0.0],
+        );
+        entry.source_bytes = 10;
+        entry.body_range = SourceRange {
+            start_byte: 2,
+            end_byte: 10,
+        };
+        let first = &mut entry.chunks[0];
+        first.scope = EvidenceScope::Passage;
+        first.range = SourceRange {
+            start_byte: 2,
+            end_byte: 6,
+        };
+        first.heading_path = vec!["First".into()];
+        first.section_range = Some(first.range);
+        entry.chunks.push(ChunkEmbedding {
+            input_hash: prepared_text_hash("second"),
+            vector: vec![0.0, 1.0, 0.0],
+            scope: EvidenceScope::Passage,
+            range: SourceRange {
+                start_byte: 6,
+                end_byte: 10,
+            },
+            overlap_range: None,
+            heading_path: vec!["Second".into()],
+            section_range: Some(SourceRange {
+                start_byte: 6,
+                end_byte: 10,
+            }),
+            block_kind: Some("code".into()),
+        });
+        entry
     }
 
     #[test]
-    fn prepare_embed_text_joins_headings() {
-        let headings = vec!["Introduction".to_string(), "Summary".to_string()];
-        let result = prepare_embed_text("My Note", &headings, "Some body text.");
-
-        assert!(result.starts_with("My Note\n"));
-        assert!(result.contains("Introduction | Summary"));
-        assert!(result.ends_with("Some body text."));
+    fn complete_chunk_sets_round_trip_and_rank_once_per_note() {
+        let mut store = EmbeddingStore::new_with_identity(test_identity(3));
+        store.insert_note("long.md".into(), passage_note()).unwrap();
+        store
+            .insert_note(
+                "short.md".into(),
+                fixture_note(
+                    Path::new("short.md"),
+                    prepared_text_hash("short"),
+                    vec![0.2, 0.8, 0.0],
+                ),
+            )
+            .unwrap();
+        assert_eq!(store.query(&[0.0, 1.0, 0.0], 2)[0].0, Path::new("long.md"));
+        assert_eq!(store.query(&[0.0, 1.0, 0.0], 2).len(), 2);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.bin");
+        store.save(&path).unwrap();
+        let loaded = EmbeddingStore::load_for_space(&path, &test_identity(3), 2).unwrap();
+        let note = loaded.note(Path::new("long.md")).unwrap();
+        assert_eq!(note.body_range.start_byte, 2);
+        assert_eq!(note.chunks.len(), 2);
+        assert_eq!(note.chunks[1].block_kind.as_deref(), Some("code"));
+        assert_eq!(note.best_chunk(&[0.0, 1.0, 0.0]), Some((1, 1.0)));
     }
 
     #[test]
-    fn prepare_embed_text_no_headings() {
-        let result = prepare_embed_text("Title", &[], "Body here.");
-        assert_eq!(result, "Title\nBody here.");
+    fn captured_entries_survive_complete_generation_replacement() {
+        let mut store = EmbeddingStore::new_with_identity(test_identity(3));
+        store.insert_note("long.md".into(), passage_note()).unwrap();
+        let captured = store.capture_entries(&HashSet::from([PathBuf::from("long.md")]));
+        let old_revision = captured[Path::new("long.md")].source_revision.clone();
+        let mut replacement = passage_note();
+        replacement.source_revision = "a".repeat(64);
+        replacement.chunks[1].vector = vec![0.0, 0.0, 1.0];
+        store.insert_note("long.md".into(), replacement).unwrap();
+        store.remove(Path::new("long.md"));
+        assert_eq!(captured[Path::new("long.md")].source_revision, old_revision);
+        assert_eq!(
+            captured[Path::new("long.md")].best_chunk(&[0.0, 1.0, 0.0]),
+            Some((1, 1.0))
+        );
     }
 
     #[test]
-    fn prepare_embed_text_short_body_unchanged() {
-        let body = "Short body with a few words.";
-        let result = prepare_embed_text("T", &[], body);
-        assert!(result.contains(body));
+    fn invalid_replacement_cannot_publish_a_partial_chunk_set() {
+        let mut store = EmbeddingStore::new_with_identity(test_identity(3));
+        store.insert_note("long.md".into(), passage_note()).unwrap();
+        let mut invalid = passage_note();
+        invalid.chunks[1].range.start_byte += 1;
+        assert!(store.insert_note("long.md".into(), invalid).is_err());
+        assert_eq!(
+            store.note(Path::new("long.md")).unwrap().chunks[1]
+                .range
+                .start_byte,
+            6
+        );
+        let mut invalid = passage_note();
+        invalid.chunks[1].vector[1] = f32::NAN;
+        assert!(store.insert_note("long.md".into(), invalid).is_err());
+        assert_eq!(
+            store
+                .note(Path::new("long.md"))
+                .unwrap()
+                .best_chunk(&[0.0, 1.0, 0.0]),
+            Some((1, 1.0))
+        );
+    }
+
+    #[test]
+    fn cache_rejects_legacy_schema_before_reading_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.bin");
+        let mut bytes = CACHE_MAGIC.to_vec();
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            EmbeddingStore::load(&path),
+            Err(VaultError::EmbeddingCacheIncompatible(_))
+        ));
+    }
+
+    #[test]
+    fn cache_rejects_huge_nested_chunk_count_before_vector_allocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.bin");
+        let entry = passage_note();
+        let mut writer = CacheWriter::default();
+        write_header(
+            &mut writer,
+            CACHE_MAGIC,
+            CACHE_SCHEMA_VERSION,
+            &test_identity(3),
+            false,
+            1,
+        )
+        .unwrap();
+        writer.string("long.md").unwrap();
+        writer.string(&entry.source_revision).unwrap();
+        writer.number(entry.source_bytes).unwrap();
+        writer.range(&entry.body_range).unwrap();
+        writer.string(&entry.title).unwrap();
+        writer.number(0).unwrap();
+        writer.number(u32::MAX as usize).unwrap();
+        std::fs::write(&path, writer.bytes).unwrap();
+        let error = EmbeddingStore::load(&path).err().unwrap();
+        assert!(error.to_string().contains("too many chunks"));
+    }
+
+    #[test]
+    fn tied_chunk_and_note_scores_use_source_and_path_order() {
+        let mut store = EmbeddingStore::new_with_identity(test_identity(3));
+        let mut entry = passage_note();
+        entry.chunks[1].vector = entry.chunks[0].vector.clone();
+        store.insert_note("z.md".into(), entry.clone()).unwrap();
+        store.insert_note("a.md".into(), entry).unwrap();
+        let hits = store.query(&[1.0, 0.0, 0.0], 1);
+        assert_eq!(hits[0].0, Path::new("a.md"));
+        assert_eq!(
+            store
+                .note(Path::new("a.md"))
+                .unwrap()
+                .best_chunk(&[1.0, 0.0, 0.0]),
+            Some((0, 1.0))
+        );
+        assert!(store.query(&[1.0, 0.0, 0.0], 0).is_empty());
     }
 
     #[test]
@@ -2059,6 +2876,26 @@ mod tests {
 
     #[cfg(feature = "embeddings")]
     #[test]
+    fn local_requests_bound_chunk_multiplication_independently_of_note_batches() {
+        let policy = EmbeddingInputPolicy {
+            max_input_tokens: 512,
+            tokenizer_fingerprint: [1; 32],
+        };
+        let limits = local_request_limits(policy.max_input_tokens).unwrap();
+        let texts = vec!["prepared chunk"; 56];
+        let accepted =
+            embedding_input::plan_batch(&texts, &policy, limits, 2, |_| Ok(512)).unwrap();
+        assert_eq!(accepted, 32);
+        assert_eq!(limits.max_total_tokens, 16_384);
+        assert!(embedding_input::validate_batch(&texts, &policy, limits, 2, |_| Ok(512)).is_err());
+        assert!(
+            embedding_input::validate_batch(&texts[..accepted], &policy, limits, 2, |_| Ok(512))
+                .is_ok()
+        );
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
     fn local_model_enum_and_repository_alias_have_one_canonical_identity() {
         let (enum_model, enum_identity, enum_dim) = resolve_local_model("BGESmallENV15").unwrap();
         let (repo_model, repo_identity, repo_dim) =
@@ -2260,16 +3097,17 @@ mod tests {
         #[test]
         fn api_cache_identity_uses_endpoint_fingerprint_not_plaintext_url() {
             let endpoint = "https://embedding-user:secret@example.invalid/v1/private";
-            let identity = EmbeddingSpaceIdentity::api("test-model".to_string(), endpoint, 3);
-            let mut store = EmbeddingStore::new_with_identity(identity);
-            store
-                .insert_hashed(
-                    PathBuf::from("one.md"),
-                    prepared_text_hash("one"),
-                    vec![1.0, 0.0, 0.0],
-                )
-                .unwrap();
-            let bytes = store.encode_cache().unwrap();
+            let identity = EmbeddingSpaceIdentity::api(
+                "test-model".to_string(),
+                endpoint,
+                3,
+                &EmbeddingInputPolicy {
+                    max_input_tokens: 512,
+                    tokenizer_fingerprint: [1; 32],
+                },
+            );
+            let bytes =
+                bincode::serde::encode_to_vec(&identity, bincode::config::standard()).unwrap();
 
             assert!(
                 !bytes
@@ -2342,6 +3180,42 @@ mod tests {
             assert!(!error.contains("api-secret"));
             assert!(!error.contains("sensitive note body"));
             server.join().unwrap();
+        }
+
+        #[test]
+        fn api_status_classification_leaves_retry_to_the_coordinator() {
+            use std::io::Write as _;
+            for (status, retryable) in [(400, false), (401, false), (429, true), (503, true)] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = std::thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    crate::test_helpers::read_http_request_headers(&mut stream);
+                    serde_json::Deserializer::from_reader(&mut stream)
+                        .into_iter::<serde_json::Value>()
+                        .next()
+                        .unwrap()
+                        .unwrap();
+                    let response = format!(
+                        "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    stream.write_all(response.as_bytes()).unwrap();
+                });
+                let client = build_api_client(std::time::Duration::from_secs(2)).unwrap();
+                let error = embed_batch_api(
+                    &client,
+                    &format!("http://{address}/v1"),
+                    "test",
+                    "synthetic-key",
+                    &["text"],
+                )
+                .unwrap_err();
+                assert!(
+                    matches!(&error, VaultError::EmbeddingRequest {retryable:actual,..} if *actual==retryable)
+                );
+                assert!(error.to_string().contains(&format!("HTTP status {status}")));
+                server.join().unwrap();
+            }
         }
 
         #[test]

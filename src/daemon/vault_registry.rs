@@ -211,12 +211,34 @@ mod tests {
                     endpoint_fingerprint: None,
                     dimension: 3,
                     input_version: EMBEDDING_INPUT_VERSION,
+                    tokenizer_fingerprint: [1; 32],
+                    max_input_tokens: 8192,
+                    chunking_version: crate::vault::embedding_input::CHUNKING_VERSION,
                 },
             }
         }
     }
 
     impl Embedder for FakeEmbedder {
+        fn input_policy(&self) -> &crate::vault::embedding_input::EmbeddingInputPolicy {
+            &crate::vault::embedding_input::EmbeddingInputPolicy {
+                max_input_tokens: 8192,
+                tokenizer_fingerprint: [1; 32],
+            }
+        }
+
+        fn count_tokens(&self, text: &str) -> VaultResult<usize> {
+            Ok(text.chars().count())
+        }
+
+        fn request_limits(&self) -> crate::vault::embedding_input::EmbeddingRequestLimits {
+            crate::vault::embedding_input::EmbeddingRequestLimits {
+                max_inputs: 64,
+                max_total_tokens: 8192 * 64,
+                max_request_bytes: 16 * 1024 * 1024,
+            }
+        }
+
         fn dimension(&self) -> usize {
             self.identity.dimension
         }
@@ -387,7 +409,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_tracks_ready_and_direct_queries_omit_missing_files() {
+    async fn ensure_tracks_ready_and_reports_unavailable_deleted_source() {
         let dir = tempfile::tempdir().unwrap();
         let vault_root = dir.path().join("vault");
         create_vault(&vault_root);
@@ -431,10 +453,17 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            result.results.is_empty(),
-            "a stale vector must not produce a ghost hit for a missing note"
+        assert_eq!(result.results.len(), 1);
+        let hit = &result.results[0];
+        assert_eq!(hit.path, "note.md");
+        assert_eq!(hit.source_status, crate::models::SourceStatus::Unavailable);
+        assert_eq!(
+            hit.context_error.as_ref().unwrap().code,
+            "source_unavailable"
         );
+        assert!(hit.snippet.is_none());
+        assert!(hit.content.is_none());
+        assert!(hit.preview.is_none());
     }
 
     #[tokio::test]
