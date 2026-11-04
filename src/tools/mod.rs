@@ -104,16 +104,21 @@ impl PendingDaemonBootstrap {
     }
 
     async fn resolve(&self) -> crate::error::VaultResult<&SemanticDaemonClient> {
-        self.client
+        let client = self
+            .client
             .get_or_try_init(|| async {
                 let initialized = self.bootstrap.lock().await.resume().await?;
-                let client = SemanticDaemonClient::new(initialized.endpoint, self.policy);
-                client
-                    .health("obsidian-mcp", env!("CARGO_PKG_VERSION"))
-                    .await?;
-                Ok(client)
+                Ok::<_, VaultError>(SemanticDaemonClient::with_health(
+                    initialized.endpoint,
+                    self.policy,
+                    initialized.health,
+                ))
             })
-            .await
+            .await?;
+        // Bootstrap completion and semantic support have different lifetimes.
+        // Keep the inspected owner so health can recover without bootstrapping again.
+        client.require_source_evidence().await?;
+        Ok(client)
     }
 }
 
@@ -144,15 +149,13 @@ impl SemanticRuntime {
 
     /// Retry a deferred startup handshake before using the resolved daemon.
     pub async fn ensure_daemon_health(&self) -> crate::error::VaultResult<()> {
-        if self.daemon_health_pending.load(Ordering::Acquire) {
-            let client = self.resolved_daemon_client().ok_or_else(|| {
-                VaultError::DaemonUnavailable("semantic daemon client is not initialized".into())
-            })?;
-            client
-                .health("obsidian-mcp", env!("CARGO_PKG_VERSION"))
-                .await?;
-            self.daemon_health_pending.store(false, Ordering::Release);
-        }
+        let client = self.resolved_daemon_client().ok_or_else(|| {
+            VaultError::DaemonUnavailable("semantic daemon client is not initialized".into())
+        })?;
+        // The shared client either reuses finalized bootstrap health or completes
+        // one deferred handshake. Capability failures retain their typed cause.
+        client.require_source_evidence().await?;
+        self.daemon_health_pending.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -245,14 +248,14 @@ impl ObsidianMcp {
     #[tool(
         name = "note_read",
         annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
-        output_schema = schema_for_output::<output::TextOutput>(),
-        description = "Read the full content of a note. Returns the raw markdown including frontmatter."
+        output_schema = schema_for_output::<notes::NoteReadOutput>(),
+        description = "Read raw note Markdown. With only path, returns the complete note. Optional expected_revision, range and max_bytes support revision-checked UTF-8 context pages."
     )]
     async fn note_read(
         &self,
         Parameters(params): Parameters<notes::NoteReadParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        output::content(notes::note_read(&self.vault, params).await?)
+        notes::note_read(&self.vault, params).await
     }
 
     #[tool(
@@ -397,7 +400,7 @@ impl ObsidianMcp {
         name = "search_semantic",
         annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = true),
         output_schema = schema_for_output::<output::Results<Vec<search::SemanticSearchResult>>>(),
-        description = "Semantic search using daemon-backed runtime (preferred) with local compatibility fallback based on OBSIDIAN_SEMANTIC_MODE. Finds conceptually related notes without requiring exact keyword matches."
+        description = "Find conceptually related notes without requiring exact keyword matches. Results identify whole-note or passage evidence and its source_revision. A passage or preview can omit distant conditions: expand with note_read using expected_revision and the evidence range or section_range, or inspect other headings with note_inspect fields=[\"headings\"]. include_content=true returns complete raw notes when their indexed revision is current."
     )]
     async fn search_semantic(
         &self,

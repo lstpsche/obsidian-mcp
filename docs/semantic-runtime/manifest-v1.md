@@ -93,7 +93,7 @@ This prevents races where multiple clients attempt install/start simultaneously.
 - A healthy `sibling` or `managed_download` daemon may be shut down and restarted from the verified package sibling.
 - The daemon flushes its `shutdown` response before terminating its IPC listener.
 - `path`, `override`, and unresolved legacy ownership remain external and are not stopped or replaced.
-- Normal bootstrap completes an interrupted activation when a locally owned running daemon is older than the installed sibling; it never downgrades a newer daemon.
+- Normal bootstrap completes an interrupted activation when a locally owned running daemon is older than the installed sibling. For equal versions, a missing required capability permits activation only after the sibling advertises support through `--__build-info`; an unsupported sibling is left intact rather than restarted repeatedly. A newer running daemon is never downgraded.
 - Semantic home, model selection, cache directories, and vault data are preserved.
 
 ## Manifest Authority

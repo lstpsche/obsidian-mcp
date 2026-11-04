@@ -19,6 +19,19 @@ pub struct NoteInspectParams {
     pub path: String,
     /// View to return: `"metadata"` (default) for rich note metadata, or `"targets"` for patchable headings/blocks/frontmatter fields.
     pub view: Option<String>,
+    /// Optional bounded projection. Currently only ["headings"] is supported.
+    #[schemars(length(min = 1, max = 1))]
+    pub fields: Option<Vec<String>>,
+    /// Require the raw-note SHA-256 revision returned by search or an earlier projection.
+    pub expected_revision: Option<String>,
+    /// Heading ordinal at which to resume; nonzero offsets require expected_revision.
+    pub heading_offset: Option<usize>,
+    /// Maximum headings returned in the projection; default 100, maximum 1000.
+    #[schemars(range(min = 1, max = 1000))]
+    pub max_headings: Option<usize>,
+    /// Maximum compact serialized bytes of the heading projection; default 65536, maximum 262144.
+    #[schemars(range(min = 1, max = 262144))]
+    pub max_bytes: Option<usize>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -40,6 +53,7 @@ pub(super) struct NoteMetadataOutput {
 pub(super) enum NoteInspectOutput {
     Metadata(NoteMetadataOutput),
     Targets(crate::models::DocumentMap),
+    Headings(crate::vault::source::SourceHeadingsPage),
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -66,6 +80,63 @@ pub async fn note_inspect(
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     let view = params.view.as_deref().unwrap_or("metadata");
 
+    if let Some(fields) = &params.fields {
+        if !view.eq_ignore_ascii_case("metadata") || fields.len() != 1 || fields[0] != "headings" {
+            return Err(invalid_projection_params(
+                "fields accepts only [\"headings\"] with the metadata view",
+            ));
+        }
+        if let Some(revision) = params.expected_revision.as_deref() {
+            crate::vault::source::validate_revision(revision)?;
+        }
+        if params.heading_offset.unwrap_or(0) > 0 && params.expected_revision.is_none() {
+            return Err(invalid_projection_params(
+                "expected_revision is required with a nonzero heading_offset",
+            ));
+        }
+        if params
+            .max_headings
+            .is_some_and(|value| value == 0 || value > 1_000)
+        {
+            return Err(invalid_projection_params(
+                "max_headings must be between 1 and 1000",
+            ));
+        }
+        if params
+            .max_bytes
+            .is_some_and(|value| value == 0 || value > crate::vault::source::MAX_PAGE_BYTES)
+        {
+            return Err(invalid_projection_params(
+                "max_bytes must be between 1 and 262144",
+            ));
+        }
+        let vault = vault.clone();
+        let page = tokio::task::spawn_blocking(move || {
+            let path = Path::new(&params.path);
+            vault.read_source_snapshot(path)?.headings_page(
+                path,
+                params.expected_revision.as_deref(),
+                params.heading_offset.unwrap_or(0),
+                params.max_headings,
+                params.max_bytes,
+            )
+        })
+        .await
+        .map_err(|error| {
+            VaultError::Other(format!("heading projection worker failed: {error}"))
+        })??;
+        return super::output::json(&NoteInspectOutput::Headings(page));
+    }
+    if params.expected_revision.is_some()
+        || params.heading_offset.is_some()
+        || params.max_headings.is_some()
+        || params.max_bytes.is_some()
+    {
+        return Err(invalid_projection_params(
+            "revision and heading page parameters require fields: [\"headings\"]",
+        ));
+    }
+
     if view.eq_ignore_ascii_case("metadata") {
         note_inspect_metadata(vault, &params.path).await
     } else if view.eq_ignore_ascii_case("targets") {
@@ -77,6 +148,14 @@ pub async fn note_inspect(
             None::<serde_json::Value>,
         ))
     }
+}
+
+fn invalid_projection_params(message: &str) -> rmcp::ErrorData {
+    rmcp::ErrorData::new(
+        ErrorCode::INVALID_PARAMS,
+        message.to_owned(),
+        None::<serde_json::Value>,
+    )
 }
 
 async fn note_inspect_metadata(
@@ -208,6 +287,89 @@ mod tests {
     use crate::tools::notes::{NotePatchParams, note_patch};
 
     #[tokio::test]
+    async fn heading_projection_is_revision_bound_and_mirrored_in_text() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+        vault
+            .write_note(
+                Path::new("outline.md"),
+                "# Parent\n## Child\nbody\n## Other\n",
+            )
+            .unwrap();
+        let result = note_inspect(
+            &vault,
+            NoteInspectParams {
+                path: "outline.md".into(),
+                fields: Some(vec!["headings".into()]),
+                max_headings: Some(2),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let text: serde_json::Value =
+            serde_json::from_str(crate::test_helpers::extract_text(&result)).unwrap();
+        let value = result.structured_content.unwrap();
+        assert_eq!(text, value);
+        assert_eq!(value["headings"][1]["parent_ordinal"], 0);
+        assert_eq!(value["next_heading_offset"], 2);
+        let revision = value["source_revision"].as_str().unwrap().to_owned();
+        vault
+            .write_note(Path::new("outline.md"), "# Changed\n")
+            .unwrap();
+        let error = note_inspect(
+            &vault,
+            NoteInspectParams {
+                path: "outline.md".into(),
+                fields: Some(vec!["headings".into()]),
+                expected_revision: Some(revision),
+                heading_offset: Some(2),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::INVALID_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn heading_projection_rejects_incompatible_parameters() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+        for params in [
+            NoteInspectParams {
+                path: "missing.md".into(),
+                max_bytes: Some(10),
+                ..Default::default()
+            },
+            NoteInspectParams {
+                path: "missing.md".into(),
+                fields: Some(vec!["tags".into()]),
+                ..Default::default()
+            },
+            NoteInspectParams {
+                path: "missing.md".into(),
+                view: Some("targets".into()),
+                fields: Some(vec!["headings".into()]),
+                ..Default::default()
+            },
+            NoteInspectParams {
+                path: "missing.md".into(),
+                fields: Some(vec!["headings".into()]),
+                heading_offset: Some(1),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                note_inspect(&vault, params).await.unwrap_err().code,
+                ErrorCode::INVALID_PARAMS
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn note_inspect_metadata_returns_all_fields() {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
@@ -228,6 +390,7 @@ mod tests {
             NoteInspectParams {
                 path: "test.md".into(),
                 view: None,
+                ..Default::default()
             },
         )
         .await
@@ -265,6 +428,7 @@ mod tests {
             NoteInspectParams {
                 path: "nonexistent.md".into(),
                 view: None,
+                ..Default::default()
             },
         )
         .await;
@@ -289,6 +453,7 @@ mod tests {
             NoteInspectParams {
                 path: "mapped.md".into(),
                 view: Some("targets".into()),
+                ..Default::default()
             },
         )
         .await
@@ -340,6 +505,7 @@ mod tests {
             NoteInspectParams {
                 path: "scratch.md".into(),
                 view: Some("targets".into()),
+                ..Default::default()
             },
         )
         .await
@@ -387,6 +553,7 @@ mod tests {
             NoteInspectParams {
                 path: "test.md".into(),
                 view: Some("invalid".into()),
+                ..Default::default()
             },
         )
         .await;

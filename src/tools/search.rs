@@ -224,10 +224,6 @@ fn search_metadata_frontmatter(
 
 #[cfg(has_embeddings)]
 const DEFAULT_PREFETCH_COUNT: usize = 50;
-#[cfg(has_embeddings)]
-const SNIPPET_CONTEXT_LEN: usize = 150;
-#[cfg(has_embeddings)]
-const SNIPPET_FALLBACK_CHARS: usize = 300;
 
 #[derive(Deserialize, JsonSchema, Default)]
 pub struct SearchSemanticParams {
@@ -241,9 +237,9 @@ pub struct SearchSemanticParams {
     #[serde(default)]
     pub include_content: Option<bool>,
     /// When true, first retrieves top candidates via BM25 lexical search,
-    /// then re-ranks by combining lexical and semantic scores. Produces
-    /// higher-quality results than either approach alone. Requires both
-    /// Tantivy and embeddings to be enabled. Default: false.
+    /// then re-ranks by combining lexical and semantic scores. Only lexical
+    /// candidates are eligible; paraphrases without keyword overlap can be
+    /// omitted. Requires both Tantivy and embeddings. Default: false.
     #[serde(default)]
     pub lexical_prefetch: Option<bool>,
     /// Blending weight for hybrid re-ranking: `alpha * BM25 + (1-alpha) * semantic`.
@@ -253,17 +249,7 @@ pub struct SearchSemanticParams {
     pub alpha: Option<f32>,
 }
 
-#[derive(serde::Serialize, JsonSchema)]
-pub(super) struct SemanticSearchResult {
-    path: std::path::PathBuf,
-    title: String,
-    score: f32,
-    tags: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    snippet: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
-}
+pub(super) type SemanticSearchResult = crate::models::SemanticNoteResult;
 
 pub async fn search_semantic(
     vault: &Vault,
@@ -407,24 +393,27 @@ async fn search_semantic_daemon(
         result => result?,
     };
 
+    let allowed_paths = allowed_paths
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    if daemon_result.results.len() > top_k {
+        return Err(VaultError::DaemonProtocol(
+            "semantic daemon returned more notes than requested".into(),
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for hit in &daemon_result.results {
+        if !allowed_paths.contains(&hit.path) || !seen.insert(&hit.path) {
+            return Err(VaultError::DaemonProtocol(
+                "semantic daemon returned duplicate notes or a note outside the requested scope"
+                    .into(),
+            ));
+        }
+    }
     Ok(daemon_result
         .results
         .into_iter()
-        .filter_map(|hit| {
-            let path = std::path::PathBuf::from(hit.path);
-            if vault.get_note_metadata(&path).is_err() {
-                return None;
-            }
-            Some(SemanticSearchResult {
-                path,
-                title: hit.title,
-                score: hit.score,
-                tags: hit.tags,
-                snippet: hit.snippet,
-                content: hit.content,
-            })
-        })
-        .take(top_k)
+        .map(SemanticSearchResult::from)
         .collect())
 }
 
@@ -463,61 +452,16 @@ fn search_semantic_local_blocking(
 ) -> Result<Vec<SemanticSearchResult>, VaultError> {
     vault.activate_embeddings();
     let hits = if lexical_prefetch {
-        vault.search_hybrid(query, top_k, DEFAULT_PREFETCH_COUNT.max(top_k), alpha)?
+        vault.search_hybrid_ranked(query, top_k, DEFAULT_PREFETCH_COUNT.max(top_k), alpha)?
     } else {
-        vault.search_semantic(query, top_k)?
+        vault.search_semantic_ranked(query, top_k)?
     };
-
-    let word_re = if !include_content {
-        compile_query_word_regex(query)
-    } else {
-        None
-    };
-
-    let mut results = Vec::with_capacity(hits.len());
-    for (path, score) in hits {
-        let meta = match vault.get_note_metadata(&path) {
-            Ok(meta) => meta,
-            Err(_) => continue,
-        };
-        let title = meta.title.clone();
-        let tags = meta.tags.clone();
-
-        let (content, snippet) = if include_content {
-            (vault.read_note(&path).ok(), None)
-        } else {
-            let snip = vault.read_note(&path).ok().map(|text| {
-                let body = crate::vault::frontmatter::get_body(&text);
-                if let Some(ref re) = word_re
-                    && let Some(found) = re.find(body)
-                {
-                    let (ctx, _, _, _) = crate::vault::index::extract_match_context(
-                        body,
-                        found.start(),
-                        found.end(),
-                        SNIPPET_CONTEXT_LEN,
-                    );
-                    return ctx;
-                }
-                body_preview(&text, SNIPPET_FALLBACK_CHARS)
-            });
-            (None, snip)
-        };
-
-        results.push(SemanticSearchResult {
-            path,
-            title,
-            score,
-            tags,
-            snippet,
-            content,
-        });
-        if results.len() == top_k {
-            break;
-        }
-    }
-
-    Ok(results)
+    Ok(hits
+        .into_iter()
+        .map(|hit| {
+            crate::vault::semantic_results::render(vault.root(), hit, query, include_content)
+        })
+        .collect())
 }
 
 #[cfg(not(has_embeddings))]
@@ -533,9 +477,6 @@ fn search_semantic_local_blocking(
         "Semantic search is not available. Rebuild with --features embeddings or --features embeddings-api".to_string(),
     ))
 }
-
-#[cfg(has_embeddings)]
-use crate::vault::search_utils::{body_preview, compile_query_word_regex};
 
 fn local_backend_available(vault: &Vault) -> bool {
     #[cfg(has_embeddings)]
@@ -588,6 +529,24 @@ mod tests {
     use serde_json::json;
     #[cfg(unix)]
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[cfg(unix)]
+    fn inspected_daemon_client(socket_path: PathBuf) -> SemanticDaemonClient {
+        SemanticDaemonClient::with_health(
+            IpcEndpoint::UnixSocket(socket_path),
+            DaemonConnectPolicy::default(),
+            protocol::HealthResult {
+                daemon_version: env!("CARGO_PKG_VERSION").into(),
+                daemon_api_version: protocol::DAEMON_API_VERSION,
+                pid: 1,
+                status: "ok".into(),
+                uptime_ms: 1,
+                model_name: "test-model".into(),
+                semantic_home: "/tmp/semantic".into(),
+                capabilities: vec![protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY.into()],
+            },
+        )
+    }
 
     #[cfg(unix)]
     fn start_prefetch_capture_server(socket_path: PathBuf) -> tokio::task::JoinHandle<usize> {
@@ -665,7 +624,13 @@ mod tests {
     fn start_semantic_filter_server(
         socket_path: PathBuf,
         filtered_path: &'static str,
+        raw_note: String,
     ) -> tokio::task::JoinHandle<usize> {
+        let source_revision = crate::vault::source::source_revision(&raw_note);
+        let source_bytes = raw_note.len();
+        let body_start = source_bytes - crate::vault::frontmatter::get_body(&raw_note).len();
+        let snippet = "Rust is a systems language.";
+        let snippet_start = raw_note.find(snippet).unwrap();
         tokio::spawn(async move {
             if socket_path.exists() {
                 let _ = std::fs::remove_file(&socket_path);
@@ -719,20 +684,24 @@ mod tests {
                             "result": {
                                 "results": [
                                     {
-                                        "path": filtered_path,
-                                        "title": "Filtered",
-                                        "score": 1.0,
-                                        "tags": [],
-                                        "snippet": "filtered",
-                                        "content": null,
-                                        "subpath": null
-                                    },
-                                    {
                                         "path": "rust.md",
-                                        "title": "Rust",
+                                        "title": "rust",
                                         "score": 0.9,
                                         "tags": ["lang", "systems"],
-                                        "snippet": "Rust is a systems language.",
+                                        "source_revision": source_revision,
+                                        "source_bytes": source_bytes,
+                                        "source_status": "current",
+                                        "evidence": {
+                                            "scope": "note",
+                                            "cosine_similarity": 0.9,
+                                            "range": {"start_byte":body_start,"end_byte":source_bytes},
+                                            "heading_path": []
+                                        },
+                                        "snippet": snippet,
+                                        "preview": {
+                                            "range": {"start_byte":snippet_start,"end_byte":snippet_start + snippet.len()},
+                                            "complete_evidence": false
+                                        },
                                         "content": null,
                                         "subpath": null
                                     }
@@ -1442,6 +1411,13 @@ mod tests {
             let text_score = text["score"].as_f64().unwrap();
             assert!((score - text_score).abs() < f32::EPSILON as f64);
             structured["score"] = text["score"].clone();
+            let cosine = structured["evidence"]["cosine_similarity"]
+                .as_f64()
+                .unwrap();
+            let text_cosine = text["evidence"]["cosine_similarity"].as_f64().unwrap();
+            assert!((cosine - text_cosine).abs() < f32::EPSILON as f64);
+            structured["evidence"]["cosine_similarity"] =
+                text["evidence"]["cosine_similarity"].clone();
             assert_eq!(structured, text);
         }
     }
@@ -1457,10 +1433,7 @@ mod tests {
         let runtime = SemanticRuntime {
             mode: SemanticMode::Daemon,
             pending_daemon_bootstrap: None,
-            daemon_client: Some(SemanticDaemonClient::new(
-                IpcEndpoint::UnixSocket(socket_path),
-                DaemonConnectPolicy::default(),
-            )),
+            daemon_client: Some(inspected_daemon_client(socket_path)),
             daemon_unavailable_reason: None,
             prefetch_count: 7,
             vault_ensured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1500,15 +1473,16 @@ mod tests {
         let (_dir, vault) = setup_search_vault().await;
         let socket_dir = tempfile::tempdir().expect("tempdir");
         let socket_path = socket_dir.path().join("semanticd.sock");
-        let server = start_semantic_filter_server(socket_path.clone(), "missing-hidden.md");
+        let server = start_semantic_filter_server(
+            socket_path.clone(),
+            "missing-hidden.md",
+            vault.read_note(Path::new("rust.md")).unwrap(),
+        );
 
         let runtime = SemanticRuntime {
             mode: SemanticMode::Daemon,
             pending_daemon_bootstrap: None,
-            daemon_client: Some(SemanticDaemonClient::new(
-                IpcEndpoint::UnixSocket(socket_path),
-                DaemonConnectPolicy::default(),
-            )),
+            daemon_client: Some(inspected_daemon_client(socket_path)),
             daemon_unavailable_reason: None,
             prefetch_count: 50,
             vault_ensured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1546,15 +1520,16 @@ mod tests {
         let (_dir, vault) = setup_excluded_search_vault().await;
         let socket_dir = tempfile::tempdir().expect("tempdir");
         let socket_path = socket_dir.path().join("semanticd.sock");
-        let server = start_semantic_filter_server(socket_path.clone(), "Archive/hidden.md");
+        let server = start_semantic_filter_server(
+            socket_path.clone(),
+            "Archive/hidden.md",
+            vault.read_note(Path::new("rust.md")).unwrap(),
+        );
 
         let runtime = SemanticRuntime {
             mode: SemanticMode::Daemon,
             pending_daemon_bootstrap: None,
-            daemon_client: Some(SemanticDaemonClient::new(
-                IpcEndpoint::UnixSocket(socket_path),
-                DaemonConnectPolicy::default(),
-            )),
+            daemon_client: Some(inspected_daemon_client(socket_path)),
             daemon_unavailable_reason: None,
             prefetch_count: 50,
             vault_ensured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1603,10 +1578,7 @@ mod tests {
         let runtime = SemanticRuntime {
             mode: SemanticMode::Auto,
             pending_daemon_bootstrap: None,
-            daemon_client: Some(SemanticDaemonClient::new(
-                IpcEndpoint::UnixSocket(socket_path),
-                DaemonConnectPolicy::default(),
-            )),
+            daemon_client: Some(inspected_daemon_client(socket_path)),
             daemon_unavailable_reason: None,
             prefetch_count: 50,
             vault_ensured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

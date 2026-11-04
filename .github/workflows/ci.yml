@@ -70,6 +70,46 @@ jobs:
       - name: Check local embeddings feature
         run: cargo check --all-features
 
+  api-embeddings:
+    name: API embeddings (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-api-embeddings-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-api-embeddings-cargo-
+
+      - name: Clippy API-only build
+        run: cargo clippy --locked --no-default-features --features embeddings-api -- -D warnings
+
+      - name: Verify API-only dependency isolation
+        shell: bash
+        run: |
+          cargo tree --locked --no-default-features --features embeddings-api --edges normal --prefix none > api-dependencies.txt
+          if grep -E '^(fastembed|ort|ort-sys) v' api-dependencies.txt; then
+            echo "API-only builds must not include local inference dependencies" >&2
+            exit 1
+          fi
+
+      - name: API library, chunking, daemon and MCP contracts
+        run: cargo test --locked --no-default-features --features embeddings-api --lib --test automatic_chunking_tests --test semantic_daemon_api_tests --test integration_tests --test mcp_transport_tests
+
   upgrade-contract:
     name: upgrade contract (${{ matrix.features }})
     runs-on: ubuntu-latest
@@ -136,3 +176,8 @@ jobs:
 
       - name: Daemon integration tests
         run: cargo test --features embeddings --test daemon_integration_tests
+
+      - name: Local embedding chunking and retrieval
+        env:
+          OBSIDIAN_EMBEDDING_PROVIDER: local
+        run: cargo test --locked --features embeddings --test automatic_chunking_tests

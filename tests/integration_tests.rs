@@ -1431,7 +1431,10 @@ mod vault_semantic_search {
     async fn wait_for_embeddings_ready(vault: &Vault) {
         tokio::time::timeout(std::time::Duration::from_secs(300), async {
             loop {
-                if vault.has_embeddings() {
+                if vault.embedding_status().is_some_and(|status| {
+                    status.phase == obsidian_mcp::vault::embedding_runtime::EmbeddingPhase::Ready
+                        && status.pending_notes == 0
+                }) {
                     return;
                 }
                 if let Some(error) = vault.embedding_load_error() {
@@ -1583,6 +1586,8 @@ mod vault_semantic_search {
             )
             .unwrap();
 
+        wait_for_embeddings_ready(&vault).await;
+
         let results = vault
             .search_hybrid("systems programming", 5, 50, 0.4)
             .unwrap();
@@ -1638,6 +1643,8 @@ mod vault_semantic_search {
                 "# Quantum Computing\nQuantum computers use qubits for exponential parallelism.\n",
             )
             .unwrap();
+
+        wait_for_embeddings_ready(&vault).await;
 
         let results = vault
             .search_hybrid("quantum computing", 5, 50, 0.4)
@@ -2123,6 +2130,7 @@ mod background_embedding_runtime {
         fn install(base_url: &str) -> Self {
             let values = [
                 ("OBSIDIAN_EMBEDDING_API_BASE", Some(base_url)),
+                ("OBSIDIAN_EMBEDDING_API_PROFILE", None),
                 ("OPENAI_BASE_URL", None),
                 ("OBSIDIAN_EMBEDDING_API_KEY", Some("integration-test-key")),
                 ("OPENAI_API_KEY", None),
@@ -2161,7 +2169,38 @@ mod background_embedding_runtime {
         }
     }
 
+    fn api_profile(vault_root: &Path, base_url: &str, model: &str) -> PathBuf {
+        let directory = vault_root.join(".obsidian-mcp");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("{model}-api-profile.json"));
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "version": 1,
+                "profile_revision": "synthetic-integration-v1",
+                "api_base": base_url,
+                "model": model,
+                "tokenizer": {"kind":"cl100k_base"},
+                "max_input_tokens": 8192,
+                "max_batch_inputs": 32,
+                "max_batch_tokens": 262144
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
     fn api_config(vault_root: &Path, model: &str, watch: bool) -> Config {
+        let profile = api_profile(
+            vault_root,
+            &std::env::var("OBSIDIAN_EMBEDDING_API_BASE").unwrap(),
+            model,
+        );
+        // These environment-mutating fixtures hold API_TEST_LOCK until the owner drops.
+        unsafe {
+            std::env::set_var("OBSIDIAN_EMBEDDING_API_PROFILE", profile);
+        }
         Config {
             vault_path: vault_root.to_path_buf(),
             watch,
@@ -2249,6 +2288,10 @@ mod background_embedding_runtime {
             .env("OBSIDIAN_EMBEDDINGS_MODEL", "api-integration-model")
             .env("OBSIDIAN_EMBEDDING_PROVIDER", "api")
             .env("OBSIDIAN_EMBEDDING_API_BASE", api.base_url())
+            .env(
+                "OBSIDIAN_EMBEDDING_API_PROFILE",
+                api_profile(vault.path(), &api.base_url(), "api-integration-model"),
+            )
             .env("OBSIDIAN_EMBEDDING_API_KEY", "integration-test-key")
             .env("OBSIDIAN_SEMANTIC_MODE", "local")
             .env("OBSIDIAN_LOG_LEVEL", "error")
@@ -2650,7 +2693,7 @@ mod background_embedding_runtime {
     }
 
     #[tokio::test]
-    async fn note_read_failure_is_degraded_and_retry_recovers() {
+    async fn invalid_note_read_is_degraded_until_a_new_valid_generation() {
         let _guard = API_TEST_LOCK.lock().await;
         let api = ControlledEmbeddingApi::start().await;
         let _env = EmbeddingApiEnv::install(&api.base_url());
@@ -2674,13 +2717,27 @@ mod background_embedding_runtime {
         .await;
         assert_eq!(degraded.indexed_notes, 0);
         assert_eq!(degraded.total_notes, 1);
+        assert_eq!(degraded.pending_notes, 0);
         assert!(degraded.last_error.is_some());
 
         std::fs::write(
             vault_dir.path().join("note.md"),
-            "# Note\nREAD_RECOVERED valid content\n",
+            "# Note\nvalid without an index event\n",
         )
         .unwrap();
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert_eq!(
+            vault.embedding_status().unwrap().phase,
+            EmbeddingPhase::Degraded
+        );
+        assert_eq!(vault.embedding_status().unwrap().pending_notes, 0);
+
+        vault
+            .write_note(
+                Path::new("note.md"),
+                "# Note\nREAD_RECOVERED valid content\n",
+            )
+            .unwrap();
         wait_for_status(&vault, "note read retry", |status| {
             status.phase == EmbeddingPhase::Ready
                 && status.queryable

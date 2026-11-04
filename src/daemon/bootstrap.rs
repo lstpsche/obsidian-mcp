@@ -62,6 +62,8 @@ pub struct BootstrapResult {
     pub daemon_binary_path: PathBuf,
     pub manifest: RuntimeManifest,
     pub reused_existing: bool,
+    /// Finalized health observation after any owned-daemon replacement.
+    pub health: protocol::HealthResult,
 }
 
 /// A timeout preserves enough startup state to resume without spawning twice.
@@ -264,13 +266,24 @@ pub async fn reconcile_daemon_after_upgrade(
             });
         }
         std::cmp::Ordering::Equal => {
-            return Ok(DaemonReconcileOutcome {
-                origin,
-                was_running: true,
-                restarted: false,
-                observed_version: Some(health.daemon_version),
-                diagnostic: "semantic daemon already reports the installed version".into(),
-            });
+            if health.supports_source_evidence() {
+                return Ok(DaemonReconcileOutcome {
+                    origin,
+                    was_running: true,
+                    restarted: false,
+                    observed_version: Some(health.daemon_version),
+                    diagnostic: "semantic daemon already reports the installed version".into(),
+                });
+            }
+            if !daemon_binary_supports_source_evidence(
+                installed_daemon,
+                &parse_daemon_version("installed semantic daemon", expected_version)?,
+            )? {
+                return Err(unsupported_candidate_capability(
+                    installed_daemon,
+                    "the installed daemon does not advertise support; preserved the running daemon",
+                ));
+            }
         }
         std::cmp::Ordering::Less => {}
     }
@@ -463,6 +476,12 @@ async fn ensure_daemon_inner(
                             &health.daemon_version,
                         )?;
                         sibling_version > running_version
+                            || (sibling_version == running_version
+                                && !health.supports_source_evidence()
+                                && daemon_binary_supports_source_evidence(
+                                    sibling,
+                                    &sibling_version,
+                                )?)
                     } else {
                         false
                     }
@@ -473,11 +492,11 @@ async fn ensure_daemon_inner(
                     preserve_manifest_model = true;
                     tracing::info!(
                         running_version = %health.daemon_version,
-                        "newer owned semantic daemon sibling detected; completing activation"
+                        "compatible owned semantic daemon sibling detected; completing activation"
                     );
                     shutdown_owned_daemon(&endpoint, current_manifest, health.pid).await?;
                 } else {
-                    current_manifest.daemon_version = health.daemon_version;
+                    current_manifest.daemon_version = health.daemon_version.clone();
                     current_manifest.daemon_api_version = health.daemon_api_version;
                     current_manifest.binary_origin = origin;
                     current_manifest.touch_health();
@@ -489,6 +508,7 @@ async fn ensure_daemon_inner(
                         daemon_binary_path,
                         manifest: current_manifest.clone(),
                         reused_existing: true,
+                        health,
                     })));
                 }
             }
@@ -632,7 +652,7 @@ async fn complete_started_daemon(started: &StartedDaemonBootstrap) -> VaultResul
 
     let runtime_manifest = RuntimeManifest::from_input(RuntimeManifestInput {
         daemon_api_version: health.daemon_api_version,
-        daemon_version: health.daemon_version,
+        daemon_version: health.daemon_version.clone(),
         binary_path: started.daemon_binary_path.display().to_string(),
         binary_origin: started.binary_origin,
         binary_sha256: started.binary_sha256.clone(),
@@ -652,6 +672,7 @@ async fn complete_started_daemon(started: &StartedDaemonBootstrap) -> VaultResul
         daemon_binary_path: started.daemon_binary_path.clone(),
         manifest: runtime_manifest,
         reused_existing: false,
+        health,
     })
 }
 
@@ -719,6 +740,62 @@ fn daemon_binary_version(binary: &Path) -> VaultResult<Version> {
             ))
         })?;
     parse_daemon_version("semantic daemon binary", version)
+}
+
+fn daemon_binary_supports_source_evidence(
+    binary: &Path,
+    expected_version: &Version,
+) -> VaultResult<bool> {
+    #[derive(serde::Deserialize)]
+    struct DaemonBuildInfo {
+        #[serde(flatten)]
+        identity: crate::upgrade::BuildIdentity,
+        #[serde(default)]
+        capabilities: Vec<String>,
+    }
+
+    let output = std::process::Command::new(binary)
+        .arg("--__build-info")
+        .output()
+        .map_err(|error| {
+            unsupported_candidate_capability(binary, &format!("inspection failed: {error}"))
+        })?;
+    if !output.status.success() {
+        return Err(unsupported_candidate_capability(
+            binary,
+            "--__build-info exited unsuccessfully",
+        ));
+    }
+    let info: DaemonBuildInfo = serde_json::from_slice(&output.stdout).map_err(|error| {
+        unsupported_candidate_capability(binary, &format!("invalid build information: {error}"))
+    })?;
+    let version = Version::parse(&info.identity.version).map_err(|error| {
+        unsupported_candidate_capability(binary, &format!("invalid build version: {error}"))
+    })?;
+    if info.identity.name != env!("CARGO_PKG_NAME") || version != *expected_version {
+        return Err(unsupported_candidate_capability(
+            binary,
+            "build information does not match the inspected daemon identity",
+        ));
+    }
+    Ok(info
+        .capabilities
+        .iter()
+        .any(|capability| capability == protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY))
+}
+
+fn unsupported_candidate_capability(binary: &Path, reason: &str) -> VaultError {
+    VaultError::DaemonRpc {
+        code: protocol::ERR_UNSUPPORTED_CAPABILITY,
+        message: format!(
+            "cannot establish required capability '{}' for semantic daemon '{}': {reason}",
+            protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY,
+            binary.display()
+        ),
+        data: Some(json!({
+            "required_capability": protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY,
+        })),
+    }
 }
 
 fn compare_daemon_versions(running: &str, installed: &str) -> VaultResult<std::cmp::Ordering> {
@@ -1663,6 +1740,7 @@ mod tests {
             .await
             .expect("bootstrap should reuse daemon");
         assert!(result.reused_existing, "expected reuse-existing path");
+        assert!(result.health.supports_source_evidence());
 
         shutdown_tx.send(()).expect("shutdown signal should send");
         server_task.await.expect("server task should join");

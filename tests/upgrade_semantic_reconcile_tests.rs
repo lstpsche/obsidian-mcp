@@ -68,6 +68,15 @@ async fn run_fake_daemon(socket: &Path, version: &str) {
 
 #[tokio::test]
 async fn reconcile_restarts_owned_daemon_and_preserves_runtime_state() {
+    assert_reconciles_owned_daemon("0.0.1").await;
+}
+
+#[tokio::test]
+async fn reconcile_activates_same_version_daemon_with_required_capability() {
+    assert_reconciles_owned_daemon(env!("CARGO_PKG_VERSION")).await;
+}
+
+async fn assert_reconciles_owned_daemon(old_version: &'static str) {
     let temp = tempfile::tempdir().expect("tempdir should be created");
     let paths = SemanticHomePaths::new(temp.path().join("semantic-home"));
     home::ensure_home_layout(&paths).expect("semantic home should be created");
@@ -80,7 +89,7 @@ async fn reconcile_restarts_owned_daemon_and_preserves_runtime_state() {
 
     let old_server = tokio::spawn({
         let socket = socket.clone();
-        async move { run_fake_daemon(&socket, "0.0.1").await }
+        async move { run_fake_daemon(&socket, old_version).await }
     });
     for _ in 0..50 {
         if socket.exists() {
@@ -92,7 +101,7 @@ async fn reconcile_restarts_owned_daemon_and_preserves_runtime_state() {
 
     let old_manifest = RuntimeManifest::from_input(RuntimeManifestInput {
         daemon_api_version: DAEMON_API_VERSION,
-        daemon_version: "0.0.1".into(),
+        daemon_version: old_version.into(),
         binary_path: "/bin/sleep".into(),
         binary_origin: BinaryOrigin::Sibling,
         binary_sha256: None,
@@ -105,7 +114,7 @@ async fn reconcile_restarts_owned_daemon_and_preserves_runtime_state() {
         fastembed_cache_dir: paths.fastembed_cache_dir.display().to_string(),
         model_name: "preserved-model".into(),
         bootstrap_client_name: "old-client".into(),
-        bootstrap_client_version: "0.0.1".into(),
+        bootstrap_client_version: old_version.into(),
     });
     manifest::save_atomic(&paths.manifest_path, &old_manifest).expect("old manifest should save");
     let config = BootstrapConfig {
@@ -148,6 +157,11 @@ async fn reconcile_restarts_owned_daemon_and_preserves_runtime_state() {
             retry_backoff: Duration::ZERO,
         },
     );
+    // The old upgrader's exact API-v2 handshake must still accept the new daemon.
+    let health = client.health("previous-upgrader", "3.2.1").await.unwrap();
+    assert_eq!(health.daemon_api_version, 2);
+    assert!(health.supports_source_evidence());
+    client.require_source_evidence().await.unwrap();
     assert!(
         client
             .shutdown()
@@ -316,6 +330,15 @@ async fn reconcile_never_downgrades_a_newer_owned_daemon() {
 
 #[tokio::test]
 async fn normal_bootstrap_completes_interrupted_owned_daemon_activation() {
+    assert_bootstraps_owned_daemon("0.0.1").await;
+}
+
+#[tokio::test]
+async fn normal_bootstrap_activates_same_version_daemon_with_required_capability() {
+    assert_bootstraps_owned_daemon(env!("CARGO_PKG_VERSION")).await;
+}
+
+async fn assert_bootstraps_owned_daemon(old_version: &'static str) {
     let temp = tempfile::tempdir().expect("tempdir should be created");
     let paths = SemanticHomePaths::new(temp.path().join("semantic-home"));
     home::ensure_home_layout(&paths).expect("semantic home should be created");
@@ -323,7 +346,7 @@ async fn normal_bootstrap_completes_interrupted_owned_daemon_activation() {
     let endpoint = IpcEndpoint::UnixSocket(socket.clone());
     let server = tokio::spawn({
         let socket = socket.clone();
-        async move { run_fake_daemon(&socket, "0.0.1").await }
+        async move { run_fake_daemon(&socket, old_version).await }
     });
     wait_for_socket(&socket).await;
 
@@ -331,7 +354,7 @@ async fn normal_bootstrap_completes_interrupted_owned_daemon_activation() {
     save_manifest(
         &paths,
         &endpoint,
-        "0.0.1",
+        old_version,
         BinaryOrigin::Sibling,
         Path::new("/bin/sleep"),
         sentinel.pid(),
@@ -341,13 +364,173 @@ async fn normal_bootstrap_completes_interrupted_owned_daemon_activation() {
         Path::new(env!("CARGO_BIN_EXE_obsidian-semanticd")),
     )
     .await
-    .expect("normal bootstrap should activate the newer sibling");
+    .expect("normal bootstrap should activate the compatible sibling");
     server.await.expect("old daemon task should join");
 
     assert!(!result.reused_existing);
     assert_eq!(result.manifest.daemon_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(result.manifest.model_name, "preserved-model");
+    assert!(result.health.supports_source_evidence());
+    let client = SemanticDaemonClient::with_health(
+        result.endpoint.clone(),
+        DaemonConnectPolicy::default(),
+        result.health,
+    );
+    client.require_source_evidence().await.unwrap();
     shutdown(result.endpoint).await;
+}
+
+#[tokio::test]
+async fn same_version_sibling_without_capability_does_not_restart_the_owner() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let paths = SemanticHomePaths::new(temp.path().join("semantic-home"));
+    home::ensure_home_layout(&paths).unwrap();
+    let socket = paths.ipc_dir.join("unsupported.sock");
+    let endpoint = IpcEndpoint::UnixSocket(socket.clone());
+    let server = tokio::spawn({
+        let socket = socket.clone();
+        async move { run_fake_daemon(&socket, env!("CARGO_PKG_VERSION")).await }
+    });
+    wait_for_socket(&socket).await;
+    let sentinel = ProcessGuard::sleep();
+    save_manifest(
+        &paths,
+        &endpoint,
+        env!("CARGO_PKG_VERSION"),
+        BinaryOrigin::Sibling,
+        Path::new("/bin/sleep"),
+        sentinel.pid(),
+    );
+    let candidate = temp.path().join("old-candidate");
+    std::fs::write(
+        temp.path().join("candidate-info.json"),
+        obsidian_mcp::upgrade::BuildIdentity::embedded()
+            .to_json()
+            .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        &candidate,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n--version) printf '%s\\n' 'obsidian-semanticd {}';;\n--__build-info) /bin/cat \"${{0%/*}}/candidate-info.json\";;\n*) : > \"${{0%/*}}/started\"; exit 77;;\nesac\n",
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    for _ in 0..2 {
+        let result = bootstrap::ensure_daemon_from_sibling(&test_config(&paths), &candidate)
+            .await
+            .unwrap();
+        assert!(result.reused_existing);
+        assert!(!result.health.supports_source_evidence());
+        let client = SemanticDaemonClient::with_health(
+            result.endpoint,
+            DaemonConnectPolicy::default(),
+            result.health,
+        );
+        assert!(matches!(
+            client.require_source_evidence().await.unwrap_err(),
+            obsidian_mcp::error::VaultError::DaemonRpc {
+                code: obsidian_mcp::daemon::protocol::ERR_UNSUPPORTED_CAPABILITY,
+                ..
+            }
+        ));
+    }
+    let error = bootstrap::reconcile_daemon_after_upgrade(
+        &test_config(&paths),
+        &candidate,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        obsidian_mcp::error::VaultError::DaemonRpc {
+            code: obsidian_mcp::daemon::protocol::ERR_UNSUPPORTED_CAPABILITY,
+            ..
+        }
+    ));
+    std::fs::write(temp.path().join("candidate-info.json"), "{}").unwrap();
+    let error = bootstrap::ensure_daemon_from_sibling(&test_config(&paths), &candidate)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        &error,
+        obsidian_mcp::error::VaultError::DaemonRpc {
+            code: obsidian_mcp::daemon::protocol::ERR_UNSUPPORTED_CAPABILITY,
+            ..
+        }
+    ));
+    let runtime = obsidian_mcp::tools::SemanticRuntime {
+        mode: obsidian_mcp::config::SemanticMode::Auto,
+        daemon_client: None,
+        pending_daemon_bootstrap: None,
+        daemon_unavailable_reason: None,
+        prefetch_count: 1,
+        vault_ensured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        local_fallback_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        daemon_health_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    assert!(!runtime.activate_local_fallback(&error));
+    assert!(!runtime.uses_local_backend());
+    assert!(socket.exists());
+    assert!(!temp.path().join("started").exists());
+    shutdown(endpoint).await;
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn external_old_daemon_is_inspected_before_rejecting_semantic_capability() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = SemanticHomePaths::new(temp.path().join("semantic-home"));
+    home::ensure_home_layout(&paths).unwrap();
+    let socket = paths.ipc_dir.join("external-old.sock");
+    let endpoint = IpcEndpoint::UnixSocket(socket.clone());
+    let server = tokio::spawn({
+        let socket = socket.clone();
+        async move { run_fake_daemon(&socket, "0.0.1").await }
+    });
+    wait_for_socket(&socket).await;
+    let external = Path::new("/external/obsidian-semanticd");
+    save_manifest(
+        &paths,
+        &endpoint,
+        "0.0.1",
+        BinaryOrigin::Override,
+        external,
+        4242,
+    );
+    let mut config = test_config(&paths);
+    config.daemon_path_override = Some(external.into());
+    let result = bootstrap::ensure_daemon(&config).await.unwrap();
+    assert!(result.reused_existing);
+    assert!(!result.health.supports_source_evidence());
+    let client = SemanticDaemonClient::with_health(
+        result.endpoint,
+        DaemonConnectPolicy::default(),
+        result.health,
+    );
+    let error = client
+        .search_semantic(Path::new("/tmp/vault"), "query", 10, false)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        obsidian_mcp::error::VaultError::DaemonRpc {
+            code: obsidian_mcp::daemon::protocol::ERR_UNSUPPORTED_CAPABILITY,
+            ..
+        }
+    ));
+    assert!(
+        socket.exists(),
+        "unsupported external daemon must remain running"
+    );
+    client.shutdown().await.unwrap();
+    server.await.unwrap();
 }
 
 async fn wait_for_socket(socket: &Path) {

@@ -444,6 +444,7 @@ fn route_health(
         uptime_ms,
         model_name: state.model_name.clone(),
         semantic_home: state.semantic_home.display().to_string(),
+        capabilities: vec![protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY.to_string()],
     };
 
     match serde_json::to_value(result) {
@@ -515,6 +516,30 @@ mod tests {
         assert_eq!(
             response.error.expect("error expected").code,
             ERR_INCOMPATIBLE_API_VERSION
+        );
+    }
+
+    #[tokio::test]
+    async fn old_exact_v2_health_request_accepts_source_evidence_capability() {
+        let tmp = tempfile::tempdir().expect("tempdir should be created");
+        let state = make_state(tmp.path());
+        let response = route_request(
+            RpcRequest {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: Some(json!(1)),
+                method: "health".to_string(),
+                params: json!({"min_api_version": 2, "max_api_version": 2}),
+            },
+            state,
+        )
+        .await;
+
+        assert!(response.error.is_none());
+        let result = response.result.unwrap();
+        assert_eq!(result["daemon_api_version"], 2);
+        assert_eq!(
+            result["capabilities"],
+            json!([protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY])
         );
     }
 
@@ -590,6 +615,10 @@ mod tests {
             json!(DAEMON_API_VERSION)
         );
         assert_eq!(health_response["result"]["pid"], json!(std::process::id()));
+        assert_eq!(
+            health_response["result"]["capabilities"],
+            json!([protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY])
+        );
 
         shutdown_tx
             .send(())

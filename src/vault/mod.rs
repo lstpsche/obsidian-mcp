@@ -12,14 +12,21 @@ pub mod patch;
 pub mod path;
 pub mod periodic;
 pub mod search_utils;
+pub mod source;
 pub mod tantivy_index;
 pub mod watcher;
 pub mod wikilink;
 
 #[cfg(has_embeddings)]
+pub(crate) mod embedding_chunks;
+#[cfg(has_embeddings)]
+pub(crate) mod embedding_input;
+#[cfg(has_embeddings)]
 pub mod embedding_runtime;
 #[cfg(has_embeddings)]
 pub mod embeddings;
+#[cfg(has_embeddings)]
+pub(crate) mod semantic_results;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -339,6 +346,11 @@ impl Vault {
         fs::read_file(&self.inner.root, path)
     }
 
+    /// Observe one bounded raw note revision for source-bound context reads.
+    pub fn read_source_snapshot(&self, path: &Path) -> VaultResult<source::SourceSnapshot> {
+        source::read_snapshot(&self.inner.root, path)
+    }
+
     pub fn file_stat(&self, path: &Path) -> VaultResult<FileStat> {
         fs::file_stat(&self.inner.root, path)
     }
@@ -581,6 +593,22 @@ impl Vault {
     /// similarity.
     #[cfg(has_embeddings)]
     pub fn search_semantic(&self, query: &str, top_k: usize) -> VaultResult<Vec<(PathBuf, f32)>> {
+        Ok(self
+            .search_semantic_ranked(query, top_k)?
+            .into_iter()
+            .map(|hit| (hit.path, hit.score))
+            .collect())
+    }
+
+    #[cfg(has_embeddings)]
+    pub(crate) fn search_semantic_ranked(
+        &self,
+        query: &str,
+        top_k: usize,
+    ) -> VaultResult<Vec<semantic_results::RankedNote>> {
+        if query.is_empty() || top_k == 0 {
+            return Ok(Vec::new());
+        }
         let runtime = self.inner.embedding_runtime.as_ref().ok_or_else(|| {
             VaultError::Embedding("embeddings not enabled (OBSIDIAN_EMBEDDINGS=false)".into())
         })?;
@@ -591,7 +619,13 @@ impl Vault {
             .keys()
             .cloned()
             .collect::<std::collections::HashSet<_>>();
-        snapshot.semantic_scores_for_paths(query, &current_paths, top_k)
+        let entries = snapshot.capture_entries(&current_paths);
+        if entries.is_empty() {
+            snapshot.validate_query(query)?;
+            return Ok(Vec::new());
+        }
+        let query_vector = snapshot.embed_query(query)?;
+        semantic_results::rank_semantic(entries, &query_vector, top_k)
     }
 
     /// Returns `true` if embeddings are available for semantic search.
@@ -647,7 +681,22 @@ impl Vault {
         prefetch_count: usize,
         alpha: f32,
     ) -> VaultResult<Vec<(PathBuf, f32)>> {
-        if query.is_empty() {
+        Ok(self
+            .search_hybrid_ranked(query, top_k, prefetch_count, alpha)?
+            .into_iter()
+            .map(|hit| (hit.path, hit.score))
+            .collect())
+    }
+
+    #[cfg(has_embeddings)]
+    pub(crate) fn search_hybrid_ranked(
+        &self,
+        query: &str,
+        top_k: usize,
+        prefetch_count: usize,
+        alpha: f32,
+    ) -> VaultResult<Vec<semantic_results::RankedNote>> {
+        if query.is_empty() || top_k == 0 {
             return Ok(Vec::new());
         }
 
@@ -658,32 +707,27 @@ impl Vault {
             VaultError::Embedding("embeddings not enabled (OBSIDIAN_EMBEDDINGS=false)".into())
         })?;
         let snapshot = runtime.query_snapshot()?;
-
+        snapshot.validate_query(query)?;
+        let current_paths = self.read_index().notes().keys().cloned().collect();
+        let entries = snapshot.capture_entries(&current_paths);
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let allowed = semantic_results::paths(&entries);
         let prefetch = prefetch_count.max(top_k);
-        let bm25_hits = tv.search(query, prefetch)?;
+        let bm25_hits = tv.search_for_paths(query, prefetch, Some(&allowed))?;
         if bm25_hits.is_empty() {
             return Ok(Vec::new());
         }
 
         let query_vec = snapshot.embed_query(query)?;
-        let index = self.read_index();
-
-        let norm_bm25 = search_utils::normalize_bm25_scores(&bm25_hits);
-
-        let mut combined: Vec<(PathBuf, f32)> = norm_bm25
-            .into_iter()
-            .filter(|(path, _)| index.get_note(path).is_some())
-            .map(|(path, norm_score)| {
-                let semantic_score = snapshot.score_for(&path, &query_vec);
-                let final_score = alpha * norm_score + (1.0 - alpha) * semantic_score;
-                (path, final_score)
-            })
-            .collect();
-
-        combined
-            .sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        combined.truncate(top_k);
-        Ok(combined)
+        semantic_results::rank_hybrid(
+            &entries,
+            &bm25_hits,
+            &query_vec,
+            alpha.clamp(0.0, 1.0),
+            top_k,
+        )
     }
 
     pub fn search_by_tag(&self, tag: &str) -> VaultResult<Vec<NoteMetadata>> {
@@ -1200,6 +1244,9 @@ mod tests {
                     endpoint_fingerprint: None,
                     dimension: 2,
                     input_version: embeddings::EMBEDDING_INPUT_VERSION,
+                    tokenizer_fingerprint: [1; 32],
+                    max_input_tokens: 8192,
+                    chunking_version: crate::vault::embedding_input::CHUNKING_VERSION,
                 },
                 inputs: Mutex::new(Vec::new()),
             }
@@ -1208,6 +1255,25 @@ mod tests {
 
     #[cfg(has_embeddings)]
     impl embeddings::Embedder for TestEmbedder {
+        fn input_policy(&self) -> &crate::vault::embedding_input::EmbeddingInputPolicy {
+            &crate::vault::embedding_input::EmbeddingInputPolicy {
+                max_input_tokens: 8192,
+                tokenizer_fingerprint: [1; 32],
+            }
+        }
+
+        fn count_tokens(&self, text: &str) -> VaultResult<usize> {
+            Ok(text.chars().count())
+        }
+
+        fn request_limits(&self) -> crate::vault::embedding_input::EmbeddingRequestLimits {
+            crate::vault::embedding_input::EmbeddingRequestLimits {
+                max_inputs: 64,
+                max_total_tokens: 8192 * 64,
+                max_request_bytes: 16 * 1024 * 1024,
+            }
+        }
+
         fn dimension(&self) -> usize {
             self.identity.dimension
         }
@@ -2127,6 +2193,147 @@ mod tests {
         vault.write_index().remove_file(&path);
 
         assert!(vault.search_semantic("stale", 5).unwrap().is_empty());
+    }
+
+    #[cfg(has_embeddings)]
+    #[tokio::test]
+    async fn semantic_facade_keeps_captured_revision_while_query_inference_blocks() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct BlockingQueryEmbedder {
+            inner: TestEmbedder,
+            entered: mpsc::SyncSender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+
+        impl embeddings::Embedder for BlockingQueryEmbedder {
+            fn input_policy(&self) -> &embedding_input::EmbeddingInputPolicy {
+                embeddings::Embedder::input_policy(&self.inner)
+            }
+
+            fn count_tokens(&self, text: &str) -> VaultResult<usize> {
+                embeddings::Embedder::count_tokens(&self.inner, text)
+            }
+
+            fn request_limits(&self) -> embedding_input::EmbeddingRequestLimits {
+                embeddings::Embedder::request_limits(&self.inner)
+            }
+
+            fn dimension(&self) -> usize {
+                embeddings::Embedder::dimension(&self.inner)
+            }
+
+            fn space_identity(&self) -> &embeddings::EmbeddingSpaceIdentity {
+                embeddings::Embedder::space_identity(&self.inner)
+            }
+
+            fn embed_batch(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>> {
+                if texts.len() == 1 && texts[0] == "REVISION_BOUND_QUERY" {
+                    self.entered.send(()).unwrap();
+                    self.release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                }
+                embeddings::Embedder::embed_batch(&self.inner, texts)
+            }
+        }
+
+        struct ReleaseOnDrop(Option<mpsc::Sender<()>>);
+
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        async fn wait_for_revision(vault: &Vault, expected: &str) {
+            let runtime = vault.inner.embedding_runtime.as_ref().unwrap();
+            let paths = std::collections::HashSet::from([PathBuf::from("policy.md")]);
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if let Ok(snapshot) = runtime.query_snapshot()
+                        && snapshot
+                            .capture_entries(&paths)
+                            .get(Path::new("policy.md"))
+                            .is_some_and(|entry| entry.source_revision == expected)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("complete note generation should commit while query inference is held");
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        create_test_vault(directory.path());
+        let old_source = "# Policy\nRetain the original source.\n";
+        let new_source =
+            "---\ntags: [updated]\n---\n# Replacement\nDifferent source and offsets.\n";
+        let old_revision = source::source_revision(old_source);
+        let new_revision = source::source_revision(new_source);
+        std::fs::write(directory.path().join("policy.md"), old_source).unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_guard = ReleaseOnDrop(Some(release_tx));
+        let model = Arc::new(BlockingQueryEmbedder {
+            inner: TestEmbedder::new(),
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        });
+        let loader: EmbeddingLoaderFuture =
+            Box::pin(async move { Ok(model as Arc<dyn embeddings::Embedder>) });
+        let vault =
+            Vault::open_with_embedding_loader(&embedding_config(directory.path()), Some(loader))
+                .await
+                .unwrap();
+        wait_for_revision(&vault, &old_revision).await;
+
+        let searching_vault = vault.clone();
+        let query = tokio::task::spawn_blocking(move || {
+            searching_vault.search_semantic_ranked("REVISION_BOUND_QUERY", 1)
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(3)))
+            .await
+            .unwrap()
+            .expect("query should reach the held provider after capturing source entries");
+
+        vault
+            .write_note(Path::new("policy.md"), new_source)
+            .unwrap();
+        wait_for_revision(&vault, &new_revision).await;
+        drop(release_guard);
+        let mut hits = query.await.unwrap().unwrap();
+        assert_eq!(hits.len(), 1);
+        let hit = hits.remove(0);
+        assert_eq!(hit.entry.source_revision, old_revision);
+        assert_eq!(hit.evidence.scope, crate::models::EvidenceScope::Note);
+        assert_eq!(
+            hit.evidence.range,
+            crate::models::SourceRange {
+                start_byte: 0,
+                end_byte: old_source.len(),
+            }
+        );
+
+        let rendered = semantic_results::render(vault.root(), hit, "REVISION_BOUND_QUERY", false);
+        assert_eq!(rendered.source_revision, old_revision);
+        assert_eq!(rendered.source_status, crate::models::SourceStatus::Changed);
+        let error = rendered.context_error.unwrap();
+        assert_eq!(error.code, "source_changed");
+        assert_eq!(
+            error.current_revision.as_deref(),
+            Some(new_revision.as_str())
+        );
+        assert!(rendered.snippet.is_none());
+        assert!(rendered.content.is_none());
+        assert!(rendered.preview.is_none());
     }
 
     #[cfg(has_embeddings)]

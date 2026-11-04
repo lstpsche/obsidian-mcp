@@ -2,6 +2,9 @@
 
 #![cfg(all(feature = "embeddings-api", any(unix, windows)))]
 
+#[path = "common/embedding_profiles.rs"]
+mod embedding_profiles;
+
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, atomic::AtomicBool};
@@ -30,7 +33,10 @@ async fn embeddings(Json(input): Json<Value>) -> Json<Value> {
         .iter()
         .enumerate()
         .map(|(index, text)| {
-            let vector = if text.as_str().unwrap().contains("VISIBLE") {
+            let text = text.as_str().unwrap();
+            let vector = if text.contains("TAIL_SIGNAL") {
+                [0.0, 1.0]
+            } else if text.contains("VISIBLE") {
                 [0.8, 0.6]
             } else {
                 [1.0, 0.0]
@@ -42,6 +48,23 @@ async fn embeddings(Json(input): Json<Value>) -> Json<Value> {
 }
 
 fn spawn_daemon(home: &Path, endpoint: &IpcEndpoint, api_port: u16) -> Child {
+    spawn_daemon_with_limits(home, endpoint, api_port, 128, 32)
+}
+
+fn spawn_daemon_with_limits(
+    home: &Path,
+    endpoint: &IpcEndpoint,
+    api_port: u16,
+    max_input_tokens: usize,
+    max_batch_inputs: usize,
+) -> Child {
+    let profile = embedding_profiles::write_api_profile(
+        home,
+        api_port,
+        "probe",
+        max_input_tokens,
+        max_batch_inputs,
+    );
     let binary = std::env::var_os("OBSIDIAN_TEST_DAEMON_BINARY")
         .unwrap_or_else(|| env!("CARGO_BIN_EXE_obsidian-semanticd").into());
     let mut command = Command::new(binary);
@@ -65,6 +88,7 @@ fn spawn_daemon(home: &Path, endpoint: &IpcEndpoint, api_port: u16) -> Child {
         )
         .env("OBSIDIAN_EMBEDDING_API_KEY", "synthetic-test-key")
         .env("OBSIDIAN_EMBEDDING_API_MODEL", "probe")
+        .env("OBSIDIAN_EMBEDDING_API_PROFILE", profile)
         .env("OBSIDIAN_EMBEDDING_DIM", "2")
         .env("OBSIDIAN_LOG_LEVEL", "error")
         .env("TOKIO_WORKER_THREADS", "1")
@@ -91,11 +115,18 @@ fn isolated_endpoint(directory: &Path) -> IpcEndpoint {
     }
 }
 
+#[derive(Clone, Copy)]
+enum InvalidEmbeddingResponse {
+    WrongDimension,
+    MissingEmbedding,
+}
+
 #[derive(Clone)]
 struct ProviderState {
     requests: Arc<Mutex<Vec<Value>>>,
     received: Arc<Notify>,
     hold: watch::Receiver<bool>,
+    invalid_response: Arc<Mutex<Option<InvalidEmbeddingResponse>>>,
 }
 
 struct ControlledProvider {
@@ -114,6 +145,7 @@ impl ControlledProvider {
             requests: Arc::new(Mutex::new(Vec::new())),
             received: Arc::new(Notify::new()),
             hold: receiver,
+            invalid_response: Arc::new(Mutex::new(None)),
         };
         let app = Router::new()
             .route("/v1/embeddings", post(controlled_embeddings))
@@ -133,6 +165,10 @@ impl ControlledProvider {
 
     fn hold_requests(&self, hold: bool) {
         self.hold.send(hold).unwrap();
+    }
+
+    fn invalid_response(&self, response: Option<InvalidEmbeddingResponse>) {
+        *self.state.invalid_response.lock().unwrap() = response;
     }
 
     async fn wait_for_requests(&self, count: usize) {
@@ -163,6 +199,15 @@ async fn controlled_embeddings(
     state.requests.lock().unwrap().push(input.clone());
     state.received.notify_one();
     state.hold.wait_for(|hold| !*hold).await.unwrap();
+    match *state.invalid_response.lock().unwrap() {
+        Some(InvalidEmbeddingResponse::WrongDimension) => {
+            return Json(json!({"data": [{"index": 0, "embedding": [1.0]}]}));
+        }
+        Some(InvalidEmbeddingResponse::MissingEmbedding) => {
+            return Json(json!({"data": []}));
+        }
+        None => {}
+    }
     embeddings(Json(input)).await
 }
 
@@ -181,7 +226,23 @@ impl StdioServer {
         mode: &str,
         api_port: u16,
     ) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_obsidian-mcp"));
+        Self::start_with_options(root, home, endpoint, mode, api_port, 128, true).await
+    }
+
+    async fn start_with_options(
+        root: &Path,
+        home: &Path,
+        endpoint: &IpcEndpoint,
+        mode: &str,
+        api_port: u16,
+        max_input_tokens: usize,
+        watch: bool,
+    ) -> Self {
+        let profile =
+            embedding_profiles::write_api_profile(home, api_port, "mcp-local", max_input_tokens, 2);
+        let binary = std::env::var_os("OBSIDIAN_TEST_MCP_BINARY")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_obsidian-mcp").into());
+        let mut command = Command::new(binary);
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with("OBSIDIAN_")
                 || key.to_string_lossy().starts_with("OPENAI_")
@@ -207,8 +268,9 @@ impl StdioServer {
             )
             .env("OBSIDIAN_EMBEDDING_API_KEY", "synthetic-test-key")
             .env("OBSIDIAN_EMBEDDING_API_MODEL", "mcp-local")
+            .env("OBSIDIAN_EMBEDDING_API_PROFILE", profile)
             .env("OBSIDIAN_EMBEDDING_DIM", "2")
-            .env("OBSIDIAN_WATCH", "true")
+            .env("OBSIDIAN_WATCH", watch.to_string())
             .env("OBSIDIAN_LOG_LEVEL", "error")
             .env("TOKIO_WORKER_THREADS", "1")
             .stdin(Stdio::piped())
@@ -284,12 +346,16 @@ impl StdioServer {
     }
 
     async fn wait_for_ready(&mut self, source: &str) {
+        self.wait_for_ready_notes(source, 1).await;
+    }
+
+    async fn wait_for_ready_notes(&mut self, source: &str, notes: usize) {
         timeout(Duration::from_secs(15), async {
             loop {
                 let info = self.embedding_info().await;
                 assert_eq!(info["source"], source, "{info}");
                 if info["status"]["phase"] == "ready" {
-                    assert_eq!(info["status"]["indexed_notes"], 1);
+                    assert_eq!(info["status"]["indexed_notes"], notes);
                     assert_eq!(info["status"]["pending_notes"], 0);
                     return;
                 }
@@ -493,6 +559,74 @@ async fn auto_mode_retains_daemon_ownership_until_unavailable_then_keeps_local_f
 }
 
 #[tokio::test]
+async fn invalid_query_vectors_preserve_daemon_ownership_in_auto_mode() {
+    let daemon_api = ControlledProvider::start(false).await;
+    let local_api = ControlledProvider::start(false).await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("vault");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("note.md"), "# Marker\nVISIBLE quokka\n").unwrap();
+    let endpoint = isolated_endpoint(directory.path());
+    let client = SemanticDaemonClient::new(endpoint.clone(), DaemonConnectPolicy::default());
+    let mut daemon = spawn_daemon(
+        &directory.path().join("semantic"),
+        &endpoint,
+        daemon_api.port,
+    );
+    wait_for_health(&mut daemon, &client).await;
+    let mut server =
+        StdioServer::start(&root, directory.path(), &endpoint, "auto", local_api.port).await;
+    let first = server
+        .tool("search_semantic", json!({"query":"quokka","top_k":1}))
+        .await;
+    if first.get("error").is_some() {
+        assert_warming(&first);
+    }
+    server.wait_for_ready("daemon").await;
+    assert!(local_api.requests().is_empty());
+    let mut expected_requests = daemon_api.requests().len();
+
+    for invalid in [
+        InvalidEmbeddingResponse::WrongDimension,
+        InvalidEmbeddingResponse::MissingEmbedding,
+    ] {
+        daemon_api.invalid_response(Some(invalid));
+        for lexical_prefetch in [false, true] {
+            let response = server
+                .tool(
+                    "search_semantic",
+                    json!({"query":"quokka","top_k":1,"lexical_prefetch":lexical_prefetch}),
+                )
+                .await;
+            assert_eq!(response["error"]["code"], -32603, "{response}");
+            expected_requests += 1;
+            assert_eq!(daemon_api.requests().len(), expected_requests);
+            assert!(local_api.requests().is_empty());
+            let info = server.embedding_info().await;
+            assert_eq!(info["source"], "daemon", "{info}");
+            assert_eq!(info["status"]["phase"], "ready", "{info}");
+        }
+    }
+    daemon_api.invalid_response(None);
+    assert_note_found(
+        &server
+            .tool("search_semantic", json!({"query":"quokka","top_k":1}))
+            .await,
+    );
+    assert!(local_api.requests().is_empty());
+    assert!(
+        daemon_api
+            .requests()
+            .iter()
+            .all(|request| request["model"] == "probe")
+    );
+    assert_eq!(server.embedding_info().await["source"], "daemon");
+    server.stop().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+#[tokio::test]
 async fn local_semantic_queries_keep_progress_responsive_on_one_worker() {
     for lexical_prefetch in [false, true] {
         let provider = ControlledProvider::start(false).await;
@@ -620,4 +754,448 @@ async fn daemon_binary_filters_before_ranking_and_recovers_existing_clients() {
     daemon.wait().await.unwrap();
     fixture.abort();
     let _ = fixture.await;
+}
+
+fn structured_result(response: &Value) -> &Value {
+    assert!(response.get("error").is_none(), "{response}");
+    &response["result"]["structuredContent"]
+}
+
+fn oversized_note() -> String {
+    format!(
+        "---\ntags: [retention]\n---\n# Operations\n\n## Weather\n\n{}\n\n## Recovery procedure\n\nTAIL_SIGNAL Keep the encrypted backup until an incident is closed.\n",
+        "The coastal station records ordinary weather observations. ".repeat(120)
+    )
+}
+
+#[tokio::test]
+async fn hybrid_query_capacity_is_checked_before_empty_lexical_results() {
+    let query = "missing ".repeat(200);
+    let measured_tokens = tiktoken_rs::cl100k_base()
+        .unwrap()
+        .encode_ordinary(&query)
+        .len();
+    let max_input_tokens = 96;
+    assert!(measured_tokens > max_input_tokens);
+
+    for mode in ["local", "daemon"] {
+        let provider = ControlledProvider::start(false).await;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("vault");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(
+            root.join("policy.md"),
+            "# Policy\nKeep backups for thirty days.\n",
+        )
+        .unwrap();
+        let endpoint = isolated_endpoint(directory.path());
+        let mut daemon = if mode == "daemon" {
+            let client =
+                SemanticDaemonClient::new(endpoint.clone(), DaemonConnectPolicy::default());
+            let mut child = spawn_daemon_with_limits(
+                &directory.path().join("semantic"),
+                &endpoint,
+                provider.port,
+                max_input_tokens,
+                2,
+            );
+            wait_for_health(&mut child, &client).await;
+            Some(child)
+        } else {
+            None
+        };
+        let mut server = StdioServer::start_with_options(
+            &root,
+            directory.path(),
+            &endpoint,
+            mode,
+            provider.port,
+            max_input_tokens,
+            true,
+        )
+        .await;
+        let first = server
+            .tool("search_semantic", json!({"query":"Policy","top_k":1}))
+            .await;
+        if first.get("error").is_some() {
+            assert_warming(&first);
+        }
+        server.wait_for_ready(mode).await;
+        let initial_requests = provider.requests().len();
+
+        for lexical_prefetch in [false, true] {
+            let response = server
+                .tool(
+                    "search_semantic",
+                    json!({"query":query,"top_k":1,"lexical_prefetch":lexical_prefetch}),
+                )
+                .await;
+            assert_eq!(response["error"]["code"], -32602, "{mode}: {response}");
+            assert!(
+                response["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!(
+                        "{measured_tokens} tokens (maximum {max_input_tokens})"
+                    )),
+                "{mode}: {response}"
+            );
+        }
+        let valid = server
+            .tool(
+                "search_semantic",
+                json!({"query":"missing","top_k":1,"lexical_prefetch":true}),
+            )
+            .await;
+        assert!(
+            structured_result(&valid)["results"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{mode}: {valid}"
+        );
+
+        let removed = server
+            .tool("note_delete", json!({"path":"policy.md", "confirm":true}))
+            .await;
+        assert!(removed.get("error").is_none(), "{mode}: {removed}");
+        for lexical_prefetch in [false, true] {
+            let empty_scope = server
+                .tool(
+                    "search_semantic",
+                    json!({"query":"missing","top_k":1,"lexical_prefetch":lexical_prefetch}),
+                )
+                .await;
+            assert!(
+                structured_result(&empty_scope)["results"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty(),
+                "{mode}: {empty_scope}"
+            );
+            let overlong = server
+                .tool(
+                    "search_semantic",
+                    json!({"query":query,"top_k":1,"lexical_prefetch":lexical_prefetch}),
+                )
+                .await;
+            assert_eq!(overlong["error"]["code"], -32602, "{mode}: {overlong}");
+        }
+        assert_eq!(
+            provider.requests().len(),
+            initial_requests,
+            "{mode}: invalid queries and empty semantic or lexical scopes must not reach the provider"
+        );
+        server.stop().await;
+        if let Some(child) = daemon.as_mut() {
+            child.kill().await.unwrap();
+            child.wait().await.unwrap();
+        }
+    }
+}
+
+/// This suite is also run against both extracted native release binaries.
+#[tokio::test]
+async fn automatic_chunking_preserves_tail_evidence_and_revision_checked_context() {
+    for mode in ["local", "daemon"] {
+        let provider = ControlledProvider::start(false).await;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("vault");
+        std::fs::create_dir(&root).unwrap();
+        let long_note = oversized_note();
+        std::fs::write(root.join("policy.md"), &long_note).unwrap();
+        std::fs::write(root.join("brief.md"), "# Brief\nA short unrelated note.\n").unwrap();
+        let endpoint = isolated_endpoint(directory.path());
+        let mut daemon = if mode == "daemon" {
+            let client =
+                SemanticDaemonClient::new(endpoint.clone(), DaemonConnectPolicy::default());
+            let mut child = spawn_daemon_with_limits(
+                &directory.path().join("semantic"),
+                &endpoint,
+                provider.port,
+                96,
+                2,
+            );
+            wait_for_health(&mut child, &client).await;
+            Some(child)
+        } else {
+            None
+        };
+        let mut server = StdioServer::start_with_options(
+            &root,
+            directory.path(),
+            &endpoint,
+            mode,
+            provider.port,
+            96,
+            true,
+        )
+        .await;
+        let first = server
+            .tool("search_semantic", json!({"query":"TAIL_SIGNAL","top_k":2}))
+            .await;
+        if first.get("error").is_some() {
+            assert_warming(&first);
+        }
+        server.wait_for_ready_notes(mode, 2).await;
+        let response = server
+            .tool("search_semantic", json!({"query":"TAIL_SIGNAL","top_k":2}))
+            .await;
+        let hits = structured_result(&response)["results"].as_array().unwrap();
+        assert_eq!(hits.len(), 2, "top_k counts notes: {response}");
+        let policy = &hits[0];
+        assert_eq!(policy["path"], "policy.md", "{response}");
+        assert_eq!(policy["source_status"], "current");
+        assert_eq!(policy["evidence"]["scope"], "passage");
+        assert_eq!(hits[1]["evidence"]["scope"], "note");
+        assert!(
+            hits[1]["evidence"]["heading_path"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let start = policy["evidence"]["range"]["start_byte"].as_u64().unwrap() as usize;
+        let end = policy["evidence"]["range"]["end_byte"].as_u64().unwrap() as usize;
+        assert!(long_note[start..end].contains("TAIL_SIGNAL"));
+        assert!(
+            start > 400,
+            "the selected evidence must be beyond the old prefix"
+        );
+        let revision = policy["source_revision"].as_str().unwrap().to_owned();
+        let mut next = start;
+        let mut reconstructed = String::new();
+        while next < end {
+            let page = server
+                .tool(
+                    "note_read",
+                    json!({
+                        "path":"policy.md", "expected_revision":revision,
+                        "range":{"start_byte":next,"end_byte":end}, "max_bytes":17
+                    }),
+                )
+                .await;
+            let page = structured_result(&page);
+            assert_eq!(page["source_revision"], revision);
+            assert_eq!(page["returned_range"]["start_byte"], next);
+            reconstructed.push_str(page["content"].as_str().unwrap());
+            let returned_end = page["returned_range"]["end_byte"].as_u64().unwrap() as usize;
+            assert!(returned_end > next, "a bounded page must make progress");
+            next = returned_end;
+        }
+        assert_eq!(reconstructed, long_note[start..end]);
+
+        let complete = server
+            .tool(
+                "search_semantic",
+                json!({"query":"TAIL_SIGNAL","top_k":1,"include_content":true}),
+            )
+            .await;
+        let full_hit = &structured_result(&complete)["results"][0];
+        assert_eq!(full_hit["content"], long_note);
+        assert!(full_hit.get("snippet").is_none());
+
+        let tokenizer = tiktoken_rs::cl100k_base().unwrap();
+        let requests = provider.requests();
+        assert!(
+            requests.len() > 2,
+            "the note should require several bounded requests"
+        );
+        for request in requests {
+            let inputs = request["input"].as_array().unwrap();
+            assert!(inputs.len() <= 2);
+            let token_count: usize = inputs
+                .iter()
+                .map(|text| {
+                    let count = tokenizer.encode_ordinary(text.as_str().unwrap()).len();
+                    assert!(count <= 96, "provider received an oversized input");
+                    count
+                })
+                .sum();
+            assert!(token_count <= 192);
+        }
+        std::fs::write(root.join("policy.md"), "# Revised\nA different policy.\n").unwrap();
+        let stale = server
+            .tool(
+                "note_read",
+                json!({"path":"policy.md","expected_revision":revision}),
+            )
+            .await;
+        assert_eq!(stale["error"]["code"], -32600, "{stale}");
+        assert!(stale.get("result").is_none());
+        server.stop().await;
+        if let Some(child) = daemon.as_mut() {
+            child.kill().await.unwrap();
+            child.wait().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn changed_source_keeps_ranked_hit_without_mixed_revision_context() {
+    let provider = ControlledProvider::start(false).await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("vault");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("note.md"), oversized_note()).unwrap();
+    let endpoint = isolated_endpoint(directory.path());
+    let mut server = StdioServer::start_with_options(
+        &root,
+        directory.path(),
+        &endpoint,
+        "local",
+        provider.port,
+        96,
+        false,
+    )
+    .await;
+    server.wait_for_ready("local").await;
+    let first = server
+        .tool("search_semantic", json!({"query":"TAIL_SIGNAL","top_k":1}))
+        .await;
+    let previous_revision = structured_result(&first)["results"][0]["source_revision"].clone();
+    std::fs::write(
+        root.join("note.md"),
+        "# Replacement\nDifferent live content.\n",
+    )
+    .unwrap();
+    let changed = server
+        .tool(
+            "search_semantic",
+            json!({"query":"TAIL_SIGNAL","top_k":1,"include_content":true}),
+        )
+        .await;
+    let hit = &structured_result(&changed)["results"][0];
+    assert_eq!(hit["path"], "note.md");
+    assert_eq!(hit["source_revision"], previous_revision);
+    assert_eq!(hit["source_status"], "changed");
+    assert_eq!(hit["context_error"]["code"], "source_changed");
+    for field in ["snippet", "content", "preview"] {
+        assert!(
+            hit.get(field).is_none(),
+            "{field} must not cross revisions: {changed}"
+        );
+    }
+    server.stop().await;
+}
+
+async fn wait_for_cache_checkpoint(directory: &Path) {
+    timeout(Duration::from_secs(15), async {
+        loop {
+            let checkpoint = walkdir::WalkDir::new(directory)
+                .into_iter()
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_type().is_file() && entry.file_name() == "embeddings.bin");
+            if checkpoint {
+                return;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("embedding cache checkpoint did not appear");
+}
+
+#[tokio::test]
+async fn chunk_cache_reuses_unchanged_inputs_and_refreshes_only_the_edited_tail() {
+    let provider = ControlledProvider::start(false).await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("vault");
+    std::fs::create_dir(&root).unwrap();
+    let original = oversized_note();
+    std::fs::write(root.join("note.md"), &original).unwrap();
+    let endpoint = isolated_endpoint(directory.path());
+    let mut server = StdioServer::start_with_options(
+        &root,
+        directory.path(),
+        &endpoint,
+        "local",
+        provider.port,
+        96,
+        false,
+    )
+    .await;
+    server.wait_for_ready("local").await;
+    wait_for_cache_checkpoint(directory.path()).await;
+    let initial_requests = provider.requests().len();
+    let initial_inputs: usize = provider
+        .requests()
+        .iter()
+        .map(|request| request["input"].as_array().unwrap().len())
+        .sum();
+    assert!(
+        initial_inputs > 2,
+        "the note must have several embedded chunks"
+    );
+
+    let invalid = server
+        .tool(
+            "search_semantic",
+            json!({"query":"query ".repeat(200),"top_k":1}),
+        )
+        .await;
+    assert_eq!(invalid["error"]["code"], -32602, "{invalid}");
+    assert_eq!(
+        provider.requests().len(),
+        initial_requests,
+        "invalid input must not reach provider"
+    );
+    server.stop().await;
+
+    let mut server = StdioServer::start_with_options(
+        &root,
+        directory.path(),
+        &endpoint,
+        "local",
+        provider.port,
+        96,
+        false,
+    )
+    .await;
+    server.wait_for_ready("local").await;
+    assert_eq!(
+        provider.requests().len(),
+        initial_requests,
+        "compatible cache must avoid inference"
+    );
+
+    let updated = original.replace(
+        "until an incident is closed",
+        "until the incident review is complete",
+    );
+    let response = server
+        .tool("note_write", json!({"path":"note.md","content":updated}))
+        .await;
+    assert!(response.get("error").is_none(), "{response}");
+    let expected_revision = obsidian_mcp::vault::source::source_revision(&updated);
+    timeout(Duration::from_secs(15), async {
+        loop {
+            let response = server
+                .tool("search_semantic", json!({"query":"TAIL_SIGNAL","top_k":1}))
+                .await;
+            if response.get("error").is_none() {
+                let hit = &structured_result(&response)["results"][0];
+                if hit["source_revision"] == expected_revision && hit["source_status"] == "current"
+                {
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("edited tail did not become searchable");
+    let new_note_inputs: Vec<_> = provider.requests()[initial_requests..]
+        .iter()
+        .flat_map(|request| request["input"].as_array().unwrap().iter())
+        .filter_map(Value::as_str)
+        .filter(|text| *text != "TAIL_SIGNAL")
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        new_note_inputs.len(),
+        1,
+        "unchanged chunks should reuse vectors: {new_note_inputs:?}"
+    );
+    assert!(new_note_inputs[0].contains("incident review is complete"));
+    server.stop().await;
 }

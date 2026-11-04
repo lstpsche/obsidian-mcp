@@ -67,7 +67,7 @@ jobs:
           Compress-Archive -Path "target/${{ matrix.target }}/release/obsidian-mcp.exe" -DestinationPath $MCP_ARCHIVE
           Compress-Archive -Path "target/${{ matrix.target }}/release/obsidian-semanticd.exe" -DestinationPath $DAEMON_ARCHIVE
 
-      - name: Verify native daemon archive
+      - name: Verify native MCP and daemon archives
         shell: bash
         run: |
           daemon_host=$(rustc -vV | sed -n 's/^host: //p')
@@ -80,10 +80,12 @@ jobs:
           if [ "${{ runner.os }}" = "Windows" ]; then
             daemon_suffix=".exe"
             python -m zipfile -e obsidian-semanticd-"${ARCHIVE_REF#v}"-${{ matrix.target }}.zip daemon-smoke
+            python -m zipfile -e obsidian-mcp-"${ARCHIVE_REF#v}"-${{ matrix.target }}.zip daemon-smoke
           else
             tar -xzf obsidian-semanticd-"${ARCHIVE_REF#v}"-${{ matrix.target }}.tar.gz -C daemon-smoke
+            tar -xzf obsidian-mcp-"${ARCHIVE_REF#v}"-${{ matrix.target }}.tar.gz -C daemon-smoke
           fi
-          OBSIDIAN_TEST_DAEMON_BINARY="$PWD/daemon-smoke/obsidian-semanticd$daemon_suffix" cargo test --locked --release --features "${{ matrix.features }}" --target ${{ matrix.target }} --test semantic_daemon_api_tests
+          OBSIDIAN_TEST_DAEMON_BINARY="$PWD/daemon-smoke/obsidian-semanticd$daemon_suffix" OBSIDIAN_TEST_MCP_BINARY="$PWD/daemon-smoke/obsidian-mcp$daemon_suffix" cargo test --locked --release --features "${{ matrix.features }}" --target ${{ matrix.target }} --test semantic_daemon_api_tests
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

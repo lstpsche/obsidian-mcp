@@ -48,7 +48,7 @@ Package installation and process activation are separate states:
 1. The current executable must be exactly `<cargo-root>/bin/obsidian-mcp` and match one unambiguous official crates.io tracker record that owns both binaries.
 2. Cargo resolves the newest release with the preserved build settings.
 3. Both final binaries must return matching build identities. A feature/target mismatch or version downgrade is an error.
-4. If hashes did not change, a healthy runtime already reporting that version is not restarted. A supported old or unhealthy runtime is retried, which repairs an earlier partial activation.
+4. If hashes did not change, a healthy runtime already reporting that version and the required semantic capability is not restarted. A supported old or unhealthy runtime is retried, which repairs an earlier partial activation. An owned same-version semantic daemon missing that capability is replaced only when the installed sibling advertises support through its additive `--__build-info` capabilities; otherwise it remains running and the new updater reports the unsupported contract.
 5. Changed binaries trigger reconciliation of locally owned runtimes. A restarted daemon or HTTP service must report the exact installed version, not merely a PID or open port. An already-running daemon with a semantically newer, API-compatible version is preserved rather than downgraded.
 
 On Windows the installed executable cannot replace itself while running. The command validates the installation, starts a uniquely isolated temporary helper, and exits so the helper can perform replacement. The helper inherits terminal output, rejects other active `obsidian-mcp.exe` processes, and prints the final result. A locally owned semantic daemon is stopped before Cargo runs so its sibling executable can be replaced, then restored even when Cargo reports no binary change. The initiating process can report only that handoff succeeded; watch the helper's final terminal message for install/activation success.
@@ -63,6 +63,16 @@ On Windows the installed executable cannot replace itself while running. The com
 
 The updater does not roll back installed files after activation failure because that would make Cargo's tracker disagree with disk state.
 
+Automatic chunking uses embedding cache schema 2. Older prefix-only vectors are rebuilt from the source notes without a manual cache deletion; the first restart can therefore remain warming while it embeds the complete selected bodies. This can increase API token use, request count and cache size. Check passive `vault_info.embeddings` and then an actual semantic query separately from package/runtime health. A successful binary activation does not establish that semantic reconciliation or a particular client query has completed.
+
+The rebuild enforces [supported source, structure, staging and cache ceilings](../README.md#semantic-limits). A note exceeding those bounds remains an explicit semantic failure; the service does not relabel a truncated old vector or partial chunk collection as complete. Resource errors and incompatible provider profiles require the stated source/configuration correction rather than repeated reinstalls or manual deletion of the vault.
+
+Custom API deployments must supply `OBSIDIAN_EMBEDDING_API_PROFILE` in the owning process's existing environment source. The profile pins the exact endpoint/model tokenizer and capacity contract; generic compatible endpoints cannot infer that information from vector dimensions. Exact official OpenAI embedding IDs at the official endpoint have built-in profiles. The updater preserves launcher definitions and does not create a profile, copy credentials or edit environment files. See the [API profile reference](../README.md#search); restart the owning daemon after correcting its configuration.
+
+API base URLs are now validated as HTTP(S) URLs with a host and optional path. Previously accepted URL forms containing embedded credentials, query strings or fragments are rejected during configuration validation. Correct those endpoint settings before restarting the owner; authentication remains in `OBSIDIAN_EMBEDDING_API_KEY` or `OPENAI_API_KEY`. The updater does not rewrite endpoint or authentication settings, and profiles contain no credentials.
+
+The daemon remains on API v2 and adds `semantic_source_evidence_v1` to health capabilities. Existing v2 upgraders can still verify the newly installed daemon using their compiled handshake. New clients require the capability after any ownership-verified old-daemon reconciliation. External daemons without it are reported as unsupported and remain under their existing owner. A downgrade can rebuild an older cache projection; cross-schema vector reuse is not guaranteed.
+
 ## Manual smoke test for maintainers
 
 Use a temporary Cargo root, vault, semantic home, service definition, and non-default port—never a personal production service.
@@ -74,3 +84,5 @@ Use a temporary Cargo root, vault, semantic home, service definition, and non-de
 5. If semantic runtime was active, verify its exact version and unchanged semantic-home/cache markers.
 6. Run the command again and verify an up-to-date healthy install restarts nothing.
 7. Remove only the temporary service, root, vault, and semantic home.
+
+Include the actual previously released updater binary in an isolated old-to-new acceptance run. Verify its API2 activation handshake against the new daemon, then verify the required capability with the new client. Use an oversized synthetic note, confirm note-level ranking plus passage evidence, and expand its source with `note_read` using the returned revision. A source edit before continuation must return a revision conflict. Verify cache rebuilding and custom-provider profile errors separately from the updater's package/process checks.
