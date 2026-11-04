@@ -553,8 +553,13 @@ impl EmbeddingStore {
             if live.is_some_and(|flag| !flag.load(AtomicOrdering::Acquire)) {
                 return Ok(false);
             }
-            temp.persist(path)
-                .map_err(|error| VaultError::Io(error.error))?;
+            // Clear temporary attributes before publication, then use the
+            // standard library's rename semantics for open Windows readers.
+            let (_file, temporary_path) =
+                temp.keep().map_err(|error| VaultError::Io(error.error))?;
+            let mut temporary_path = tempfile::TempPath::try_from_path(temporary_path)?;
+            std::fs::rename(&temporary_path, path)?;
+            temporary_path.disable_cleanup(true);
             Ok(true)
         } else {
             Err(cache_error("embedding cache path has no parent"))
@@ -2621,6 +2626,79 @@ mod tests {
         }
         writer.join().unwrap();
         assert!(reads > 0);
+    }
+
+    #[test]
+    fn cache_publication_preserves_an_open_reader_and_replaces_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("embeddings.bin");
+        let original = make_store();
+        original.save(&path).unwrap();
+        let original_bytes = std::fs::read(&path).unwrap();
+        let mut reader = std::fs::File::open(&path).unwrap();
+        let mut replacement = make_store();
+        replacement
+            .insert_hashed(
+                PathBuf::from("a.md"),
+                prepared_text_hash("replacement"),
+                vec![0.0, 0.0, 1.0],
+            )
+            .unwrap();
+        replacement.save(&path).unwrap();
+        let mut observed = Vec::new();
+        reader.read_to_end(&mut observed).unwrap();
+        assert_eq!(observed, original_bytes);
+        assert_eq!(
+            EmbeddingStore::load(&path).unwrap().get(Path::new("a.md")),
+            Some(&[0.0, 0.0, 1.0][..])
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn failed_cache_publication_preserves_the_target_and_cleans_up_the_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("embeddings.bin");
+        std::fs::create_dir(&target).unwrap();
+        let sentinel = target.join("preserved");
+        std::fs::write(&sentinel, b"existing target").unwrap();
+        assert!(matches!(make_store().save(&target), Err(VaultError::Io(_))));
+        assert!(target.is_dir());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"existing target");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cache_publication_reports_exclusive_reader_failure_without_losing_the_previous_cache() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("embeddings.bin");
+        let original = make_store();
+        original.save(&path).unwrap();
+        let original_bytes = std::fs::read(&path).unwrap();
+        let exclusive = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let mut replacement = make_store();
+        replacement
+            .insert_hashed(
+                PathBuf::from("a.md"),
+                prepared_text_hash("replacement"),
+                vec![0.0, 0.0, 1.0],
+            )
+            .unwrap();
+        assert!(matches!(replacement.save(&path), Err(VaultError::Io(_))));
+        drop(exclusive);
+        assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        replacement.save(&path).unwrap();
+        assert_eq!(
+            EmbeddingStore::load(&path).unwrap().get(Path::new("a.md")),
+            Some(&[0.0, 0.0, 1.0][..])
+        );
     }
 
     #[test]
