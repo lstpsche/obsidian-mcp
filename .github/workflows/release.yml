@@ -4,7 +4,10 @@ on:
   push:
     tags: ["v*"]
   pull_request:
-    paths: [".github/workflows/release.yml"]
+    paths:
+      - ".github/workflows/release.yml"
+      - "tests/semantic_daemon_api_tests.rs"
+      - "tests/common/**"
 
 permissions:
   contents: read
