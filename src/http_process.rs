@@ -1,7 +1,9 @@
 //! Ownership checks for the HTTP listener controlled by the local CLI.
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
+use std::net::SocketAddr;
+#[cfg(unix)]
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpStream};
 use std::path::Path;
 use std::time::Duration;
 
@@ -9,19 +11,25 @@ pub(crate) fn listener_pid(endpoint: SocketAddr) -> io::Result<Option<u32>> {
     if endpoint.port() == 0 {
         return Ok(None);
     }
-    let connect_ip = match endpoint.ip() {
-        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
-        ip => ip,
+    // Unix lsof can hide another user's listener. Windows supplies the
+    // system-wide owner table directly, including an empty endpoint.
+    #[cfg(unix)]
+    let reachable = {
+        let connect_ip = match endpoint.ip() {
+            IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+            ip => ip,
+        };
+        match TcpStream::connect_timeout(
+            &SocketAddr::new(connect_ip, endpoint.port()),
+            Duration::from_millis(200),
+        ) {
+            Ok(_) => true,
+            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => false,
+            Err(error) => return Err(error),
+        }
     };
-    let reachable = match TcpStream::connect_timeout(
-        &SocketAddr::new(connect_ip, endpoint.port()),
-        Duration::from_millis(200),
-    ) {
-        Ok(_) => true,
-        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => false,
-        Err(error) => return Err(error),
-    };
+    #[cfg(unix)]
     if !reachable && !endpoint.ip().is_unspecified() {
         return Ok(None);
     }
@@ -38,10 +46,11 @@ pub(crate) fn listener_pid(endpoint: SocketAddr) -> io::Result<Option<u32>> {
     pids.dedup();
     match pids.as_slice() {
         [pid] => Ok(Some(*pid)),
-        [] if !reachable => Ok(None),
-        [] => Err(io::Error::other(format!(
+        #[cfg(unix)]
+        [] if reachable => Err(io::Error::other(format!(
             "{endpoint} is occupied but its exact listener could not be identified; use the owning service to stop it"
         ))),
+        [] => Ok(None),
         _ => Err(io::Error::other(format!(
             "multiple processes own the listener on {endpoint}; use the owning service to stop it"
         ))),
@@ -585,7 +594,7 @@ mod platform {
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::process::{Child, Command, Stdio};
 
     const LISTENER_READY: &str = "test listener address: ";

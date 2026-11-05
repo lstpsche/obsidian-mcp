@@ -1908,7 +1908,8 @@ mod tests {
         let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let logs = captured_logs();
-        let marker = directory.path().display().to_string();
+        // The handle's canonical path can expand a Windows short-name ancestor.
+        let marker = directory.path().file_name().unwrap().to_string_lossy();
         let started = Instant::now();
         let runtime = EmbeddingRuntime::spawn_for_test(
             directory.path().to_path_buf(),
@@ -2748,7 +2749,8 @@ mod tests {
             snapshot.score_for(Path::new("two.md"), &[0.0, 1.0, 0.0]),
             1.0
         );
-        let output = captured_logs().text_for(&directory.path().display().to_string());
+        let marker = directory.path().file_name().unwrap().to_string_lossy();
+        let output = captured_logs().text_for(&marker);
         assert!(output.contains("outcome=\"failed\""));
         assert!(output.contains("1 vectors for 2 inputs"));
     }
