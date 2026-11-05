@@ -10,10 +10,8 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-
-#[cfg(feature = "embeddings-api")]
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use super::embedding_input::{self, EmbeddingInputPolicy, EmbeddingRequestLimits, TokenCounter};
 use crate::config::EmbeddingProvider;
@@ -77,6 +75,13 @@ impl EmbeddingSpaceIdentity {
     }
 }
 
+fn check_document_owner(owner_live: Option<&AtomicBool>) -> VaultResult<()> {
+    if owner_live.is_some_and(|live| !live.load(AtomicOrdering::Acquire)) {
+        return Err(VaultError::Embedding("embedding scope retired".into()));
+    }
+    Ok(())
+}
+
 pub(crate) trait Embedder: Send + Sync {
     fn dimension(&self) -> usize;
     fn space_identity(&self) -> &EmbeddingSpaceIdentity;
@@ -94,7 +99,14 @@ pub(crate) trait Embedder: Send + Sync {
         )
     }
     fn embed_batch(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>>;
-    fn embed_next_batch(&self, texts: &[&str]) -> (usize, VaultResult<Vec<Vec<f32>>>) {
+    fn embed_next_batch(
+        &self,
+        texts: &[&str],
+        owner_live: &Arc<AtomicBool>,
+    ) -> (usize, VaultResult<Vec<Vec<f32>>>) {
+        if let Err(error) = check_document_owner(Some(owner_live)) {
+            return (1, Err(error));
+        }
         let count = match self.plan_batch(texts) {
             Ok(count) if count > 0 && count <= texts.len() => count,
             Ok(_) => {
@@ -107,8 +119,18 @@ pub(crate) trait Embedder: Send + Sync {
             }
             Err(error) => return (1, Err(error)),
         };
-        (count, self.embed_batch(&texts[..count]))
+        (count, self.dispatch_documents(&texts[..count], owner_live))
     }
+
+    fn dispatch_documents(
+        &self,
+        texts: &[&str],
+        owner_live: &Arc<AtomicBool>,
+    ) -> VaultResult<Vec<Vec<f32>>> {
+        check_document_owner(Some(owner_live))?;
+        self.embed_batch(texts)
+    }
+
     fn embed_query(&self, query: &str) -> VaultResult<Vec<f32>> {
         embedding_input::validate_input(query, self.input_policy(), |text| {
             self.count_tokens(text)
@@ -484,7 +506,17 @@ impl EmbeddingStore {
     }
 
     pub fn save(&self, path: &Path) -> VaultResult<()> {
-        Self::persist_cache_bytes(path, &self.encode_cache()?, None).map(|_| ())
+        let parent = path
+            .parent()
+            .ok_or_else(|| cache_error("cache path has no parent"))?;
+        std::fs::create_dir_all(parent)?;
+        let root = super::fs::VaultRoot::open(parent)?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| cache_error("cache path has no filename"))?;
+        CacheFile::new(root, PathBuf::from(name))
+            .publish(&self.encode_cache()?, None)
+            .map(|_| ())
     }
 
     pub(crate) fn encode_cache(&self) -> VaultResult<Vec<u8>> {
@@ -525,51 +557,11 @@ impl EmbeddingStore {
         Ok(out.bytes)
     }
 
-    pub(crate) fn persist_cache_bytes_if_live(
-        path: &Path,
-        bytes: &[u8],
-        live: &AtomicBool,
-    ) -> VaultResult<bool> {
-        Self::persist_cache_bytes(path, bytes, Some(live))
-    }
-
-    fn persist_cache_bytes(
-        path: &Path,
-        bytes: &[u8],
-        live: Option<&AtomicBool>,
-    ) -> VaultResult<bool> {
-        if bytes.len() as u64 > MAX_CACHE_BYTES {
-            return Err(cache_error("embedding cache is too large to persist"));
-        }
-        if live.is_some_and(|flag| !flag.load(AtomicOrdering::Acquire)) {
-            return Ok(false);
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-            let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-            temp.write_all(bytes)?;
-            temp.flush()?;
-            temp.as_file().sync_all()?;
-            if live.is_some_and(|flag| !flag.load(AtomicOrdering::Acquire)) {
-                return Ok(false);
-            }
-            // Clear temporary attributes before publication, then use the
-            // standard library's rename semantics for open Windows readers.
-            let (_file, temporary_path) =
-                temp.keep().map_err(|error| VaultError::Io(error.error))?;
-            let mut temporary_path = tempfile::TempPath::try_from_path(temporary_path)?;
-            std::fs::rename(&temporary_path, path)?;
-            temporary_path.disable_cleanup(true);
-            Ok(true)
-        } else {
-            Err(cache_error("embedding cache path has no parent"))
-        }
-    }
-
     pub fn load(path: &Path) -> VaultResult<Self> {
         Self::load_bounded(path, None, MAX_CACHE_ENTRIES)
     }
 
+    #[cfg(test)]
     pub(crate) fn load_for_space(
         path: &Path,
         expected: &EmbeddingSpaceIdentity,
@@ -589,7 +581,14 @@ impl EmbeddingStore {
         expected: Option<&EmbeddingSpaceIdentity>,
         max_entries: usize,
     ) -> VaultResult<Self> {
-        let file = std::fs::File::open(path)?;
+        Self::decode_file(std::fs::File::open(path)?, expected, max_entries)
+    }
+
+    fn decode_file(
+        file: std::fs::File,
+        expected: Option<&EmbeddingSpaceIdentity>,
+        max_entries: usize,
+    ) -> VaultResult<Self> {
         let size = file.metadata()?.len();
         if size > MAX_CACHE_BYTES {
             return Err(cache_error("embedding cache is too large"));
@@ -1212,6 +1211,7 @@ enum EmbeddingBackend {
 #[cfg(feature = "embeddings-api")]
 struct ApiEmbeddingRequest {
     texts: Vec<String>,
+    owner_live: Option<Arc<AtomicBool>>,
     retry_deadline: Option<std::time::Instant>,
     response: std::sync::mpsc::Sender<VaultResult<Vec<Vec<f32>>>>,
 }
@@ -1260,24 +1260,15 @@ impl ApiEmbeddingClient {
                             break;
                         };
                         let texts = request.texts.iter().map(String::as_str).collect::<Vec<_>>();
-                        let result = if request.retry_deadline.is_some() {
-                            embed_batch_api_with_policy(
-                                &client,
-                                base_url.as_str(),
-                                model.as_str(),
-                                api_key.as_str(),
-                                &texts,
-                                request.retry_deadline,
-                            )
-                        } else {
-                            embed_batch_api(
-                                &client,
-                                base_url.as_str(),
-                                model.as_str(),
-                                api_key.as_str(),
-                                &texts,
-                            )
-                        };
+                        let result = embed_batch_api_with_policy(
+                            &client,
+                            base_url.as_str(),
+                            model.as_str(),
+                            api_key.as_str(),
+                            &texts,
+                            request.retry_deadline,
+                            request.owner_live.as_ref(),
+                        );
                         let _ = request.response.send(result);
                     }
                 }) {
@@ -1301,15 +1292,21 @@ impl ApiEmbeddingClient {
         })
     }
 
+    #[cfg(test)]
     fn embed_batch(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>> {
-        self.request(texts, false)
+        self.request(texts, false, None)
     }
 
     fn embed_with_retry(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>> {
-        self.request(texts, true)
+        self.request(texts, true, None)
     }
 
-    fn request(&self, texts: &[&str], retry_transient: bool) -> VaultResult<Vec<Vec<f32>>> {
+    fn request(
+        &self,
+        texts: &[&str],
+        retry_transient: bool,
+        owner_live: Option<&Arc<AtomicBool>>,
+    ) -> VaultResult<Vec<Vec<f32>>> {
         let sender = self
             .sender
             .as_ref()
@@ -1318,6 +1315,7 @@ impl ApiEmbeddingClient {
         let (response, receiver) = std::sync::mpsc::channel();
         let mut request = ApiEmbeddingRequest {
             texts: texts.iter().map(|text| (*text).to_string()).collect(),
+            owner_live: owner_live.cloned(),
             retry_deadline,
             response,
         };
@@ -1429,13 +1427,14 @@ impl EmbeddingModel {
             self.request_overhead,
             |text| self.counter.count(text),
         )?;
-        self.dispatch_validated(texts, _retry_transient)
+        self.dispatch_validated(texts, _retry_transient, None)
     }
 
     fn dispatch_validated(
         &self,
         texts: &[&str],
         _retry_transient: bool,
+        owner_live: Option<&Arc<AtomicBool>>,
     ) -> VaultResult<Vec<Vec<f32>>> {
         let vectors = match &self.backend {
             #[cfg(feature = "embeddings")]
@@ -1443,6 +1442,7 @@ impl EmbeddingModel {
                 let mut model = inner
                     .lock()
                     .map_err(|e| VaultError::Embedding(format!("model lock poisoned: {e}")))?;
+                check_document_owner(owner_live.map(Arc::as_ref))?;
                 model
                     .embed(texts, Some(LOCAL_MAX_REQUEST_INPUTS))
                     .map_err(|error| VaultError::EmbeddingRequest {
@@ -1452,13 +1452,7 @@ impl EmbeddingModel {
                     })?
             }
             #[cfg(feature = "embeddings-api")]
-            EmbeddingBackend::Api(client) => {
-                if _retry_transient {
-                    client.embed_with_retry(texts)?
-                } else {
-                    client.embed_batch(texts)?
-                }
-            }
+            EmbeddingBackend::Api(client) => client.request(texts, _retry_transient, owner_live)?,
         };
         validate_embedding_batch(vectors, texts.len(), self.dim)
     }
@@ -1675,20 +1669,12 @@ impl Embedder for EmbeddingModel {
         self.embed_with_policy(texts, false)
     }
 
-    fn embed_next_batch(&self, texts: &[&str]) -> (usize, VaultResult<Vec<Vec<f32>>>) {
-        let count = match self.plan_batch(texts) {
-            Ok(count) if count > 0 && count <= texts.len() => count,
-            Ok(_) => {
-                return (
-                    1,
-                    Err(VaultError::Embedding(
-                        "embedding request planner did not make progress".into(),
-                    )),
-                );
-            }
-            Err(error) => return (1, Err(error)),
-        };
-        (count, self.dispatch_validated(&texts[..count], false))
+    fn dispatch_documents(
+        &self,
+        texts: &[&str],
+        owner_live: &Arc<AtomicBool>,
+    ) -> VaultResult<Vec<Vec<f32>>> {
+        self.dispatch_validated(texts, false, Some(owner_live))
     }
 
     fn embed_query(&self, query: &str) -> VaultResult<Vec<f32>> {
@@ -1826,7 +1812,7 @@ fn probe_api_dimension(client: &ApiEmbeddingClient) -> Result<usize, VaultError>
     Ok(first.len())
 }
 
-#[cfg(feature = "embeddings-api")]
+#[cfg(all(feature = "embeddings-api", test))]
 fn embed_batch_api(
     client: &reqwest::blocking::Client,
     base_url: &str,
@@ -1834,7 +1820,25 @@ fn embed_batch_api(
     api_key: &str,
     texts: &[&str],
 ) -> Result<Vec<Vec<f32>>, VaultError> {
-    embed_batch_api_with_policy(client, base_url, model, api_key, texts, None)
+    embed_batch_api_with_policy(client, base_url, model, api_key, texts, None, None)
+}
+
+// A blocking HTTP client can queue work internally after our provider worker
+// dequeues it. Admit the document again when the transport takes its first bytes.
+#[cfg(feature = "embeddings-api")]
+struct ScopedRequestBody {
+    bytes: std::io::Cursor<Vec<u8>>,
+    live: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "embeddings-api")]
+impl Read for ScopedRequestBody {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.bytes.position() == 0 && !self.live.load(AtomicOrdering::Acquire) {
+            return Err(std::io::Error::other("embedding scope retired"));
+        }
+        self.bytes.read(buf)
+    }
 }
 
 #[cfg(feature = "embeddings-api")]
@@ -1854,7 +1858,9 @@ fn embed_batch_api_with_policy(
     api_key: &str,
     texts: &[&str],
     retry_deadline: Option<std::time::Instant>,
+    owner_live: Option<&Arc<AtomicBool>>,
 ) -> Result<Vec<Vec<f32>>, VaultError> {
+    check_document_owner(owner_live.map(Arc::as_ref))?;
     let url = format!("{}/embeddings", base_url.trim_end_matches('/'));
     let body = serde_json::json!({
         "model": model,
@@ -1866,8 +1872,22 @@ fn embed_batch_api_with_policy(
     loop {
         let mut request = client
             .post(&url)
-            .header("Authorization", format!("Bearer {api_key}"))
-            .json(&body);
+            .header("Authorization", format!("Bearer {api_key}"));
+        request = if let Some(live) = owner_live {
+            let bytes = serde_json::to_vec(&body).map_err(|err| {
+                VaultError::Embedding(format!("cannot encode embedding request: {err}"))
+            })?;
+            let size = bytes.len() as u64;
+            let input = ScopedRequestBody {
+                bytes: std::io::Cursor::new(bytes),
+                live: Arc::clone(live),
+            };
+            request
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(reqwest::blocking::Body::sized(input, size))
+        } else {
+            request.json(&body)
+        };
         if let Some(deadline) = retry_deadline {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
@@ -1875,6 +1895,7 @@ fn embed_batch_api_with_policy(
             }
             request = request.timeout(remaining);
         }
+        check_document_owner(owner_live.map(Arc::as_ref))?;
         attempts += 1;
         let (mut message, retryable, retry_after) = match request.send() {
             Ok(response) => {
@@ -2064,6 +2085,138 @@ fn parse_usize_env(var_name: &str) -> Option<usize> {
     std::env::var(var_name).ok()?.trim().parse::<usize>().ok()
 }
 
+/// A checkpoint path below an explicitly selected, already-open data root.
+#[derive(Clone)]
+pub(crate) struct CacheFile {
+    root: super::fs::VaultRoot,
+    relative: PathBuf,
+}
+
+impl CacheFile {
+    pub(crate) fn new(root: super::fs::VaultRoot, relative: PathBuf) -> Self {
+        Self { root, relative }
+    }
+
+    fn open_optional(&self) -> VaultResult<Option<std::fs::File>> {
+        match self.root.open_exact(&self.relative) {
+            Ok(file) => Ok(Some(file)),
+            Err(error) if error.is_not_found() => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn load(
+        &self,
+        identity: &EmbeddingSpaceIdentity,
+        note_count: usize,
+    ) -> VaultResult<Option<EmbeddingStore>> {
+        self.open_optional()?
+            .map(|file| {
+                EmbeddingStore::decode_file(
+                    file,
+                    Some(identity),
+                    note_count.saturating_add(1024).min(MAX_CACHE_ENTRIES),
+                )
+            })
+            .transpose()
+    }
+
+    fn parent_and_name(&self) -> VaultResult<(cap_std::fs::Dir, &std::ffi::OsStr)> {
+        self.root.parent(&self.relative, true)
+    }
+
+    pub(crate) fn publish(
+        &self,
+        bytes: &[u8],
+        owner: Option<(&AtomicBool, &std::sync::Mutex<()>)>,
+    ) -> VaultResult<bool> {
+        if bytes.len() as u64 > MAX_CACHE_BYTES {
+            return Err(cache_error("embedding cache is too large to persist"));
+        }
+        let active = || owner.is_none_or(|(live, _)| live.load(AtomicOrdering::Acquire));
+        if !active() {
+            return Ok(false);
+        }
+        let (dir, name) = self.parent_and_name()?;
+        match dir.symlink_metadata(name) {
+            Ok(meta) if super::fs::is_link(&meta) => {
+                return Err(VaultError::InvalidPath(format!(
+                    "symbolic link at cache path {}",
+                    self.relative.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        let temp = CheckpointTemp::write_in(&dir, |file| {
+            file.write_all(bytes)?;
+            Ok(())
+        })?;
+        // Retirement only waits for the atomic replacement. Preparing and syncing
+        // a large checkpoint cannot stall withdrawal of a connection's rights.
+        let _commit = owner.map(|(_, gate)| gate.lock().unwrap_or_else(|error| error.into_inner()));
+        if !active() {
+            return Ok(false);
+        }
+        temp.replace(name)?;
+        Ok(true)
+    }
+}
+
+/// All operations use the same pinned parent, including failed-write cleanup.
+struct CheckpointTemp<'a> {
+    dir: &'a cap_std::fs::Dir,
+    name: String,
+    cleanup: bool,
+}
+
+impl<'a> CheckpointTemp<'a> {
+    fn write_in(
+        dir: &'a cap_std::fs::Dir,
+        write: impl FnOnce(&mut cap_std::fs::File) -> VaultResult<()>,
+    ) -> VaultResult<Self> {
+        let mut id = [0u8; 16];
+        getrandom::fill(&mut id)
+            .map_err(|err| cache_error(format!("cannot name temporary checkpoint: {err}")))?;
+        let name = format!(".checkpoint-{:032x}.tmp", u128::from_le_bytes(id));
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = dir.open_with(&name, &options)?;
+        let guard = Self {
+            dir,
+            name,
+            cleanup: true,
+        };
+        write(&mut file)?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(guard)
+    }
+
+    fn replace(mut self, destination: &std::ffi::OsStr) -> VaultResult<()> {
+        super::fs::replace_child(self.dir, self.name.as_ref(), destination)?;
+        self.cleanup = false;
+        Ok(())
+    }
+}
+
+impl Drop for CheckpointTemp<'_> {
+    fn drop(&mut self) {
+        if self.cleanup
+            && let Err(err) = super::fs::remove_temp_file(self.dir, self.name.as_ref())
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(error = %err, "failed to remove temporary checkpoint");
+        }
+    }
+}
+
 // ── Legacy cache relocation ────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2078,70 +2231,54 @@ pub fn migrate_legacy_cache_to_daemon_store(
     semantic_home: &Path,
 ) -> VaultResult<LegacyCacheMigration> {
     let vault_id = crate::daemon::home::compute_vault_id(vault_root)?;
-    let target = semantic_home
-        .join("vaults")
-        .join(vault_id)
-        .join("embeddings.bin");
-    let legacy_source = vault_root
-        .join(".obsidian")
-        .join("obsidian-mcp")
-        .join("embeddings.bin");
-    let new_source = vault_root
-        .join(".obsidian-mcp")
-        .join("embeddings")
-        .join("embeddings.bin");
-
-    migrate_cache_candidates_to_path(&[new_source, legacy_source], &target)
+    let source_root = super::fs::VaultRoot::open(vault_root)?;
+    std::fs::create_dir_all(semantic_home)?;
+    let target_root = super::fs::VaultRoot::open(semantic_home)?;
+    let target_rel = Path::new("vaults").join(vault_id).join("embeddings.bin");
+    let target_path = semantic_home.join(&target_rel);
+    let target = CacheFile::new(target_root, target_rel);
+    let sources = [
+        ".obsidian-mcp/embeddings/embeddings.bin",
+        ".obsidian/obsidian-mcp/embeddings.bin",
+    ]
+    .map(|name| CacheFile::new(source_root.clone(), name.into()));
+    migrate_cache_candidates(&sources, &target, &target_path)
 }
 
-pub(crate) fn migrate_cache_candidates_to_path(
-    sources: &[PathBuf],
-    target: &Path,
+fn migrate_cache_candidates(
+    sources: &[CacheFile],
+    target: &CacheFile,
+    target_path: &Path,
 ) -> VaultResult<LegacyCacheMigration> {
-    if target.exists() {
-        return Ok(LegacyCacheMigration::AlreadyPresent(target.to_path_buf()));
+    if target.open_optional()?.is_some() {
+        return Ok(LegacyCacheMigration::AlreadyPresent(target_path.to_owned()));
     }
-
-    let Some(source) = sources.iter().find(|source| source.is_file()) else {
-        return Ok(LegacyCacheMigration::NotFound);
-    };
-
-    let source_file = std::fs::File::open(source)?;
-    let source_len = source_file.metadata()?.len();
-    if source_len > MAX_CACHE_BYTES {
-        return Err(VaultError::Embedding(format!(
-            "embedding cache is too large to relocate: {source_len} bytes (limit {MAX_CACHE_BYTES})"
-        )));
-    }
-
-    let parent = target.parent().ok_or_else(|| {
-        VaultError::Embedding(format!(
-            "embedding cache migration target has no parent: {}",
-            target.display()
-        ))
-    })?;
-    std::fs::create_dir_all(parent)?;
-
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    let mut limited_source = source_file.take(MAX_CACHE_BYTES + 1);
-    let copied = std::io::copy(&mut limited_source, &mut temp)?;
-    if copied > MAX_CACHE_BYTES {
-        return Err(VaultError::Embedding(format!(
-            "embedding cache is too large to relocate: more than {MAX_CACHE_BYTES} bytes"
-        )));
-    }
-    temp.flush()?;
-    temp.as_file().sync_all()?;
-
-    match temp.persist_noclobber(target) {
-        Ok(_) => Ok(LegacyCacheMigration::Migrated(target.to_path_buf())),
-        Err(error)
-            if error.error.kind() == std::io::ErrorKind::AlreadyExists || target.exists() =>
-        {
-            Ok(LegacyCacheMigration::AlreadyPresent(target.to_path_buf()))
+    for source in sources {
+        let Some(file) = source.open_optional()? else {
+            continue;
+        };
+        if file.metadata()?.len() > MAX_CACHE_BYTES {
+            return Err(cache_error("embedding cache is too large to relocate"));
         }
-        Err(error) => Err(VaultError::Io(error.error)),
+        let (dir, name) = target.parent_and_name()?;
+        let temp = CheckpointTemp::write_in(&dir, |tempfile| {
+            let copied = std::io::copy(&mut file.take(MAX_CACHE_BYTES + 1), tempfile)?;
+            if copied > MAX_CACHE_BYTES {
+                return Err(cache_error("embedding cache is too large to relocate"));
+            }
+            Ok(())
+        })?;
+        // A same-directory hard link publishes atomically without replacing a
+        // concurrently created destination. The guard unlinks the staging name.
+        return match dir.hard_link(&temp.name, &dir, name) {
+            Ok(()) => Ok(LegacyCacheMigration::Migrated(target_path.to_owned())),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                Ok(LegacyCacheMigration::AlreadyPresent(target_path.to_owned()))
+            }
+            Err(err) => Err(err.into()),
+        };
     }
+    Ok(LegacyCacheMigration::NotFound)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -3146,6 +3283,72 @@ mod tests {
     }
 
     #[test]
+    fn retiring_while_a_checkpoint_is_staged_preserves_the_committed_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = super::super::fs::VaultRoot::open(directory.path()).unwrap();
+        let cache = CacheFile::new(root, PathBuf::from("embeddings.bin"));
+        cache.publish(b"committed", None).unwrap();
+        let live = AtomicBool::new(true);
+        let gate = std::sync::Mutex::new(());
+        std::thread::scope(|scope| {
+            let commit = gate.lock().unwrap();
+            let writer = scope.spawn(|| cache.publish(b"withdrawn", Some((&live, &gate))));
+            // The final commit is blocked, but the temp file must still be prepared.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::fs::read_dir(directory.path()).unwrap().count() == 1 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "checkpoint did not stage"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            live.store(false, AtomicOrdering::Release);
+            drop(commit);
+            assert!(!writer.join().unwrap().unwrap());
+        });
+        assert_eq!(
+            std::fs::read(directory.path().join("embeddings.bin")).unwrap(),
+            b"committed"
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_parent_swap_cannot_load_or_publish_external_bytes() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let handle = super::super::fs::VaultRoot::open(root.path()).unwrap();
+        let folder = root.path().join("scope");
+        std::fs::create_dir(&folder).unwrap();
+        let cache = CacheFile::new(handle, PathBuf::from("scope/embeddings.bin"));
+        cache.publish(b"inside", None).unwrap();
+        std::fs::rename(&folder, root.path().join("retired")).unwrap();
+        symlink(external.path(), &folder).unwrap();
+        let target = external.path().join("embeddings.bin");
+        std::fs::write(&target, b"outside sentinel").unwrap();
+        assert!(cache.open_optional().is_err());
+        assert!(cache.publish(b"must stay inside", None).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"outside sentinel");
+        assert_eq!(std::fs::read_dir(external.path()).unwrap().count(), 1);
+    }
+
+    fn migrate_cache_candidates_to_path(
+        sources: &[PathBuf],
+        target: &Path,
+    ) -> VaultResult<LegacyCacheMigration> {
+        let base = target.parent().unwrap().parent().unwrap();
+        let root = super::super::fs::VaultRoot::open(base)?;
+        let sources = sources
+            .iter()
+            .map(|p| CacheFile::new(root.clone(), p.strip_prefix(base).unwrap().to_owned()))
+            .collect::<Vec<_>>();
+        let destination = CacheFile::new(root, target.strip_prefix(base).unwrap().to_owned());
+        migrate_cache_candidates(&sources, &destination, target)
+    }
+
+    #[test]
     fn migrate_legacy_cache_copies_once_and_keeps_source() {
         let vault_root = tempfile::tempdir().expect("temp vault root");
         let semantic_home = tempfile::tempdir().expect("temp semantic home");
@@ -3617,7 +3820,11 @@ mod tests {
                 api_fixture_with_content_lengths(vec![(200, "0", "{".into(), Some(100))]);
             let model =
                 api_fixture_model(&base, Some(2), std::time::Duration::from_secs(2)).unwrap();
-            let (count, result) = Embedder::embed_next_batch(&model, &["document body"]);
+            let (count, result) = Embedder::embed_next_batch(
+                &model,
+                &["document body"],
+                &Arc::new(AtomicBool::new(true)),
+            );
             assert_eq!(count, 1);
             let error = result.unwrap_err();
             assert!(
@@ -3648,7 +3855,11 @@ mod tests {
                 let (base, server) = api_fixture(vec![(status, "0", String::new())]);
                 let model =
                     api_fixture_model(&base, Some(2), std::time::Duration::from_secs(2)).unwrap();
-                let (count, result) = Embedder::embed_next_batch(&model, &["document body"]);
+                let (count, result) = Embedder::embed_next_batch(
+                    &model,
+                    &["document body"],
+                    &Arc::new(AtomicBool::new(true)),
+                );
                 assert_eq!(count, 1);
                 let error = result.unwrap_err();
                 assert!(matches!(
@@ -3668,7 +3879,11 @@ mod tests {
             let model =
                 api_fixture_model(&base, Some(2), std::time::Duration::from_secs(2)).unwrap();
             let started = std::time::Instant::now();
-            let (count, result) = Embedder::embed_next_batch(&model, &["document body"]);
+            let (count, result) = Embedder::embed_next_batch(
+                &model,
+                &["document body"],
+                &Arc::new(AtomicBool::new(true)),
+            );
             assert_eq!(count, 1);
             let error = result.unwrap_err();
             assert!(matches!(error, VaultError::EmbeddingRequest {
@@ -3687,7 +3902,8 @@ mod tests {
             let (base, server) = api_fixture(vec![(200, "0", body)]);
             let model =
                 api_fixture_model(&base, Some(2), std::time::Duration::from_secs(2)).unwrap();
-            let (count, result) = Embedder::embed_next_batch(&model, &["body"; 33]);
+            let (count, result) =
+                Embedder::embed_next_batch(&model, &["body"; 33], &Arc::new(AtomicBool::new(true)));
             assert_eq!(count, 32);
             assert_eq!(result.unwrap(), vec![vec![1.0, 0.0]; 32]);
             assert_eq!(
@@ -3696,7 +3912,11 @@ mod tests {
             );
 
             let oversized = "body ".repeat(600);
-            let (count, result) = Embedder::embed_next_batch(&model, &[oversized.as_str()]);
+            let (count, result) = Embedder::embed_next_batch(
+                &model,
+                &[oversized.as_str()],
+                &Arc::new(AtomicBool::new(true)),
+            );
             assert_eq!(count, 1);
             assert!(matches!(
                 result,
@@ -3970,6 +4190,111 @@ mod tests {
             assert!(!error.contains("api-secret"));
             assert!(!error.contains("sensitive note body"));
             server.join().unwrap();
+        }
+
+        #[test]
+        fn revoked_documents_do_not_leave_the_provider_queue() {
+            use std::net::TcpListener;
+            use std::sync::mpsc;
+            use std::time::Duration;
+
+            let deadline = Duration::from_secs(5);
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+            let (entered, workers_held) = mpsc::channel();
+            let (release, released) = mpsc::channel();
+            let fixture = std::thread::spawn(move || {
+                let mut streams = Vec::new();
+                for _ in 0..ApiEmbeddingClient::WORKER_COUNT {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream.set_read_timeout(Some(deadline)).unwrap();
+                    crate::test_helpers::read_http_request_headers(&mut stream);
+                    let payload = serde_json::Deserializer::from_reader(&mut stream)
+                        .into_iter::<serde_json::Value>()
+                        .next()
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(payload["input"], serde_json::json!(["in flight"]));
+                    streams.push(stream);
+                }
+                entered.send(()).unwrap();
+                released.recv_timeout(deadline).unwrap();
+                let body = r#"{"data":[{"embedding":[1.0,0.0]}]}"#;
+                for mut stream in streams {
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                }
+                listener
+            });
+            let client = ApiEmbeddingClient::start(
+                build_api_client(deadline).unwrap(),
+                base_url,
+                "model".into(),
+                zeroize::Zeroizing::new("synthetic-key".into()),
+                deadline,
+            )
+            .unwrap();
+            let sender = client.sender.as_ref().unwrap();
+            let mut in_flight = Vec::new();
+            for _ in 0..ApiEmbeddingClient::WORKER_COUNT {
+                let (response, outcome) = mpsc::channel();
+                sender
+                    .send(ApiEmbeddingRequest {
+                        texts: vec!["in flight".into()],
+                        owner_live: None,
+                        retry_deadline: None,
+                        response,
+                    })
+                    .unwrap();
+                in_flight.push(outcome);
+            }
+            workers_held.recv_timeout(deadline).unwrap();
+            let live = Arc::new(AtomicBool::new(true));
+            let (response, outcome) = mpsc::channel();
+            sender
+                .try_send(ApiEmbeddingRequest {
+                    texts: vec!["private queued document".into()],
+                    owner_live: Some(Arc::clone(&live)),
+                    retry_deadline: None,
+                    response,
+                })
+                .expect("request must be waiting behind the held workers");
+            live.store(false, AtomicOrdering::Release);
+            release.send(()).unwrap();
+            for response in in_flight {
+                assert_eq!(
+                    response.recv_timeout(deadline).unwrap().unwrap(),
+                    vec![vec![1.0, 0.0]]
+                );
+            }
+            assert!(
+                outcome
+                    .recv_timeout(deadline)
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("scope retired")
+            );
+            let listener = fixture.join().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+
+            // A request admitted by a worker may still be waiting for the HTTP
+            // transport to take its body. Its first byte has the same boundary.
+            let mut body = ScopedRequestBody {
+                bytes: std::io::Cursor::new(b"private".to_vec()),
+                live,
+            };
+            let mut received = Vec::new();
+            assert!(body.read_to_end(&mut received).is_err());
+            assert!(received.is_empty());
         }
 
         #[test]

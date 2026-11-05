@@ -95,53 +95,76 @@ const WRITER_HEAP_BYTES: usize = 50_000_000;
 
 /// BM25 full-text index backed by Tantivy with an in-RAM directory.
 ///
-/// The index rebuilds from scratch on startup (< 100ms for 5000 notes) so no
+/// The index rebuilds from vault source on startup, so no
 /// disk persistence is needed. The `IndexReader` uses `Manual` reload policy;
 /// mutations call `reader.reload()` explicitly after each commit.
 pub struct TantivyIndex {
     ts: TantivySchema,
     reader: IndexReader,
     writer: Mutex<IndexWriter>,
+    publication: Mutex<()>,
 }
 
-impl TantivyIndex {
-    /// Build the full-text index from all notes in the vault.
-    ///
-    /// Reads each note's content from disk, constructs a Tantivy document
-    /// with title/headings/tags/body/frontmatter fields, and commits once.
-    pub fn build(vault_root: &Path, notes: &HashMap<PathBuf, NoteMetadata>) -> VaultResult<Self> {
-        let ts = TantivySchema::build();
-        let index = Index::create_in_ram(ts.schema.clone());
-        let mut writer: IndexWriter = index.writer(WRITER_HEAP_BYTES)?;
+/// Streams complete documents into one commit while the metadata index is built.
+pub(super) struct TantivyBuilder {
+    schema: TantivySchema,
+    index: Index,
+    writer: IndexWriter,
+}
 
-        for (path, meta) in notes {
-            let content = match fs::read_file(vault_root, path) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "skipping note during tantivy index build"
-                    );
-                    continue;
-                }
-            };
-            let doc = build_document(&ts, path, meta, &content);
-            writer.add_document(doc)?;
-        }
+impl TantivyBuilder {
+    pub(super) fn new() -> VaultResult<Self> {
+        let schema = TantivySchema::build();
+        let index = Index::create_in_ram(schema.schema.clone());
+        let writer = index.writer(WRITER_HEAP_BYTES)?;
+        Ok(Self {
+            schema,
+            index,
+            writer,
+        })
+    }
 
-        writer.commit()?;
+    pub(super) fn add(
+        &mut self,
+        path: &Path,
+        note: &NoteMetadata,
+        content: &str,
+    ) -> VaultResult<()> {
+        self.writer
+            .add_document(build_document(&self.schema, path, note, content))?;
+        Ok(())
+    }
 
-        let reader = index
+    pub(super) fn finish(mut self) -> VaultResult<TantivyIndex> {
+        self.writer.commit()?;
+        let reader = self
+            .index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
             .try_into()?;
-
-        Ok(Self {
-            ts,
+        Ok(TantivyIndex {
+            ts: self.schema,
             reader,
-            writer: Mutex::new(writer),
+            writer: Mutex::new(self.writer),
+            publication: Mutex::new(()),
         })
+    }
+}
+
+impl TantivyIndex {
+    /// Build a lexical index from an existing set of note metadata.
+    pub fn build(vault_root: &Path, notes: &HashMap<PathBuf, NoteMetadata>) -> VaultResult<Self> {
+        let filesystem = fs::VaultRoot::open(vault_root)?;
+        let mut builder = TantivyBuilder::new()?;
+        for (path, note) in notes {
+            match filesystem.read_observed(path) {
+                Ok(content) => builder.add(path, note, &content)?,
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "skipping note during tantivy index build")
+                }
+            }
+        }
+        builder.finish()
     }
 
     /// Re-index a single file after create or modify (commits immediately).
@@ -164,6 +187,15 @@ impl TantivyIndex {
         meta: &NoteMetadata,
     ) -> VaultResult<()> {
         let content = fs::read_file(vault_root, path)?;
+        self.replace_document(path, meta, &content).map(|_| ())
+    }
+
+    pub(crate) fn replace_document(
+        &self,
+        path: &Path,
+        meta: &NoteMetadata,
+        content: &str,
+    ) -> VaultResult<tantivy::Opstamp> {
         let path_str = path.to_string_lossy();
 
         let writer = self
@@ -172,10 +204,8 @@ impl TantivyIndex {
             .map_err(|e| VaultError::Other(format!("tantivy writer lock poisoned: {e}")))?;
 
         writer.delete_term(Term::from_field_text(self.ts.f_path, &path_str));
-        let doc = build_document(&self.ts, path, meta, &content);
-        writer.add_document(doc)?;
-
-        Ok(())
+        let doc = build_document(&self.ts, path, meta, content);
+        Ok(writer.add_document(doc)?)
     }
 
     /// Remove a file from the index (commits immediately).
@@ -201,14 +231,26 @@ impl TantivyIndex {
 
     /// Commit pending writes and reload the reader.
     pub fn flush(&self) -> VaultResult<()> {
+        self.publish().map(|_| ())
+    }
+
+    /// Return the last operation covered by the newly published reader.
+    pub(super) fn publish(&self) -> VaultResult<tantivy::Opstamp> {
+        // Reload constructs a searcher and publishes it separately. Serialize
+        // commits through publication so a slower reload cannot restore an older
+        // snapshot. Writers can stage new documents while the reader reloads.
+        let _publication = self
+            .publication
+            .lock()
+            .map_err(|e| VaultError::Other(format!("tantivy publication lock poisoned: {e}")))?;
         let mut writer = self
             .writer
             .lock()
             .map_err(|e| VaultError::Other(format!("tantivy writer lock poisoned: {e}")))?;
-        writer.commit()?;
+        let committed = writer.commit()?;
         drop(writer);
         self.reader.reload()?;
-        Ok(())
+        Ok(committed)
     }
 
     /// BM25-ranked full-text search across title, headings, body, and frontmatter.
@@ -230,23 +272,7 @@ impl TantivyIndex {
 
         let searcher = self.reader.searcher();
 
-        let mut query_parser = QueryParser::for_index(
-            searcher.index(),
-            vec![
-                self.ts.f_title,
-                self.ts.f_headings,
-                self.ts.f_body,
-                self.ts.f_frontmatter_text,
-            ],
-        );
-        query_parser.set_field_boost(self.ts.f_title, TITLE_BOOST);
-        query_parser.set_field_boost(self.ts.f_headings, HEADINGS_BOOST);
-        query_parser.set_field_boost(self.ts.f_body, 1.0);
-        query_parser.set_field_boost(self.ts.f_frontmatter_text, FRONTMATTER_BOOST);
-
-        let parsed = query_parser
-            .parse_query(query)
-            .map_err(|e| VaultError::Other(format!("tantivy query parse error: {e}")))?;
+        let parsed = self.parse_default_query(query)?;
 
         let query: Box<dyn tantivy::query::Query> = if let Some(paths) = allowed_paths {
             let terms = paths
@@ -270,6 +296,30 @@ impl TantivyIndex {
         }
 
         Ok(results)
+    }
+
+    pub(crate) fn parse_default_query(
+        &self,
+        query: &str,
+    ) -> VaultResult<Box<dyn tantivy::query::Query>> {
+        let searcher = self.reader.searcher();
+        let mut query_parser = QueryParser::for_index(
+            searcher.index(),
+            vec![
+                self.ts.f_title,
+                self.ts.f_headings,
+                self.ts.f_body,
+                self.ts.f_frontmatter_text,
+            ],
+        );
+        query_parser.set_field_boost(self.ts.f_title, TITLE_BOOST);
+        query_parser.set_field_boost(self.ts.f_headings, HEADINGS_BOOST);
+        query_parser.set_field_boost(self.ts.f_body, 1.0);
+        query_parser.set_field_boost(self.ts.f_frontmatter_text, FRONTMATTER_BOOST);
+
+        query_parser
+            .parse_query(query)
+            .map_err(|e| VaultError::Other(format!("tantivy query parse error: {e}")))
     }
 
     /// BM25-ranked search with optional fuzzy matching and field filtering.

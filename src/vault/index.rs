@@ -5,10 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use regex::Regex;
-use walkdir::WalkDir;
 
 use crate::error::{VaultError, VaultResult};
-use crate::models::{NoteMetadata, SearchMatch, SearchResult, VaultStats, WikiLink};
+use crate::models::{FileStat, NoteMetadata, SearchMatch, SearchResult, VaultStats, WikiLink};
 use crate::vault::wikilink::{LinkResolver, build_link_resolver};
 use crate::vault::{frontmatter, fs, parser, path as vault_path};
 
@@ -20,9 +19,13 @@ pub struct VaultIndex {
     link_resolver: LinkResolver,
     backlinks: HashMap<PathBuf, HashSet<PathBuf>>,
     stats: VaultStats,
-    non_md_file_count: usize,
-    non_md_bytes: u64,
+    attachments: HashMap<PathBuf, u64>,
+    attachment_bytes: u64,
+    filesystem: Option<fs::VaultRoot>,
+    exclude: Arc<ExcludeSet>,
     excluded_note_paths: HashSet<PathBuf>,
+    #[cfg(has_embeddings)]
+    waiting_for_lexical: HashMap<PathBuf, tantivy::Opstamp>,
 }
 
 impl VaultIndex {
@@ -41,104 +44,131 @@ impl VaultIndex {
                 vault_size_bytes: 0,
                 excluded_notes: 0,
             },
-            non_md_file_count: 0,
-            non_md_bytes: 0,
+            attachments: HashMap::new(),
+            attachment_bytes: 0,
+            filesystem: None,
+            exclude: Arc::default(),
             excluded_note_paths: HashSet::new(),
+            #[cfg(has_embeddings)]
+            waiting_for_lexical: HashMap::new(),
         }
     }
 
     /// Build the index by walking the entire vault directory.
     pub async fn build(vault_root: &Path, exclude: Arc<ExcludeSet>) -> VaultResult<Self> {
-        let root = vault_root.to_path_buf();
-        tokio::task::spawn_blocking(move || Self::build_sync(&root, &exclude))
-            .await
-            .map_err(|e| VaultError::Other(format!("index build task panicked: {e}")))?
+        Self::build_rooted(fs::VaultRoot::open(vault_root)?, exclude).await
     }
 
-    fn build_sync(vault_root: &Path, exclude: &ExcludeSet) -> VaultResult<Self> {
-        let mut notes = HashMap::new();
-        let mut tags: HashMap<String, HashSet<PathBuf>> = HashMap::new();
-        let mut non_md_file_count: usize = 0;
-        let mut non_md_bytes: u64 = 0;
-        let mut excluded_note_paths: HashSet<PathBuf> = HashSet::new();
+    pub(crate) async fn build_rooted(
+        filesystem: fs::VaultRoot,
+        exclude: Arc<ExcludeSet>,
+    ) -> VaultResult<Self> {
+        run_cold_build(move |check| Self::build_sync(filesystem, exclude, check, |_, _| Ok(())))
+            .await
+    }
 
-        let walker = WalkDir::new(vault_root)
-            .min_depth(1)
-            .into_iter()
-            .filter_entry(|e| super::exclude::is_visible_path(Path::new(e.file_name())));
-
-        for entry in walker {
-            let entry = entry.map_err(|e| match e.into_io_error() {
-                Some(io_err) => VaultError::Io(io_err),
-                None => VaultError::Other("walkdir: directory loop detected".into()),
+    pub(crate) async fn build_ranked(
+        filesystem: fs::VaultRoot,
+        exclude: Arc<ExcludeSet>,
+    ) -> VaultResult<(Self, super::tantivy_index::TantivyIndex)> {
+        run_cold_build(move |check| {
+            let mut builder = super::tantivy_index::TantivyBuilder::new()?;
+            let index = Self::build_sync(filesystem, exclude, check, |note, content| {
+                builder.add(&note.path, note, content)
             })?;
+            check()?;
+            Ok((index, builder.finish()?))
+        })
+        .await
+    }
 
-            if !entry.file_type().is_file() {
-                continue;
-            }
-
-            let abs_path = entry.path();
-            let rel_path = vault_path::relative_from_absolute(vault_root, abs_path)?;
-
-            let is_md = abs_path
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
-
-            if is_md {
-                if exclude.is_excluded(&rel_path) {
-                    excluded_note_paths.insert(rel_path);
-                    continue;
+    fn build_sync(
+        filesystem: fs::VaultRoot,
+        exclude: Arc<ExcludeSet>,
+        check: &dyn Fn() -> VaultResult<()>,
+        mut index_content: impl FnMut(&NoteMetadata, &str) -> VaultResult<()>,
+    ) -> VaultResult<Self> {
+        let mut index = Self::empty();
+        visit_files(&filesystem, Path::new(""), check, |path| {
+            match classify(path, &exclude) {
+                FileClass::Excluded => {
+                    index.excluded_note_paths.insert(path.to_owned());
                 }
-                match parse_note_metadata(vault_root, &rel_path) {
-                    Ok(metadata) => {
+                FileClass::Attachment => {
+                    let metadata = match filesystem.entry_metadata_exact(path) {
+                        Ok(metadata) => metadata,
+                        Err(error) if is_missing(&error) => return Ok(()),
+                        Err(error) => return Err(error),
+                    };
+                    if metadata.is_file() && !fs::is_link(&metadata) {
+                        index.attachments.insert(path.to_owned(), metadata.len());
+                        index.attachment_bytes += metadata.len();
+                    }
+                }
+                FileClass::Note => match read_indexed_note(&filesystem, path) {
+                    Ok((metadata, content)) => {
+                        check()?;
+                        index_content(&metadata, &content)?;
                         for tag in &metadata.tags {
-                            tags.entry(tag.to_lowercase())
+                            index
+                                .tags
+                                .entry(tag.to_lowercase())
                                 .or_default()
-                                .insert(rel_path.clone());
+                                .insert(path.to_owned());
                         }
-                        notes.insert(rel_path, metadata);
+                        index.notes.insert(path.to_owned(), metadata);
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            path = %rel_path.display(),
-                            error = %e,
-                            "skipping unparseable note during index build"
-                        );
+                    Err(error) => {
+                        tracing::warn!(path = %path.display(), %error, "skipping unparseable note during index build")
                     }
-                }
-            } else {
-                non_md_file_count += 1;
-                if let Ok(meta) = entry.metadata() {
-                    non_md_bytes += meta.len();
-                }
+                },
             }
-        }
-
-        let note_paths: Vec<PathBuf> = notes.keys().cloned().collect();
-        let link_resolver = build_link_resolver(&note_paths);
-
-        let mut index = Self {
-            notes,
-            tags,
-            link_resolver,
-            backlinks: HashMap::new(),
-            stats: VaultStats {
-                total_notes: 0,
-                total_files: 0,
-                total_tags: 0,
-                total_links: 0,
-                vault_size_bytes: 0,
-                excluded_notes: 0,
-            },
-            non_md_file_count,
-            non_md_bytes,
-            excluded_note_paths,
-        };
-
+            Ok(())
+        })?;
+        check()?;
+        index.link_resolver = build_link_resolver(&index.notes.keys().cloned().collect::<Vec<_>>());
         index.rebuild_backlinks();
         index.recompute_stats();
-
+        index.filesystem = Some(filesystem);
+        index.exclude = exclude;
         Ok(index)
+    }
+
+    pub(crate) fn filesystem(&self, root: &Path) -> VaultResult<fs::VaultRoot> {
+        if let Some(filesystem) = &self.filesystem {
+            if filesystem.path() == root || filesystem.path() == root.canonicalize()? {
+                return Ok(filesystem.clone());
+            }
+            return Err(VaultError::InvalidPath(
+                "index belongs to a different vault".into(),
+            ));
+        }
+        fs::VaultRoot::open(root)
+    }
+
+    /// An empty index takes ownership of its root on its first mutation or
+    /// watcher registration, just as a cold-built index does at construction.
+    fn bind_filesystem(&mut self, root: &Path) -> VaultResult<fs::VaultRoot> {
+        let filesystem = self.filesystem(root)?;
+        if self.filesystem.is_none() {
+            self.filesystem = Some(filesystem.clone());
+        }
+        Ok(filesystem)
+    }
+
+    pub(crate) fn bind_watcher(
+        &mut self,
+        root: &Path,
+        policy: &Arc<ExcludeSet>,
+    ) -> VaultResult<fs::VaultRoot> {
+        if self.filesystem.is_some() && self.exclude.patterns() != policy.patterns() {
+            return Err(VaultError::Watcher(
+                "watcher exclusions differ from the index policy".into(),
+            ));
+        }
+        let filesystem = self.bind_filesystem(root)?;
+        self.exclude = Arc::clone(policy);
+        Ok(filesystem)
     }
 
     /// Re-index a single file (on create or modify).
@@ -148,16 +178,34 @@ impl VaultIndex {
     /// (because the `LinkResolver` path set changes, potentially altering
     /// ambiguity for other notes' wikilinks).
     pub fn reindex_file(&mut self, vault_root: &Path, path: &Path) -> VaultResult<()> {
-        let metadata = match parse_note_metadata(vault_root, path) {
-            Ok(metadata) => metadata,
+        let filesystem = self.bind_filesystem(vault_root)?;
+        let actual = match filesystem.resolve_existing(path) {
+            Ok(resolved) => resolved.relative,
             Err(error) => {
                 self.remove_file(path);
                 return Err(error);
             }
         };
+        if actual != path {
+            self.remove_file(path);
+        }
+        let exclude = Arc::clone(&self.exclude);
+        let result = self.update_file(&filesystem, &actual, &exclude, true);
+        if result.is_err() {
+            self.remove_file(&actual);
+        }
+        result.map(|_| ())
+    }
+
+    fn replace_note(&mut self, path: &Path, metadata: NoteMetadata) {
+        #[cfg(has_embeddings)]
+        self.waiting_for_lexical.remove(path);
         let was_existing = self.notes.contains_key(path);
         let old_links = self.notes.get(path).map(|n| n.links.clone());
         self.excluded_note_paths.remove(path);
+        if let Some(size) = self.attachments.remove(path) {
+            self.attachment_bytes -= size;
+        }
 
         self.remove_note_contributions(path);
         self.link_resolver.remove_path(path);
@@ -177,18 +225,41 @@ impl VaultIndex {
             self.rebuild_backlinks();
         }
         self.recompute_stats();
-        Ok(())
     }
 
-    /// Remove a file from the index (on delete).
+    /// Remove all contributions for a deleted file.
     pub fn remove_file(&mut self, path: &Path) {
-        self.excluded_note_paths.remove(path);
-        self.remove_note_contributions(path);
-        self.link_resolver.remove_path(path);
-        self.backlinks.remove(path);
+        #[cfg(has_embeddings)]
+        self.waiting_for_lexical.remove(path);
+        if self.excluded_note_paths.remove(path) {
+            self.stats.excluded_notes -= 1;
+        }
+        if let Some(size) = self.attachments.remove(path) {
+            self.attachment_bytes -= size;
+            self.stats.total_files -= 1;
+            self.stats.vault_size_bytes -= size;
+        }
+        if self.notes.contains_key(path) {
+            self.remove_note_contributions(path);
+            self.link_resolver.remove_path(path);
+            self.backlinks.remove(path);
+            self.rebuild_backlinks();
+            self.recompute_stats();
+        }
+    }
 
-        self.rebuild_backlinks();
-        self.recompute_stats();
+    pub(crate) fn remove_projection(
+        &mut self,
+        path: &Path,
+        tantivy: Option<&super::tantivy_index::TantivyIndex>,
+    ) -> VaultResult<bool> {
+        let was_note = self.notes.contains_key(path);
+        self.remove_file(path);
+        if was_note && let Some(tv) = tantivy {
+            tv.remove_file_batch(path)?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Handle a file rename/move.
@@ -197,63 +268,144 @@ impl VaultIndex {
         self.reindex_file(vault_root, new)
     }
 
-    /// Refresh metadata and lexical search together, invalidating unreadable notes.
-    /// The caller holds the index write lock and flushes any Tantivy batch afterwards.
+    /// Classify a physical filesystem entry and return source only for a live note.
+    fn update_file(
+        &mut self,
+        filesystem: &fs::VaultRoot,
+        path: &Path,
+        exclude: &ExcludeSet,
+        require_existing: bool,
+    ) -> VaultResult<Option<String>> {
+        if !super::exclude::is_visible_path(path) {
+            self.remove_file(path);
+            return Ok(None);
+        }
+
+        let metadata = match filesystem.entry_metadata_exact(path) {
+            Ok(metadata) if metadata.is_file() && !fs::is_link(&metadata) => metadata,
+            Ok(_) => {
+                self.remove_file(path);
+                return Ok(None);
+            }
+            Err(error) if !require_existing && is_missing(&error) => {
+                self.remove_file(path);
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        match classify(path, exclude) {
+            FileClass::Note => {
+                let (note, content) = read_indexed_note(filesystem, path)?;
+                self.replace_note(path, note);
+                Ok(Some(content))
+            }
+            FileClass::Excluded => {
+                self.add_excluded_file(path);
+                Ok(None)
+            }
+            FileClass::Attachment => {
+                let size = metadata.len();
+                if self.attachments.get(path) != Some(&size) {
+                    self.remove_file(path);
+                    self.attachments.insert(path.to_owned(), size);
+                    self.attachment_bytes += size;
+                    self.stats.total_files += 1;
+                    self.stats.vault_size_bytes += size;
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// Refresh metadata and lexical search from the same source. The returned flag
+    /// indicates that the caller must flush a Tantivy batch after releasing the lock.
     pub(crate) fn refresh_file(
         &mut self,
-        vault_root: &Path,
+        filesystem: &fs::VaultRoot,
         path: &Path,
         exclude: &ExcludeSet,
         tantivy: Option<&super::tantivy_index::TantivyIndex>,
-    ) -> VaultResult<()> {
-        let result = if !super::exclude::is_visible_path(path) {
+        #[cfg(has_embeddings)] embeddings_enabled: bool,
+    ) -> VaultResult<bool> {
+        let was_note = self.notes.contains_key(path);
+        let update = self.update_file(filesystem, path, exclude, false);
+        if update.is_err() {
             self.remove_file(path);
-            Ok(())
-        } else {
-            match std::fs::metadata(vault_root.join(path)) {
-                Ok(metadata) if metadata.is_file() => {
-                    if exclude.is_excluded(path) {
-                        self.remove_file(path);
-                        self.add_excluded_file(path);
-                        Ok(())
-                    } else {
-                        self.reindex_file(vault_root, path)
+        }
+        let lexical = match (tantivy, &update, self.notes.get(path)) {
+            (Some(tv), Ok(Some(content)), Some(metadata)) => {
+                tv.replace_document(path, metadata, content).map(|_stamp| {
+                    #[cfg(has_embeddings)]
+                    if embeddings_enabled {
+                        self.waiting_for_lexical.insert(path.to_owned(), _stamp);
                     }
-                }
-                Ok(_) => {
-                    self.remove_file(path);
-                    Ok(())
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    self.remove_file(path);
-                    Ok(())
-                }
-                Err(error) => {
-                    self.remove_file(path);
-                    Err(VaultError::Io(error))
-                }
+                    true
+                })
             }
+            (Some(tv), _, _) if was_note => tv.remove_file_batch(path).map(|_| true),
+            _ => Ok(false),
         };
-        let lexical = if let Some(tv) = tantivy {
-            match self.get_note(path) {
-                Some(metadata) => tv.reindex_file_batch(vault_root, path, metadata),
-                None => tv.remove_file_batch(path),
-            }
-        } else {
-            Ok(())
-        };
-        match (result, lexical) {
+        if lexical.is_err() {
+            self.remove_file(path);
+        }
+        match (update, lexical) {
             (Err(error), Err(cleanup)) => Err(VaultError::Other(format!(
                 "{error}; synchronizing search for {} also failed: {cleanup}",
                 path.display()
             ))),
-            (Err(error), _) | (_, Err(error)) => Err(error),
-            _ => Ok(()),
+            (Err(error), _) => Err(error),
+            (_, lexical) => lexical,
+        }
+    }
+
+    #[cfg(has_embeddings)]
+    pub(super) fn embedding_change(
+        &self,
+        path: &Path,
+        was_note: bool,
+    ) -> Option<super::embedding_runtime::PendingKind> {
+        use super::embedding_runtime::PendingKind;
+        if self.waiting_for_lexical.contains_key(path) {
+            Some(PendingKind::AwaitingLexical)
+        } else if self.notes.contains_key(path) {
+            Some(PendingKind::Upsert)
+        } else {
+            was_note.then_some(PendingKind::Remove)
+        }
+    }
+
+    /// A later writer can replace a path while a commit/reload is under way.
+    /// Release only the current stamps covered by the successfully published reader.
+    /// An unrelated successful commit also recovers upserts held by a failed flush.
+    #[cfg(has_embeddings)]
+    pub(super) fn publish_embedding_upserts(
+        &mut self,
+        committed: tantivy::Opstamp,
+        mut upsert: impl FnMut(&Path),
+    ) {
+        let mut ready: Vec<_> = self
+            .waiting_for_lexical
+            .extract_if(|_, stamp| *stamp <= committed)
+            .collect();
+        ready.sort_unstable_by_key(|(_, stamp)| *stamp);
+        for (path, _) in ready {
+            if self.notes.contains_key(&path) {
+                upsert(&path);
+            }
         }
     }
 
     pub(crate) fn tracked_paths(&self) -> impl Iterator<Item = &PathBuf> {
-        self.notes.keys().chain(self.excluded_note_paths.iter())
+        self.notes
+            .keys()
+            .chain(&self.excluded_note_paths)
+            .chain(self.attachments.keys())
+    }
+
+    pub(crate) fn tracks(&self, path: &Path) -> bool {
+        self.notes.contains_key(path)
+            || self.excluded_note_paths.contains(path)
+            || self.attachments.contains_key(path)
     }
 
     // ── query methods ───────────────────────────────────────────────
@@ -348,12 +500,14 @@ impl VaultIndex {
 
     /// Track a markdown file that exists on disk but is excluded from the index.
     pub fn add_excluded_file(&mut self, path: &Path) {
-        self.remove_note_contributions(path);
-        self.link_resolver.remove_path(path);
-        self.backlinks.remove(path);
-        self.excluded_note_paths.insert(path.to_path_buf());
-        self.rebuild_backlinks();
-        self.recompute_stats();
+        if self.excluded_note_paths.contains(path) {
+            return;
+        }
+        self.remove_file(path);
+        if super::exclude::is_visible_path(path) && is_markdown(path) {
+            self.excluded_note_paths.insert(path.to_owned());
+            self.stats.excluded_notes += 1;
+        }
     }
 
     // ── search methods ──────────────────────────────────────────────
@@ -365,6 +519,16 @@ impl VaultIndex {
         query: &str,
         context_len: usize,
     ) -> VaultResult<Vec<SearchResult>> {
+        self.search_text_limited(&self.filesystem(vault_root)?, query, context_len, None)
+    }
+
+    pub(crate) fn search_text_limited(
+        &self,
+        filesystem: &fs::VaultRoot,
+        query: &str,
+        context_len: usize,
+        limit: Option<usize>,
+    ) -> VaultResult<Vec<SearchResult>> {
         if query.is_empty() {
             return Ok(Vec::new());
         }
@@ -373,7 +537,7 @@ impl VaultIndex {
             pattern: query.to_string(),
             source: e,
         })?;
-        self.search_with_regex(vault_root, &re, context_len, 0)
+        self.search_with_regex(filesystem, &re, context_len, limit)
     }
 
     const MAX_REGEX_PATTERN_LEN: usize = 1000;
@@ -386,6 +550,17 @@ impl VaultIndex {
         pattern: &str,
         context_len: usize,
         max_results: usize,
+    ) -> VaultResult<Vec<SearchResult>> {
+        let limit = (max_results != 0).then_some(max_results);
+        self.search_regex_limited(&self.filesystem(vault_root)?, pattern, context_len, limit)
+    }
+
+    pub(crate) fn search_regex_limited(
+        &self,
+        filesystem: &fs::VaultRoot,
+        pattern: &str,
+        context_len: usize,
+        limit: Option<usize>,
     ) -> VaultResult<Vec<SearchResult>> {
         if pattern.len() > Self::MAX_REGEX_PATTERN_LEN {
             return Err(VaultError::InvalidRegex {
@@ -403,7 +578,7 @@ impl VaultIndex {
                 pattern: pattern.to_string(),
                 source: e,
             })?;
-        self.search_with_regex(vault_root, &re, context_len, max_results)
+        self.search_with_regex(filesystem, &re, context_len, limit)
     }
 
     /// Search notes by frontmatter field values.
@@ -524,29 +699,32 @@ impl VaultIndex {
         let md_bytes: u64 = self.notes.values().map(|n| n.stat.size).sum();
         self.stats = VaultStats {
             total_notes: self.notes.len(),
-            total_files: self.notes.len() + self.non_md_file_count,
+            total_files: self.notes.len() + self.attachments.len(),
             total_tags: self.tags.len(),
             total_links: self.notes.values().map(|n| n.links.len()).sum(),
-            vault_size_bytes: md_bytes + self.non_md_bytes,
+            vault_size_bytes: md_bytes + self.attachment_bytes,
             excluded_notes: self.excluded_note_paths.len(),
         };
     }
 
     fn search_with_regex(
         &self,
-        vault_root: &Path,
+        filesystem: &fs::VaultRoot,
         re: &Regex,
         context_len: usize,
-        max_results: usize,
+        limit: Option<usize>,
     ) -> VaultResult<Vec<SearchResult>> {
         let mut results = Vec::new();
+        if limit == Some(0) {
+            return Ok(results);
+        }
 
         for path in self.notes.keys() {
-            if max_results > 0 && results.len() >= max_results {
+            if limit == Some(results.len()) {
                 break;
             }
 
-            let content = match fs::read_file(vault_root, path) {
+            let content = match filesystem.read_observed(path) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
@@ -580,20 +758,105 @@ impl VaultIndex {
 
 // ── module-level helpers ────────────────────────────────────────────
 
-fn parse_note_metadata(vault_root: &Path, path: &Path) -> VaultResult<NoteMetadata> {
-    let content = fs::read_file(vault_root, path)?;
-    let stat = fs::file_stat(vault_root, path)?;
+enum FileClass {
+    Note,
+    Excluded,
+    Attachment,
+}
 
-    let fm = frontmatter::parse_frontmatter(&content)?;
+fn is_markdown(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+}
+
+fn classify(path: &Path, exclude: &ExcludeSet) -> FileClass {
+    if !is_markdown(path) {
+        FileClass::Attachment
+    } else if exclude.is_excluded(path) {
+        FileClass::Excluded
+    } else {
+        FileClass::Note
+    }
+}
+
+pub(crate) fn is_missing(error: &VaultError) -> bool {
+    matches!(error, VaultError::NoteNotFound(_))
+        || matches!(error, VaultError::Io(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory))
+}
+
+/// A blocking task cannot be aborted once started. Keep the receiver in the
+/// requesting future so dropping that future withdraws the ongoing disk scan.
+async fn run_cold_build<T: Send + 'static>(
+    build: impl FnOnce(&dyn Fn() -> VaultResult<()>) -> VaultResult<T> + Send + 'static,
+) -> VaultResult<T> {
+    let (caller, lifetime) = tokio::sync::oneshot::channel::<()>();
+    let result = tokio::task::spawn_blocking(move || {
+        let check = || {
+            if caller.is_closed() {
+                Err(VaultError::Other("index build cancelled".into()))
+            } else {
+                Ok(())
+            }
+        };
+        check()?;
+        build(&check)
+    })
+    .await
+    .map_err(|error| VaultError::Other(format!("index build task panicked: {error}")))?;
+    drop(lifetime);
+    result
+}
+
+/// Walk visible physical entries through directory handles. The caller receives
+/// native spellings from directory enumeration; symlinks are never descended.
+pub(crate) fn visit_files(
+    root: &fs::VaultRoot,
+    directory: &Path,
+    check: impl Fn() -> VaultResult<()>,
+    mut visit: impl FnMut(&Path) -> VaultResult<()>,
+) -> VaultResult<()> {
+    let mut directories = vec![directory.to_owned()];
+    while let Some(relative) = directories.pop() {
+        check()?;
+        let directory = root.open_dir_exact(&relative)?;
+        #[cfg(test)]
+        crate::test_helpers::count_io(&crate::test_helpers::INDEX_DIRECTORY_VISITS);
+        for entry in fs::dir_entries(&directory)? {
+            check()?;
+            let entry = entry?;
+            let name = entry.file_name();
+            if !super::exclude::is_visible_path(Path::new(&name)) {
+                continue;
+            }
+            let child = vault_path::portable_native(&relative.join(name))?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                directories.push(child);
+            } else if kind.is_file() {
+                visit(&child)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_indexed_note(root: &fs::VaultRoot, path: &Path) -> VaultResult<(NoteMetadata, String)> {
+    let (content, stat) = root.read_observed_with_stat(path)?;
+    let metadata = parse_note_metadata(path, &content, stat)?;
+    Ok((metadata, content))
+}
+
+fn parse_note_metadata(path: &Path, content: &str, stat: FileStat) -> VaultResult<NoteMetadata> {
+    let fm = frontmatter::parse_frontmatter(content)?;
     let fm_tags = fm
         .as_ref()
         .map(frontmatter::extract_frontmatter_tags)
         .unwrap_or_default();
 
-    let headings = parser::extract_headings(&content);
-    let inline_tags = parser::extract_inline_tags(&content);
-    let links = parser::extract_wikilinks(&content);
-    let block_refs = parser::extract_block_refs(&content);
+    let headings = parser::extract_headings(content);
+    let inline_tags = parser::extract_inline_tags(content);
+    let links = parser::extract_wikilinks(content);
+    let block_refs = parser::extract_block_refs(content);
 
     let mut tags = fm_tags;
     tags.extend(inline_tags);
@@ -737,6 +1000,137 @@ mod tests {
                 ["documentation", "updated"]
             );
         }
+    }
+
+    #[test]
+    fn cold_indexes_open_walked_names_without_sibling_lookups() {
+        use crate::test_helpers::{EXACT_FILE_OPENS, INDEX_DIRECTORY_VISITS, NAME_LOOKUP_SCANS};
+        for siblings in [1, 100] {
+            let directory = TempDir::new().unwrap();
+            let filesystem = fs::VaultRoot::open(directory.path()).unwrap();
+            let folder = directory.path().join("notes");
+            stdfs::create_dir(&folder).unwrap();
+            // Keep the exact spelling returned by the filesystem, including NFD.
+            let target_name = "re\u{301}sume\u{301}.md";
+            let source = "quokka #tag [[re\u{301}sume\u{301}]]";
+            for i in 0..siblings {
+                let name = if i == 0 {
+                    target_name.to_owned()
+                } else {
+                    format!("{i}.md")
+                };
+                stdfs::write(folder.join(name), source).unwrap();
+            }
+            stdfs::write(folder.join("asset.bin"), [0xff, 0]).unwrap();
+            stdfs::write(folder.join("ignored.md"), "unread").unwrap();
+            let excluded = Arc::new(ExcludeSet::build(vec!["notes/ignored.md".into()]).unwrap());
+            NAME_LOOKUP_SCANS.set(0);
+            INDEX_DIRECTORY_VISITS.set(0);
+            EXACT_FILE_OPENS.set(0);
+            let mut builder = crate::vault::tantivy_index::TantivyBuilder::new().unwrap();
+            let index =
+                VaultIndex::build_sync(filesystem, excluded, &|| Ok(()), |note, content| {
+                    builder.add(&note.path, note, content)
+                })
+                .unwrap();
+            let lexical = builder.finish().unwrap();
+            assert_eq!(lexical.search("quokka", siblings).unwrap().len(), siblings);
+            assert_eq!(EXACT_FILE_OPENS.get(), siblings);
+            assert_eq!(INDEX_DIRECTORY_VISITS.get(), 2);
+            assert_eq!(NAME_LOOKUP_SCANS.get(), 0);
+            assert_eq!(index.notes_with_tag("tag").len(), siblings);
+            let target = Path::new("notes").join(target_name);
+            assert_eq!(index.backlinks_to(&target).len(), siblings);
+            assert_eq!(index.stats().total_links, siblings);
+            assert_eq!(
+                index.stats().vault_size_bytes,
+                (source.len() * siblings + 2) as u64
+            );
+            assert_eq!(index.stats().total_files, siblings + 1);
+            assert_eq!(index.excluded_notes(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_the_cold_build_request_stops_source_opens() {
+        let temp = TempDir::new().unwrap();
+        for i in 0..5 {
+            stdfs::write(temp.path().join(format!("{i}.md")), "source").unwrap();
+        }
+        let root = fs::VaultRoot::open(temp.path()).unwrap();
+        let (first_read, started) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let (worker, stopped) = tokio::sync::oneshot::channel();
+        let request = tokio::spawn(run_cold_build(move |check| {
+            crate::test_helpers::EXACT_FILE_OPENS.set(0);
+            let mut first_read = Some(first_read);
+            let result = VaultIndex::build_sync(root, empty_exclude(), check, |_, _| {
+                if let Some(first_read) = first_read.take() {
+                    first_read.send(()).unwrap();
+                    wait.recv().unwrap();
+                }
+                Ok(())
+            });
+            worker
+                .send((result.is_err(), crate::test_helpers::EXACT_FILE_OPENS.get()))
+                .unwrap();
+            result.map(|_| ())
+        }));
+        started.await.unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), stopped)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, (true, 1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_incrementally_built_index_retains_its_original_root() {
+        let temp = TempDir::new().unwrap();
+        let original = temp.path().canonicalize().unwrap().join("vault");
+        let moved = original.with_file_name("moved");
+        stdfs::create_dir(&original).unwrap();
+        let path = Path::new("note.md");
+        stdfs::write(original.join(path), "#before").unwrap();
+        let mut index = VaultIndex::empty();
+        index.reindex_file(&original, path).unwrap();
+        stdfs::rename(&original, &moved).unwrap();
+        stdfs::create_dir(&original).unwrap();
+        stdfs::write(original.join(path), "#replacement").unwrap();
+        stdfs::write(moved.join(path), "#retained").unwrap();
+        index.reindex_file(&original, path).unwrap();
+        assert_eq!(index.get_note(path).unwrap().tags, ["retained"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_observed_name_cannot_redirect_after_directory_enumeration() {
+        use std::os::unix::fs::symlink;
+        let directory = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let sentinel = outside.path().join("private.md");
+        stdfs::write(&sentinel, "outside source").unwrap();
+        let file = directory.path().join("visible.md");
+        stdfs::write(&file, "inside source").unwrap();
+        let root = fs::VaultRoot::open(directory.path()).unwrap();
+        visit_files(
+            &root,
+            Path::new(""),
+            || Ok(()),
+            |path| {
+                stdfs::remove_file(&file)?;
+                assert!(is_missing(&root.open_exact(path).unwrap_err()));
+                symlink(&sentinel, &file)?;
+                assert!(read_indexed_note(&root, path).is_err());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(stdfs::read_to_string(sentinel).unwrap(), "outside source");
     }
 
     fn setup_vault() -> TempDir {
@@ -1076,7 +1470,7 @@ mod tests {
         assert!(
             !beta_bl
                 .iter()
-                .any(|n| n.path == PathBuf::from("notes/alpha.md")),
+                .any(|n| n.path == Path::new("notes/alpha.md")),
             "alpha should no longer appear as a backlink source"
         );
     }

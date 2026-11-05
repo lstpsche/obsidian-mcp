@@ -9,9 +9,10 @@ pub mod periodic;
 pub mod search;
 pub mod utility;
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::schema_for_output;
@@ -19,11 +20,11 @@ use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{CallToolResult, ErrorData, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 
-use crate::client::semantic_daemon::{DaemonConnectPolicy, SemanticDaemonClient};
+use crate::client::semantic_daemon::{DaemonConnectPolicy, SemanticDaemonClient, VaultAttachment};
 use crate::config::SemanticMode;
 use crate::daemon::bootstrap::PendingBootstrap;
 use crate::daemon::protocol;
-use crate::error::VaultError;
+use crate::error::{VaultError, VaultResult};
 use crate::vault::Vault;
 
 /// JSON Schema for a value that may be any JSON type.
@@ -82,9 +83,160 @@ pub struct SemanticRuntime {
     pub pending_daemon_bootstrap: Option<Arc<PendingDaemonBootstrap>>,
     pub daemon_unavailable_reason: Option<String>,
     pub prefetch_count: usize,
-    pub vault_ensured: Arc<AtomicBool>,
+    pub attachments: Arc<RuntimeAttachments>,
     pub local_fallback_active: Arc<AtomicBool>,
     pub daemon_health_pending: Arc<AtomicBool>,
+}
+
+/// All HTTP handlers for a configured runtime share its daemon holders.
+#[derive(Default)]
+pub struct RuntimeAttachments {
+    scopes: Mutex<AttachmentState>,
+}
+
+type AttachmentSlot = Arc<tokio::sync::Mutex<AttachmentWork>>;
+
+#[derive(Default)]
+struct AttachmentWork {
+    held: Option<Arc<VaultAttachment>>,
+    acquisition: Option<tokio::task::JoinHandle<VaultResult<Arc<VaultAttachment>>>>,
+}
+
+impl Drop for AttachmentWork {
+    fn drop(&mut self) {
+        if let Some(task) = &self.acquisition {
+            task.abort();
+        }
+    }
+}
+
+#[derive(Default)]
+struct AttachmentState {
+    slots: HashMap<(PathBuf, String, bool), AttachmentSlot>,
+    negotiating: usize,
+    stricter_owner_seen: bool,
+}
+
+struct Negotiation {
+    runtime: std::sync::Weak<RuntimeAttachments>,
+    stricter_scope: bool,
+}
+
+impl Drop for Negotiation {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.upgrade() {
+            let mut state = runtime.state();
+            state.stricter_owner_seen |= self.stricter_scope;
+            state.negotiating -= 1;
+        }
+    }
+}
+
+impl RuntimeAttachments {
+    fn state(&self) -> std::sync::MutexGuard<'_, AttachmentState> {
+        self.scopes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    async fn handle(
+        self: &Arc<Self>,
+        vault: &Vault,
+        client: &SemanticDaemonClient,
+        local_selected: &AtomicBool,
+        expired: Option<&str>,
+    ) -> VaultResult<Arc<VaultAttachment>> {
+        let local_scope_id = vault.exclude().scope_id(vault.root());
+        let key = (
+            vault.root().to_owned(),
+            local_scope_id.clone(),
+            vault.watch_enabled(),
+        );
+        let slot = {
+            let mut state = self.state();
+            if local_selected.load(Ordering::Acquire) {
+                return Err(VaultError::DaemonUnavailable(
+                    "local fallback is already selected".into(),
+                ));
+            }
+            Arc::clone(state.slots.entry(key).or_default())
+        };
+        client
+            .with_deadline("ensure_vault", async {
+                let mut work = slot.lock().await;
+                let task = {
+                    let mut state = self.state();
+                    if local_selected.load(Ordering::Acquire) {
+                        return Err(VaultError::DaemonUnavailable(
+                            "local fallback is already selected".into(),
+                        ));
+                    }
+                    if let Some(attachment) = &work.held
+                        && expired != Some(attachment.result.attachment_id.as_str())
+                    {
+                        return Ok(Arc::clone(attachment));
+                    }
+                    work.held = None;
+                    work.acquisition.get_or_insert_with(|| {
+                        state.negotiating += 1;
+                        drop(state);
+                        let mut negotiation = Negotiation {
+                            runtime: Arc::downgrade(self),
+                            stricter_scope: false,
+                        };
+                        let root = vault.root().to_owned();
+                        let watch = vault.watch_enabled();
+                        let scope = protocol::IndexScope::new(vault.exclude().patterns());
+                        let client = client.clone();
+                        tokio::spawn(async move {
+                            let attachment =
+                                client.attach_vault(&root, &scope, watch, None).await?;
+                            negotiation.stricter_scope =
+                                attachment.result.scope_id != local_scope_id;
+                            drop(negotiation);
+                            Ok(Arc::new(attachment))
+                        })
+                    })
+                };
+                // A timed-out/cancelled waiter releases the mutex. The runtime
+                // still owns the same acquisition task and its open socket.
+                let result = task
+                    .await
+                    .map_err(|error| {
+                        VaultError::DaemonProtocol(format!(
+                            "daemon attachment task failed: {error}"
+                        ))
+                    })
+                    .and_then(|result| result);
+                work.acquisition = None;
+                if let Ok(attachment) = &result {
+                    work.held = Some(Arc::clone(attachment));
+                }
+                result
+            })
+            .await
+    }
+
+    fn select_local(&self, selected: &AtomicBool, error: &VaultError) -> bool {
+        let mut scopes = self.state();
+        if scopes.stricter_owner_seen || scopes.negotiating > 0 {
+            return false;
+        }
+        if !selected.swap(true, Ordering::AcqRel) {
+            scopes.slots.clear();
+            tracing::warn!(error = %error, "semantic daemon unavailable; local fallback selected until MCP restarts");
+        }
+        true
+    }
+
+    #[cfg(all(test, any(unix, has_embeddings)))]
+    fn is_attached(&self) -> bool {
+        self.state().slots.values().any(|slot| {
+            slot.try_lock().map_or(true, |work| {
+                work.held.is_some() || work.acquisition.is_some()
+            })
+        })
+    }
 }
 
 /// Shared startup continuation; passive status only observes an initialized client.
@@ -117,7 +269,7 @@ impl PendingDaemonBootstrap {
             .await?;
         // Bootstrap completion and semantic support have different lifetimes.
         // Keep the inspected owner so health can recover without bootstrapping again.
-        client.require_source_evidence().await?;
+        client.require_semantic_capabilities().await?;
         Ok(client)
     }
 }
@@ -154,7 +306,7 @@ impl SemanticRuntime {
         })?;
         // The shared client either reuses finalized bootstrap health or completes
         // one deferred handshake. Capability failures retain their typed cause.
-        client.require_source_evidence().await?;
+        client.require_semantic_capabilities().await?;
         self.daemon_health_pending.store(false, Ordering::Release);
         Ok(())
     }
@@ -169,29 +321,18 @@ impl SemanticRuntime {
     /// A timeout or a warming index does not establish that the daemon stopped.
     pub fn activate_local_fallback(&self, error: &VaultError) -> bool {
         let unavailable = match error {
-            VaultError::DaemonUnavailable(_)
-            | VaultError::DaemonIpc(_)
-            | VaultError::DaemonBootstrap(_) => true,
+            VaultError::DaemonUnavailable(_) => true,
             VaultError::DaemonRpc { code, .. } => matches!(
                 *code,
-                protocol::ERR_DAEMON_UNAVAILABLE
-                    | protocol::ERR_BOOTSTRAP_REQUIRED
-                    | protocol::ERR_INCOMPATIBLE_API_VERSION
+                protocol::ERR_DAEMON_UNAVAILABLE | protocol::ERR_BOOTSTRAP_REQUIRED
             ),
             _ => false,
         };
         if self.mode != SemanticMode::Auto || !unavailable {
             return false;
         }
-        if self
-            .local_fallback_active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            self.vault_ensured.store(false, Ordering::Release);
-            tracing::warn!(error = %error, "semantic daemon unavailable; local fallback selected until MCP restarts");
-        }
-        true
+        self.attachments
+            .select_local(&self.local_fallback_active, error)
     }
 }
 
@@ -536,7 +677,7 @@ mod tests {
             daemon_client: None,
             daemon_unavailable_reason: None,
             prefetch_count: 50,
-            vault_ensured: Arc::new(AtomicBool::new(false)),
+            attachments: Default::default(),
             local_fallback_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             daemon_health_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -560,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn slow_or_warming_daemon_never_selects_local_fallback() {
+    fn semantic_policy_failures_and_timeouts_keep_daemon_ownership() {
         let mut runtime = test_runtime();
         runtime.mode = SemanticMode::Auto;
         for error in [
@@ -573,6 +714,18 @@ mod tests {
                 message: "warming".into(),
                 data: None,
             },
+            VaultError::DaemonRpc {
+                code: protocol::ERR_INCOMPATIBLE_API_VERSION,
+                message: "incompatible owner".into(),
+                data: None,
+            },
+            VaultError::DaemonRpc {
+                code: protocol::ERR_INVALID_PARAMS,
+                message: "invalid exclusion rule".into(),
+                data: None,
+            },
+            VaultError::DaemonBootstrap("invalid owner configuration".into()),
+            VaultError::DaemonIpc("owner closed the connection".into()),
         ] {
             assert!(!runtime.activate_local_fallback(&error));
             assert!(!runtime.uses_local_backend());
@@ -580,6 +733,181 @@ mod tests {
         runtime.mode = SemanticMode::Daemon;
         assert!(!runtime.activate_local_fallback(&VaultError::DaemonUnavailable("offline".into())));
         assert!(!runtime.uses_local_backend());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_handlers_share_initial_and_replacement_attachments() {
+        use crate::daemon::server::IpcEndpoint;
+        use serde_json::json;
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let mut config = test_config(directory.path());
+        config.exclude_patterns = vec!["Private/".into()];
+        let vault = Vault::open(&config).await.unwrap();
+        let expected_scope = vault.exclude().scope_id(vault.root());
+        let server = tokio::spawn(async move {
+            let mut holders = Vec::new();
+            for id in ["rejected", "original", "replacement"] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let request =
+                    crate::test_daemon_rpc::scoped_request(&mut reader, &mut writer).await;
+                assert_eq!(request["method"], "ensure_vault");
+                assert_eq!(
+                    request["params"]["index_scope"],
+                    json!({"version":1, "exclude_patterns":["Private/**"]})
+                );
+                assert_eq!(request["params"]["watch"], false);
+                if id == "rejected" {
+                    let error = json!({"jsonrpc":"2.0","id":request["id"],"error":{
+                        "code":protocol::ERR_INVALID_PARAMS,"message":"operator policy requires repair"
+                    }});
+                    writer
+                        .write_all(format!("{error}\n").as_bytes())
+                        .await
+                        .unwrap();
+                    continue;
+                }
+                let response = json!({"jsonrpc":"2.0", "id":request["id"], "result":{
+                    "vault_id":"vault", "scope_id":expected_scope, "attachment_id":id,
+                    "watch_enabled":false, "ready":true, "model_name":"model"
+                }});
+                writer
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+                holders.push((reader, writer));
+            }
+        });
+        let client = SemanticDaemonClient::new(IpcEndpoint::UnixSocket(socket), Default::default());
+        let mut runtime = test_runtime();
+        runtime.mode = SemanticMode::Auto;
+        let clone = runtime.clone();
+        let error = runtime
+            .attachments
+            .handle(&vault, &client, &runtime.local_fallback_active, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            VaultError::DaemonRpc {
+                code: protocol::ERR_INVALID_PARAMS,
+                ..
+            }
+        ));
+        assert!(!runtime.activate_local_fallback(&error));
+        let acquire = async |runtime: &SemanticRuntime, expired: Option<&str>| {
+            runtime
+                .attachments
+                .handle(&vault, &client, &runtime.local_fallback_active, expired)
+                .await
+                .unwrap()
+        };
+        let (first, second) = tokio::join!(acquire(&runtime, None), acquire(&clone, None));
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.result.attachment_id, "original");
+        let expired = Some(first.result.attachment_id.as_str());
+        let (first, second) = tokio::join!(acquire(&runtime, expired), acquire(&clone, expired));
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.result.attachment_id, "replacement");
+        assert!(Arc::ptr_eq(&first, &acquire(&clone, expired).await));
+        server.await.unwrap();
+        assert!(runtime.activate_local_fallback(&VaultError::DaemonUnavailable("offline".into())));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn slow_attachment_outlives_timed_out_and_cancelled_waiters_until_runtime_drop() {
+        use crate::daemon::server::IpcEndpoint;
+        use serde_json::json;
+        use std::time::Duration;
+        use tokio::sync::oneshot;
+
+        for finish in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let vault = Vault::open(&test_config(directory.path())).await.unwrap();
+            let socket = directory.path().join("slow-daemon.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let (seen, accepted) = oneshot::channel();
+            let (release, gate) = oneshot::channel();
+            let peer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let request =
+                    crate::test_daemon_rpc::scoped_request(&mut reader, &mut writer).await;
+                assert_eq!(request["method"], "ensure_vault");
+                seen.send(()).unwrap();
+                let mut line = String::new();
+                tokio::select! {
+                    closed = reader.read_line(&mut line) => {
+                        assert!(!finish, "the sole holder disconnected during its cold scan");
+                        assert_eq!(closed.unwrap(), 0);
+                    }
+                    completed = gate => {
+                        completed.unwrap();
+                        let reply = json!({"jsonrpc":"2.0","id":request["id"],"result":{
+                            "scope_id":"stricter","attachment_id":"retained","vault_id":"vault",
+                            "ready":true,"watch_enabled":false,"model_name":"model"
+                        }});
+                        writer.write_all(format!("{reply}\n").as_bytes()).await.unwrap();
+                        assert_eq!(reader.read_line(&mut line).await.unwrap(), 0);
+                    }
+                }
+            });
+            let mut runtime = test_runtime();
+            runtime.mode = SemanticMode::Auto;
+            let clone = runtime.clone();
+            let client = SemanticDaemonClient::new(
+                IpcEndpoint::UnixSocket(socket),
+                DaemonConnectPolicy {
+                    timeout: Duration::from_millis(300),
+                    retries: 0,
+                    retry_backoff: Duration::ZERO,
+                },
+            );
+            let acquire = async |runtime: &SemanticRuntime| {
+                runtime
+                    .attachments
+                    .handle(&vault, &client, &runtime.local_fallback_active, None)
+                    .await
+            };
+            let mut cancelled = Box::pin(acquire(&runtime));
+            tokio::select! {
+                result = &mut cancelled => panic!("attachment unexpectedly finished: {result:?}"),
+                result = accepted => result.unwrap(),
+            }
+            drop(cancelled);
+            drop(runtime);
+            for _ in 0..2 {
+                assert!(matches!(
+                    acquire(&clone).await,
+                    Err(VaultError::DaemonTimeout { .. })
+                ));
+                assert!(
+                    !clone
+                        .activate_local_fallback(&VaultError::DaemonUnavailable("offline".into()))
+                );
+            }
+            if finish {
+                release.send(()).unwrap();
+                let attachment = acquire(&clone).await.unwrap();
+                assert_eq!(attachment.result.attachment_id, "retained");
+                assert!(
+                    !clone
+                        .activate_local_fallback(&VaultError::DaemonUnavailable("offline".into()))
+                );
+            }
+            drop(clone);
+            tokio::time::timeout(Duration::from_secs(3), peer)
+                .await
+                .expect("dropping the last runtime must withdraw its grant")
+                .unwrap();
+        }
     }
 
     async fn call_tool_raw(

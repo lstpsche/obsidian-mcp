@@ -3,10 +3,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
+use super::fs::VaultRoot;
+use cap_fs_ext::DirExt;
 use chrono::{Datelike, Local, NaiveDate};
 use regex::Regex;
 use serde::Deserialize;
-use walkdir::WalkDir;
 
 use crate::error::{VaultError, VaultResult};
 use crate::models::{NotePeriod, PeriodicNoteConfig};
@@ -235,32 +236,35 @@ pub fn read_periodic_config(
     vault_root: &Path,
     period: &NotePeriod,
 ) -> VaultResult<PeriodicNoteConfig> {
-    let plugin_path = vault_root
-        .join(".obsidian")
-        .join("plugins")
-        .join("periodic-notes")
-        .join("data.json");
+    read_config_rooted(&VaultRoot::open(vault_root)?, period)
+}
 
-    if let Some(config) = try_read_plugin_config(&plugin_path, period)? {
+pub(super) fn read_config_rooted(
+    root: &VaultRoot,
+    period: &NotePeriod,
+) -> VaultResult<PeriodicNoteConfig> {
+    let plugin = Path::new(".obsidian/plugins/periodic-notes/data.json");
+    if let Some(config) = try_read_plugin_config(root, plugin, period)? {
         return Ok(config);
     }
-
-    if matches!(period, NotePeriod::Daily) {
-        let core_path = vault_root.join(".obsidian").join("daily-notes.json");
-        if let Some(config) = try_read_core_daily_config(&core_path)? {
-            return Ok(config);
-        }
+    if matches!(period, NotePeriod::Daily)
+        && let Some(config) =
+            try_read_core_daily_config(root, Path::new(".obsidian/daily-notes.json"))?
+    {
+        return Ok(config);
     }
-
     Ok(default_config(period))
 }
 
 /// Read and deserialize a JSON config file, returning `None` if missing.
-fn read_json_config<T: serde::de::DeserializeOwned>(path: &Path) -> VaultResult<Option<T>> {
-    let content = match std::fs::read_to_string(path) {
+fn read_json_config<T: serde::de::DeserializeOwned>(
+    root: &VaultRoot,
+    path: &Path,
+) -> VaultResult<Option<T>> {
+    let content = match root.read_file(path) {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(VaultError::Io(e)),
+        Err(e) if e.is_not_found() => return Ok(None),
+        Err(e) => return Err(e),
     };
     let parsed: T = serde_json::from_str(&content)
         .map_err(|e| VaultError::Other(format!("Failed to parse {}: {e}", path.display())))?;
@@ -268,10 +272,11 @@ fn read_json_config<T: serde::de::DeserializeOwned>(path: &Path) -> VaultResult<
 }
 
 fn try_read_plugin_config(
+    root: &VaultRoot,
     path: &Path,
     period: &NotePeriod,
 ) -> VaultResult<Option<PeriodicNoteConfig>> {
-    let Some(parsed): Option<PluginPeriodicConfig> = read_json_config(path)? else {
+    let Some(parsed): Option<PluginPeriodicConfig> = read_json_config(root, path)? else {
         return Ok(None);
     };
 
@@ -323,8 +328,11 @@ fn entry_to_config(entry: PluginPeriodEntry, period: &NotePeriod) -> PeriodicNot
     }
 }
 
-fn try_read_core_daily_config(path: &Path) -> VaultResult<Option<PeriodicNoteConfig>> {
-    let Some(parsed): Option<CoreDailyNotesConfig> = read_json_config(path)? else {
+fn try_read_core_daily_config(
+    root: &VaultRoot,
+    path: &Path,
+) -> VaultResult<Option<PeriodicNoteConfig>> {
+    let Some(parsed): Option<CoreDailyNotesConfig> = read_json_config(root, path)? else {
         return Ok(None);
     };
 
@@ -368,52 +376,43 @@ pub fn list_recent_periodic_notes(
     config: &PeriodicNoteConfig,
     limit: usize,
 ) -> VaultResult<Vec<PathBuf>> {
-    let scan_dir = match &config.folder {
-        Some(folder) if !folder.is_empty() => {
-            match resolve_config_path(vault_root, Path::new(folder)) {
-                Ok(path) => path,
-                Err(VaultError::NoteNotFound(_)) => return Ok(Vec::new()),
-                Err(error) => return Err(error),
-            }
-        }
-        _ => vault_root.to_path_buf(),
+    list_rooted(&VaultRoot::open(vault_root)?, config, limit)
+}
+
+pub(super) fn list_rooted(
+    root: &VaultRoot,
+    config: &PeriodicNoteConfig,
+    limit: usize,
+) -> VaultResult<Vec<PathBuf>> {
+    let folder = Path::new(config.folder.as_deref().unwrap_or(""));
+    let scan_dir = match root.open_dir(folder) {
+        Ok(dir) => dir,
+        Err(error) if error.is_not_found() => return Ok(Vec::new()),
+        Err(error) => return Err(error),
     };
-
-    if !scan_dir.is_dir() {
-        return Ok(Vec::new());
-    }
-
     let chrono_fmt = momentjs_to_chrono(&config.format);
     let has_quarter = chrono_fmt.contains(QUARTER_PLACEHOLDER);
-
-    let mut dated_paths: Vec<(NaiveDate, PathBuf)> = Vec::new();
-
-    for entry in WalkDir::new(&scan_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-    {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-
-        let rel = match path.strip_prefix(&scan_dir) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let stem = rel.with_extension("");
-        let stem_str = stem.to_string_lossy().replace('\\', "/");
-
-        if let Some(date) = try_parse_date(&stem_str, &chrono_fmt, has_quarter) {
-            let vault_rel = match &config.folder {
-                Some(folder) if !folder.is_empty() => PathBuf::from(folder).join(rel),
-                _ => rel.to_path_buf(),
-            };
-            dated_paths.push((date, vault_rel));
+    let mut dated_paths = Vec::new();
+    let mut dirs = vec![(PathBuf::new(), scan_dir)];
+    while let Some((prefix, dir)) = dirs.pop() {
+        for entry in super::fs::dir_entries(&dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let relative = prefix.join(&name);
+            let ty = entry.file_type()?;
+            if ty.is_dir() {
+                dirs.push((relative, dir.open_dir_nofollow(&name)?));
+            } else if ty.is_file() && relative.extension().is_some_and(|ext| ext == "md") {
+                let stem = relative.with_extension("");
+                let text = stem
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/");
+                if let Some(date) = try_parse_date(&text, &chrono_fmt, has_quarter) {
+                    dated_paths.push((date, folder.join(relative)));
+                }
+            }
         }
     }
-
     dated_paths.sort_by_key(|x| std::cmp::Reverse(x.0));
     dated_paths.truncate(limit);
 
@@ -507,23 +506,6 @@ fn try_parse_quarter_date(stem: &str, chrono_fmt: &str) -> Option<NaiveDate> {
     NaiveDate::from_ymd_opt(y, month, 1)
 }
 
-/// Resolve an untrusted periodic configuration path within the vault while
-/// preserving native filesystem matching before trying Unicode normalization.
-fn resolve_config_path(vault_root: &Path, path: &Path) -> VaultResult<PathBuf> {
-    let relative_path = super::path::normalize_relative(path)?;
-    let canonical_root = vault_root.canonicalize()?;
-    match canonical_root.join(&relative_path).canonicalize() {
-        Ok(full_path) => {
-            super::path::relative_from_absolute(&canonical_root, &full_path)?;
-            Ok(full_path)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(super::path::resolve_existing(&canonical_root, &relative_path)?.absolute)
-        }
-        Err(error) => Err(VaultError::Io(error)),
-    }
-}
-
 // ── Template expansion ─────────────────────────────────────────────────
 
 /// Read a template file and expand template variables:
@@ -536,18 +518,21 @@ pub fn expand_template(
     date: &NaiveDate,
     title: &str,
 ) -> VaultResult<String> {
+    expand_rooted(&VaultRoot::open(vault_root)?, template_path, date, title)
+}
+
+pub(super) fn expand_rooted(
+    root: &VaultRoot,
+    template_path: &Path,
+    date: &NaiveDate,
+    title: &str,
+) -> VaultResult<String> {
     let relative_path = if template_path.extension().is_none() {
         template_path.with_extension("md")
     } else {
         template_path.to_path_buf()
     };
-    let full_path = resolve_config_path(vault_root, &relative_path)?;
-
-    let content = std::fs::read_to_string(&full_path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => VaultError::NoteNotFound(template_path.to_path_buf()),
-        _ => VaultError::Io(e),
-    })?;
-
+    let content = root.read_file(&relative_path)?;
     expand_template_string(&content, date, title)
 }
 
@@ -789,6 +774,27 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = read_periodic_config(tmp.path(), &NotePeriod::Yearly).unwrap();
         assert_eq!(config.format, "YYYY");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configuration_symlinks_cannot_import_external_settings() {
+        use std::os::unix::fs::symlink;
+        let vault = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let source = outside.path().join("settings.json");
+        std::fs::write(&source, r#"{"enabled":true,"folder":"PRIVATE_CONTENT"}"#).unwrap();
+        for name in [
+            ".obsidian/plugins/periodic-notes/data.json",
+            ".obsidian/daily-notes.json",
+        ] {
+            let path = vault.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            symlink(&source, &path).unwrap();
+            let error = read_periodic_config(vault.path(), &NotePeriod::Daily).unwrap_err();
+            assert!(!error.to_string().contains("PRIVATE_CONTENT"));
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]

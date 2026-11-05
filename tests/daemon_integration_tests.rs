@@ -6,6 +6,8 @@ mod daemon_integration_tests {
     use std::sync::LazyLock;
     use std::time::{Duration, Instant};
 
+    use obsidian_mcp::client::semantic_daemon::{DaemonConnectPolicy, SemanticDaemonClient};
+    use obsidian_mcp::daemon::{protocol::IndexScope, server::IpcEndpoint};
     use serde_json::json;
     use unicode_normalization::UnicodeNormalization;
 
@@ -47,13 +49,15 @@ mod daemon_integration_tests {
 
         let vault = create_temp_vault();
         write_note(vault.path(), "note.md", "# Note\nhello world");
-        let ensure = server.ensure_vault(vault.path(), false).await;
+        let attachment = server.ensure_vault(vault.path(), false).await;
         assert!(
-            ensure.phase.is_some(),
+            attachment.result.phase.is_some(),
             "attach should expose semantic lifecycle status"
         );
 
-        let hint = server.open_hint(vault.path(), "note.md#Heading").await;
+        let hint = server
+            .open_hint(vault.path(), &attachment, "note.md#Heading")
+            .await;
         assert_eq!(hint.path, "note.md");
         assert!(hint.exists);
         assert_eq!(hint.subpath.as_deref(), Some("Heading"));
@@ -70,10 +74,10 @@ mod daemon_integration_tests {
         let composed = "02_База-знаний/Сущности/lic1c.md";
         let decomposed: String = composed.nfd().collect();
         write_note(vault.path(), &decomposed, "# License\nhello world");
-        server.ensure_vault(vault.path(), false).await;
+        let attachment = server.ensure_vault(vault.path(), false).await;
 
         let hint = server
-            .open_hint(vault.path(), &format!("{composed}#Heading"))
+            .open_hint(vault.path(), &attachment, &format!("{composed}#Heading"))
             .await;
         assert_eq!(hint.path, decomposed);
         assert!(hint.exists);
@@ -89,14 +93,15 @@ mod daemon_integration_tests {
 
         let vault = create_temp_vault();
         write_note(vault.path(), "note.md", "# Note\nhello world");
-        server.ensure_vault(vault.path(), false).await;
+        let attachment = server.ensure_vault(vault.path(), false).await;
 
         let response = server
             .request_value(
                 "open_hint",
                 json!({
                     "vault_root": vault.path().display().to_string(),
-                    "path": "../outside.md"
+                    "path": "../outside.md",
+                    "attachment_id": attachment.result.attachment_id
                 }),
             )
             .await;
@@ -124,15 +129,15 @@ mod daemon_integration_tests {
             "# Shared\nB_ONLY_MARKER Tomato gardening compost basil soil and watering.",
         );
 
-        server
+        let a = server
             .ensure_vault_ready(vault_a.path(), false, Duration::from_secs(300))
             .await;
-        server
+        let b = server
             .ensure_vault_ready(vault_b.path(), false, Duration::from_secs(300))
             .await;
 
         let a_results = server
-            .search_semantic(vault_a.path(), "tomato basil soil", 5, true)
+            .search_semantic(&a, "tomato basil soil", 5, true)
             .await;
         assert!(!a_results.results.is_empty());
         assert!(
@@ -146,7 +151,7 @@ mod daemon_integration_tests {
         );
 
         let b_results = server
-            .search_semantic(vault_b.path(), "borrow checker ownership", 5, true)
+            .search_semantic(&b, "borrow checker ownership", 5, true)
             .await;
         assert!(!b_results.results.is_empty());
         assert!(
@@ -168,7 +173,7 @@ mod daemon_integration_tests {
         let server = DaemonTestServer::start(MODEL_NAME).await;
         let vault = create_temp_vault();
 
-        server
+        let attachment = server
             .ensure_vault_ready(vault.path(), true, Duration::from_secs(300))
             .await;
 
@@ -183,7 +188,7 @@ mod daemon_integration_tests {
             "watcher create propagation",
             || async {
                 let result = server
-                    .search_semantic(vault.path(), "vector embeddings retrieval", 5, true)
+                    .search_semantic(&attachment, "vector embeddings retrieval", 5, true)
                     .await;
                 result.results.iter().any(|hit| hit.path == "watched.md")
             },
@@ -201,7 +206,7 @@ mod daemon_integration_tests {
             "watcher modify propagation",
             || async {
                 let result = server
-                    .search_semantic(vault.path(), "raft consensus leader election", 5, true)
+                    .search_semantic(&attachment, "raft consensus leader election", 5, true)
                     .await;
                 result.results.iter().any(|hit| {
                     hit.path == "watched.md"
@@ -222,7 +227,7 @@ mod daemon_integration_tests {
             "watcher delete propagation",
             || async {
                 let result = server
-                    .search_semantic(vault.path(), "raft consensus leader election", 5, true)
+                    .search_semantic(&attachment, "raft consensus leader election", 5, true)
                     .await;
                 !result.results.iter().any(|hit| hit.path == "watched.md")
             },
@@ -257,20 +262,14 @@ mod daemon_integration_tests {
             let endpoint = endpoint.clone();
             let vault_root = vault_root.clone();
             join_set.spawn(async move {
-                let ensure = rpc_request(
-                    &endpoint,
-                    "ensure_vault",
-                    json!({
-                        "vault_root": vault_root.display().to_string(),
-                        "watch": false
-                    }),
-                )
-                .await;
-                assert!(
-                    ensure.get("error").is_none() || ensure["error"].is_null(),
-                    "ensure_vault should succeed: {ensure}"
+                let client = SemanticDaemonClient::new(
+                    IpcEndpoint::UnixSocket(endpoint.clone()),
+                    DaemonConnectPolicy::default(),
                 );
-
+                let attachment = client
+                    .attach_vault(&vault_root, &IndexScope::default(), false, None)
+                    .await
+                    .expect("establish concurrent attachment");
                 let deadline = Instant::now() + Duration::from_secs(300);
                 let search = loop {
                     let response = rpc_request(
@@ -278,6 +277,7 @@ mod daemon_integration_tests {
                         "search_semantic",
                         json!({
                             "vault_root": vault_root.display().to_string(),
+                            "attachment_id": attachment.result.attachment_id,
                             "query": "concurrent clients semantic query",
                             "top_k": 5,
                             "include_content": false
@@ -322,7 +322,7 @@ mod daemon_integration_tests {
         let server = DaemonTestServer::start(MODEL_NAME).await;
         let vault = create_temp_vault();
 
-        server
+        let attachment = server
             .ensure_vault_ready(vault.path(), true, Duration::from_secs(300))
             .await;
 
@@ -337,7 +337,7 @@ mod daemon_integration_tests {
 
         wait_until(Duration::from_secs(20), "post-error recovery", || async {
             let result = server
-                .search_semantic(vault.path(), "daemon recovery marker", 5, true)
+                .search_semantic(&attachment, "daemon recovery marker", 5, true)
                 .await;
             result.results.iter().any(|hit| {
                 hit.path == "recover.md"
@@ -364,10 +364,10 @@ mod daemon_integration_tests {
             "hybrid.md",
             "# Hybrid\nhybrid lexical semantic reranking example",
         );
-        server.ensure_vault(vault.path(), false).await;
+        let attachment = server.ensure_vault(vault.path(), false).await;
 
         let result = server
-            .search_hybrid(vault.path(), "", 5, 50, 0.25, false)
+            .search_hybrid(&attachment, "", 5, 50, 0.25, false)
             .await;
         assert!(result.results.is_empty());
 

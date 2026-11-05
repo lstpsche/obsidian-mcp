@@ -1,6 +1,5 @@
 //! Shared semantic-home path, namespace, and lock helpers.
 
-use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
@@ -90,15 +89,29 @@ pub fn semantic_home_paths(semantic_home: &Path) -> SemanticHomePaths {
 }
 
 pub fn ensure_home_layout(paths: &SemanticHomePaths) -> VaultResult<()> {
+    open_home_layout(paths).map(drop)
+}
+
+pub(crate) fn open_home_layout(
+    paths: &SemanticHomePaths,
+) -> VaultResult<crate::vault::fs::VaultRoot> {
     std::fs::create_dir_all(&paths.root)?;
-    std::fs::create_dir_all(&paths.lock_dir)?;
-    std::fs::create_dir_all(&paths.logs_dir)?;
-    std::fs::create_dir_all(&paths.bin_dir)?;
-    std::fs::create_dir_all(&paths.model_dir)?;
-    std::fs::create_dir_all(&paths.fastembed_cache_dir)?;
-    std::fs::create_dir_all(&paths.ipc_dir)?;
-    std::fs::create_dir_all(&paths.vaults_dir)?;
-    Ok(())
+    let root = crate::vault::fs::VaultRoot::open(&paths.root)?;
+    for directory in [
+        &paths.lock_dir,
+        &paths.logs_dir,
+        &paths.bin_dir,
+        &paths.model_dir,
+        &paths.fastembed_cache_dir,
+        &paths.ipc_dir,
+        &paths.vaults_dir,
+    ] {
+        let relative = directory
+            .strip_prefix(&paths.root)
+            .map_err(|_| VaultError::OutsideVault(directory.clone()))?;
+        root.create_dir_all(relative)?;
+    }
+    Ok(root)
 }
 
 pub fn default_ipc_endpoint(paths: &SemanticHomePaths) -> IpcEndpoint {
@@ -118,12 +131,15 @@ pub fn compute_vault_id(vault_root: &Path) -> VaultResult<String> {
     let canonical = vault_root.canonicalize().map_err(|err| {
         VaultError::InvalidPath(format!("failed to canonicalize vault root: {err}"))
     })?;
+    Ok(vault_id_from_canonical(&canonical))
+}
 
+pub(super) fn vault_id_from_canonical(canonical: &Path) -> String {
     let mut text = canonical.to_string_lossy().to_string();
     if cfg!(windows) {
         text.make_ascii_lowercase();
     }
-    Ok(sha256_hex(text.as_bytes()))
+    sha256_hex(text.as_bytes())
 }
 
 pub struct InstallLock {
@@ -286,12 +302,7 @@ fn strip_matching_outer_quotes(mut value: &str) -> &str {
 }
 
 pub(crate) fn sha256_hex(input: &[u8]) -> String {
-    let digest = Sha256::digest(input);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        let _ = write!(&mut out, "{byte:02x}");
-    }
-    out
+    crate::config::digest_hex(Sha256::new_with_prefix(input))
 }
 
 #[cfg(test)]
@@ -307,6 +318,18 @@ mod tests {
         let second = compute_vault_id(dir.path()).expect("second id");
         assert_eq!(first, second);
         assert_eq!(first.len(), 64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_layout_refuses_symlinked_model_directory() {
+        let home = tempfile::tempdir().expect("semantic home");
+        let outside = tempfile::tempdir().expect("outside home");
+        let paths = SemanticHomePaths::new(home.path().to_owned());
+        std::os::unix::fs::symlink(outside.path(), &paths.model_dir).expect("symlink model");
+
+        assert!(ensure_home_layout(&paths).is_err());
+        assert!(!outside.path().join("fastembed-cache").exists());
     }
 
     #[test]

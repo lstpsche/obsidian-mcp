@@ -23,14 +23,17 @@ fn parser_options() -> Options {
 // Static regex patterns
 // ---------------------------------------------------------------------------
 
-static WIKILINK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[\[([^\[\]]+)\]\]").unwrap());
+static WIKILINK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[\[([^\[\]]+)\]\]").expect("valid wikilink regex"));
 
 /// Tag after whitespace or line start; first char must be a letter.
-static INLINE_TAG_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?m)(?:^|[ \t])#([a-zA-Z][\w/-]*)").unwrap());
+static INLINE_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)(?:^|[ \t])#([a-zA-Z][\w/-]*)").expect("valid inline tag regex")
+});
 
-static BLOCK_REF_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?m)\^([a-zA-Z0-9-]+)\s*$").unwrap());
+static BLOCK_REF_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)\^([a-zA-Z0-9-]+)[^\S\n]*$").expect("valid block reference regex")
+});
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -558,20 +561,48 @@ pub fn extract_wikilinks(content: &str) -> Vec<WikiLink> {
         .collect()
 }
 
-/// Extract all block reference IDs (`^blockid` at end of line or standalone).
-/// Skips block refs inside code blocks and inline code spans.
-pub fn extract_block_refs(content: &str) -> Vec<String> {
+/// Block IDs at the end of a physical line, outside code and frontmatter.
+fn block_ref_ids(content: &str) -> impl Iterator<Item = regex::Match<'_>> {
     let exclusions = code_block_ranges(content);
-    BLOCK_REF_RE
-        .captures_iter(content)
-        .filter_map(|cap| {
-            let m = cap.get(1)?;
-            if is_in_code_block(m.start(), &exclusions) {
-                return None;
-            }
-            Some(m.as_str().to_string())
-        })
+    BLOCK_REF_RE.captures_iter(content).filter_map(move |cap| {
+        let id = cap.get(1)?;
+        (!is_in_code_block(id.start(), &exclusions)).then_some(id)
+    })
+}
+
+pub fn extract_block_refs(content: &str) -> Vec<String> {
+    block_ref_ids(content)
+        .map(|id| id.as_str().to_owned())
         .collect()
+}
+
+pub(super) struct BlockRef {
+    pub line: Range<usize>,
+    pub marker_start: usize,
+    pub end_with_newline: usize,
+}
+
+pub(super) fn find_block_ref(content: &str, block_id: &str) -> Option<BlockRef> {
+    let id = block_ref_ids(content).find(|id| id.as_str() == block_id)?;
+    let marker_start = id.start() - 1; // ASCII caret preceding the captured ID.
+    let start = content[..marker_start].rfind('\n').map_or(0, |i| i + 1);
+    let (end, end_with_newline) = match content[id.end()..].find('\n') {
+        Some(offset) => {
+            let lf = id.end() + offset;
+            let end = if content.as_bytes()[lf - 1] == b'\r' {
+                lf - 1
+            } else {
+                lf
+            };
+            (end, lf + 1)
+        }
+        None => (content.len(), content.len()),
+    };
+    Some(BlockRef {
+        line: start..end,
+        marker_start,
+        end_with_newline,
+    })
 }
 
 /// Build a [`DocumentMap`] for a note (headings, block refs, frontmatter fields).
@@ -631,10 +662,8 @@ pub fn find_heading_range(
 
 /// Find the byte range of the line containing a block reference (`^blockid`).
 pub fn find_block_ref_range(content: &str, block_id: &str) -> Option<(usize, usize)> {
-    let pattern = format!(r"(?m)^.*\^{}\s*$", regex::escape(block_id));
-    let re = Regex::new(&pattern).ok()?;
-    let m = re.find(content)?;
-    Some((m.start(), m.end()))
+    let block = find_block_ref(content, block_id)?;
+    Some((block.line.start, block.line.end))
 }
 
 // ---------------------------------------------------------------------------

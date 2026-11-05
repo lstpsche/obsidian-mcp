@@ -1,10 +1,11 @@
 //! Vault-relative path normalization and Unicode-aware filesystem resolution.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 use unicode_normalization::UnicodeNormalization;
 
+use super::fs::VaultRoot;
 use crate::error::{VaultError, VaultResult};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,15 +14,28 @@ pub struct ResolvedPath {
     pub absolute: PathBuf,
 }
 
-/// Normalize a vault-relative path, rejecting absolute paths and root escapes.
+/// Normalize a caller-supplied path, including its accepted separator spelling,
+/// before checking traversal. Paths discovered from the filesystem use
+/// `relative_from_absolute` and never reinterpret a literal filename.
 pub fn normalize_relative(path: &Path) -> VaultResult<PathBuf> {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
+    let text = path
+        .to_str()
+        .ok_or_else(|| VaultError::InvalidPath("vault-relative paths must be UTF-8".into()))?;
+    let portable = text.replace('\\', "/");
+    let mut names = Vec::new();
+    for component in Path::new(&portable).components() {
         match component {
-            Component::Normal(c) => normalized.push(c),
+            Component::Normal(name) => {
+                #[cfg(windows)]
+                validate_windows_name(
+                    name.to_str()
+                        .ok_or_else(|| VaultError::InvalidPath("invalid vault name".into()))?,
+                )?;
+                names.push(name);
+            }
             Component::CurDir => {}
             Component::ParentDir => {
-                if !normalized.pop() {
+                if names.pop().is_none() {
                     return Err(VaultError::OutsideVault(path.to_path_buf()));
                 }
             }
@@ -33,218 +47,98 @@ pub fn normalize_relative(path: &Path) -> VaultResult<PathBuf> {
             }
         }
     }
-    Ok(forward_slash_path(&normalized))
+    Ok(PathBuf::from(names.join(std::ffi::OsStr::new("/"))))
 }
 
-/// Convert an absolute path under the vault root into the internal relative form.
+/// Keep the exact disk identity when serializing a native relative name.
+pub(super) fn portable_native(path: &Path) -> VaultResult<PathBuf> {
+    let mut result = OsString::new();
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            return Err(VaultError::InvalidPath(format!(
+                "expected a physical vault-relative path: {}",
+                path.display()
+            )));
+        };
+        let text = name
+            .to_str()
+            .filter(|name| !name.contains('\\'))
+            .ok_or_else(|| {
+                VaultError::InvalidPath(format!(
+                    "unrepresentable vault filename: {}",
+                    name.display()
+                ))
+            })?;
+        #[cfg(windows)]
+        validate_windows_name(text)?;
+        if !result.is_empty() {
+            result.push("/");
+        }
+        result.push(text);
+    }
+    Ok(result.into())
+}
+
+#[cfg(windows)]
+fn validate_windows_name(name: &str) -> VaultResult<()> {
+    // Native relative directory creation and rename operate below Win32's DOS
+    // name translation. Refuse alternate data streams and device aliases
+    // before they can acquire a different meaning in another operation.
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or(name)
+        .trim_end()
+        .to_ascii_uppercase();
+    let numbered = stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"));
+    if name.contains(':')
+        || matches!(
+            stem.as_str(),
+            "NUL" | "CON" | "AUX" | "PRN" | "CONIN$" | "CONOUT$"
+        )
+        || matches!(
+            numbered,
+            Some("0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")
+        )
+    {
+        return Err(VaultError::InvalidPath(format!(
+            "reserved Windows vault filename: {name}"
+        )));
+    }
+    Ok(())
+}
+
 pub fn relative_from_absolute(vault_root: &Path, absolute: &Path) -> VaultResult<PathBuf> {
     let relative = absolute
         .strip_prefix(vault_root)
         .map_err(|_| VaultError::OutsideVault(absolute.to_path_buf()))?;
-    normalize_relative(relative)
+    portable_native(relative)
 }
 
-/// Unicode canonical key used for normalization-form-insensitive comparisons.
 pub fn canonical_unicode_key(s: &str) -> String {
     s.nfc().collect()
 }
 
-/// Resolve an existing vault path to the actual disk-relative spelling.
+/// Return the current physical spelling for reporting or index identity.
+/// Perform filesystem operations through the rooted handle.
 pub fn resolve_existing(vault_root: &Path, relative: &Path) -> VaultResult<ResolvedPath> {
-    let normalized = normalize_relative(relative)?;
-    let canonical_root = canonical_root(vault_root)?;
-
-    if normalized.as_os_str().is_empty() {
-        return Ok(ResolvedPath {
-            relative: PathBuf::new(),
-            absolute: canonical_root,
-        });
-    }
-
-    let mut absolute = canonical_root.clone();
-    let mut actual_relative = PathBuf::new();
-
-    for component in normal_components(&normalized) {
-        let entry_name = match find_component(&absolute, &component, relative)? {
-            Some(name) => name,
-            None => return Err(VaultError::NoteNotFound(relative.to_path_buf())),
-        };
-        absolute.push(&entry_name);
-        actual_relative.push(&entry_name);
-        ensure_inside_root(&canonical_root, &absolute, relative)?;
-    }
-
-    Ok(ResolvedPath {
-        relative: forward_slash_path(&actual_relative),
-        absolute,
-    })
+    VaultRoot::open(vault_root)?.resolve_existing(relative)
 }
 
-/// Resolve a write target, preserving existing component spellings and the new
-/// final spelling when the target does not already exist.
 pub fn resolve_for_write(vault_root: &Path, relative: &Path) -> VaultResult<ResolvedPath> {
-    match resolve_existing(vault_root, relative) {
-        Ok(existing) => return Ok(existing),
-        Err(VaultError::NoteNotFound(_)) => {}
-        Err(err) => return Err(err),
-    }
-
-    let normalized = normalize_relative(relative)?;
-    let canonical_root = canonical_root(vault_root)?;
-
-    if normalized.as_os_str().is_empty() {
-        return Ok(ResolvedPath {
-            relative: PathBuf::new(),
-            absolute: canonical_root,
-        });
-    }
-
-    let components = normal_components(&normalized);
-    let mut absolute = canonical_root.clone();
-    let mut actual_relative = PathBuf::new();
-
-    for (index, component) in components.iter().enumerate() {
-        match find_component(&absolute, component, relative)? {
-            Some(entry_name) => {
-                absolute.push(&entry_name);
-                actual_relative.push(&entry_name);
-                ensure_inside_root(&canonical_root, &absolute, relative)?;
-            }
-            None => {
-                absolute.push(component);
-                actual_relative.push(component);
-                for remaining in components.iter().skip(index + 1) {
-                    absolute.push(remaining);
-                    actual_relative.push(remaining);
-                }
-                ensure_write_parent_inside_root(&canonical_root, &absolute, relative)?;
-                return Ok(ResolvedPath {
-                    relative: forward_slash_path(&actual_relative),
-                    absolute,
-                });
-            }
-        }
-    }
-
-    Ok(ResolvedPath {
-        relative: forward_slash_path(&actual_relative),
-        absolute,
-    })
+    VaultRoot::open(vault_root)?.resolve_for_write(relative)
 }
 
 pub fn resolve_parent_for_write(
     vault_root: &Path,
     relative: &Path,
 ) -> VaultResult<(PathBuf, PathBuf)> {
-    let resolved = resolve_for_write(vault_root, relative)?;
-    let parent_abs = resolved
-        .absolute
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| resolved.absolute.clone());
-    let parent_rel = resolved
-        .relative
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_default();
-    Ok((forward_slash_path(&parent_rel), parent_abs))
-}
-
-fn canonical_root(vault_root: &Path) -> VaultResult<PathBuf> {
-    vault_root
-        .canonicalize()
-        .map_err(|_| VaultError::InvalidPath(vault_root.display().to_string()))
-}
-
-fn normal_components(path: &Path) -> Vec<OsString> {
-    path.components()
-        .filter_map(|component| match component {
-            Component::Normal(c) => Some(c.to_os_string()),
-            _ => None,
-        })
-        .collect()
-}
-
-fn find_component(
-    directory: &Path,
-    requested: &OsStr,
-    original_path: &Path,
-) -> VaultResult<Option<OsString>> {
-    let entries = match std::fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(VaultError::Io(err)),
-    };
-
-    let requested_key = canonical_unicode_key(&requested.to_string_lossy());
-    let mut normalized_matches = Vec::new();
-
-    for entry in entries {
-        let entry = entry?;
-        let file_name = entry.file_name();
-        if file_name == requested {
-            return Ok(Some(file_name));
-        }
-
-        let entry_key = canonical_unicode_key(&file_name.to_string_lossy());
-        if entry_key == requested_key {
-            normalized_matches.push(file_name);
-        }
-    }
-
-    match normalized_matches.as_slice() {
-        [] => Ok(None),
-        [single] => Ok(Some(single.clone())),
-        _ => Err(VaultError::InvalidPath(format!(
-            "ambiguous Unicode-normalized path component '{}' in {}",
-            requested.to_string_lossy(),
-            original_path.display()
-        ))),
-    }
-}
-
-fn ensure_inside_root(
-    canonical_root: &Path,
-    absolute: &Path,
-    original_path: &Path,
-) -> VaultResult<()> {
-    if absolute.exists() {
-        let canonical = absolute.canonicalize()?;
-        if !canonical.starts_with(canonical_root) {
-            return Err(VaultError::OutsideVault(original_path.to_path_buf()));
-        }
-    }
-    Ok(())
-}
-
-fn ensure_write_parent_inside_root(
-    canonical_root: &Path,
-    absolute: &Path,
-    original_path: &Path,
-) -> VaultResult<()> {
-    if let Some(parent) = nearest_existing_parent(absolute) {
-        let canonical_parent = parent.canonicalize()?;
-        if !canonical_parent.starts_with(canonical_root) {
-            return Err(VaultError::OutsideVault(original_path.to_path_buf()));
-        }
-    }
-    Ok(())
-}
-
-fn nearest_existing_parent(path: &Path) -> Option<PathBuf> {
-    let mut current = path.parent()?.to_path_buf();
-    loop {
-        if current.exists() {
-            return Some(current);
-        }
-        if !current.pop() {
-            return None;
-        }
-    }
-}
-
-fn forward_slash_path(path: &Path) -> PathBuf {
-    PathBuf::from(path.to_string_lossy().replace('\\', "/"))
+    let root = VaultRoot::open(vault_root)?;
+    let resolved = root.resolve_for_write(relative)?;
+    let parent = resolved.relative.parent().unwrap_or(Path::new(""));
+    Ok((parent.to_owned(), root.path().join(parent)))
 }
 
 #[cfg(test)]

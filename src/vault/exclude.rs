@@ -1,10 +1,12 @@
 //! Path exclusion logic: compile glob patterns and test vault-relative paths.
 
-use std::fs;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use sha2::{Digest, Sha256};
 
+use super::fs::VaultRoot;
 use crate::error::{VaultError, VaultResult};
 
 /// Whether a vault-relative path belongs to the visible indexing namespace.
@@ -18,51 +20,71 @@ pub(crate) fn is_visible_path(path: &Path) -> bool {
 }
 
 /// Compiled set of glob patterns for excluding vault paths from indexing.
+#[derive(Default)]
 pub struct ExcludeSet {
     set: GlobSet,
     patterns: Vec<String>,
 }
 
 impl ExcludeSet {
-    /// Compile a list of raw patterns into a `GlobSet`.
-    ///
-    /// Each pattern is trimmed, blank entries are skipped, and trailing `/`
-    /// is normalized to `/**`. Invalid patterns are logged and skipped.
+    /// Compile a complete policy. A malformed exclusion cannot grant access
+    /// to a path that the operator intended to exclude.
     pub fn build(patterns: Vec<String>) -> VaultResult<Self> {
-        let mut builder = GlobSetBuilder::new();
-        let mut accepted = Vec::new();
+        Self::from_sources(
+            patterns
+                .into_iter()
+                .enumerate()
+                .map(|(i, p)| ("exclusion policy", i + 1, p)),
+        )
+    }
 
-        for raw in &patterns {
+    fn from_sources<'a>(
+        entries: impl IntoIterator<Item = (&'a str, usize, String)>,
+    ) -> VaultResult<Self> {
+        let mut builder = GlobSetBuilder::new();
+        let mut accepted = BTreeSet::new();
+        for (source, line, raw) in entries {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
                 continue;
             }
-
-            let normalized = if let Some(prefix) = trimmed.strip_suffix('/') {
-                format!("{prefix}/**")
-            } else {
-                trimmed.to_string()
+            let normalized = match trimmed.strip_suffix('/') {
+                Some(prefix) => format!("{prefix}/**"),
+                None => trimmed.to_owned(),
             };
-
-            match Glob::new(&normalized) {
-                Ok(glob) => {
-                    builder.add(glob);
-                    accepted.push(normalized);
-                }
-                Err(e) => {
-                    tracing::warn!(pattern = trimmed, error = %e, "skipping invalid exclude pattern");
-                }
+            if accepted.contains(&normalized) {
+                continue;
             }
+            let glob = Glob::new(&normalized).map_err(|error| {
+                VaultError::InvalidPath(format!(
+                    "invalid exclusion pattern in {source} at line {line}: {}",
+                    error.kind()
+                ))
+            })?;
+            builder.add(glob);
+            accepted.insert(normalized);
         }
-
-        let set = builder
-            .build()
-            .map_err(|e| VaultError::Other(format!("glob set compile: {e}")))?;
-
         Ok(Self {
-            set,
-            patterns: accepted,
+            set: builder
+                .build()
+                .map_err(|err| VaultError::Other(format!("compile exclusion policy: {err}")))?,
+            patterns: accepted.into_iter().collect(),
         })
+    }
+
+    pub fn merged(&self, extra: &[String]) -> VaultResult<Self> {
+        Self::build(self.patterns.iter().chain(extra).cloned().collect())
+    }
+
+    pub fn scope_id(&self, canonical_root: &Path) -> String {
+        let mut hash = Sha256::new();
+        hash.update(b"obsidian-mcp/index-scope/v1\0");
+        hash.update(crate::config::vault_storage_key(canonical_root));
+        for rule in &self.patterns {
+            hash.update((rule.len() as u64).to_be_bytes());
+            hash.update(rule.as_bytes());
+        }
+        crate::config::digest_hex(hash)
     }
 
     /// Check whether a vault-relative path is excluded.
@@ -89,42 +111,52 @@ impl ExcludeSet {
 /// Lines starting with `#` (after trimming leading whitespace) are comments.
 /// Blank lines and surrounding whitespace are stripped.
 pub fn parse_ignore_lines(content: &str) -> Vec<String> {
-    content
-        .lines()
-        .filter_map(|line| {
-            let ltrimmed = line.trim_start();
-            if ltrimmed.starts_with('#') {
-                return None;
-            }
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                return None;
-            }
-            Some(trimmed.to_string())
-        })
+    ignore_rules(content)
+        .map(|(_, rule)| rule.to_owned())
         .collect()
 }
 
-/// Load and merge ignore patterns from both config locations.
-///
-/// Reads `{mcp_home}/ignore` and (if different) `{mcp_data}/ignore`,
-/// merges both lists, sorts, and deduplicates.
-pub fn load_ignore_patterns(mcp_home: &Path, mcp_data: &Path) -> Vec<String> {
-    let mut patterns = Vec::new();
+fn ignore_rules(content: &str) -> impl Iterator<Item = (usize, &str)> {
+    content.lines().enumerate().filter_map(|(i, line)| {
+        let rule = line.trim();
+        (!rule.is_empty() && !rule.starts_with('#')).then_some((i + 1, rule))
+    })
+}
 
-    if let Ok(content) = fs::read_to_string(mcp_home.join("ignore")) {
-        patterns.extend(parse_ignore_lines(&content));
+/// Read one optional policy through its originating filesystem capability.
+pub(crate) fn read_ignore(root: &VaultRoot, path: &Path) -> VaultResult<Option<ExcludeSet>> {
+    let content = match root.read_file(path) {
+        Ok(content) => content,
+        Err(err) if err.is_not_found() => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let label = root.path().join(path).display().to_string();
+    ExcludeSet::from_sources(
+        ignore_rules(&content).map(|(line, rule)| (label.as_str(), line, rule.to_owned())),
+    )
+    .map(Some)
+}
+
+/// Load the portable and machine policies from two explicitly supplied roots.
+pub fn load_ignore_patterns(mcp_home: &Path, mcp_data: &Path) -> VaultResult<Vec<String>> {
+    let mut rules = Vec::new();
+    for (index, path) in [mcp_home, mcp_data].into_iter().enumerate() {
+        if index == 1 && mcp_home == mcp_data {
+            break;
+        }
+        if let Some(set) = read_ignore(&VaultRoot::open(path)?, Path::new("ignore"))? {
+            rules.extend(set.patterns);
+        }
     }
+    rules.sort();
+    rules.dedup();
+    Ok(rules)
+}
 
-    if mcp_data != mcp_home
-        && let Ok(content) = fs::read_to_string(mcp_data.join("ignore"))
-    {
-        patterns.extend(parse_ignore_lines(&content));
-    }
-
-    patterns.sort();
-    patterns.dedup();
-    patterns
+pub(crate) fn daemon_exclusions(root: &VaultRoot) -> VaultResult<ExcludeSet> {
+    let machine = crate::config::normalize_optional_path_env("OBSIDIAN_MCP_DATA");
+    let extra = crate::config::exclusion_env().map_err(VaultError::InvalidPath)?;
+    super::data::effective_policy(root, machine.as_deref(), &extra)
 }
 
 #[cfg(test)]
@@ -158,10 +190,12 @@ mod tests {
     }
 
     #[test]
-    fn build_skips_invalid_pattern() {
-        let set = ExcludeSet::build(vec!["[invalid".into(), "valid/**".into()]).unwrap();
-        assert_eq!(set.patterns().len(), 1);
-        assert_eq!(set.patterns()[0], "valid/**");
+    fn build_rejects_an_invalid_rule_without_exposing_it() {
+        let err = ExcludeSet::build(vec!["[invalid".into(), "valid/**".into()])
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("line 1"));
+        assert!(!err.to_string().contains("[invalid"));
     }
 
     #[test]
@@ -173,8 +207,7 @@ mod tests {
 
     #[test]
     fn build_all_invalid() {
-        let set = ExcludeSet::build(vec!["[bad1".into(), "[bad2".into()]).unwrap();
-        assert!(set.is_empty());
+        assert!(ExcludeSet::build(vec!["[bad1".into(), "[bad2".into()]).is_err());
     }
 
     #[test]
@@ -312,8 +345,8 @@ Resources/Meetings/
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("ignore"), "Archive/\n*.tmp\n").unwrap();
 
-        let result = load_ignore_patterns(dir.path(), dir.path());
-        assert_eq!(result, vec!["*.tmp", "Archive/"]);
+        let result = load_ignore_patterns(dir.path(), dir.path()).unwrap();
+        assert_eq!(result, vec!["*.tmp", "Archive/**"]);
     }
 
     #[test]
@@ -323,8 +356,8 @@ Resources/Meetings/
         std::fs::write(home.path().join("ignore"), "Archive/\n").unwrap();
         std::fs::write(data.path().join("ignore"), "Drafts/\n").unwrap();
 
-        let result = load_ignore_patterns(home.path(), data.path());
-        assert_eq!(result, vec!["Archive/", "Drafts/"]);
+        let result = load_ignore_patterns(home.path(), data.path()).unwrap();
+        assert_eq!(result, vec!["Archive/**", "Drafts/**"]);
     }
 
     #[test]
@@ -334,14 +367,14 @@ Resources/Meetings/
         std::fs::write(home.path().join("ignore"), "Archive/\nDrafts/\n").unwrap();
         std::fs::write(data.path().join("ignore"), "Archive/\nMeetings/\n").unwrap();
 
-        let result = load_ignore_patterns(home.path(), data.path());
-        assert_eq!(result, vec!["Archive/", "Drafts/", "Meetings/"]);
+        let result = load_ignore_patterns(home.path(), data.path()).unwrap();
+        assert_eq!(result, vec!["Archive/**", "Drafts/**", "Meetings/**"]);
     }
 
     #[test]
     fn load_ignore_patterns_missing_files() {
         let dir = tempfile::TempDir::new().unwrap();
-        let result = load_ignore_patterns(dir.path(), dir.path());
+        let result = load_ignore_patterns(dir.path(), dir.path()).unwrap();
         assert!(result.is_empty());
     }
 
@@ -350,8 +383,8 @@ Resources/Meetings/
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("ignore"), "Archive/\nDrafts/\n").unwrap();
 
-        let result = load_ignore_patterns(dir.path(), dir.path());
-        assert_eq!(result, vec!["Archive/", "Drafts/"]);
+        let result = load_ignore_patterns(dir.path(), dir.path()).unwrap();
+        assert_eq!(result, vec!["Archive/**", "Drafts/**"]);
     }
 
     #[test]
@@ -360,7 +393,7 @@ Resources/Meetings/
         let data = tempfile::TempDir::new().unwrap();
         std::fs::write(data.path().join("ignore"), "External/\n").unwrap();
 
-        let result = load_ignore_patterns(home.path(), data.path());
-        assert_eq!(result, vec!["External/"]);
+        let result = load_ignore_patterns(home.path(), data.path()).unwrap();
+        assert_eq!(result, vec!["External/**"]);
     }
 }

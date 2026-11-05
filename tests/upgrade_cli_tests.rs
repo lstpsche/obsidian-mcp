@@ -1,3 +1,7 @@
+#[cfg(unix)]
+#[path = "common/http_listening.rs"]
+mod http_listening;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -153,40 +157,28 @@ fn upgrade_rejects_unknown_options_before_loading_vault_config() {
 }
 
 #[cfg(unix)]
-#[test]
-fn active_ad_hoc_http_runtime_blocks_upgrade_before_mutation() {
-    use std::net::{TcpListener, TcpStream};
-    use std::time::{Duration, Instant};
-
+#[tokio::test]
+async fn active_ad_hoc_http_runtime_blocks_upgrade_before_mutation() {
     let (root, main, fake_home) =
         staged_cargo_install("registry+https://github.com/rust-lang/crates.io-index");
     let vault = tempfile::tempdir().expect("temporary vault should be created");
-    let port = TcpListener::bind(("127.0.0.1", 0))
-        .expect("temporary port should bind")
-        .local_addr()
-        .expect("temporary address should resolve")
-        .port();
-    let mut server = Command::new(&main)
+    let mut server = http_listening::isolated_command(&main)
         .arg(vault.path())
         .env("HOME", &fake_home)
         .env("OBSIDIAN_TRANSPORT", "http")
         .env("OBSIDIAN_HTTP_HOST", "127.0.0.1")
-        .env("OBSIDIAN_HTTP_PORT", port.to_string())
+        .env("OBSIDIAN_HTTP_PORT", "0")
         .env("OBSIDIAN_WATCH", "false")
+        .env("OBSIDIAN_EMBEDDINGS", "false")
+        .env("OBSIDIAN_SEMANTIC_MODE", "local")
+        .env("OBSIDIAN_LOG_LEVEL", "info")
+        .env("NO_COLOR", "1")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .expect("ad-hoc HTTP server should start");
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        if Instant::now() >= deadline {
-            let _ = server.kill();
-            let _ = server.wait();
-            panic!("ad-hoc HTTP server did not become ready");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    http_listening::ready(&mut server).await.unwrap();
     let marker = root.path().join("settings.marker");
     fs::write(&marker, "unchanged").expect("marker should be written");
     let output = Command::new(&main)
@@ -194,8 +186,7 @@ fn active_ad_hoc_http_runtime_blocks_upgrade_before_mutation() {
         .env("HOME", &fake_home)
         .output()
         .expect("upgrade dry run should execute");
-    let _ = server.kill();
-    let _ = server.wait();
+    server.kill().await.unwrap();
 
     assert_eq!(
         output.status.code(),

@@ -11,7 +11,7 @@ use super::protocol::{
     VaultStatusParams,
 };
 use super::vault_context::VaultContext;
-use super::vault_registry::VaultRegistry;
+use super::vault_registry::{VaultAttachment, VaultRegistry};
 use crate::error::VaultError;
 
 const DEFAULT_TOP_K: usize = 10;
@@ -42,32 +42,53 @@ pub async fn vault_status(
     registry: &VaultRegistry,
     params: VaultStatusParams,
 ) -> QueryResult<SemanticStatus> {
-    let context = require_context(registry, &params.vault_root).await?;
+    let path = Path::new(&params.vault_root);
+    let context = match (params.attachment_id.as_deref(), params.index_scope) {
+        (Some(id), None) => registry.context_for_holder(path, id),
+        (None, Some(scope)) => registry.context_for_policy(path, scope).await,
+        _ => {
+            return Err(QueryError::new(
+                protocol::ERR_INVALID_PARAMS,
+                "vault_status requires exactly one of attachment_id or index_scope",
+            ));
+        }
+    }
+    .map_err(map_vault_error)?
+    .ok_or_else(not_attached)?;
     Ok(semantic_status(&context))
 }
 
-pub async fn ensure_vault(
+pub(crate) async fn ensure_vault(
     registry: &VaultRegistry,
     params: EnsureVaultParams,
+    attachment: &mut Option<VaultAttachment>,
 ) -> QueryResult<EnsureVaultResult> {
     let watch_enabled = params.watch.unwrap_or(true);
     let requested_model = params
         .model_name
         .as_deref()
         .unwrap_or(registry.model_name());
-    let context = registry
-        .ensure_vault(
+    let (context, new_holder) = registry
+        .attach(
             Path::new(&params.vault_root),
             watch_enabled,
             requested_model,
+            &params.index_scope,
+            attachment.as_ref(),
         )
         .await
         .map_err(map_vault_error)?;
 
-    let watch_enabled = context.watch_enabled().map_err(map_vault_error)?;
+    if let Some(new_holder) = new_holder {
+        *attachment = Some(new_holder);
+    }
+    let holder = attachment.as_ref().ok_or_else(not_attached)?;
+    let watch_enabled = context.watch_enabled();
     let status = semantic_status(&context);
     Ok(EnsureVaultResult {
         vault_id: context.vault_id().to_string(),
+        scope_id: holder.scope_id.clone(),
+        attachment_id: holder.id.clone(),
         ready: status.ready,
         watch_enabled,
         model_name: context.model_name().to_string(),
@@ -83,12 +104,12 @@ pub async fn search_semantic(
     registry: &VaultRegistry,
     params: SearchSemanticParams,
 ) -> QueryResult<SearchResult> {
-    let context = require_context(registry, &params.vault_root).await?;
+    let context = require_context(registry, &params.vault_root, &params.attachment_id)?;
     require_semantic_ready(&context)?;
     let top_k = params.top_k.unwrap_or(DEFAULT_TOP_K);
     let include_content = params.include_content.unwrap_or(false);
 
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         let results = context
             .search_semantic_results(
                 &params.query,
@@ -107,14 +128,16 @@ pub async fn search_semantic(
             protocol::ERR_INTERNAL,
             format!("semantic search worker failed: {error}"),
         )
-    })?
+    })?;
+    require_context(registry, &params.vault_root, &params.attachment_id)?;
+    result
 }
 
 pub async fn search_hybrid(
     registry: &VaultRegistry,
     params: SearchHybridParams,
 ) -> QueryResult<SearchResult> {
-    let context = require_context(registry, &params.vault_root).await?;
+    let context = require_context(registry, &params.vault_root, &params.attachment_id)?;
     if params.query.is_empty() {
         return Ok(SearchResult {
             results: Vec::new(),
@@ -127,7 +150,7 @@ pub async fn search_hybrid(
     let prefetch = params.prefetch.unwrap_or(DEFAULT_PREFETCH_COUNT).max(top_k);
     let alpha = params.alpha.unwrap_or(DEFAULT_ALPHA).clamp(0.0, 1.0);
 
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         let results = context
             .search_hybrid_results(
                 &params.query,
@@ -148,14 +171,16 @@ pub async fn search_hybrid(
             protocol::ERR_INTERNAL,
             format!("hybrid search worker failed: {error}"),
         )
-    })?
+    })?;
+    require_context(registry, &params.vault_root, &params.attachment_id)?;
+    result
 }
 
 pub async fn open_hint(
     registry: &VaultRegistry,
     params: OpenHintParams,
 ) -> QueryResult<OpenHintResult> {
-    let context = require_context(registry, &params.vault_root).await?;
+    let context = require_context(registry, &params.vault_root, &params.attachment_id)?;
     let (path_part, subpath) = split_subpath(&params.path);
     let relative = Path::new(path_part);
     if relative.is_absolute() {
@@ -185,21 +210,22 @@ pub async fn open_hint(
     })
 }
 
-async fn require_context(
+fn not_attached() -> QueryError {
+    QueryError::new(
+        protocol::ERR_VAULT_NOT_ATTACHED,
+        "vault scope is not attached; call ensure_vault",
+    )
+}
+
+fn require_context(
     registry: &VaultRegistry,
     vault_root: &str,
+    attachment_id: &str,
 ) -> QueryResult<Arc<VaultContext>> {
-    match registry
-        .get_context_by_root(Path::new(vault_root))
-        .await
+    registry
+        .context_for_holder(Path::new(vault_root), attachment_id)
         .map_err(map_vault_error)?
-    {
-        Some(context) => Ok(context),
-        None => Err(QueryError::new(
-            protocol::ERR_VAULT_NOT_ATTACHED,
-            "vault not attached; call ensure_vault first",
-        )),
-    }
+        .ok_or_else(not_attached)
 }
 
 fn semantic_status(context: &VaultContext) -> SemanticStatus {
@@ -285,6 +311,15 @@ fn split_subpath(path: &str) -> (&str, Option<String>) {
 fn map_vault_error(err: VaultError) -> QueryError {
     let message = err.to_string();
     match err {
+        VaultError::DaemonRpc {
+            code,
+            message,
+            data,
+        } => QueryError {
+            code,
+            message,
+            data,
+        },
         VaultError::InvalidPath(_)
         | VaultError::OutsideVault(_)
         | VaultError::AlreadyExists(_)
@@ -319,9 +354,9 @@ mod tests {
         std::fs::create_dir(&vault_root).unwrap();
         let context = VaultContext::open(
             "test-vault".into(),
-            vault_root,
+            crate::vault::fs::VaultRoot::open(&vault_root).unwrap(),
             "test-model".into(),
-            directory.path().join("state"),
+            Arc::new(crate::vault::exclude::ExcludeSet::build(vec![]).unwrap()),
             false,
         )
         .await

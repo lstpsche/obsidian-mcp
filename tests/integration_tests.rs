@@ -6,7 +6,7 @@ use obsidian_mcp::models::{NotePeriod, PatchOperation, PatchRequest, PatchTarget
 use obsidian_mcp::vault::Vault;
 
 #[cfg(all(unix, feature = "embeddings"))]
-mod common;
+pub mod common;
 
 fn fixture_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -294,7 +294,7 @@ mod vault_search {
     fn search_text_finds_match() {
         let results = VAULT.search_text("quantum entanglement", 40).unwrap();
         assert!(!results.is_empty());
-        assert!(results.iter().any(|r| r.path == PathBuf::from("orphan.md")));
+        assert!(results.iter().any(|r| r.path == Path::new("orphan.md")));
     }
 
     #[test]
@@ -303,7 +303,7 @@ mod vault_search {
         assert!(
             results
                 .iter()
-                .any(|r| r.path == PathBuf::from("Projects/rust-mcp.md"))
+                .any(|r| r.path == Path::new("Projects/rust-mcp.md"))
         );
     }
 
@@ -327,7 +327,7 @@ mod vault_search {
         assert!(
             notes
                 .iter()
-                .any(|n| n.path == PathBuf::from("Projects/rust-mcp.md"))
+                .any(|n| n.path == Path::new("Projects/rust-mcp.md"))
         );
     }
 
@@ -337,12 +337,12 @@ mod vault_search {
         assert!(
             notes
                 .iter()
-                .any(|n| n.path == PathBuf::from("Projects/rust-mcp.md"))
+                .any(|n| n.path == Path::new("Projects/rust-mcp.md"))
         );
         assert!(
             notes
                 .iter()
-                .any(|n| n.path == PathBuf::from("Projects/python-tools.md"))
+                .any(|n| n.path == Path::new("Projects/python-tools.md"))
         );
     }
 
@@ -354,7 +354,7 @@ mod vault_search {
         assert!(
             notes
                 .iter()
-                .any(|n| n.path == PathBuf::from("Projects/rust-mcp.md"))
+                .any(|n| n.path == Path::new("Projects/rust-mcp.md"))
         );
     }
 
@@ -364,7 +364,7 @@ mod vault_search {
         assert!(
             notes
                 .iter()
-                .any(|n| n.path == PathBuf::from("Projects/python-tools.md"))
+                .any(|n| n.path == Path::new("Projects/python-tools.md"))
         );
     }
 
@@ -376,7 +376,7 @@ mod vault_search {
         assert!(
             notes
                 .iter()
-                .any(|n| n.path == PathBuf::from("Projects/python-tools.md"))
+                .any(|n| n.path == Path::new("Projects/python-tools.md"))
         );
     }
 }
@@ -417,7 +417,7 @@ mod vault_graph {
     fn orphan_notes() {
         let orphans = VAULT.orphan_notes().unwrap();
         assert!(
-            orphans.iter().any(|n| n.path == PathBuf::from("orphan.md")),
+            orphans.iter().any(|n| n.path == Path::new("orphan.md")),
             "orphan.md should be detected as orphan, got: {:?}",
             orphans.iter().map(|n| &n.path).collect::<Vec<_>>()
         );
@@ -511,7 +511,7 @@ mod vault_tantivy_search {
         assert!(
             results
                 .iter()
-                .any(|r| r.path == PathBuf::from("fuzzy_target.md")),
+                .any(|r| r.path == Path::new("fuzzy_target.md")),
             "fuzzy should find 'architecture' from 'architeture'"
         );
     }
@@ -534,7 +534,7 @@ mod vault_tantivy_search {
         assert!(
             title_results
                 .iter()
-                .any(|r| r.path == PathBuf::from("elasticsearch.md"))
+                .any(|r| r.path == Path::new("elasticsearch.md"))
         );
 
         // "indexing" appears only in the body, not title
@@ -544,7 +544,7 @@ mod vault_tantivy_search {
         assert!(
             body_results
                 .iter()
-                .any(|r| r.path == PathBuf::from("elasticsearch.md"))
+                .any(|r| r.path == Path::new("elasticsearch.md"))
         );
     }
 
@@ -721,11 +721,7 @@ mod vault_write {
             )
             .unwrap();
         let results = vault.search_text("findable_xyzzy_content", 40).unwrap();
-        assert!(
-            results
-                .iter()
-                .any(|r| r.path == PathBuf::from("searchme.md"))
-        );
+        assert!(results.iter().any(|r| r.path == Path::new("searchme.md")));
     }
 }
 
@@ -787,7 +783,7 @@ mod unicode_paths {
         assert!(
             backlinks
                 .iter()
-                .any(|note| note.path == PathBuf::from("source.md"))
+                .any(|note| note.path == Path::new("source.md"))
         );
 
         let outgoing = vault.outgoing_links(Path::new(composed)).unwrap();
@@ -862,8 +858,6 @@ mod vault_periodic {
 
 mod tool_filtering {
     use std::collections::HashSet;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
 
     use obsidian_mcp::config::{ALL_TOOL_NAMES, SemanticMode};
     use obsidian_mcp::tools::{ObsidianMcp, SemanticRuntime};
@@ -877,7 +871,7 @@ mod tool_filtering {
             daemon_client: None,
             daemon_unavailable_reason: None,
             prefetch_count: 50,
-            vault_ensured: Arc::new(AtomicBool::new(false)),
+            attachments: Default::default(),
             local_fallback_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             daemon_health_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -1165,11 +1159,16 @@ mod vault_exclusion {
         };
         let vault = Vault::open(&config).await.unwrap();
 
-        let slug = obsidian_mcp::config::vault_slug(vault.root());
-        let expected = data_dir.path().join("vaults").join(&slug);
+        let key = obsidian_mcp::config::vault_storage_key(vault.root());
+        let expected = data_dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("vaults-v2")
+            .join(key);
         assert!(
             expected.is_dir(),
-            "external data dir should contain vaults/{slug}/ structure"
+            "external data directory should contain a vault-specific namespace"
         );
         assert_eq!(vault.mcp_data(), expected);
     }
@@ -1659,8 +1658,7 @@ mod vault_semantic_search {
 #[cfg(all(unix, feature = "embeddings"))]
 mod semantic_tool_runtime_modes {
     use super::*;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::{Arc, LazyLock};
+    use std::sync::LazyLock;
 
     use obsidian_mcp::client::semantic_daemon::{DaemonConnectPolicy, SemanticDaemonClient};
     use obsidian_mcp::config::SemanticMode;
@@ -1767,13 +1765,13 @@ mod semantic_tool_runtime_modes {
                 DaemonConnectPolicy::default(),
             )),
             daemon_unavailable_reason: None,
-            vault_ensured: Arc::new(AtomicBool::new(false)),
+            attachments: Default::default(),
             local_fallback_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             daemon_health_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             prefetch_count: 50,
         };
 
-        server
+        let _owner = server
             .ensure_vault_ready(vault_dir.path(), true, std::time::Duration::from_secs(300))
             .await;
 
@@ -1827,7 +1825,7 @@ mod semantic_tool_runtime_modes {
             pending_daemon_bootstrap: None,
             daemon_client: None,
             daemon_unavailable_reason: Some("daemon socket unavailable".to_string()),
-            vault_ensured: Arc::new(AtomicBool::new(false)),
+            attachments: Default::default(),
             local_fallback_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             daemon_health_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             prefetch_count: 50,
@@ -1861,7 +1859,7 @@ mod semantic_tool_runtime_modes {
             pending_daemon_bootstrap: None,
             daemon_client: None,
             daemon_unavailable_reason: Some("not connected".to_string()),
-            vault_ensured: Arc::new(AtomicBool::new(false)),
+            attachments: Default::default(),
             local_fallback_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             daemon_health_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             prefetch_count: 50,
@@ -2225,10 +2223,13 @@ mod background_embedding_runtime {
         vault
     }
 
-    fn cache_path(vault_root: &Path) -> PathBuf {
+    fn cache_path(vault_root: &Path, rules: &[String]) -> PathBuf {
+        let scope = obsidian_mcp::vault::exclude::ExcludeSet::build(rules.to_vec())
+            .unwrap()
+            .scope_id(&vault_root.canonicalize().unwrap());
         vault_root
-            .join(".obsidian-mcp")
-            .join("embeddings")
+            .join(".obsidian-mcp/embeddings/scopes")
+            .join(scope)
             .join("embeddings.bin")
     }
 
@@ -2372,8 +2373,67 @@ mod background_embedding_runtime {
         api.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn ambiguous_machine_ignore_blocks_provider_access_until_confirmed_for_that_vault() {
+        let _guard = API_TEST_LOCK.lock().await;
+        let api = ControlledEmbeddingApi::start().await;
+        let _env = EmbeddingApiEnv::install(&api.base_url());
+        let vault_dir = create_api_vault();
+        let root = vault_dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("public.md"), "# Public\nALLOWED_AFTER_MIGRATION").unwrap();
+        std::fs::write(
+            root.join("private.md"),
+            "# Private\nPRIVATE_MIGRATION_MARKER",
+        )
+        .unwrap();
+        let machine = tempfile::tempdir().unwrap();
+        let legacy = machine
+            .path()
+            .join("vaults")
+            .join(obsidian_mcp::config::vault_slug(&root));
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("ignore"), "private.md\n").unwrap();
+        let mut config = api_config(&root, "migration-policy-model", false);
+        config.mcp_data_dir = Some(machine.path().to_owned());
+        let error = Vault::open(&config)
+            .await
+            .err()
+            .expect("ambiguous legacy rules");
+        assert!(error.to_string().contains("legacy configuration"));
+        assert!(api.recorded_inputs().is_empty());
+
+        let namespace = machine
+            .path()
+            .join("vaults-v2")
+            .join(obsidian_mcp::config::vault_storage_key(&root));
+        std::fs::create_dir_all(&namespace).unwrap();
+        std::fs::copy(legacy.join("ignore"), namespace.join("ignore")).unwrap();
+        let vault = Vault::open(&config).await.unwrap();
+        wait_for_status(&vault, "confirmed machine policy", |s| {
+            s.phase == EmbeddingPhase::Ready
+        })
+        .await;
+        let inputs = api.recorded_inputs();
+        assert!(
+            inputs
+                .iter()
+                .any(|input| input.contains("ALLOWED_AFTER_MIGRATION"))
+        );
+        assert!(
+            !inputs
+                .iter()
+                .any(|input| input.contains("PRIVATE_MIGRATION_MARKER"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(legacy.join("ignore")).unwrap(),
+            "private.md\n"
+        );
+        drop(vault);
+        api.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn compatible_cache_serves_lkg_while_reconciling_and_prunes_exclusions() {
+    async fn changing_policy_starts_cold_and_only_that_scopes_checkpoint_can_serve_while_warming() {
         let _guard = API_TEST_LOCK.lock().await;
         let api = ControlledEmbeddingApi::start().await;
         let _env = EmbeddingApiEnv::install(&api.base_url());
@@ -2397,7 +2457,7 @@ mod background_embedding_runtime {
             status.phase == EmbeddingPhase::Ready && status.indexed_notes == 2
         })
         .await;
-        let cache = cache_path(vault_dir.path());
+        let cache = cache_path(vault_dir.path(), &[]);
         let old_cache = wait_for_cache_bytes(&cache, None).await;
         drop(first);
 
@@ -2412,48 +2472,61 @@ mod background_embedding_runtime {
         pruned_config.exclude_patterns = vec!["Archive/".into()];
         let second = Vault::open(&pruned_config).await.unwrap();
         api.wait_for_input("BLOCK_CHANGED").await;
-        let warming = wait_for_status(&second, "queryable last-known-good cache", |status| {
-            status.phase == EmbeddingPhase::Warming && status.queryable
-        })
-        .await;
-        assert_eq!(warming.indexed_notes, 1);
-        assert_eq!(warming.total_notes, 1);
-
-        let results = second.search_semantic("query-ready", 10).unwrap();
-        assert!(
-            results
-                .iter()
-                .any(|(path, _)| path == Path::new("active.md"))
-        );
-        assert!(
-            results
-                .iter()
-                .all(|(path, _)| path != Path::new("Archive/hidden.md")),
-            "newly excluded cached paths must be pruned before publication"
-        );
+        let warming = second.embedding_status().unwrap();
+        assert_eq!(warming.phase, EmbeddingPhase::Warming);
+        assert_eq!((warming.indexed_notes, warming.total_notes), (0, 1));
+        assert!(!warming.queryable);
+        assert!(second.search_semantic("query-ready", 10).is_err());
 
         api.release_blocked();
-        wait_for_status(&second, "changed-note reconciliation", |status| {
-            status.phase == EmbeddingPhase::Ready && status.indexed_notes == 1
+        wait_for_status(&second, "narrow scope ready", |s| {
+            s.phase == EmbeddingPhase::Ready && s.indexed_notes == 1
         })
         .await;
-        let new_cache = wait_for_cache_bytes(&cache, Some(&old_cache)).await;
+        let narrow = cache_path(vault_dir.path(), &pruned_config.exclude_patterns);
+        let checkpoint = wait_for_cache_bytes(&narrow, None).await;
+        assert_eq!(std::fs::read(&cache).unwrap(), old_cache);
+        assert!(
+            !api.recorded_inputs()
+                .iter()
+                .any(|s| s.contains("HIDDEN_MARKER"))
+        );
         drop(second);
+
+        std::fs::write(
+            vault_dir.path().join("active.md"),
+            "# Active\nNEXT_REVISION another change\n",
+        )
+        .unwrap();
+        api.block_inputs_containing(&["NEXT_REVISION"]);
+        let same_scope = Vault::open(&pruned_config).await.unwrap();
+        api.wait_for_input("NEXT_REVISION").await;
+        let warming = same_scope.embedding_status().unwrap();
+        assert_eq!(warming.phase, EmbeddingPhase::Warming);
+        assert!(warming.queryable);
+        assert_eq!((warming.indexed_notes, warming.total_notes), (1, 1));
+        let hits = same_scope.search_semantic("query-ready", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, Path::new("active.md"));
+        api.release_blocked();
+        wait_for_status(&same_scope, "changed note reconciled", |s| {
+            s.phase == EmbeddingPhase::Ready
+        })
+        .await;
+        wait_for_cache_bytes(&narrow, Some(&checkpoint)).await;
+        drop(same_scope);
 
         api.clear_requests();
         let third = Vault::open(&pruned_config).await.unwrap();
-        wait_for_status(&third, "unchanged-cache restart", |status| {
-            status.phase == EmbeddingPhase::Ready && status.indexed_notes == 1
+        wait_for_status(&third, "unchanged-cache restart", |s| {
+            s.phase == EmbeddingPhase::Ready && s.indexed_notes == 1
         })
         .await;
-        let restart_inputs = api.recorded_inputs();
         assert!(
-            !restart_inputs
+            !api.recorded_inputs()
                 .iter()
-                .any(|input| input.contains("BLOCK_CHANGED") || input.contains("HIDDEN_MARKER")),
-            "unchanged and excluded notes must not be inferred on restart: {restart_inputs:?}"
+                .any(|s| s.contains("NEXT_REVISION") || s.contains("HIDDEN_MARKER"))
         );
-        assert_ne!(old_cache, new_cache);
         drop(third);
         api.shutdown().await;
     }
@@ -2478,7 +2551,7 @@ mod background_embedding_runtime {
             status.phase == EmbeddingPhase::Ready
         })
         .await;
-        let valid_cache = wait_for_cache_bytes(&cache_path(seed.path()), None).await;
+        let valid_cache = wait_for_cache_bytes(&cache_path(seed.path(), &[]), None).await;
         drop(seed_vault);
 
         let legacy = bincode::serde::encode_to_vec(
@@ -2510,7 +2583,7 @@ mod background_embedding_runtime {
                 format!("# Note\nCASE_MARKER_{name}\n"),
             )
             .unwrap();
-            let cache = cache_path(vault_dir.path());
+            let cache = cache_path(vault_dir.path(), &[]);
             std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
             std::fs::write(&cache, bytes).unwrap();
             api.clear_requests();
@@ -2640,7 +2713,7 @@ mod background_embedding_runtime {
             status.phase == EmbeddingPhase::Ready
         })
         .await;
-        let cache = cache_path(vault_dir.path());
+        let cache = cache_path(vault_dir.path(), &[]);
         let old_cache = wait_for_cache_bytes(&cache, None).await;
         drop(first);
 

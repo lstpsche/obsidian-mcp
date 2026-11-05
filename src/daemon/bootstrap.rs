@@ -13,7 +13,7 @@ use tokio::net::UnixStream;
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::ClientOptions;
 
-use crate::client::semantic_daemon::{DaemonConnectPolicy, SemanticDaemonClient};
+use crate::client::semantic_daemon::{DaemonConnectPolicy, SemanticDaemonClient, parse_response};
 use crate::config::SemanticRuntimeConfig;
 use crate::error::{VaultError, VaultResult};
 
@@ -266,7 +266,7 @@ pub async fn reconcile_daemon_after_upgrade(
             });
         }
         std::cmp::Ordering::Equal => {
-            if health.supports_source_evidence() {
+            if protocol::missing_semantic_capability(&health.capabilities).is_none() {
                 return Ok(DaemonReconcileOutcome {
                     origin,
                     was_running: true,
@@ -275,7 +275,7 @@ pub async fn reconcile_daemon_after_upgrade(
                     diagnostic: "semantic daemon already reports the installed version".into(),
                 });
             }
-            if !daemon_binary_supports_source_evidence(
+            if !daemon_binary_supports_semantics(
                 installed_daemon,
                 &parse_daemon_version("installed semantic daemon", expected_version)?,
             )? {
@@ -437,8 +437,11 @@ async fn ensure_daemon_inner(
     let mut preserve_manifest_model = preferred_sibling.is_some();
 
     if let Some(current_manifest) = existing_manifest.as_mut() {
-        let endpoint =
-            endpoint_from_manifest(current_manifest).unwrap_or_else(|| default_endpoint.clone());
+        let endpoint = endpoint_from_manifest(current_manifest).ok_or_else(|| {
+            VaultError::DaemonBootstrap(
+                "semantic manifest contains an unsupported IPC endpoint".into(),
+            )
+        })?;
         let probe = match probe_health(&endpoint).await {
             Err(VaultError::DaemonTimeout {
                 operation,
@@ -477,11 +480,9 @@ async fn ensure_daemon_inner(
                         )?;
                         sibling_version > running_version
                             || (sibling_version == running_version
-                                && !health.supports_source_evidence()
-                                && daemon_binary_supports_source_evidence(
-                                    sibling,
-                                    &sibling_version,
-                                )?)
+                                && protocol::missing_semantic_capability(&health.capabilities)
+                                    .is_some()
+                                && daemon_binary_supports_semantics(sibling, &sibling_version)?)
                     } else {
                         false
                     }
@@ -513,12 +514,16 @@ async fn ensure_daemon_inner(
                 }
             }
             HealthProbeOutcome::Incompatible(message) => {
-                return Err(VaultError::DaemonBootstrap(format!(
-                    "existing daemon is incompatible with API v{DAEMON_API_VERSION}: {message}"
-                )));
+                return Err(VaultError::DaemonRpc {
+                    code: ERR_INCOMPATIBLE_API_VERSION,
+                    message,
+                    data: None,
+                });
             }
             HealthProbeOutcome::Invalid(message) => {
-                tracing::warn!(error = %message, "manifest endpoint responded but was invalid; daemon will be restarted");
+                return Err(VaultError::DaemonProtocol(format!(
+                    "manifest endpoint returned invalid daemon health: {message}"
+                )));
             }
             HealthProbeOutcome::Unreachable => {
                 tracing::info!("manifest endpoint unreachable; daemon will be started");
@@ -742,7 +747,7 @@ fn daemon_binary_version(binary: &Path) -> VaultResult<Version> {
     parse_daemon_version("semantic daemon binary", version)
 }
 
-fn daemon_binary_supports_source_evidence(
+fn daemon_binary_supports_semantics(
     binary: &Path,
     expected_version: &Version,
 ) -> VaultResult<bool> {
@@ -778,22 +783,19 @@ fn daemon_binary_supports_source_evidence(
             "build information does not match the inspected daemon identity",
         ));
     }
-    Ok(info
-        .capabilities
-        .iter()
-        .any(|capability| capability == protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY))
+    Ok(protocol::missing_semantic_capability(&info.capabilities).is_none())
 }
 
 fn unsupported_candidate_capability(binary: &Path, reason: &str) -> VaultError {
     VaultError::DaemonRpc {
         code: protocol::ERR_UNSUPPORTED_CAPABILITY,
         message: format!(
-            "cannot establish required capability '{}' for semantic daemon '{}': {reason}",
-            protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY,
+            "cannot establish required capabilities {} for semantic daemon '{}': {reason}",
+            protocol::SEMANTIC_CAPABILITIES.join(", "),
             binary.display()
         ),
         data: Some(json!({
-            "required_capability": protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY,
+            "required_capabilities": protocol::SEMANTIC_CAPABILITIES,
         })),
     }
 }
@@ -853,25 +855,25 @@ fn target_triple() -> VaultResult<&'static str> {
     } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
         Ok("x86_64-pc-windows-msvc")
     } else {
-        Err(VaultError::DaemonBootstrap(
-            "unsupported target for daemon auto-download".to_string(),
+        Err(VaultError::DaemonUnavailable(
+            "no daemon download is available for this target".to_string(),
         ))
     }
 }
 
 async fn download_and_install(url: &str, destination: &Path) -> VaultResult<String> {
     let response = reqwest::get(url).await.map_err(|err| {
-        VaultError::DaemonBootstrap(format!("failed to download daemon binary '{url}': {err}"))
+        VaultError::DaemonUnavailable(format!("failed to download daemon binary '{url}': {err}"))
     })?;
     if !response.status().is_success() {
-        return Err(VaultError::DaemonBootstrap(format!(
+        return Err(VaultError::DaemonUnavailable(format!(
             "failed to download daemon binary '{url}': HTTP {}",
             response.status()
         )));
     }
 
     let bytes = response.bytes().await.map_err(|err| {
-        VaultError::DaemonBootstrap(format!("failed to read daemon download bytes: {err}"))
+        VaultError::DaemonUnavailable(format!("failed to read daemon download bytes: {err}"))
     })?;
 
     if let Some(parent) = destination.parent() {
@@ -1026,6 +1028,8 @@ fn start_daemon_process(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr_log))
+        .env_remove("OBSIDIAN_EXCLUDE_PATHS")
+        .env_remove("OBSIDIAN_MCP_DATA")
         .env("OBSIDIAN_SEMANTIC_HOME", &paths.root)
         .env("OBSIDIAN_SEMANTIC_ENDPOINT", endpoint.endpoint_string())
         .env("OBSIDIAN_SEMANTIC_MODEL", model_name)
@@ -1059,9 +1063,11 @@ async fn wait_for_health(
         match probe {
             HealthProbeOutcome::Healthy(health) => return Ok(health),
             HealthProbeOutcome::Incompatible(message) => {
-                return Err(VaultError::DaemonBootstrap(format!(
-                    "daemon API incompatibility detected: {message}"
-                )));
+                return Err(VaultError::DaemonRpc {
+                    code: ERR_INCOMPATIBLE_API_VERSION,
+                    message,
+                    data: None,
+                });
             }
             HealthProbeOutcome::Invalid(message) => {
                 return Err(VaultError::DaemonBootstrap(format!(
@@ -1338,9 +1344,7 @@ async fn probe_health_unbounded(endpoint: &IpcEndpoint) -> VaultResult<HealthPro
         Err(err)
             if matches!(
                 err.kind(),
-                std::io::ErrorKind::NotFound
-                    | std::io::ErrorKind::ConnectionRefused
-                    | std::io::ErrorKind::ConnectionReset
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
             ) =>
         {
             return Ok(HealthProbeOutcome::Unreachable);
@@ -1358,21 +1362,30 @@ async fn probe_health_unbounded(endpoint: &IpcEndpoint) -> VaultResult<HealthPro
 
 #[cfg(windows)]
 async fn probe_health_unbounded(endpoint: &IpcEndpoint) -> VaultResult<HealthProbeOutcome> {
+    use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+
     let IpcEndpoint::NamedPipe(name) = endpoint;
-    let stream = match ClientOptions::new().open(name) {
-        Ok(stream) => stream,
-        Err(err)
-            if err.kind() == std::io::ErrorKind::NotFound
-                || err.kind() == std::io::ErrorKind::ConnectionRefused
-                || err.raw_os_error() == Some(231) =>
-        {
-            return Ok(HealthProbeOutcome::Unreachable);
-        }
-        Err(err) => {
-            return Err(VaultError::DaemonBootstrap(format!(
-                "failed to connect to daemon named pipe '{}': {err}",
-                name
-            )));
+    let stream = loop {
+        match ClientOptions::new().open(name) {
+            Ok(stream) => break stream,
+            // All instances are busy. There is a live owner; wait within the
+            // health deadline for its next accept instead of starting a daemon.
+            Err(err) if err.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                return Ok(HealthProbeOutcome::Unreachable);
+            }
+            Err(err) => {
+                return Err(VaultError::DaemonBootstrap(format!(
+                    "failed to connect to daemon named pipe '{name}': {err}"
+                )));
+            }
         }
     };
 
@@ -1422,40 +1435,27 @@ where
         VaultError::DaemonBootstrap(format!("failed to read daemon health response: {err}"))
     })?;
     if read == 0 {
-        return Ok(HealthProbeOutcome::Unreachable);
+        return Ok(HealthProbeOutcome::Invalid(
+            "daemon closed the connection without a health response".into(),
+        ));
     }
-
-    let response: serde_json::Value = serde_json::from_str(&line).map_err(|err| {
-        VaultError::DaemonBootstrap(format!(
-            "failed to parse daemon health response JSON: {err}"
-        ))
-    })?;
-
-    if let Some(error) = response.get("error") {
-        let code = error
-            .get("code")
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or_default();
-        let message = error
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("daemon health error")
-            .to_string();
-        if code == ERR_INCOMPATIBLE_API_VERSION {
+    let health = match parse_response::<protocol::HealthResult>("health", 1, &line) {
+        Ok(health) => health,
+        Err(VaultError::DaemonRpc {
+            code: ERR_INCOMPATIBLE_API_VERSION,
+            message,
+            ..
+        }) => {
             return Ok(HealthProbeOutcome::Incompatible(message));
         }
-        return Ok(HealthProbeOutcome::Invalid(message));
-    }
-
-    let Some(result) = response.get("result") else {
-        return Ok(HealthProbeOutcome::Invalid(
-            "missing result in daemon health response".to_string(),
-        ));
+        Err(error) => return Ok(HealthProbeOutcome::Invalid(error.to_string())),
     };
-    let health =
-        serde_json::from_value::<protocol::HealthResult>(result.clone()).map_err(|err| {
-            VaultError::DaemonBootstrap(format!("failed to decode daemon health result: {err}"))
-        })?;
+    if health.daemon_api_version != DAEMON_API_VERSION {
+        return Ok(HealthProbeOutcome::Incompatible(format!(
+            "daemon reported API version {}, expected {DAEMON_API_VERSION}",
+            health.daemon_api_version
+        )));
+    }
     Ok(HealthProbeOutcome::Healthy(health))
 }
 
@@ -1491,6 +1491,7 @@ fn endpoint_from_manifest(manifest: &RuntimeManifest) -> Option<IpcEndpoint> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::daemon::server;
 
     fn zip_bytes(entries: &[(&str, &[u8])], compression: zip::CompressionMethod) -> Vec<u8> {
@@ -1614,8 +1615,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn endpoint_from_manifest_rejects_unknown_transport() {
+    #[tokio::test]
+    async fn bootstrap_rejects_an_unknown_manifest_transport_before_starting_an_owner() {
         let manifest = RuntimeManifest::from_input(RuntimeManifestInput {
             daemon_api_version: 1,
             daemon_version: "1.0.1".to_string(),
@@ -1633,7 +1634,19 @@ mod tests {
             bootstrap_client_name: "obsidian-mcp".to_string(),
             bootstrap_client_version: "1.0.1".to_string(),
         });
-        assert!(endpoint_from_manifest(&manifest).is_none());
+        let directory = tempfile::tempdir().unwrap();
+        let paths = SemanticHomePaths::new(directory.path().join("home"));
+        home::ensure_home_layout(&paths).unwrap();
+        manifest::save_atomic(&paths.manifest_path, &manifest).unwrap();
+        let config = BootstrapConfig {
+            semantic_home_override: Some(paths.root),
+            daemon_path_override: Some(directory.path().join("missing-daemon")),
+            ..Default::default()
+        };
+        let error = ensure_daemon(&config).await.unwrap_err();
+        assert!(
+            matches!(error, VaultError::DaemonBootstrap(message) if message.contains("unsupported IPC endpoint"))
+        );
     }
 
     #[test]
@@ -1740,7 +1753,7 @@ mod tests {
             .await
             .expect("bootstrap should reuse daemon");
         assert!(result.reused_existing, "expected reuse-existing path");
-        assert!(result.health.supports_source_evidence());
+        assert!(protocol::missing_semantic_capability(&result.health.capabilities).is_none());
 
         shutdown_tx.send(()).expect("shutdown signal should send");
         server_task.await.expect("server task should join");
@@ -1966,6 +1979,79 @@ mod tests {
         server.await.unwrap();
         assert_eq!(fixture.spawned_pids(), [pid]);
         assert_eq!(completed.manifest.pid, pid);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawned_daemon_inherits_provider_settings_and_drops_client_policy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD: &str = "OBSIDIAN_MCP_TEST_DAEMON_SPAWN";
+        if std::env::var_os(CHILD).is_none() {
+            // Run with an isolated parent environment; other tests open vaults concurrently.
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "daemon::bootstrap::tests::spawned_daemon_inherits_provider_settings_and_drops_client_policy"])
+                .env(CHILD, "1")
+                .env("OBSIDIAN_EXCLUDE_PATHS", "ClientOnly/")
+                .env("OBSIDIAN_MCP_DATA", "client-only-store")
+                .env("OBSIDIAN_EMBEDDING_PROVIDER", "api")
+                .env("OBSIDIAN_EMBEDDING_API_KEY", "fixture-only")
+                .output().await.unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let paths = SemanticHomePaths::new(directory.path().join("home"));
+        home::ensure_home_layout(&paths).unwrap();
+        let executable = directory.path().join("inspect-environment");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+test -z "${OBSIDIAN_EXCLUDE_PATHS+x}" &&
+test -z "${OBSIDIAN_MCP_DATA+x}" &&
+test "$OBSIDIAN_EMBEDDING_PROVIDER" = api &&
+test "$OBSIDIAN_EMBEDDING_API_KEY" = fixture-only &&
+test "$OBSIDIAN_SEMANTIC_MODEL" = scoped-model
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut child = start_daemon_process(
+            &executable,
+            &paths,
+            &home::default_ipc_endpoint(&paths),
+            "scoped-model",
+        )
+        .unwrap();
+        assert!(child.wait().await.unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_distinguishes_an_incompatible_reply_from_an_outage() {
+        let (client, server) = tokio::io::duplex(4096);
+        let peer = async {
+            let (read, mut write) = tokio::io::split(server);
+            let mut request = String::new();
+            BufReader::new(read).read_line(&mut request).await.unwrap();
+            let reply = json!({"jsonrpc":"2.0","id":1,"result":{
+                "daemon_version":"1.0.0","daemon_api_version":1,"status":"ok",
+                "uptime_ms":1,"model_name":"model","semantic_home":"home"
+            }});
+            write
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(request_health(client), peer);
+        assert!(matches!(
+            result.unwrap(),
+            HealthProbeOutcome::Incompatible(_)
+        ));
     }
 
     #[cfg(unix)]

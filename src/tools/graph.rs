@@ -329,7 +329,6 @@ mod tests {
         WikilinksParams {
             query: "backlinks".into(),
             path: Some(path.into()),
-            ..Default::default()
         }
     }
 
@@ -337,7 +336,6 @@ mod tests {
         WikilinksParams {
             query: "outgoing".into(),
             path: Some(path.into()),
-            ..Default::default()
         }
     }
 
@@ -345,7 +343,6 @@ mod tests {
         WikilinksParams {
             query: "broken".into(),
             path: path.map(Into::into),
-            ..Default::default()
         }
     }
 
@@ -448,7 +445,6 @@ mod tests {
             WikilinksParams {
                 query: "backlinks".into(),
                 path: None,
-                ..Default::default()
             },
         )
         .await;
@@ -587,13 +583,13 @@ mod tests {
 
         let orphan_entry = orphans
             .iter()
-            .find(|entry| entry.path == PathBuf::from("orphan.md"))
+            .find(|entry| entry.path == Path::new("orphan.md"))
             .expect("expected orphan.md in orphans");
         assert_eq!(orphan_entry.status, OrphanStatus::NoLinks);
 
         let broken_only_entry = orphans
             .iter()
-            .find(|entry| entry.path == PathBuf::from("broken_only.md"))
+            .find(|entry| entry.path == Path::new("broken_only.md"))
             .expect("expected broken_only.md in orphans");
         assert_eq!(broken_only_entry.status, OrphanStatus::BrokenOutgoingOnly);
         assert!(
@@ -603,21 +599,9 @@ mod tests {
                 .any(|target| target == "still_missing")
         );
 
-        assert!(
-            !orphans
-                .iter()
-                .any(|entry| entry.path == PathBuf::from("a.md"))
-        );
-        assert!(
-            !orphans
-                .iter()
-                .any(|entry| entry.path == PathBuf::from("b.md"))
-        );
-        assert!(
-            !orphans
-                .iter()
-                .any(|entry| entry.path == PathBuf::from("c.md"))
-        );
+        assert!(!orphans.iter().any(|entry| entry.path == Path::new("a.md")));
+        assert!(!orphans.iter().any(|entry| entry.path == Path::new("b.md")));
+        assert!(!orphans.iter().any(|entry| entry.path == Path::new("c.md")));
     }
 
     #[tokio::test]
@@ -629,11 +613,7 @@ mod tests {
         let result = wikilinks(&vault, orphans_params()).await.unwrap();
         let text = extract_text(&result);
         let orphans: Vec<OrphanNoteEntry> = serde_json::from_str(text).unwrap();
-        assert!(
-            !orphans
-                .iter()
-                .any(|entry| entry.path == PathBuf::from("d.md"))
-        );
+        assert!(!orphans.iter().any(|entry| entry.path == Path::new("d.md")));
     }
 
     #[tokio::test]

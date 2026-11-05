@@ -1,4 +1,9 @@
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        let source = "src/daemon/server/ipc_acl_macos.c";
+        cc::Build::new().file(source).compile("ipc_acl_macos");
+        println!("cargo:rerun-if-changed={source}");
+    }
     let has_local = std::env::var("CARGO_FEATURE_EMBEDDINGS").is_ok();
     let has_api = std::env::var("CARGO_FEATURE_EMBEDDINGS_API").is_ok();
 

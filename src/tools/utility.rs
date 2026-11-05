@@ -140,7 +140,12 @@ async fn embedding_info(vault: &Vault, runtime: &SemanticRuntime) -> EmbeddingIn
     };
     let status = async {
         runtime.ensure_daemon_health().await?;
-        client.vault_status(vault.root()).await
+        client
+            .vault_status(
+                vault.root(),
+                &protocol::IndexScope::new(vault.exclude().patterns()),
+            )
+            .await
     }
     .await;
     match status {
@@ -293,7 +298,7 @@ mod tests {
             daemon_client: None,
             daemon_unavailable_reason: None,
             prefetch_count: 50,
-            vault_ensured: Arc::new(AtomicBool::new(false)),
+            attachments: Default::default(),
             local_fallback_active: Arc::new(AtomicBool::new(false)),
             daemon_health_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -393,7 +398,7 @@ mod tests {
         use crate::client::semantic_daemon::{DaemonConnectPolicy, SemanticDaemonClient};
         use crate::daemon::server::IpcEndpoint;
         use serde_json::json;
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::io::{AsyncWriteExt, BufReader};
 
         let cases = [
             (
@@ -426,11 +431,16 @@ mod tests {
             let server = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
                 let (reader, mut writer) = stream.into_split();
-                let mut line = String::new();
-                BufReader::new(reader).read_line(&mut line).await.unwrap();
-                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let request = crate::test_daemon_rpc::scoped_request(
+                    &mut BufReader::new(reader),
+                    &mut writer,
+                )
+                .await;
                 assert_eq!(request["method"], "vault_status");
-                assert_eq!(request["params"], json!({"vault_root": expected_root}));
+                assert_eq!(
+                    request["params"],
+                    json!({"vault_root": expected_root, "index_scope":protocol::IndexScope::default()})
+                );
                 response["jsonrpc"] = json!("2.0");
                 response["id"] = request["id"].clone();
                 writer
@@ -445,7 +455,7 @@ mod tests {
                     retries: 0,
                     ..Default::default()
                 },
-                test_daemon_health(vec![protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY.into()]),
+                test_daemon_health(protocol::semantic_capabilities()),
             ));
             let result = vault_info(&vault, &runtime, VaultInfoParams {})
                 .await
@@ -462,11 +472,7 @@ mod tests {
                 assert!(info["embeddings"].get("status").is_none());
                 assert!(info["embeddings"]["error"].is_string());
             }
-            assert!(
-                !runtime
-                    .vault_ensured
-                    .load(std::sync::atomic::Ordering::Relaxed)
-            );
+            assert!(!runtime.attachments.is_attached());
             assert!(!runtime.uses_local_backend());
             server.await.unwrap();
         }
@@ -524,11 +530,7 @@ mod tests {
                 .unwrap()
                 .contains(protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY)
         );
-        assert!(
-            !runtime
-                .vault_ensured
-                .load(std::sync::atomic::Ordering::Relaxed)
-        );
+        assert!(!runtime.attachments.is_attached());
         assert!(!runtime.uses_local_backend());
         tokio::time::timeout(std::time::Duration::from_secs(5), server)
             .await

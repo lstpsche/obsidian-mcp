@@ -23,9 +23,68 @@ use crate::daemon::protocol::{
 use crate::daemon::server::IpcEndpoint;
 use crate::error::{VaultError, VaultResult};
 
-trait AsyncReadWrite: AsyncRead + AsyncWrite + Send + Unpin {}
-impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
+trait AsyncReadWrite: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
+impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
 type DaemonStream = Box<dyn AsyncReadWrite>;
+
+/// A daemon-side holder lives until this connection is dropped.
+#[must_use = "retain the attachment while this scope should index or serve queries"]
+pub struct VaultAttachment {
+    pub result: EnsureVaultResult,
+    root: String,
+    _connection: DaemonStream,
+}
+
+impl std::fmt::Debug for VaultAttachment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VaultAttachment")
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
+}
+
+fn wire_root(root: &Path) -> VaultResult<String> {
+    root.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| VaultError::DaemonProtocol("the daemon requires a UTF-8 vault root".into()))
+}
+
+fn validate_semantics(health: &HealthResult) -> VaultResult<()> {
+    if health.daemon_api_version != DAEMON_API_VERSION {
+        return Err(VaultError::DaemonRpc {
+            code: protocol::ERR_INCOMPATIBLE_API_VERSION,
+            message: format!(
+                "semantic daemon API version {} is incompatible with v{DAEMON_API_VERSION}",
+                health.daemon_api_version
+            ),
+            data: None,
+        });
+    }
+    if let Some(required) = protocol::missing_semantic_capability(&health.capabilities) {
+        return Err(VaultError::DaemonRpc {
+            code: protocol::ERR_UNSUPPORTED_CAPABILITY,
+            message: format!(
+                "semantic daemon requires capability '{required}'; upgrade or restart its owner with a compatible daemon"
+            ),
+            data: Some(json!({
+                "required_capability": required,
+                "reported_capabilities": health.capabilities,
+                "daemon_version": health.daemon_version,
+            })),
+        });
+    }
+    Ok(())
+}
+
+fn health_params(client_name: &str, client_version: &str) -> protocol::HealthParams {
+    protocol::HealthParams {
+        client_name: Some(client_name.into()),
+        client_version: Some(client_version.into()),
+        min_api_version: Some(DAEMON_API_VERSION),
+        max_api_version: Some(DAEMON_API_VERSION),
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct DaemonConnectPolicy {
@@ -94,39 +153,21 @@ impl SemanticDaemonClient {
         }
     }
 
-    /// Verify semantic behavior after transport/ownership reconciliation.
-    ///
-    /// An API-compatible daemon can predate source evidence. Treat that as an
-    /// unsupported contract, never an outage that selects competing inference.
-    pub async fn require_source_evidence(&self) -> VaultResult<()> {
+    /// Refresh a negative observation so a compatible replacement can recover.
+    pub async fn require_semantic_capabilities(&self) -> VaultResult<()> {
         let mut observation = self.inner.health.lock().await;
         if observation
             .as_ref()
-            .is_some_and(HealthResult::supports_source_evidence)
+            .is_some_and(|health| validate_semantics(health).is_ok())
         {
             return Ok(());
         }
-        // Recheck unsupported daemons so replacing their owner can repair an
-        // existing client. Accepted observations remain shared by all clones.
         let health = self
             .fetch_health("obsidian-mcp", env!("CARGO_PKG_VERSION"))
             .await?;
-        *observation = Some(health.clone());
-        if health.supports_source_evidence() {
-            return Ok(());
-        }
-        Err(VaultError::DaemonRpc {
-            code: protocol::ERR_UNSUPPORTED_CAPABILITY,
-            message: format!(
-                "semantic daemon does not support required capability '{}'; upgrade or restart its owner with a compatible daemon",
-                protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY
-            ),
-            data: Some(json!({
-                "required_capability": protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY,
-                "reported_capabilities": health.capabilities,
-                "daemon_version": health.daemon_version,
-            })),
-        })
+        let result = validate_semantics(&health);
+        *observation = Some(health);
+        result
     }
 
     pub fn endpoint(&self) -> &IpcEndpoint {
@@ -155,16 +196,8 @@ impl SemanticDaemonClient {
         client_name: &str,
         client_version: &str,
     ) -> VaultResult<HealthResult> {
-        self.call_request(
-            "health",
-            protocol::HealthParams {
-                client_name: Some(client_name.to_string()),
-                client_version: Some(client_version.to_string()),
-                min_api_version: Some(DAEMON_API_VERSION),
-                max_api_version: Some(DAEMON_API_VERSION),
-            },
-        )
-        .await
+        self.call("health", health_params(client_name, client_version))
+            .await
     }
 
     pub async fn shutdown(&self) -> VaultResult<ShutdownResult> {
@@ -172,29 +205,53 @@ impl SemanticDaemonClient {
             .await
     }
 
-    pub async fn ensure_vault(
+    /// Connect and dispatch within the RPC deadline, then await the initial scan.
+    /// Dropping this future or its returned attachment withdraws the holder.
+    pub async fn attach_vault(
         &self,
         vault_root: &Path,
+        scope: &protocol::IndexScope,
         watch: bool,
         model_name: Option<&str>,
-    ) -> VaultResult<EnsureVaultResult> {
-        self.call(
-            "ensure_vault",
-            protocol::EnsureVaultParams {
-                vault_root: vault_root.display().to_string(),
-                watch: Some(watch),
-                model_name: model_name.map(|value| value.to_string()),
-            },
-        )
-        .await
+    ) -> VaultResult<VaultAttachment> {
+        scope.validate().map_err(VaultError::InvalidPath)?;
+        let root = wire_root(vault_root)?;
+        let (result, stream): (EnsureVaultResult, _) = self
+            .request(
+                "ensure_vault",
+                protocol::EnsureVaultParams {
+                    vault_root: root.clone(),
+                    index_scope: scope.clone(),
+                    watch: Some(watch),
+                    model_name: model_name.map(str::to_owned),
+                },
+            )
+            .await?;
+        if result.scope_id.is_empty() || result.attachment_id.is_empty() {
+            return Err(VaultError::DaemonProtocol(
+                "daemon returned an empty indexing scope or attachment handle".into(),
+            ));
+        }
+        Ok(VaultAttachment {
+            result,
+            root,
+            _connection: stream,
+        })
     }
 
-    /// Inspect existing daemon state without attaching or activating the vault.
-    pub async fn vault_status(&self, vault_root: &Path) -> VaultResult<protocol::SemanticStatus> {
+    /// Inspect a matching active scope without creating a holder.
+    pub async fn vault_status(
+        &self,
+        vault_root: &Path,
+        scope: &protocol::IndexScope,
+    ) -> VaultResult<protocol::SemanticStatus> {
+        scope.validate().map_err(VaultError::InvalidPath)?;
         self.call(
             "vault_status",
             protocol::VaultStatusParams {
-                vault_root: vault_root.display().to_string(),
+                vault_root: wire_root(vault_root)?,
+                attachment_id: None,
+                index_scope: Some(scope.clone()),
             },
         )
         .await
@@ -202,208 +259,264 @@ impl SemanticDaemonClient {
 
     pub async fn search_semantic(
         &self,
-        vault_root: &Path,
+        attachment: &VaultAttachment,
         query: &str,
         top_k: usize,
         include_content: bool,
     ) -> VaultResult<SearchResult> {
-        self.call(
-            "search_semantic",
-            protocol::SearchSemanticParams {
-                vault_root: vault_root.display().to_string(),
-                query: query.to_string(),
-                top_k: Some(top_k),
-                include_content: Some(include_content),
-                allowed_paths: None,
-            },
-        )
-        .await
+        self.search(attachment, query, top_k, include_content, None, None)
+            .await
     }
 
     pub async fn search_hybrid(
         &self,
-        vault_root: &Path,
+        attachment: &VaultAttachment,
         query: &str,
         top_k: usize,
         prefetch: usize,
         alpha: f32,
         include_content: bool,
     ) -> VaultResult<SearchResult> {
-        self.call(
-            "search_hybrid",
-            protocol::SearchHybridParams {
-                vault_root: vault_root.display().to_string(),
-                query: query.to_string(),
-                top_k: Some(top_k),
-                prefetch: Some(prefetch),
-                alpha: Some(alpha),
-                include_content: Some(include_content),
-                allowed_paths: None,
-            },
+        self.search(
+            attachment,
+            query,
+            top_k,
+            include_content,
+            None,
+            Some((prefetch, alpha)),
         )
         .await
     }
 
-    pub(crate) async fn call<P, R>(&self, method: &str, params: P) -> VaultResult<R>
-    where
-        P: Serialize,
-        R: DeserializeOwned,
-    {
-        if matches!(method, "search_semantic" | "search_hybrid") {
-            self.require_source_evidence().await?;
+    /// Both direct calls and MCP queries route to the held view. MCP also
+    /// supplies its current visible paths before either ranking strategy runs.
+    pub(crate) async fn search(
+        &self,
+        attachment: &VaultAttachment,
+        query: &str,
+        top_k: usize,
+        include_content: bool,
+        allowed_paths: Option<&[String]>,
+        hybrid: Option<(usize, f32)>,
+    ) -> VaultResult<SearchResult> {
+        let attachment_id = attachment.result.attachment_id.clone();
+        let vault_root = attachment.root.clone();
+        let query = query.to_owned();
+        let top_k = Some(top_k);
+        let include_content = Some(include_content);
+        let allowed_paths = allowed_paths.map(<[String]>::to_vec);
+        if let Some((prefetch, alpha)) = hybrid {
+            self.call(
+                "search_hybrid",
+                protocol::SearchHybridParams {
+                    attachment_id,
+                    vault_root,
+                    query,
+                    top_k,
+                    include_content,
+                    allowed_paths,
+                    prefetch: Some(prefetch),
+                    alpha: Some(alpha),
+                },
+            )
+            .await
+        } else {
+            self.call(
+                "search_semantic",
+                protocol::SearchSemanticParams {
+                    attachment_id,
+                    vault_root,
+                    query,
+                    top_k,
+                    include_content,
+                    allowed_paths,
+                },
+            )
+            .await
         }
-        self.call_request(method, params).await
     }
 
-    async fn call_request<P, R>(&self, method: &str, params: P) -> VaultResult<R>
-    where
-        P: Serialize,
-        R: DeserializeOwned,
-    {
-        let params = serde_json::to_value(params).map_err(|err| {
-            VaultError::DaemonProtocol(format!(
-                "failed to serialize daemon params for '{method}': {err}"
-            ))
-        })?;
-        let attempts = self.inner.policy.retries.saturating_add(1);
+    async fn call<P: Serialize, R: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: P,
+    ) -> VaultResult<R> {
+        self.request(method, params)
+            .await
+            .map(|(result, _connection)| result)
+    }
 
-        let mut last_error = None;
-        for attempt_idx in 0..attempts {
-            match self.call_once(method, params.clone()).await {
-                Ok(result) => return Ok(result),
-                Err(err) => {
-                    let is_last = attempt_idx + 1 >= attempts;
-                    let retryable = is_retryable_error(&err);
-                    if is_last || !retryable {
-                        return Err(err);
-                    }
-
-                    let backoff_ms = self
-                        .inner
-                        .policy
-                        .retry_backoff
-                        .as_millis()
-                        .saturating_mul((attempt_idx + 1) as u128)
-                        .min(u64::MAX as u128) as u64;
-
-                    tracing::warn!(
-                        method,
-                        attempt = attempt_idx + 1,
-                        retries = attempts - 1,
-                        backoff_ms,
-                        error = %err,
-                        "daemon call failed; retrying"
-                    );
-
-                    last_error = Some(err);
-                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+    async fn request<P: Serialize, R: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: P,
+    ) -> VaultResult<(R, DaemonStream)> {
+        let mut retries = 0;
+        loop {
+            let result = self.call_once(method, &params).await;
+            match result {
+                Err(error) if retries < self.inner.policy.retries && is_retryable_error(&error) => {
+                    retries += 1;
+                    tracing::warn!(method, retries, error = %error, "retrying daemon request");
+                    tokio::time::sleep(self.inner.policy.retry_backoff.saturating_mul(retries))
+                        .await;
                 }
+                result => return result,
             }
         }
-
-        Err(last_error.unwrap_or_else(|| {
-            VaultError::DaemonProtocol(format!("daemon call '{method}' exhausted attempts"))
-        }))
     }
 
-    async fn call_once<R>(&self, method: &str, params: Value) -> VaultResult<R>
-    where
-        R: DeserializeOwned,
-    {
+    async fn call_once<R: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: &impl Serialize,
+    ) -> VaultResult<(R, DaemonStream)> {
+        let connect_and_send = async {
+            let mut stream = self.connect().await?;
+            if !matches!(method, "health" | "shutdown") {
+                // Older v2 peers ignore unknown fields. Inspect the actual connection before
+                // submitting a policy, query text or path to the process that accepted it.
+                let probe = self
+                    .send_request(
+                        &mut stream,
+                        "health",
+                        &health_params("obsidian-mcp", env!("CARGO_PKG_VERSION")),
+                    )
+                    .await?;
+                let health = self.read_response(&mut stream, "health", probe).await?;
+                let accepted = validate_semantics(&health);
+                *self.inner.health.lock().await = Some(health);
+                accepted?;
+            }
+            let id = self.send_request(&mut stream, method, params).await?;
+            Ok((stream, id))
+        };
+        if method == "ensure_vault" {
+            // Once delivered, the live connection owns the cold scan. Its caller
+            // controls the lifetime; an RPC deadline must not restart that scan.
+            let (mut stream, id) = self.with_deadline(method, connect_and_send).await?;
+            let result = self.read_response(&mut stream, method, id).await?;
+            Ok((result, stream))
+        } else {
+            self.with_deadline(method, async {
+                let (mut stream, id) = connect_and_send.await?;
+                let result = self.read_response(&mut stream, method, id).await?;
+                Ok((result, stream))
+            })
+            .await
+        }
+    }
+
+    pub(crate) async fn with_deadline<T>(
+        &self,
+        method: &str,
+        future: impl Future<Output = VaultResult<T>>,
+    ) -> VaultResult<T> {
+        tokio::time::timeout(self.inner.policy.timeout, future)
+            .await
+            .map_err(|_| VaultError::DaemonTimeout {
+                operation: method.to_owned(),
+                timeout_ms: self.inner.policy.timeout.as_millis().min(u64::MAX as u128) as u64,
+            })?
+    }
+
+    async fn send_request(
+        &self,
+        stream: &mut DaemonStream,
+        method: &str,
+        params: &impl Serialize,
+    ) -> VaultResult<u64> {
+        #[derive(Serialize)]
+        struct Request<'a, P> {
+            jsonrpc: &'static str,
+            id: u64,
+            method: &'a str,
+            params: &'a P,
+        }
+
         let request_id = self.inner.request_id.fetch_add(1, Ordering::Relaxed);
-        let request = json!({
-            "jsonrpc": protocol::JSONRPC_VERSION,
-            "id": request_id,
-            "method": method,
-            "params": params,
-        });
-        let encoded = serde_json::to_string(&request).map_err(|err| {
+        let mut encoded = serde_json::to_vec(&Request {
+            jsonrpc: protocol::JSONRPC_VERSION,
+            id: request_id,
+            method,
+            params,
+        })
+        .map_err(|err| {
             VaultError::DaemonProtocol(format!(
                 "failed to serialize daemon request '{method}': {err}"
             ))
         })?;
+        encoded.push(b'\n');
+        stream
+            .write_all(&encoded)
+            .await
+            .map_err(|error| self.ipc_error(method, error))?;
+        stream
+            .flush()
+            .await
+            .map_err(|error| self.ipc_error(method, error))?;
+        Ok(request_id)
+    }
 
-        let timeout_ms = self.inner.policy.timeout.as_millis().min(u64::MAX as u128) as u64;
-        let operation = method.to_string();
-        let future = async {
-            let mut stream = self.connect().await?;
-            stream.write_all(encoded.as_bytes()).await.map_err(|err| {
-                VaultError::DaemonIpc(format!(
-                    "failed to write daemon request '{method}' to '{}': {err}",
-                    self.inner.endpoint.endpoint_string()
-                ))
-            })?;
-            stream.write_all(b"\n").await.map_err(|err| {
-                VaultError::DaemonIpc(format!(
-                    "failed to finish daemon request '{method}' to '{}': {err}",
-                    self.inner.endpoint.endpoint_string()
-                ))
-            })?;
-            stream.flush().await.map_err(|err| {
-                VaultError::DaemonIpc(format!(
-                    "failed to flush daemon request '{method}' to '{}': {err}",
-                    self.inner.endpoint.endpoint_string()
-                ))
-            })?;
+    fn ipc_error(&self, method: &str, error: std::io::Error) -> VaultError {
+        VaultError::DaemonIpc(format!(
+            "daemon request '{method}' at '{}': {error}",
+            self.inner.endpoint.endpoint_string()
+        ))
+    }
 
-            let mut reader = BufReader::new(stream);
-            let mut line = String::new();
-            let read = reader.read_line(&mut line).await.map_err(|err| {
-                VaultError::DaemonIpc(format!(
-                    "failed to read daemon response for '{method}' from '{}': {err}",
-                    self.inner.endpoint.endpoint_string()
-                ))
-            })?;
-            if read == 0 {
-                return Err(VaultError::DaemonIpc(format!(
-                    "daemon endpoint '{}' closed connection for '{method}'",
-                    self.inner.endpoint.endpoint_string()
-                )));
-            }
-
-            parse_response(method, request_id, &line)
-        };
-
-        match tokio::time::timeout(self.inner.policy.timeout, future).await {
-            Ok(result) => result,
-            Err(_) => Err(VaultError::DaemonTimeout {
-                operation,
-                timeout_ms,
-            }),
+    async fn read_response<R: DeserializeOwned>(
+        &self,
+        stream: &mut DaemonStream,
+        method: &str,
+        request_id: u64,
+    ) -> VaultResult<R> {
+        let mut line = String::new();
+        if BufReader::new(stream)
+            .read_line(&mut line)
+            .await
+            .map_err(|error| self.ipc_error(method, error))?
+            == 0
+        {
+            return Err(VaultError::DaemonIpc(format!(
+                "daemon endpoint '{}' closed connection for '{method}'",
+                self.inner.endpoint.endpoint_string()
+            )));
         }
+        parse_response(method, request_id, &line)
     }
 
     async fn connect(&self) -> VaultResult<DaemonStream> {
+        let failure = |err: std::io::Error| {
+            let message = format!(
+                "failed to connect to daemon endpoint '{}': {err}",
+                self.inner.endpoint.endpoint_string()
+            );
+            match err.kind() {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+                    VaultError::DaemonUnavailable(message)
+                }
+                _ => VaultError::DaemonIpc(message),
+            }
+        };
         match &self.inner.endpoint {
             #[cfg(unix)]
             IpcEndpoint::UnixSocket(path) => {
-                let stream = UnixStream::connect(path).await.map_err(|err| {
-                    VaultError::DaemonIpc(format!(
-                        "failed to connect to daemon socket '{}': {err}",
-                        path.display()
-                    ))
-                })?;
-                Ok(Box::new(stream))
+                Ok(Box::new(UnixStream::connect(path).await.map_err(failure)?))
             }
             #[cfg(windows)]
             IpcEndpoint::NamedPipe(name) => {
-                let stream = ClientOptions::new().open(name).map_err(|err| {
-                    VaultError::DaemonIpc(format!(
-                        "failed to connect to daemon named pipe '{}': {err}",
-                        name
-                    ))
-                })?;
-                Ok(Box::new(stream))
+                Ok(Box::new(ClientOptions::new().open(name).map_err(failure)?))
             }
         }
     }
 }
 
-fn parse_response<R>(method: &str, request_id: u64, line: &str) -> VaultResult<R>
+pub(crate) fn parse_response<R>(method: &str, request_id: u64, line: &str) -> VaultResult<R>
 where
     R: DeserializeOwned,
 {
-    let response: Value = serde_json::from_str(line).map_err(|err| {
+    let mut response: Value = serde_json::from_str(line).map_err(|err| {
         VaultError::DaemonProtocol(format!(
             "failed to parse daemon response JSON for '{method}': {err}"
         ))
@@ -450,13 +563,13 @@ where
         });
     }
 
-    let Some(result) = response.get("result") else {
+    let Some(result) = response.get_mut("result") else {
         return Err(VaultError::DaemonProtocol(format!(
             "daemon response for '{method}' missing result"
         )));
     };
 
-    serde_json::from_value(result.clone()).map_err(|err| {
+    serde_json::from_value(result.take()).map_err(|err| {
         VaultError::DaemonProtocol(format!(
             "failed to decode daemon result for '{method}': {err}"
         ))
@@ -466,21 +579,20 @@ where
 fn is_retryable_error(err: &VaultError) -> bool {
     matches!(
         err,
-        VaultError::DaemonIpc(_) | VaultError::DaemonTimeout { .. }
+        VaultError::DaemonIpc(_)
+            | VaultError::DaemonUnavailable(_)
+            | VaultError::DaemonTimeout { .. }
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     use std::path::PathBuf;
-    #[cfg(unix)]
     use tokio::net::UnixListener;
 
-    #[cfg(unix)]
-    fn source_evidence_health() -> HealthResult {
+    fn capable_health() -> HealthResult {
         HealthResult {
             daemon_version: env!("CARGO_PKG_VERSION").into(),
             daemon_api_version: DAEMON_API_VERSION,
@@ -489,11 +601,26 @@ mod tests {
             uptime_ms: 1,
             model_name: "test-model".into(),
             semantic_home: "/tmp/semantic".into(),
-            capabilities: vec![protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY.into()],
+            capabilities: protocol::semantic_capabilities(),
         }
     }
 
-    #[cfg(unix)]
+    fn attachment_result() -> Value {
+        json!({"scope_id": "scope","attachment_id":"holder","vault_id":"vault",
+            "ready":true,"watch_enabled":true,"model_name":"model"})
+    }
+
+    async fn attach(client: &SemanticDaemonClient) -> VaultResult<VaultAttachment> {
+        client
+            .attach_vault(
+                Path::new("/tmp/vault"),
+                &protocol::IndexScope::default(),
+                true,
+                None,
+            )
+            .await
+    }
+
     async fn start_unix_server_once(
         socket_path: PathBuf,
         response_fn: impl FnOnce(Value) -> Value + Send + 'static,
@@ -520,7 +647,6 @@ mod tests {
         })
     }
 
-    #[cfg(unix)]
     fn start_unix_server_responses(
         socket_path: &Path,
         responses: Vec<(&'static str, Value)>,
@@ -530,9 +656,12 @@ mod tests {
             for (method, result) in responses {
                 let (stream, _) = listener.accept().await.unwrap();
                 let (reader, mut writer) = stream.into_split();
-                let mut line = String::new();
-                BufReader::new(reader).read_line(&mut line).await.unwrap();
-                let request: Value = serde_json::from_str(&line).unwrap();
+                let mut reader = BufReader::new(reader);
+                let request = if method == "health" {
+                    crate::test_daemon_rpc::request(&mut reader).await
+                } else {
+                    crate::test_daemon_rpc::scoped_request(&mut reader, &mut writer).await
+                };
                 assert_eq!(request["method"], method);
                 let response = json!({
                     "jsonrpc": "2.0", "id": request["id"], "result": result
@@ -545,7 +674,6 @@ mod tests {
         })
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn health_call_decodes_success_response() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -584,13 +712,12 @@ mod tests {
         server.await.expect("server task should complete");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn unsupported_capability_fails_before_search_without_rpc_retry() {
+    async fn cached_capabilities_cannot_authorize_attachment_to_a_replaced_owner() {
         let temp = tempfile::tempdir().unwrap();
         let socket = temp.path().join("semantic.sock");
-        let mut health = source_evidence_health();
-        health.capabilities.clear();
+        let mut health = capable_health();
+        health.capabilities = vec![protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY.into()];
         let server = start_unix_server_responses(
             &socket,
             vec![("health", serde_json::to_value(&health).unwrap())],
@@ -598,19 +725,16 @@ mod tests {
         let client = SemanticDaemonClient::with_health(
             IpcEndpoint::UnixSocket(socket),
             DaemonConnectPolicy::default(),
-            health,
+            capable_health(),
         );
-        let error = client
-            .search_semantic(Path::new("/tmp/vault"), "query", 10, false)
-            .await
-            .unwrap_err();
+        let error = attach(&client).await.unwrap_err();
         assert!(!is_retryable_error(&error));
         match error {
             VaultError::DaemonRpc { code, data, .. } => {
                 assert_eq!(code, protocol::ERR_UNSUPPORTED_CAPABILITY);
                 assert_eq!(
                     data.unwrap()["required_capability"],
-                    protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY
+                    protocol::SCOPED_INDEXING_CAPABILITY
                 );
             }
             other => panic!("expected unsupported capability, got {other:?}"),
@@ -621,19 +745,18 @@ mod tests {
             .unwrap();
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn semantic_client_recovers_after_daemon_gains_required_capability() {
         let temp = tempfile::tempdir().unwrap();
         let socket = temp.path().join("semantic.sock");
-        let capable = source_evidence_health();
+        let capable = capable_health();
         let mut unsupported = capable.clone();
         unsupported.capabilities.clear();
         let server = start_unix_server_responses(
             &socket,
             vec![
                 ("health", serde_json::to_value(unsupported).unwrap()),
-                ("health", serde_json::to_value(capable).unwrap()),
+                ("ensure_vault", attachment_result()),
                 ("search_semantic", json!({"results": []})),
             ],
         );
@@ -641,10 +764,7 @@ mod tests {
             IpcEndpoint::UnixSocket(socket),
             DaemonConnectPolicy::default(),
         );
-        let error = client
-            .search_semantic(Path::new("/tmp/vault"), "query", 10, false)
-            .await
-            .unwrap_err();
+        let error = attach(&client).await.unwrap_err();
         assert!(matches!(
             error,
             VaultError::DaemonRpc {
@@ -653,9 +773,10 @@ mod tests {
             }
         ));
 
+        let attachment = attach(&client).await.unwrap();
         let result = client
             .clone()
-            .search_semantic(Path::new("/tmp/vault"), "query", 10, false)
+            .search_semantic(&attachment, "query", 10, false)
             .await
             .unwrap();
         assert!(result.results.is_empty());
@@ -663,15 +784,14 @@ mod tests {
             .await
             .expect("capability server must receive the expected requests")
             .unwrap();
-        client.require_source_evidence().await.unwrap();
+        client.require_semantic_capabilities().await.unwrap();
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn explicit_health_replaces_an_unsupported_observation() {
         let temp = tempfile::tempdir().unwrap();
         let socket = temp.path().join("semantic.sock");
-        let capable = source_evidence_health();
+        let capable = capable_health();
         let mut unsupported = capable.clone();
         unsupported.capabilities.clear();
         let server = start_unix_server_responses(
@@ -695,10 +815,9 @@ mod tests {
             .await
             .expect("capability server must receive the expected requests")
             .unwrap();
-        client.require_source_evidence().await.unwrap();
+        client.require_semantic_capabilities().await.unwrap();
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn concurrent_semantic_capability_checks_share_one_handshake() {
         let temp = tempfile::tempdir().unwrap();
@@ -708,7 +827,7 @@ mod tests {
             json!({
                 "jsonrpc": "2.0",
                 "id": request["id"],
-                "result": source_evidence_health()
+                "result": capable_health()
             })
         })
         .await;
@@ -718,132 +837,78 @@ mod tests {
         );
         let cloned = client.clone();
         let (left, right) = tokio::join!(
-            client.require_source_evidence(),
-            cloned.require_source_evidence()
+            client.require_semantic_capabilities(),
+            cloned.require_semantic_capabilities()
         );
         left.unwrap();
         right.unwrap();
         server.await.unwrap();
         // The server is gone; the established contract remains shared by clones.
-        client.require_source_evidence().await.unwrap();
+        client.require_semantic_capabilities().await.unwrap();
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn capable_daemon_response_still_requires_source_evidence_fields() {
         let temp = tempfile::tempdir().unwrap();
         let socket = temp.path().join("semantic.sock");
-        let server = start_unix_server_once(socket.clone(), |request| {
-            assert_eq!(request["method"], "search_semantic");
-            json!({
-                "jsonrpc": "2.0",
-                "id": request["id"],
-                "result": {"results": [{
-                    "path":"note.md", "title":"note", "score":0.8, "tags":[]
-                }]}
-            })
-        })
-        .await;
-        let client = SemanticDaemonClient::with_health(
+        let server = start_unix_server_responses(
+            &socket,
+            vec![
+                ("ensure_vault", attachment_result()),
+                (
+                    "search_semantic",
+                    json!({"results": [{"path":"note.md","score":0.8,"title":"note","tags":[]}]}),
+                ),
+            ],
+        );
+        let client = SemanticDaemonClient::new(
             IpcEndpoint::UnixSocket(socket),
             DaemonConnectPolicy::default(),
-            source_evidence_health(),
         );
+        let attachment = attach(&client).await.unwrap();
         let error = client
-            .search_semantic(Path::new("/tmp/vault"), "query", 10, false)
+            .search_semantic(&attachment, "query", 10, false)
             .await
             .unwrap_err();
         assert!(matches!(error, VaultError::DaemonProtocol(_)));
         server.await.unwrap();
     }
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn ensure_vault_decodes_legacy_v1_response() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let socket_path = temp.path().join("semanticd.sock");
-        let server = start_unix_server_once(socket_path.clone(), |request| {
-            let id = request
-                .get("id")
-                .cloned()
-                .expect("request id should be present");
-            json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "vault_id": "legacy-vault",
-                    "ready": true,
-                    "watch_enabled": true,
-                    "model_name": "legacy-model"
-                }
-            })
-        })
-        .await;
-
+    async fn attachment_requires_both_handles_and_preserves_progress() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("semantic.sock");
+        let legacy =
+            json!({"vault_id": "vault","watch_enabled":true,"model_name":"model","ready":true});
+        let mut current = attachment_result();
+        current["phase"] = json!("warming");
+        current["ready"] = json!(false);
+        current["indexed_notes"] = json!(3);
+        current["total_notes"] = json!(9);
+        current["pending_notes"] = json!(6);
+        let server = start_unix_server_responses(
+            &socket,
+            vec![("ensure_vault", legacy), ("ensure_vault", current)],
+        );
         let client = SemanticDaemonClient::new(
-            IpcEndpoint::UnixSocket(socket_path),
+            IpcEndpoint::UnixSocket(socket),
             DaemonConnectPolicy::default(),
         );
-        let result = client
-            .ensure_vault(Path::new("/tmp/vault"), true, None)
-            .await
-            .expect("legacy v1 ensure result should decode");
-
-        assert!(result.ready);
-        assert_eq!(result.phase, None);
-        assert_eq!(result.indexed_notes, None);
-        assert_eq!(result.total_notes, None);
-        assert_eq!(result.pending_notes, None);
-        assert_eq!(result.last_error, None);
-        server.await.expect("server task should complete");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn ensure_vault_decodes_additive_progress_fields() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let socket_path = temp.path().join("semanticd.sock");
-        let server = start_unix_server_once(socket_path.clone(), |request| {
-            let id = request
-                .get("id")
-                .cloned()
-                .expect("request id should be present");
-            json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "vault_id": "warming-vault",
-                    "ready": false,
-                    "watch_enabled": true,
-                    "model_name": "current-model",
-                    "phase": "warming",
-                    "indexed_notes": 3,
-                    "total_notes": 9,
-                    "pending_notes": 6
-                }
-            })
-        })
-        .await;
-
-        let client = SemanticDaemonClient::new(
-            IpcEndpoint::UnixSocket(socket_path),
-            DaemonConnectPolicy::default(),
-        );
-        let result = client
-            .ensure_vault(Path::new("/tmp/vault"), true, None)
-            .await
-            .expect("additive v1 ensure result should decode");
-
+        assert!(matches!(
+            attach(&client).await.unwrap_err(),
+            VaultError::DaemonProtocol(_)
+        ));
+        let holder = attach(&client).await.unwrap();
+        let result = &holder.result;
         assert!(!result.ready);
         assert_eq!(result.phase, Some(protocol::SemanticPhase::Warming));
         assert_eq!(result.indexed_notes, Some(3));
         assert_eq!(result.total_notes, Some(9));
         assert_eq!(result.pending_notes, Some(6));
         assert_eq!(result.last_error, None);
-        server.await.expect("server task should complete");
+        server.await.unwrap();
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn call_retries_when_endpoint_is_temporarily_missing() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -888,42 +953,32 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn rpc_errors_preserve_semantic_status_data() {
         let temp = tempfile::tempdir().expect("tempdir");
         let socket_path = temp.path().join("semanticd.sock");
-        let server = start_unix_server_once(socket_path.clone(), |request| {
-            let id = request
-                .get("id")
-                .cloned()
-                .expect("request id should be present");
-            json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {
-                    "code": -32030,
-                    "message": "semantic index is warming; retry the query shortly",
-                    "data": {
-                        "phase": "warming",
-                        "ready": false,
-                        "indexed_notes": 2,
-                        "total_notes": 5,
-                        "pending_notes": 3
-                    }
-                }
-            })
-        })
-        .await;
-
-        let client = SemanticDaemonClient::with_health(
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let request =
+                crate::test_daemon_rpc::scoped_request(&mut BufReader::new(reader), &mut writer)
+                    .await;
+            let response = json!({
+                "jsonrpc":"2.0", "id":request["id"],
+                "error":{"code":-32030,"message":"semantic index is warming; retry the query shortly",
+                    "data":{"phase":"warming","ready":false,"indexed_notes":2,"total_notes":5,"pending_notes":3}}
+            });
+            writer
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+        let client = SemanticDaemonClient::new(
             IpcEndpoint::UnixSocket(socket_path),
             DaemonConnectPolicy::default(),
-            source_evidence_health(),
         );
-        let result = client
-            .search_semantic(Path::new("/tmp/vault"), "query", 10, false)
-            .await;
+        let result = attach(&client).await;
         match result {
             Err(VaultError::DaemonRpc {
                 code,
@@ -945,7 +1000,6 @@ mod tests {
         server.await.expect("server task should complete");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn response_with_mismatched_id_is_rejected() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -981,7 +1035,6 @@ mod tests {
         server.await.expect("server task should complete");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn response_missing_jsonrpc_is_rejected() {
         let temp = tempfile::tempdir().expect("tempdir");

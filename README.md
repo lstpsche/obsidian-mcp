@@ -150,18 +150,24 @@ This pulls the latest `main` and runs `cargo install --path . --features embeddi
 
 Current semantic daemon API version: `2` (`DAEMON_API_VERSION` in `src/daemon/protocol.rs`).
 
-Semantic search additionally requires the health capability `semantic_source_evidence_v1`. New clients verify it after any ownership-verified daemon reconciliation. Older v2 clients can still perform their existing health/activation handshake; new clients report an unsupported contract when an external daemon lacks the capability. Restart or upgrade that daemon through its owner. A capability mismatch does not activate a competing local index.
+Semantic search requires the health capabilities `semantic_source_evidence_v1` and `scoped_indexing_v1`. New clients verify both on the connection that will carry the request, after reconciling an owned daemon. Older v2 clients can still perform their existing health/activation handshake. New clients report an unsupported contract when an external daemon lacks either capability. Restart or upgrade that daemon through its owner. A capability mismatch does not activate a competing local index.
 
 For an owned daemon at the same version, bootstrap may activate an installed sibling that advertises the missing capability through `--__build-info`. A sibling without the capability leaves the running daemon intact and remains explicitly unsupported; newer running versions and external owners are preserved.
 
 | Component | Compatibility contract | Enforcement |
 |----------|-------------------------|-------------|
-| `obsidian-mcp` | Daemon API version must match exactly | MCP daemon `health` handshake validates `min_api_version`/`max_api_version` against current API version and fails fast on mismatch |
-| `obsidian-semantic-search-plugin` | Daemon API version must match exactly | Plugin bootstrap performs daemon `health` handshake and surfaces explicit incompatibility notices |
+| `obsidian-mcp` | IPC v2 and both semantic capabilities | The client validates health before submitting scope or search data and holds the attachment connection open. |
+| `obsidian-semantic-search-plugin` | A release pinned to IPC v1 requires a v1 daemon. | A plugin build connecting to this daemon must negotiate scoped IPC v2, retain its attachment connection and send the issued handle with content requests. |
 
-Daemon API v2 applies each search request's optional `allowed_paths` scope before ranking and distinguishes an unattached vault from an index that is warming. Clients must support v2; a v1 daemon cannot safely serve scoped searches.
+Daemon API v2 associates document indexing with a live, scoped attachment. Clients with the same effective exclusions on the same daemon share their index and watcher. Different policies have separate caches, counters and search results. The running provider and model remain shared. A document visible to two different scopes can be embedded twice. Each request can narrow eligible paths further using `allowed_paths` before ranking.
+
+Use `.obsidian-mcp/ignore` for restrictions that every client of a vault must honor. The MCP instance’s machine ignore and `OBSIDIAN_EXCLUDE_PATHS` can narrow its own scope. A separately launched daemon may impose additional operator exclusions. Withdrawing the final attachment stops new document submissions from that scope after the daemon observes the disconnect. An already dispatched request can finish. Restart the owners after changing ignore files. A new attachment that observes a changed portable policy invalidates the older views.
+
+During an upgrade, retire the old daemon before relying on scoped exclusions. Older IPC v2 tools can still probe health for activation. Clients performing semantic operations need both capabilities and must attach explicitly. Before downgrading to an unscoped daemon, stop the scoped MCP instances and daemon. Keep embeddings disabled for vaults that depend on these exclusions until a compatible owner is running again.
 
 Release binaries for Linux, Windows, and Apple Silicon macOS include local and API embedding backends. Intel macOS binaries include the API backend only because the current ONNX dependency has no prebuilt Intel macOS library. Cargo users on Intel macOS should install with `--features embeddings-api` instead of `--features embeddings`. Every release archive is smoke-tested on its native target.
+
+The combined ARM64 Linux archives use the Ubuntu 24.04 release runner’s glibc and C++ runtime. Debian 12’s system libraries lack symbols required by the bundled ONNX Runtime. To use a remote embedding provider on Debian 12, build locally with `--no-default-features --features embeddings-api`.
 
 Release asset compatibility expectations:
 
@@ -240,7 +246,9 @@ obsidian-mcp stop --port 9000        # Stop server on specific port
 obsidian-mcp restart /path/to/vault  # Stop + start (picks up new binary after upgrade)
 ```
 
-`serve` and `restart` wait for the server to pass a `/health` check before reporting success (up to 15s). If the server fails during startup, the exit code and log path are reported.
+`stop`, `serve`, and `restart` target the exact bind address. A missing or invalid `--host` or `--port` value stops the command before listener discovery. The commands verify that the listener belongs to this installation before stopping its process. An unrelated listener or a supervisor that starts a replacement requires action through its owner. On Linux these commands use `lsof` for listener discovery and a kernel PID file descriptor for signaling.
+
+`serve` and `restart` require a fixed port and verify the new child owns a healthy listener before reporting success. Startup errors include the log path. Foreground `--http --port 0` lets the operating system assign a port and reports the bound address in the listening log event.
 
 ## Client Setup
 
@@ -493,8 +501,7 @@ second process. Passive `vault_info` inspection never resumes bootstrap.
 
 Daemon startup policy:
 
-- MCP only initializes/starts the daemon when `OBSIDIAN_WATCH=true`.
-- When `OBSIDIAN_WATCH=false`, MCP skips daemon initialization and semantic search must use local mode (if enabled) or returns a clear error.
+- In `auto` mode, disabling `OBSIDIAN_WATCH` keeps semantic work local. Explicit `daemon` mode can attach a snapshot with watching disabled. The shared view is watched while any live holder requests watching.
 
 Embedding lifecycle:
 
@@ -527,7 +534,7 @@ at most once every 30 seconds in addition to lifecycle changes. Debug-level batc
 logs include request size, duration, outcome, and sanitized failures. Ready and
 dormant runtimes do not emit idle progress logs.
 
-Embedding cache schema 2 stores complete per-note chunk collections and is atomically replaced. Reuse requires matching backend, canonical model, vector dimension, tokenizer fingerprint, effective input capacity, preparation/partition policy, and—for API backends—the endpoint fingerprint. Schema-1 prefix embeddings are rebuilt automatically from notes rather than relabeled as complete coverage. The first rebuild embeds more text and may increase API requests, token use and cache size; progress remains visible as warming/degraded until the current reconciliation completes. Cache locations do not change: local runtime uses `{mcp_data}/embeddings/embeddings.bin`, while the daemon uses `<semantic-home>/vaults/<vault_id>/embeddings.bin`. Legacy-location relocation remains non-destructive; copying a file is not a schema conversion. Checkpoints contain complete note collections, including when the whole vault is still reconciling.
+Embedding cache schema 2 stores complete per-note chunk collections and is atomically replaced. Reuse requires matching backend, canonical model, vector dimension, tokenizer fingerprint, effective input capacity, preparation/partition policy, and—for API backends—the endpoint fingerprint. Schema-1 prefix embeddings are rebuilt automatically from notes rather than relabeled as complete coverage. The first rebuild embeds more text and may increase API requests, token use and cache size. Progress remains visible as warming/degraded until the current reconciliation completes. The local checkpoint is `{mcp_data}/embeddings/scopes/<scope_id>/embeddings.bin`. The daemon checkpoint is `<semantic-home>/vaults/<vault_id>/scopes/<scope_id>/embeddings.bin`. Scoped indexes rebuild from permitted notes on first use and leave unscoped files intact. Checkpoints contain complete note collections, including when the whole vault is still reconciling.
 
 Compatible cached notes whose complete raw source revision is unchanged skip preparation, tokenization and inference. Changed notes reuse exact unchanged chunk inputs while refreshing source revisions and ranges. A later request failure preserves the previous complete note collection. Supported resource limits produce explicit failures and preserve the prior complete note collection; they never turn oversized input into a partially complete success.
 
@@ -560,7 +567,6 @@ For a remote API, the identity can prove the configured endpoint and model name,
 - Finds notes by **meaning**, not keywords — "making money from software" surfaces notes about monetization
 - **Hybrid search** — `lexical_prefetch: true` selects eligible BM25 candidate notes and reranks their actual winning embedding. It cannot retrieve a note absent from lexical preselection.
 - **Tunable blending** — `alpha` controls the weight between lexical and semantic scores (default 0.25)
-- Daemon cache-location migration is one-way and non-destructive: the active local cache is preferred, then legacy `.obsidian/obsidian-mcp/embeddings.bin`; relocation runs in the background, never overwrites an existing daemon cache, and an old payload format is rebuilt rather than trusted
 
 ### Regex — `search_regex`
 
@@ -603,6 +609,8 @@ Always available. Full regex syntax for pattern matching across all notes.
 | `note_patch` | `path`, `operation`, `target_type`, `target`, `content` | Patch a heading section, block ref, or frontmatter field |
 | `note_delete` | `path`, `confirm` | Delete a note (requires `confirm: true`) |
 | `note_move` | `from`, `to` | Move or rename a note |
+
+`note_move` checks that the source resolves to a regular file before creating destination directories and refuses to overwrite an existing destination. On macOS and Linux the source check and the atomic rename are separate kernel operations. If an external editor replaces the file with a directory between them, the move can rename that directory within the vault.
 
 Every tool advertises an object-shaped `outputSchema` and returns matching `structuredContent`. Existing calls retain their text format: Markdown for full note reads, JSON arrays for searches and listings, and confirmation messages for writes. Extended revision/range reads emit their typed page as JSON text as well so text-only clients see revision and continuation metadata. Structured results use `content` for text, `results` for collections, and `message` for confirmations. `vault_info`, `note_inspect`, and `note_read_many` retain their domain-specific fields; `periodic` includes an `action` discriminator.
 
@@ -685,7 +693,7 @@ The `read` profile exposes frontmatter as part of the raw Markdown returned by `
 | `OBSIDIAN_LOG_LEVEL` | No | `info` | `trace`, `debug`, `info`, `warn`, `error` |
 | `OBSIDIAN_TANTIVY` | No | `true` | BM25 full-text index |
 | `OBSIDIAN_TOOLS` | No | `full` | Tool filtering: profile name, comma-separated allow-list, or `!`-prefixed deny-list |
-| `OBSIDIAN_MCP_DATA` | No | `{vault}/.obsidian-mcp` | External obsidian-mcp data directory. When set, cache/config data is stored under `{value}/vaults/{vault_slug}/` and merged with vault-local config |
+| `OBSIDIAN_MCP_DATA` | No | `{vault}/.obsidian-mcp` | External obsidian-mcp data directory. When set, cache/config data is stored under `{value}/vaults-v2/<vault_key>/` and merged with vault-local config |
 | `OBSIDIAN_EXCLUDE_PATHS` | No | *(empty)* | Comma-separated glob patterns excluded from indexing, search, graph, and stats. Merged with `.obsidian-mcp/ignore`; restart after changing ignore files |
 | `OBSIDIAN_EMBEDDINGS` | No | `false` | Semantic embedding search (requires `embeddings` or `embeddings-api` feature) |
 | `OBSIDIAN_EMBEDDINGS_MODEL` | No | `BAAI/bge-small-en-v1.5` | HuggingFace model for embeddings |
@@ -714,6 +722,15 @@ The `read` profile exposes frontmatter as part of the raw Markdown returned by `
 | `FASTEMBED_CACHE_DIR` | No | `<semantic-home>/model/fastembed-cache` | Daemon-internal shared fastembed cache root |
 
 \* Also accepted as the first CLI argument: `obsidian-mcp /path/to/vault`
+
+The machine-data key hashes the canonical native vault path. On upgrade, a legacy
+directory containing operator configuration can require a decision because different
+vaults could have shared its old name. Startup reports the old directory and the
+new vault-specific destination before indexing. Create the destination and copy the
+intended `ignore` into it. If this vault should have no machine exclusions, create
+an empty `ignore` there explicitly. Repeat for each affected vault. Legacy directories
+containing only disposable caches or a comment-only ignore can rebuild automatically.
+Unreadable or invalid configured exclusions produce an error before indexing.
 
 Invalid explicit embedding API timeout or batch-size settings are reported as
 configuration errors. Both binaries read their own process environment; a running

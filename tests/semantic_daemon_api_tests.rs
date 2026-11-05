@@ -4,8 +4,12 @@
 
 #[path = "common/embedding_profiles.rs"]
 mod embedding_profiles;
+#[path = "common/http_listening.rs"]
+mod http_listening;
+#[path = "common/http_rpc.rs"]
+mod http_rpc;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, atomic::AtomicBool};
 use std::time::Duration;
@@ -13,7 +17,7 @@ use std::time::Duration;
 use axum::{Json, Router, extract::State, routing::post};
 use obsidian_mcp::client::semantic_daemon::{DaemonConnectPolicy, SemanticDaemonClient};
 use obsidian_mcp::config::{Config, SemanticMode, ToolFilter, Transport};
-use obsidian_mcp::daemon::protocol::DAEMON_API_VERSION;
+use obsidian_mcp::daemon::protocol::{DAEMON_API_VERSION, ERR_VAULT_NOT_ATTACHED, IndexScope};
 use obsidian_mcp::daemon::server::IpcEndpoint;
 use obsidian_mcp::tools::{
     SemanticRuntime,
@@ -58,6 +62,26 @@ fn spawn_daemon_with_limits(
     max_input_tokens: usize,
     max_batch_inputs: usize,
 ) -> Child {
+    daemon_command(
+        home,
+        endpoint,
+        api_port,
+        max_input_tokens,
+        max_batch_inputs,
+        "",
+    )
+    .spawn()
+    .unwrap()
+}
+
+fn daemon_command(
+    home: &Path,
+    endpoint: &IpcEndpoint,
+    api_port: u16,
+    max_input_tokens: usize,
+    max_batch_inputs: usize,
+    exclusions: &str,
+) -> Command {
     let profile = embedding_profiles::write_api_profile(
         home,
         api_port,
@@ -67,20 +91,14 @@ fn spawn_daemon_with_limits(
     );
     let binary = std::env::var_os("OBSIDIAN_TEST_DAEMON_BINARY")
         .unwrap_or_else(|| env!("CARGO_BIN_EXE_obsidian-semanticd").into());
-    let mut command = Command::new(binary);
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("OBSIDIAN_")
-            || key.to_string_lossy().starts_with("OPENAI_")
-        {
-            command.env_remove(key);
-        }
-    }
+    let mut command = http_listening::isolated_command(binary);
     command
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("OBSIDIAN_SEMANTIC_HOME", home)
         .env("OBSIDIAN_SEMANTIC_ENDPOINT", endpoint.endpoint_string())
         .env("OBSIDIAN_SEMANTIC_MODEL", "probe")
+        .env("OBSIDIAN_EXCLUDE_PATHS", exclusions)
         .env("OBSIDIAN_EMBEDDING_PROVIDER", "api")
         .env(
             "OBSIDIAN_EMBEDDING_API_BASE",
@@ -95,9 +113,8 @@ fn spawn_daemon_with_limits(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap()
+        .kill_on_drop(true);
+    command
 }
 
 fn isolated_endpoint(directory: &Path) -> IpcEndpoint {
@@ -119,6 +136,7 @@ fn isolated_endpoint(directory: &Path) -> IpcEndpoint {
 enum InvalidEmbeddingResponse {
     WrongDimension,
     MissingEmbedding,
+    RateLimited,
 }
 
 #[derive(Clone)]
@@ -163,6 +181,31 @@ impl ControlledProvider {
         self.state.requests.lock().unwrap().clone()
     }
 
+    fn count_inputs_containing(&self, marker: &str) -> usize {
+        self.state
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|request| request["input"].as_array().unwrap())
+            .filter(|text| text.as_str().unwrap().contains(marker))
+            .count()
+    }
+
+    async fn wait_for_input(&self, marker: &str) {
+        timeout(Duration::from_secs(15), async {
+            loop {
+                let notified = self.state.received.notified();
+                if self.count_inputs_containing(marker) > 0 {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("missing provider input marker {marker}"));
+    }
+
     fn hold_requests(&self, hold: bool) {
         self.hold.send(hold).unwrap();
     }
@@ -195,20 +238,78 @@ impl Drop for ControlledProvider {
 async fn controlled_embeddings(
     State(mut state): State<ProviderState>,
     Json(input): Json<Value>,
-) -> Json<Value> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     state.requests.lock().unwrap().push(input.clone());
     state.received.notify_one();
     state.hold.wait_for(|hold| !*hold).await.unwrap();
-    match *state.invalid_response.lock().unwrap() {
+    let failure = *state.invalid_response.lock().unwrap();
+    match failure {
         Some(InvalidEmbeddingResponse::WrongDimension) => {
-            return Json(json!({"data": [{"index": 0, "embedding": [1.0]}]}));
+            Json(json!({"data": [{"index": 0, "embedding": [1.0]}]})).into_response()
         }
         Some(InvalidEmbeddingResponse::MissingEmbedding) => {
-            return Json(json!({"data": []}));
+            Json(json!({"data": []})).into_response()
         }
-        None => {}
+        Some(InvalidEmbeddingResponse::RateLimited) => (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            [(axum::http::header::RETRY_AFTER, "2")],
+        )
+            .into_response(),
+        None => embeddings(Json(input)).await.into_response(),
     }
-    embeddings(Json(input)).await
+}
+
+struct ClientIndex<'a> {
+    max_input_tokens: usize,
+    watch: bool,
+    exclude_paths: &'a str,
+}
+
+fn mcp_command(
+    root: &Path,
+    home: &Path,
+    endpoint: &IpcEndpoint,
+    mode: &str,
+    api_port: u16,
+    policy: ClientIndex<'_>,
+) -> Command {
+    let profile = embedding_profiles::write_api_profile(
+        home,
+        api_port,
+        "mcp-local",
+        policy.max_input_tokens,
+        2,
+    );
+    let binary = std::env::var_os("OBSIDIAN_TEST_MCP_BINARY")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_obsidian-mcp").into());
+    let mut command = http_listening::isolated_command(binary);
+    command
+        .arg(root)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("OBSIDIAN_MCP_DATA", home.join("mcp-data"))
+        .env("OBSIDIAN_SEMANTIC_HOME", home.join("semantic"))
+        .env("OBSIDIAN_SEMANTIC_ENDPOINT", endpoint.endpoint_string())
+        .env("OBSIDIAN_SEMANTIC_MODE", mode)
+        .env("OBSIDIAN_SEMANTIC_CONNECT_TIMEOUT_MS", "1500")
+        .env("OBSIDIAN_SEMANTIC_CONNECT_RETRIES", "0")
+        .env("OBSIDIAN_EMBEDDINGS", "true")
+        .env("OBSIDIAN_EMBEDDING_PROVIDER", "api")
+        .env(
+            "OBSIDIAN_EMBEDDING_API_BASE",
+            format!("http://127.0.0.1:{api_port}/v1"),
+        )
+        .env("OBSIDIAN_EMBEDDING_API_KEY", "synthetic-test-key")
+        .env("OBSIDIAN_EMBEDDING_API_MODEL", "mcp-local")
+        .env("OBSIDIAN_EMBEDDING_API_PROFILE", profile)
+        .env("OBSIDIAN_EMBEDDING_DIM", "2")
+        .env("OBSIDIAN_WATCH", policy.watch.to_string())
+        .env("OBSIDIAN_EXCLUDE_PATHS", policy.exclude_paths)
+        .env("OBSIDIAN_LOG_LEVEL", "error")
+        .env("TOKIO_WORKER_THREADS", "1")
+        .kill_on_drop(true);
+    command
 }
 
 struct StdioServer {
@@ -238,45 +339,33 @@ impl StdioServer {
         max_input_tokens: usize,
         watch: bool,
     ) -> Self {
-        let profile =
-            embedding_profiles::write_api_profile(home, api_port, "mcp-local", max_input_tokens, 2);
-        let binary = std::env::var_os("OBSIDIAN_TEST_MCP_BINARY")
-            .unwrap_or_else(|| env!("CARGO_BIN_EXE_obsidian-mcp").into());
-        let mut command = Command::new(binary);
-        for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("OBSIDIAN_")
-                || key.to_string_lossy().starts_with("OPENAI_")
-            {
-                command.env_remove(key);
-            }
-        }
-        let mut child = command
-            .arg(root)
-            .env("HOME", home)
-            .env("USERPROFILE", home)
-            .env("OBSIDIAN_MCP_DATA", home.join("mcp-data"))
-            .env("OBSIDIAN_SEMANTIC_HOME", home.join("semantic"))
-            .env("OBSIDIAN_SEMANTIC_ENDPOINT", endpoint.endpoint_string())
-            .env("OBSIDIAN_SEMANTIC_MODE", mode)
-            .env("OBSIDIAN_SEMANTIC_CONNECT_TIMEOUT_MS", "1500")
-            .env("OBSIDIAN_SEMANTIC_CONNECT_RETRIES", "0")
-            .env("OBSIDIAN_EMBEDDINGS", "true")
-            .env("OBSIDIAN_EMBEDDING_PROVIDER", "api")
-            .env(
-                "OBSIDIAN_EMBEDDING_API_BASE",
-                format!("http://127.0.0.1:{api_port}/v1"),
-            )
-            .env("OBSIDIAN_EMBEDDING_API_KEY", "synthetic-test-key")
-            .env("OBSIDIAN_EMBEDDING_API_MODEL", "mcp-local")
-            .env("OBSIDIAN_EMBEDDING_API_PROFILE", profile)
-            .env("OBSIDIAN_EMBEDDING_DIM", "2")
-            .env("OBSIDIAN_WATCH", watch.to_string())
-            .env("OBSIDIAN_LOG_LEVEL", "error")
-            .env("TOKIO_WORKER_THREADS", "1")
+        Self::start_with_policy(
+            root,
+            home,
+            endpoint,
+            mode,
+            api_port,
+            ClientIndex {
+                max_input_tokens,
+                watch,
+                exclude_paths: "",
+            },
+        )
+        .await
+    }
+
+    async fn start_with_policy(
+        root: &Path,
+        home: &Path,
+        endpoint: &IpcEndpoint,
+        mode: &str,
+        api_port: u16,
+        policy: ClientIndex<'_>,
+    ) -> Self {
+        let mut child = mcp_command(root, home, endpoint, mode, api_port, policy)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .kill_on_drop(true)
             .spawn()
             .unwrap();
         let mut server = Self {
@@ -354,8 +443,7 @@ impl StdioServer {
             loop {
                 let info = self.embedding_info().await;
                 assert_eq!(info["source"], source, "{info}");
-                if info["status"]["phase"] == "ready" {
-                    assert_eq!(info["status"]["indexed_notes"], notes);
+                if info["status"]["phase"] == "ready" && info["status"]["indexed_notes"] == notes {
                     assert_eq!(info["status"]["pending_notes"], 0);
                     return;
                 }
@@ -364,6 +452,51 @@ impl StdioServer {
         })
         .await
         .expect("embedding index did not become ready");
+    }
+
+    async fn wait_for_local_note_count(&mut self, expected: usize) {
+        // Each MCP process and its daemon consume filesystem notifications independently.
+        // A ready daemon can see an incoming file before this client's allowed_paths does.
+        let mut local_notes = Value::Null;
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let response = self.tool("vault_info", json!({})).await;
+                local_notes = structured_result(&response)["total_notes"].clone();
+                if local_notes == expected {
+                    return;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("local vault reported {local_notes} notes, expected {expected}")
+        });
+    }
+
+    async fn attach_and_check_paths(&mut self, mut expected: Vec<&str>) {
+        let query = json!({"query":"quokka","top_k":10});
+        let first = self.tool("search_semantic", query.clone()).await;
+        if first.get("error").is_some() {
+            assert_warming(&first);
+        }
+        self.wait_for_ready_notes("daemon", expected.len()).await;
+        let tools = self.call("tools/list", json!({})).await;
+        let schema = tool_output_schema(&tools, "search_semantic");
+        expected.sort_unstable();
+        for hybrid in [false, true] {
+            let mut request = query.clone();
+            request["lexical_prefetch"] = json!(hybrid);
+            let response = self.tool("search_semantic", request).await;
+            let mut found: Vec<_> = validated_output(&schema, &response)["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|hit| hit["path"].as_str().unwrap().to_owned())
+                .collect();
+            found.sort_unstable();
+            assert_eq!(found, expected, "{response}");
+        }
     }
 
     async fn stop(mut self) {
@@ -441,7 +574,8 @@ async fn verify_daemon_indexing_ownership(mode: &str) {
     let local_api = ControlledProvider::start(true).await;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("vault");
-    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir_all(root.join("Private")).unwrap();
+    std::fs::write(root.join("Private/hidden.md"), "quokka EXCLUDED_BY_CLIENT").unwrap();
     std::fs::write(root.join("note.md"), "# Marker\nVISIBLE quokka\n").unwrap();
     let endpoint = isolated_endpoint(directory.path());
     let client = SemanticDaemonClient::new(
@@ -455,8 +589,19 @@ async fn verify_daemon_indexing_ownership(mode: &str) {
     let home = directory.path().join("semantic");
     let mut daemon = spawn_daemon(&home, &endpoint, daemon_api.port);
     wait_for_health(&mut daemon, &client).await;
-    let mut server =
-        StdioServer::start(&root, directory.path(), &endpoint, mode, local_api.port).await;
+    let mut server = StdioServer::start_with_policy(
+        &root,
+        directory.path(),
+        &endpoint,
+        mode,
+        local_api.port,
+        ClientIndex {
+            max_input_tokens: 128,
+            watch: true,
+            exclude_paths: "Private/",
+        },
+    )
+    .await;
 
     // Initialization and a passive tool response form a startup barrier.
     let info = server.embedding_info().await;
@@ -543,6 +688,8 @@ async fn verify_daemon_indexing_ownership(mode: &str) {
         assert_eq!(daemon_api.requests().len(), 4);
     }
 
+    assert_eq!(daemon_api.count_inputs_containing("EXCLUDED_BY_CLIENT"), 0);
+    assert_eq!(local_api.count_inputs_containing("EXCLUDED_BY_CLIENT"), 0);
     server.stop().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
@@ -704,7 +851,6 @@ async fn daemon_binary_filters_before_ranking_and_recovers_existing_clients() {
     let client = SemanticDaemonClient::new(
         endpoint.clone(),
         DaemonConnectPolicy {
-            timeout: Duration::from_millis(500),
             retries: 0,
             ..Default::default()
         },
@@ -715,7 +861,7 @@ async fn daemon_binary_filters_before_ranking_and_recovers_existing_clients() {
         daemon_client: Some(client.clone()),
         daemon_unavailable_reason: None,
         prefetch_count: 1,
-        vault_ensured: Arc::new(AtomicBool::new(false)),
+        attachments: Default::default(),
         local_fallback_active: Arc::new(AtomicBool::new(false)),
         daemon_health_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
@@ -754,6 +900,673 @@ async fn daemon_binary_filters_before_ranking_and_recovers_existing_clients() {
     daemon.wait().await.unwrap();
     fixture.abort();
     let _ = fixture.await;
+}
+
+async fn wait_for_detachment(client: &SemanticDaemonClient, root: &Path, scope: &IndexScope) {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            match client.vault_status(root, scope).await {
+                Err(obsidian_mcp::error::VaultError::DaemonRpc {
+                    code: ERR_VAULT_NOT_ATTACHED,
+                    ..
+                }) => return,
+                Ok(_) => sleep(Duration::from_millis(20)).await,
+                Err(error) => panic!("cannot observe attachment retirement: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("last holder did not release the scope");
+}
+
+async fn check_shared_vault_scopes(broader_first: bool) {
+    let provider = ControlledProvider::start(false).await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("vault");
+    let home = directory.path().join("semantic");
+    for folder in [".obsidian-mcp", "Global", "Private"] {
+        std::fs::create_dir_all(root.join(folder)).unwrap();
+    }
+    std::fs::write(root.join(".obsidian-mcp/ignore"), "Global/\n").unwrap();
+    std::fs::write(root.join("Global/marker.md"), "quokka GLOBAL_NEVER_SENT").unwrap();
+    std::fs::write(root.join("Private/marker.md"), "quokka PRIVATE_AT_START").unwrap();
+    std::fs::write(root.join("shared.md"), "quokka SHARED_AT_START").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(root.join("Global/marker.md"), root.join("alias.md")).unwrap();
+    let endpoint = isolated_endpoint(directory.path());
+    let client = SemanticDaemonClient::new(endpoint.clone(), DaemonConnectPolicy::default());
+    let mut daemon = spawn_daemon(&home, &endpoint, provider.port);
+    wait_for_health(&mut daemon, &client).await;
+
+    // These processes share a vault, daemon and provider. Only their own policy differs.
+    let mut narrow = StdioServer::start_with_policy(
+        &root,
+        directory.path(),
+        &endpoint,
+        "daemon",
+        provider.port,
+        ClientIndex {
+            max_input_tokens: 128,
+            watch: true,
+            exclude_paths: "Private/",
+        },
+    )
+    .await;
+    let mut broad =
+        StdioServer::start(&root, directory.path(), &endpoint, "daemon", provider.port).await;
+    assert_eq!(narrow.embedding_info().await["availability"], "unattached");
+    assert_eq!(broad.embedding_info().await["availability"], "unattached");
+    assert!(provider.requests().is_empty());
+
+    let narrow_paths = vec!["shared.md"];
+    let broad_paths = vec!["Private/marker.md", "shared.md"];
+    if broader_first {
+        broad.attach_and_check_paths(broad_paths.clone()).await;
+        assert_eq!(narrow.embedding_info().await["availability"], "unattached");
+        narrow.attach_and_check_paths(narrow_paths.clone()).await;
+    } else {
+        narrow.attach_and_check_paths(narrow_paths.clone()).await;
+        assert_eq!(provider.count_inputs_containing("PRIVATE_AT_START"), 0);
+        assert_eq!(broad.embedding_info().await["availability"], "unattached");
+        broad.attach_and_check_paths(broad_paths.clone()).await;
+    }
+    assert_eq!(provider.count_inputs_containing("SHARED_AT_START"), 2);
+    assert_eq!(provider.count_inputs_containing("PRIVATE_AT_START"), 1);
+    assert_eq!(provider.count_inputs_containing("GLOBAL_NEVER_SENT"), 0);
+
+    // Equivalent exclusions attach to the live index and add no document work.
+    let narrow_scope = IndexScope::new(&["Private/**".into()]);
+    let mut twin = StdioServer::start_with_policy(
+        &root,
+        directory.path(),
+        &endpoint,
+        "daemon",
+        provider.port,
+        ClientIndex {
+            max_input_tokens: 128,
+            watch: false,
+            exclude_paths: "Private/**",
+        },
+    )
+    .await;
+    twin.attach_and_check_paths(narrow_paths.clone()).await;
+    assert_eq!(provider.count_inputs_containing("SHARED_AT_START"), 2);
+    wait_for_checkpoints(&home, 2).await;
+
+    broad.stop().await;
+    wait_for_detachment(&client, &root, &IndexScope::default()).await;
+    std::fs::write(root.join("Private/marker.md"), "quokka PRIVATE_AFTER_EXIT").unwrap();
+    std::fs::write(root.join("Global/marker.md"), "quokka GLOBAL_AFTER_EDIT").unwrap();
+    let created = root.join("Private/new.md");
+    std::fs::write(&created, "quokka CREATED_IN_PRIVATE").unwrap();
+    std::fs::write(root.join("shared.md"), "quokka SHARED_AFTER_EXIT").unwrap();
+    provider.wait_for_input("SHARED_AFTER_EXIT").await;
+    narrow.attach_and_check_paths(narrow_paths.clone()).await;
+    assert_eq!(provider.count_inputs_containing("PRIVATE_AFTER_EXIT"), 0);
+    assert_eq!(provider.count_inputs_containing("GLOBAL_AFTER_EDIT"), 0);
+    assert_eq!(provider.count_inputs_containing("CREATED_IN_PRIVATE"), 0);
+
+    let moved = root.join("moved.md");
+    std::fs::rename(&created, &moved).unwrap();
+    provider.wait_for_input("CREATED_IN_PRIVATE").await;
+    narrow.wait_for_local_note_count(2).await;
+    narrow
+        .attach_and_check_paths(vec!["moved.md", "shared.md"])
+        .await;
+    std::fs::rename(&moved, &created).unwrap();
+    std::fs::write(&created, "quokka RENAMED_BACK_TO_PRIVATE").unwrap();
+    std::fs::write(root.join("shared.md"), "quokka VISIBLE_AFTER_RENAME").unwrap();
+    provider.wait_for_input("VISIBLE_AFTER_RENAME").await;
+    narrow.wait_for_local_note_count(1).await;
+    narrow.attach_and_check_paths(narrow_paths.clone()).await;
+    assert_eq!(provider.count_inputs_containing("CREATED_IN_PRIVATE"), 1);
+    assert_eq!(
+        provider.count_inputs_containing("RENAMED_BACK_TO_PRIVATE"),
+        0
+    );
+    std::fs::remove_file(&created).unwrap();
+
+    narrow.stop().await;
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let probe = client
+                .attach_vault(&root, &narrow_scope, false, None)
+                .await
+                .unwrap();
+            if !probe.result.watch_enabled {
+                break;
+            }
+            drop(probe);
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("last watch-enabled holder must release watcher");
+    twin.attach_and_check_paths(narrow_paths.clone()).await;
+    twin.stop().await;
+    wait_for_detachment(&client, &root, &narrow_scope).await;
+
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+    let mut daemon = spawn_daemon(&home, &endpoint, provider.port);
+    wait_for_health(&mut daemon, &client).await;
+    wait_for_detachment(&client, &root, &IndexScope::default()).await;
+    let mut narrow = StdioServer::start_with_policy(
+        &root,
+        directory.path(),
+        &endpoint,
+        "daemon",
+        provider.port,
+        ClientIndex {
+            max_input_tokens: 128,
+            watch: false,
+            exclude_paths: "Private/**",
+        },
+    )
+    .await;
+    narrow.attach_and_check_paths(narrow_paths).await;
+    assert_eq!(provider.count_inputs_containing("PRIVATE_AFTER_EXIT"), 0);
+    let mut broad =
+        StdioServer::start(&root, directory.path(), &endpoint, "daemon", provider.port).await;
+    broad.attach_and_check_paths(broad_paths).await;
+    assert_eq!(provider.count_inputs_containing("PRIVATE_AFTER_EXIT"), 1);
+    assert_eq!(provider.count_inputs_containing("GLOBAL_AFTER_EDIT"), 0);
+    narrow.stop().await;
+    broad.stop().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn daemon_limits_provider_inputs_to_independently_attached_scopes() {
+    for broader_first in [false, true] {
+        check_shared_vault_scopes(broader_first).await;
+    }
+}
+
+fn tool_output_schema(tools: &Value, name: &str) -> jsonschema::Validator {
+    let descriptor = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == name)
+        .expect("tool is advertised");
+    jsonschema::validator_for(&descriptor["outputSchema"]).unwrap()
+}
+
+fn validated_output<'a>(schema: &jsonschema::Validator, response: &'a Value) -> &'a Value {
+    let result = structured_result(response);
+    schema
+        .validate(result)
+        .expect("result matches advertised schema");
+    result
+}
+
+#[tokio::test]
+async fn stateless_http_filters_share_one_configured_scope() {
+    let provider = ControlledProvider::start(true).await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("vault");
+    std::fs::create_dir_all(root.join("Private")).unwrap();
+    std::fs::write(root.join("shared.md"), "quokka HTTP_VISIBLE_DOCUMENT").unwrap();
+    std::fs::write(
+        root.join("Private/hidden.md"),
+        "quokka HTTP_PRIVATE_DOCUMENT",
+    )
+    .unwrap();
+    let endpoint = isolated_endpoint(directory.path());
+    let client = SemanticDaemonClient::new(endpoint.clone(), DaemonConnectPolicy::default());
+    let mut daemon = spawn_daemon(&directory.path().join("semantic"), &endpoint, provider.port);
+    wait_for_health(&mut daemon, &client).await;
+    let mut server = mcp_command(
+        &root,
+        directory.path(),
+        &endpoint,
+        "daemon",
+        provider.port,
+        ClientIndex {
+            max_input_tokens: 128,
+            watch: true,
+            exclude_paths: "Private/",
+        },
+    )
+    .args(["--http", "--host", "127.0.0.1", "--port", "0"])
+    .env("OBSIDIAN_LOG_LEVEL", "info")
+    .env("NO_COLOR", "1")
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    let address = http_listening::ready(&mut server).await.unwrap();
+    let url = format!("http://{address}");
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let request = async |filter: &str, method: &str, params: Value| {
+        let response = http_rpc::request(&http, &url, method, params, http_rpc::MODERN)
+            .header("X-Obsidian-Tools", filter)
+            .send()
+            .await
+            .unwrap();
+        http_rpc::rpc_response(response).await
+    };
+    let tools = request("full", "tools/list", json!({})).await;
+    let status_schema = tool_output_schema(&tools, "vault_info");
+    let search_schema = tool_output_schema(&tools, "search_semantic");
+    let status = json!({"name": "vault_info", "arguments": {}});
+    let passive = request("vault_info", "tools/call", status.clone()).await;
+    assert_eq!(
+        validated_output(&status_schema, &passive)["embeddings"]["availability"],
+        "unattached"
+    );
+    assert!(provider.requests().is_empty());
+
+    let search = json!({"name": "search_semantic", "arguments": {"query":"quokka"}});
+    assert_warming(&request("search_semantic", "tools/call", search.clone()).await);
+    provider.wait_for_input("HTTP_VISIBLE_DOCUMENT").await;
+    let progress = request("vault_info", "tools/call", status.clone()).await;
+    assert_eq!(
+        validated_output(&status_schema, &progress)["embeddings"]["status"]["total_notes"],
+        1,
+    );
+    provider.hold_requests(false);
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let info = request("vault_info", "tools/call", status.clone()).await;
+            if validated_output(&status_schema, &info)["embeddings"]["status"]["phase"] == "ready" {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (full, filtered) = tokio::join!(
+        request("full", "tools/call", search.clone()),
+        request("search_semantic", "tools/call", search),
+    );
+    for response in [full, filtered] {
+        let hits = validated_output(&search_schema, &response)["results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["path"], "shared.md");
+    }
+    assert_eq!(provider.count_inputs_containing("HTTP_VISIBLE_DOCUMENT"), 1);
+    assert_eq!(provider.count_inputs_containing("HTTP_PRIVATE_DOCUMENT"), 0);
+    server.kill().await.unwrap();
+    server.wait().await.unwrap();
+    wait_for_detachment(&client, &root, &IndexScope::new(&["Private/".into()])).await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn detached_scope_cannot_dispatch_the_next_document_batch() {
+    let provider = ControlledProvider::start(false).await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("vault");
+    std::fs::create_dir_all(root.join("Private")).unwrap();
+    std::fs::write(root.join("Private/a.md"), "quokka IN_FLIGHT_PRIVATE").unwrap();
+    std::fs::write(root.join("Private/b.md"), "quokka NEXT_PRIVATE_BATCH").unwrap();
+    std::fs::write(root.join("shared.md"), "quokka visible").unwrap();
+    let endpoint = isolated_endpoint(directory.path());
+    let client = SemanticDaemonClient::new(endpoint.clone(), DaemonConnectPolicy::default());
+    let mut daemon = spawn_daemon_with_limits(
+        &directory.path().join("semantic"),
+        &endpoint,
+        provider.port,
+        128,
+        1,
+    );
+    wait_for_health(&mut daemon, &client).await;
+    let mut narrow = StdioServer::start_with_policy(
+        &root,
+        directory.path(),
+        &endpoint,
+        "daemon",
+        provider.port,
+        ClientIndex {
+            max_input_tokens: 128,
+            watch: true,
+            exclude_paths: "Private/",
+        },
+    )
+    .await;
+    narrow.attach_and_check_paths(vec!["shared.md"]).await;
+    provider.hold_requests(true);
+    let mut broad =
+        StdioServer::start(&root, directory.path(), &endpoint, "daemon", provider.port).await;
+    assert_warming(
+        &broad
+            .tool("search_semantic", json!({"query":"quokka"}))
+            .await,
+    );
+    provider.wait_for_input("IN_FLIGHT_PRIVATE").await;
+    broad.stop().await;
+    wait_for_detachment(&client, &root, &IndexScope::default()).await;
+    assert_eq!(narrow.embedding_info().await["status"]["phase"], "ready");
+    let health = client.health("scope-test", "1").await.unwrap();
+    assert_eq!(health.pid, daemon.id().unwrap());
+
+    std::fs::write(root.join("shared.md"), "quokka NARROW_COMPLETED").unwrap();
+    provider.hold_requests(false);
+    provider.wait_for_input("NARROW_COMPLETED").await;
+    narrow.attach_and_check_paths(vec!["shared.md"]).await;
+    assert_eq!(provider.count_inputs_containing("NEXT_PRIVATE_BATCH"), 0);
+    assert_eq!(provider.count_inputs_containing("IN_FLIGHT_PRIVATE"), 1);
+    narrow.stop().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_provider_retry_queued_by_a_disconnected_scope_cannot_send_documents() {
+    let api = ControlledProvider::start(false).await;
+    api.invalid_response(Some(InvalidEmbeddingResponse::RateLimited));
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("vault");
+    std::fs::create_dir_all(root.join("Private")).unwrap();
+    std::fs::write(root.join("Private/note.md"), "PRIVATE_RETRY").unwrap();
+    std::fs::write(root.join("public.md"), "LIVE_SCOPE_RETRY").unwrap();
+    let endpoint = isolated_endpoint(directory.path());
+    let client = SemanticDaemonClient::new(endpoint.clone(), DaemonConnectPolicy::default());
+    let mut daemon = spawn_daemon(&directory.path().join("semantic"), &endpoint, api.port);
+    wait_for_health(&mut daemon, &client).await;
+
+    let broad_scope = IndexScope::default();
+    let narrow_scope = IndexScope::new(&["Private/".into()]);
+    let broad = client
+        .attach_vault(&root, &broad_scope, false, None)
+        .await
+        .unwrap();
+    let narrow = client
+        .attach_vault(&root, &narrow_scope, false, None)
+        .await
+        .unwrap();
+    for scope in [&broad_scope, &narrow_scope] {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let status = client.vault_status(&root, scope).await.unwrap();
+                if status
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|message| message.contains("429"))
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("each scope must observe the retryable provider response");
+    }
+    drop(broad);
+    wait_for_detachment(&client, &root, &broad_scope).await;
+    let private_attempts = api.count_inputs_containing("PRIVATE_RETRY");
+    let public_attempts = api.count_inputs_containing("LIVE_SCOPE_RETRY");
+    assert!(private_attempts > 0 && public_attempts >= 2);
+    let after_retry = tokio::time::Instant::now() + Duration::from_millis(2300);
+    api.invalid_response(None);
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if client
+                .vault_status(&root, &narrow_scope)
+                .await
+                .unwrap()
+                .ready
+            {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the still-live scope must retry and recover");
+    tokio::time::sleep_until(after_retry).await;
+    assert!(api.count_inputs_containing("LIVE_SCOPE_RETRY") > public_attempts);
+    assert_eq!(
+        api.count_inputs_containing("PRIVATE_RETRY"),
+        private_attempts
+    );
+    drop(narrow);
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn standalone_daemon_policy_prevents_wider_auto_fallback() {
+    let owner_provider = ControlledProvider::start(false).await;
+    let local_provider = ControlledProvider::start(false).await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("vault");
+    std::fs::create_dir_all(root.join("Private")).unwrap();
+    std::fs::write(root.join("shared.md"), "quokka visible").unwrap();
+    std::fs::write(root.join("Private/one.md"), "quokka OPERATOR_PRIVATE").unwrap();
+    let endpoint = isolated_endpoint(directory.path());
+    let client = SemanticDaemonClient::new(endpoint.clone(), DaemonConnectPolicy::default());
+    let mut daemon = daemon_command(
+        &directory.path().join("semantic"),
+        &endpoint,
+        owner_provider.port,
+        128,
+        2,
+        "Private/",
+    )
+    .spawn()
+    .unwrap();
+    wait_for_health(&mut daemon, &client).await;
+    let mut server = StdioServer::start(
+        &root,
+        directory.path(),
+        &endpoint,
+        "auto",
+        local_provider.port,
+    )
+    .await;
+    server.attach_and_check_paths(vec!["shared.md"]).await;
+    assert_eq!(
+        owner_provider.count_inputs_containing("OPERATOR_PRIVATE"),
+        0
+    );
+
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+    let unavailable = server
+        .tool("search_semantic", json!({"query":"quokka"}))
+        .await;
+    assert!(unavailable.get("error").is_some(), "{unavailable}");
+    assert_eq!(server.embedding_info().await["source"], "daemon");
+    assert!(
+        local_provider.requests().is_empty(),
+        "an unavailable stricter owner cannot authorize local document processing"
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn local_embedding_checkpoints_are_isolated_by_policy() {
+    let api = ControlledProvider::start(false).await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("vault");
+    std::fs::create_dir_all(root.join("Private")).unwrap();
+    std::fs::write(root.join("shared.md"), "quokka LOCAL_SHARED").unwrap();
+    std::fs::write(root.join("Private/one.md"), "quokka LOCAL_PRIVATE").unwrap();
+    let endpoint = isolated_endpoint(directory.path());
+    let mut broad = StdioServer::start(&root, directory.path(), &endpoint, "local", api.port).await;
+    broad.wait_for_ready_notes("local", 2).await;
+    let broad_cache = wait_for_checkpoints(directory.path(), 1)
+        .await
+        .pop()
+        .unwrap();
+    let legacy = directory
+        .path()
+        .join("mcp-data/vaults")
+        .join(obsidian_mcp::config::vault_slug(
+            &root.canonicalize().unwrap(),
+        ))
+        .join("embeddings/embeddings.bin");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    let mixed_cache = std::fs::read(broad_cache).unwrap();
+    std::fs::write(&legacy, &mixed_cache).unwrap();
+
+    let mut narrow = StdioServer::start_with_policy(
+        &root,
+        directory.path(),
+        &endpoint,
+        "local",
+        api.port,
+        ClientIndex {
+            max_input_tokens: 128,
+            watch: false,
+            exclude_paths: "Private/",
+        },
+    )
+    .await;
+    narrow.wait_for_ready_notes("local", 1).await;
+    wait_for_checkpoints(directory.path(), 2).await;
+    assert_eq!(std::fs::read(&legacy).unwrap(), mixed_cache);
+    assert_eq!(api.count_inputs_containing("LOCAL_SHARED"), 2);
+    assert_eq!(api.count_inputs_containing("LOCAL_PRIVATE"), 1);
+    narrow.stop().await;
+    broad.stop().await;
+
+    let submissions = api.requests().len();
+    let mut narrow = StdioServer::start_with_policy(
+        &root,
+        directory.path(),
+        &endpoint,
+        "local",
+        api.port,
+        ClientIndex {
+            max_input_tokens: 128,
+            watch: false,
+            exclude_paths: "Private/**",
+        },
+    )
+    .await;
+    narrow.wait_for_ready_notes("local", 1).await;
+    assert_eq!(api.requests().len(), submissions);
+    narrow.stop().await;
+}
+
+#[tokio::test]
+async fn prepared_index_keys_cannot_read_notes_renamed_into_case_sensitive_exclusions() {
+    let api = ControlledProvider::start(true).await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("vault");
+    std::fs::create_dir_all(root.join("private")).unwrap();
+    for (path, body) in [
+        ("0-first.md", "HOLD_BEFORE_SOURCE_READ"),
+        ("private/child.md", "formerly permitted directory"),
+        ("case-note.md", "formerly permitted file"),
+        ("z-last.md", "VISIBLE_AFTER_CASE_RENAME"),
+    ] {
+        std::fs::write(root.join(path), body).unwrap();
+    }
+    let endpoint = isolated_endpoint(directory.path());
+    let client = SemanticDaemonClient::new(endpoint.clone(), DaemonConnectPolicy::default());
+    let mut daemon = daemon_command(
+        &directory.path().join("semantic"),
+        &endpoint,
+        api.port,
+        128,
+        1,
+        "",
+    )
+    .env("OBSIDIAN_EMBEDDING_BATCH_SIZE", "1")
+    .spawn()
+    .unwrap();
+    wait_for_health(&mut daemon, &client).await;
+    let scope = IndexScope::new(&["Private/".into(), "CASE-NOTE.md".into()]);
+    let attachment = client
+        .attach_vault(&root, &scope, false, None)
+        .await
+        .unwrap();
+    api.wait_for_input("HOLD_BEFORE_SOURCE_READ").await;
+    assert_eq!(attachment.result.total_notes, Some(4));
+    // The metadata contains both original spellings. The provider has blocked
+    // note 0, and the coordinator prepares only one source per batch.
+    for (before, after) in [("private", "Private"), ("case-note.md", "CASE-NOTE.md")] {
+        std::fs::rename(root.join(before), root.join("intermediate-name")).unwrap();
+        std::fs::rename(root.join("intermediate-name"), root.join(after)).unwrap();
+    }
+    std::fs::write(root.join("Private/child.md"), "EXCLUDED_PARENT_SPELLING").unwrap();
+    std::fs::write(root.join("CASE-NOTE.md"), "EXCLUDED_FILE_SPELLING").unwrap();
+    api.hold_requests(false);
+    api.wait_for_input("VISIBLE_AFTER_CASE_RENAME").await;
+    assert_eq!(api.count_inputs_containing("EXCLUDED_PARENT_SPELLING"), 0);
+    assert_eq!(api.count_inputs_containing("EXCLUDED_FILE_SPELLING"), 0);
+    assert_eq!(api.count_inputs_containing("formerly permitted"), 0);
+    drop(attachment);
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn refreshing_the_portable_floor_expires_previous_attachments() {
+    let api = ControlledProvider::start(false).await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("vault");
+    std::fs::create_dir_all(root.join("Private")).unwrap();
+    std::fs::create_dir_all(root.join(".obsidian-mcp")).unwrap();
+    let ignore = root.join(".obsidian-mcp/ignore");
+    std::fs::write(&ignore, "").unwrap();
+    std::fs::write(root.join("shared.md"), "quokka visible").unwrap();
+    std::fs::write(root.join("Private/one.md"), "quokka PREVIOUS_FLOOR").unwrap();
+    let endpoint = isolated_endpoint(directory.path());
+    let client = SemanticDaemonClient::new(endpoint.clone(), DaemonConnectPolicy::default());
+    let mut daemon = spawn_daemon(&directory.path().join("semantic"), &endpoint, api.port);
+    wait_for_health(&mut daemon, &client).await;
+    let scope = IndexScope::default();
+    let broad = client
+        .attach_vault(&root, &scope, true, None)
+        .await
+        .unwrap();
+    api.wait_for_input("PREVIOUS_FLOOR").await;
+
+    std::fs::write(&ignore, "Private/\n").unwrap();
+    let narrow = client
+        .attach_vault(&root, &scope, true, None)
+        .await
+        .unwrap();
+    assert_ne!(broad.result.scope_id, narrow.result.scope_id);
+    let stale = client.search_semantic(&broad, "quokka", 10, true).await;
+    assert!(
+        matches!(
+            stale,
+            Err(obsidian_mcp::error::VaultError::DaemonRpc {
+                code: ERR_VAULT_NOT_ATTACHED,
+                ..
+            })
+        ),
+        "{stale:?}"
+    );
+    std::fs::write(root.join("Private/one.md"), "quokka WITHDRAWN_FLOOR").unwrap();
+    std::fs::write(root.join("shared.md"), "quokka CURRENT_FLOOR").unwrap();
+    api.wait_for_input("CURRENT_FLOOR").await;
+    assert_eq!(api.count_inputs_containing("WITHDRAWN_FLOOR"), 0);
+
+    std::fs::write(&ignore, "[invalid-pattern").unwrap();
+    assert!(
+        client
+            .attach_vault(&root, &scope, false, None)
+            .await
+            .is_err()
+    );
+    let stale = client.search_semantic(&narrow, "quokka", 10, true).await;
+    assert!(
+        matches!(
+            stale,
+            Err(obsidian_mcp::error::VaultError::DaemonRpc {
+                code: ERR_VAULT_NOT_ATTACHED,
+                ..
+            })
+        ),
+        "{stale:?}"
+    );
+    drop((narrow, broad));
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
 }
 
 fn structured_result(response: &Value) -> &Value {
@@ -1078,21 +1891,35 @@ async fn changed_source_keeps_ranked_hit_without_mixed_revision_context() {
     server.stop().await;
 }
 
-async fn wait_for_cache_checkpoint(directory: &Path) {
+async fn wait_for_checkpoints(directory: &Path, expected_scopes: usize) -> Vec<PathBuf> {
     timeout(Duration::from_secs(15), async {
         loop {
-            let checkpoint = walkdir::WalkDir::new(directory)
+            let paths: Vec<_> = walkdir::WalkDir::new(directory)
                 .into_iter()
-                .filter_map(Result::ok)
-                .any(|entry| entry.file_type().is_file() && entry.file_name() == "embeddings.bin");
-            if checkpoint {
-                return;
+                .map(Result::unwrap)
+                .filter(|e| {
+                    e.file_type().is_file()
+                        && e.file_name() == "embeddings.bin"
+                        && e.path()
+                            .parent()
+                            .and_then(Path::parent)
+                            .and_then(Path::file_name)
+                            == Some(std::ffi::OsStr::new("scopes"))
+                })
+                .map(|entry| entry.into_path())
+                .collect();
+            assert!(
+                paths.len() <= expected_scopes,
+                "more scoped checkpoints than active policies"
+            );
+            if paths.len() == expected_scopes {
+                return paths;
             }
             sleep(Duration::from_millis(25)).await;
         }
     })
     .await
-    .expect("embedding cache checkpoint did not appear");
+    .expect("scoped embedding checkpoints did not appear")
 }
 
 #[tokio::test]
@@ -1115,7 +1942,7 @@ async fn chunk_cache_reuses_unchanged_inputs_and_refreshes_only_the_edited_tail(
     )
     .await;
     server.wait_for_ready("local").await;
-    wait_for_cache_checkpoint(directory.path()).await;
+    wait_for_checkpoints(directory.path(), 1).await;
     let initial_requests = provider.requests().len();
     let initial_inputs: usize = provider
         .requests()

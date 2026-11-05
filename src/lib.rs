@@ -1,3 +1,6 @@
+#[cfg(all(test, unix))]
+mod test_daemon_rpc;
+
 pub mod client;
 pub mod config;
 pub mod daemon;
