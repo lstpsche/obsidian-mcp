@@ -1157,9 +1157,19 @@ async fn note_mutations_cannot_reach_outside_through_vault_links() {
         assert!(status.success());
         match symlink_file(&marker, &alias) {
             Ok(()) => symlink_file(&missing, &dangling).unwrap(),
-            Err(error) if error.raw_os_error() == Some(1314) => (),
+            Err(error) if error.raw_os_error() == Some(1314) => {
+                eprintln!("file symlink privilege unavailable; exercising directory junctions");
+            }
             Err(error) => panic!("cannot create symlink fixture: {error}"),
         }
+    }
+    let alternate_case_link = server.vault.path().join("external.MD").is_symlink();
+    #[cfg(windows)]
+    if std::env::var_os("GITHUB_ACTIONS").is_some() {
+        assert!(
+            alternate_case_link,
+            "Windows CI must exercise file symlinks on a case-insensitive vault"
+        );
     }
     let mut cases = vec![
         (
@@ -1191,7 +1201,7 @@ async fn note_mutations_cannot_reach_outside_through_vault_links() {
                 json!({"path":"Dangling.md","content":"outside create"}),
             ),
         ]);
-        if server.vault.path().join("external.MD").is_symlink() {
+        if alternate_case_link {
             cases.push((
                 "note_write",
                 json!({"path":"external.MD","content":"wrong case"}),
