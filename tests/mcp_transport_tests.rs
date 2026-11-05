@@ -1005,7 +1005,7 @@ async fn serve_and_restart_replace_the_selected_http_instance() {
     let vaults = [temporary_vault(), temporary_vault()];
     for (cmd, vault) in ["serve", "restart"].into_iter().zip(&vaults) {
         std::fs::write(vault.path().join("identity.md"), cmd).unwrap();
-        let output = http_listening::isolated_command(env!("CARGO_BIN_EXE_obsidian-mcp"))
+        let mut launcher = http_listening::isolated_command(env!("CARGO_BIN_EXE_obsidian-mcp"))
             .args([cmd, "--host", "127.0.0.1", "--port", &port])
             .arg(vault.path())
             .env("HOME", log_home.path())
@@ -1014,8 +1014,19 @@ async fn serve_and_restart_replace_the_selected_http_instance() {
             .env("OBSIDIAN_WATCH", "false")
             .env("OBSIDIAN_EMBEDDINGS", "false")
             .env("OBSIDIAN_SEMANTIC_MODE", "local")
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        timeout(Duration::from_secs(30), launcher.wait())
             .await
+            .expect("HTTP launcher must exit after startup")
+            .unwrap();
+        let output = timeout(Duration::from_secs(5), launcher.wait_with_output())
+            .await
+            .expect("an exited HTTP launcher must release its caller's output pipes")
             .unwrap();
         assert!(output.status.success(), "{output:?}");
         let read = rpc_response(

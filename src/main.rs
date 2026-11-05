@@ -717,7 +717,29 @@ fn daemonize() -> Result<(), Box<dyn std::error::Error>> {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{
+            HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+        };
 
+        // CreateProcess inherits other inheritable handles alongside the
+        // explicitly redirected stdio. A background child retaining the
+        // launcher's original output pipes would keep its caller waiting for EOF.
+        for handle in [
+            std::io::stdin().as_raw_handle(),
+            std::io::stdout().as_raw_handle(),
+            std::io::stderr().as_raw_handle(),
+        ] {
+            if !handle.is_null()
+                && handle != INVALID_HANDLE_VALUE
+                && unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+    }
     let mut child = cmd.spawn()?;
     let child_pid = child.id();
     if let Err(reason) = wait_for_http_child(&mut child, endpoint) {
