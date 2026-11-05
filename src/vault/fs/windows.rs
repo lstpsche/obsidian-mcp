@@ -10,30 +10,37 @@ use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::ptr;
 
-use cap_fs_ext::{FollowSymlinks, OpenOptionsExt, OpenOptionsFollowExt};
-use cap_std::fs::{Dir, OpenOptions};
+use cap_std::fs::Dir;
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, FILE_RENAME_POSIX_SEMANTICS,
-    FILE_RENAME_REPLACE_IF_EXISTS, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
+    FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS, FILE_SYNCHRONOUS_IO_NONALERT,
+    NtCreateFile,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError,
-    UNICODE_STRING,
+    ERROR_NO_MORE_FILES, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_FULL_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo,
+    FILE_DISPOSITION_INFO, FILE_FULL_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+    FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo,
     FileFullDirectoryInfo, FileFullDirectoryRestartInfo, FileRenameInfo, FileRenameInfoEx,
-    GetFileInformationByHandleEx, ReOpenFile, SYNCHRONIZE, SetFileInformationByHandle,
+    GetFileInformationByHandleEx, SYNCHRONIZE, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-pub(super) fn create_child_dir(parent: &Dir, name: &OsStr) -> io::Result<()> {
+/// Open a single native name against its pinned parent. An empty name reopens
+/// the directory itself with an independent enumeration cursor.
+fn open_relative(
+    parent: &Dir,
+    name: &OsStr,
+    access: u32,
+    disposition: u32,
+    options: u32,
+) -> io::Result<File> {
     let mut wide: Vec<u16> = name.encode_wide().collect();
     let length = u16::try_from(size_of_val(wide.as_slice())).map_err(io::Error::other)?;
+    wide.push(0);
     let string = UNICODE_STRING {
         Length: length,
         MaximumLength: length,
@@ -48,19 +55,19 @@ pub(super) fn create_child_dir(parent: &Dir, name: &OsStr) -> io::Result<()> {
     };
     let mut handle = ptr::null_mut();
     let mut result = IO_STATUS_BLOCK::default();
-    // FILE_CREATE never opens an existing entry, including a reparse point.
-    // The name is a single validated component relative to the retained handle.
+    // Synchronous directory queries require SYNCHRONIZE on the new handle.
+    // OPEN_REPARSE_POINT makes deletion and rename apply to the entry itself.
     let status = unsafe {
         NtCreateFile(
             &mut handle,
-            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            access | SYNCHRONIZE,
             &attributes,
             &mut result,
             ptr::null(),
             FILE_ATTRIBUTE_NORMAL,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_CREATE,
-            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            disposition,
+            options | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
             ptr::null(),
             0,
         )
@@ -71,16 +78,22 @@ pub(super) fn create_child_dir(parent: &Dir, name: &OsStr) -> io::Result<()> {
         ));
     }
     // SAFETY: a successful synchronous NtCreateFile returned one owned handle.
-    drop(unsafe { File::from_raw_handle(handle) });
-    Ok(())
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+pub(super) fn create_child_dir(parent: &Dir, name: &OsStr) -> io::Result<()> {
+    open_relative(
+        parent,
+        name,
+        FILE_READ_ATTRIBUTES,
+        FILE_CREATE,
+        FILE_DIRECTORY_FILE,
+    )
+    .map(drop)
 }
 
 fn open_entry_for_delete(parent: &Dir, name: &OsStr) -> io::Result<File> {
-    let mut opts = OpenOptions::new();
-    opts.access_mode(DELETE | FILE_READ_ATTRIBUTES)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-        .follow(FollowSymlinks::No);
-    Ok(parent.open_with(name, &opts)?.into_std())
+    open_relative(parent, name, DELETE | FILE_READ_ATTRIBUTES, FILE_OPEN, 0)
 }
 
 pub(super) fn remove_entry(dir: &Dir, name: &OsStr, directory: bool) -> io::Result<()> {
@@ -189,19 +202,14 @@ impl EntryType {
 pub(crate) fn dir_entries(
     dir: &Dir,
 ) -> io::Result<impl Iterator<Item = io::Result<DirectoryEntry>>> {
-    // Distinct directory listings need independent kernel enumeration cursors.
-    let handle = unsafe {
-        ReOpenFile(
-            dir.as_raw_handle(),
-            FILE_LIST_DIRECTORY,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
-    }
-    let file = unsafe { File::from_raw_handle(handle) };
+    let file = open_relative(
+        dir,
+        OsStr::new(""),
+        FILE_LIST_DIRECTORY,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE,
+    )
+    .map_err(|e| io::Error::new(e.kind(), format!("open directory for enumeration: {e}")))?;
     let mut buffer = vec![0u64; 8192];
     let mut entries = Vec::new().into_iter();
     let mut restart = true;
@@ -232,8 +240,12 @@ pub(crate) fn dir_entries(
             {
                 done = true;
                 let err = io::Error::last_os_error();
-                return (err.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32))
-                    .then_some(Err(err));
+                return (err.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32)).then(|| {
+                    Err(io::Error::new(
+                        err.kind(),
+                        format!("read directory entries: {err}"),
+                    ))
+                });
             }
             match directory_page(&buffer) {
                 Ok(page) => entries = page.into_iter(),
