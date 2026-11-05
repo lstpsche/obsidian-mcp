@@ -13,9 +13,9 @@ use std::ptr;
 use cap_std::fs::Dir;
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
+    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION,
     FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS, FILE_SYNCHRONOUS_IO_NONALERT,
-    NtCreateFile,
+    FileRenameInformation, FileRenameInformationEx, NtCreateFile, NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
     ERROR_NO_MORE_FILES, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
@@ -23,9 +23,9 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_DISPOSITION_INFO, FILE_FULL_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-    FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo,
-    FileFullDirectoryInfo, FileFullDirectoryRestartInfo, FileRenameInfo, FileRenameInfoEx,
-    GetFileInformationByHandleEx, SYNCHRONIZE, SetFileInformationByHandle,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo,
+    FileFullDirectoryInfo, FileFullDirectoryRestartInfo, GetFileInformationByHandleEx, SYNCHRONIZE,
+    SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -142,12 +142,12 @@ pub(super) fn rename(
     }
     let name: Vec<u16> = new.encode_wide().collect();
     let name_bytes = u32::try_from(size_of_val(name.as_slice())).map_err(io::Error::other)?;
-    let bytes = size_of::<FILE_RENAME_INFO>() + name_bytes as usize;
+    let bytes = size_of::<FILE_RENAME_INFORMATION>() + name_bytes as usize;
     let size = u32::try_from(bytes).map_err(io::Error::other)?;
     let mut words = vec![0usize; bytes.div_ceil(size_of::<usize>())];
-    let info = words.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-    // The aligned allocation includes the variable UTF-16 tail. For checkpoint
-    // replacement the old readers retain their old file handle.
+    let info = words.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    // Submit the counted name relative to the existing destination handle.
+    // The aligned allocation includes the variable UTF-16 tail.
     unsafe {
         (*info).RootDirectory = destination.as_raw_handle();
         (*info).FileNameLength = name_bytes;
@@ -160,12 +160,17 @@ pub(super) fn rename(
             name.len(),
         );
         let class = if replace {
-            FileRenameInfoEx
+            FileRenameInformationEx
         } else {
-            FileRenameInfo
+            FileRenameInformation
         };
-        if SetFileInformationByHandle(file.as_raw_handle(), class, info.cast(), size) == 0 {
-            return Err(io::Error::last_os_error());
+        let mut result = IO_STATUS_BLOCK::default();
+        let status =
+            NtSetInformationFile(file.as_raw_handle(), &mut result, info.cast(), size, class);
+        if status < 0 {
+            return Err(io::Error::from_raw_os_error(
+                RtlNtStatusToDosError(status) as i32
+            ));
         }
     }
     Ok(())
