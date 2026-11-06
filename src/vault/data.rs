@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::exclude::{ExcludeSet, read_ignore};
+use super::exclude::{ExcludeSet, ignore_rule, read_ignore};
 use super::fs::VaultRoot;
 use crate::config::{vault_slug, vault_storage_key};
 use crate::error::{VaultError, VaultResult};
@@ -187,9 +187,8 @@ fn unclaimed_configuration(root: &VaultRoot, vault: &Path) -> VaultResult<Option
 
 fn legacy_ignore_is_empty(reader: impl std::io::BufRead) -> std::io::Result<bool> {
     for line in reader.split(b'\n') {
-        if let Some(first) = line?.into_iter().find(|byte| !byte.is_ascii_whitespace())
-            && first != b'#'
-        {
+        // Undecodable legacy config needs the same ownership confirmation as a rule.
+        if !std::str::from_utf8(&line?).is_ok_and(|text| ignore_rule(text).is_none()) {
             return Ok(false);
         }
     }
@@ -212,6 +211,29 @@ mod tests {
     use super::*;
     use crate::test_helpers::test_config;
     use crate::vault::Vault;
+
+    #[tokio::test]
+    async fn vault_merges_and_normalizes_all_ignore_sources() {
+        let vault = tempfile::tempdir().unwrap();
+        let machine = tempfile::tempdir().unwrap();
+        let portable = vault.path().join(PORTABLE);
+        std::fs::create_dir(&portable).unwrap();
+        std::fs::write(portable.join("ignore"), "Archive/\n# local comment\n").unwrap();
+        let specific = machine
+            .path()
+            .join("vaults-v2")
+            .join(vault_storage_key(&vault.path().canonicalize().unwrap()));
+        std::fs::create_dir_all(&specific).unwrap();
+        std::fs::write(specific.join("ignore"), "Archive/**\nDrafts/\n").unwrap();
+        let mut config = test_config(vault.path());
+        config.mcp_data_dir = Some(machine.path().to_owned());
+        config.exclude_patterns = vec!["Drafts/**".into(), "Temp/".into()];
+        let opened = Vault::open(&config).await.unwrap();
+        assert_eq!(
+            opened.exclude().patterns(),
+            ["Archive/**", "Drafts/**", "Temp/**"]
+        );
+    }
 
     #[tokio::test]
     async fn colliding_legacy_vaults_require_independent_machine_policies() {
@@ -275,7 +297,7 @@ mod tests {
             .join(vault_slug(&vault.canonicalize().unwrap()));
         std::fs::create_dir_all(old.join("embeddings")).unwrap();
         std::fs::write(old.join("embeddings/embeddings.bin"), "old").unwrap();
-        std::fs::write(old.join("ignore"), "  # user comment\n").unwrap();
+        std::fs::write(old.join("ignore"), "\u{2003}# user comment\r\n\u{a0}\n").unwrap();
         let mut config = test_config(&vault);
         config.mcp_data_dir = Some(machine);
         let opened = Vault::open(&config).await.unwrap();
@@ -286,6 +308,11 @@ mod tests {
             b"old"
         );
         drop(opened);
+        std::fs::write(old.join("ignore"), b"#\xff").unwrap();
+        assert!(
+            matches!(Vault::open(&config).await, Err(VaultError::InvalidPath(message)) if message.contains("cannot identify"))
+        );
+        std::fs::write(old.join("ignore"), "").unwrap();
         std::fs::write(old.join("custom-settings"), "owned").unwrap();
         assert!(Vault::open(&config).await.is_err());
     }

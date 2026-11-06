@@ -117,10 +117,15 @@ pub fn parse_ignore_lines(content: &str) -> Vec<String> {
 }
 
 fn ignore_rules(content: &str) -> impl Iterator<Item = (usize, &str)> {
-    content.lines().enumerate().filter_map(|(i, line)| {
-        let rule = line.trim();
-        (!rule.is_empty() && !rule.starts_with('#')).then_some((i + 1, rule))
-    })
+    content
+        .lines()
+        .enumerate()
+        .filter_map(|(i, line)| ignore_rule(line).map(|rule| (i + 1, rule)))
+}
+
+pub(super) fn ignore_rule(line: &str) -> Option<&str> {
+    let rule = line.trim();
+    (!rule.is_empty() && !rule.starts_with('#')).then_some(rule)
 }
 
 /// Read one optional policy through its originating filesystem capability.
@@ -135,22 +140,6 @@ pub(crate) fn read_ignore(root: &VaultRoot, path: &Path) -> VaultResult<Option<E
         ignore_rules(&content).map(|(line, rule)| (label.as_str(), line, rule.to_owned())),
     )
     .map(Some)
-}
-
-/// Load the portable and machine policies from two explicitly supplied roots.
-pub fn load_ignore_patterns(mcp_home: &Path, mcp_data: &Path) -> VaultResult<Vec<String>> {
-    let mut rules = Vec::new();
-    for (index, path) in [mcp_home, mcp_data].into_iter().enumerate() {
-        if index == 1 && mcp_home == mcp_data {
-            break;
-        }
-        if let Some(set) = read_ignore(&VaultRoot::open(path)?, Path::new("ignore"))? {
-            rules.extend(set.patterns);
-        }
-    }
-    rules.sort();
-    rules.dedup();
-    Ok(rules)
 }
 
 pub(crate) fn daemon_exclusions(root: &VaultRoot) -> VaultResult<ExcludeSet> {
@@ -336,64 +325,5 @@ Resources/Meetings/
             result,
             vec!["Archive/", "Resources/Meetings/", "**/drafts/*.tmp"]
         );
-    }
-
-    // ── load_ignore_patterns ──
-
-    #[test]
-    fn load_ignore_patterns_single_location() {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(dir.path().join("ignore"), "Archive/\n*.tmp\n").unwrap();
-
-        let result = load_ignore_patterns(dir.path(), dir.path()).unwrap();
-        assert_eq!(result, vec!["*.tmp", "Archive/**"]);
-    }
-
-    #[test]
-    fn load_ignore_patterns_both_locations() {
-        let home = tempfile::TempDir::new().unwrap();
-        let data = tempfile::TempDir::new().unwrap();
-        std::fs::write(home.path().join("ignore"), "Archive/\n").unwrap();
-        std::fs::write(data.path().join("ignore"), "Drafts/\n").unwrap();
-
-        let result = load_ignore_patterns(home.path(), data.path()).unwrap();
-        assert_eq!(result, vec!["Archive/**", "Drafts/**"]);
-    }
-
-    #[test]
-    fn load_ignore_patterns_dedup() {
-        let home = tempfile::TempDir::new().unwrap();
-        let data = tempfile::TempDir::new().unwrap();
-        std::fs::write(home.path().join("ignore"), "Archive/\nDrafts/\n").unwrap();
-        std::fs::write(data.path().join("ignore"), "Archive/\nMeetings/\n").unwrap();
-
-        let result = load_ignore_patterns(home.path(), data.path()).unwrap();
-        assert_eq!(result, vec!["Archive/**", "Drafts/**", "Meetings/**"]);
-    }
-
-    #[test]
-    fn load_ignore_patterns_missing_files() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let result = load_ignore_patterns(dir.path(), dir.path()).unwrap();
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn load_ignore_patterns_same_path_no_duplicates() {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(dir.path().join("ignore"), "Archive/\nDrafts/\n").unwrap();
-
-        let result = load_ignore_patterns(dir.path(), dir.path()).unwrap();
-        assert_eq!(result, vec!["Archive/**", "Drafts/**"]);
-    }
-
-    #[test]
-    fn load_ignore_patterns_one_missing_one_present() {
-        let home = tempfile::TempDir::new().unwrap();
-        let data = tempfile::TempDir::new().unwrap();
-        std::fs::write(data.path().join("ignore"), "External/\n").unwrap();
-
-        let result = load_ignore_patterns(home.path(), data.path()).unwrap();
-        assert_eq!(result, vec!["External/**"]);
     }
 }
