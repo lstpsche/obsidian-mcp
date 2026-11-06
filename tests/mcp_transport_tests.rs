@@ -467,7 +467,11 @@ async fn http_rejects_invalid_routing_headers_and_untrusted_hosts() {
 
 async fn exchange_stdio_messages(messages: &[Value], pipelined: bool) -> Vec<Value> {
     let vault = temporary_vault();
-    let mut child = server_command(&vault)
+    exchange_stdio(server_command(&vault), messages, pipelined).await
+}
+
+async fn exchange_stdio(mut command: Command, messages: &[Value], pipelined: bool) -> Vec<Value> {
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -501,6 +505,73 @@ async fn exchange_stdio_messages(messages: &[Value], pipelined: bool) -> Vec<Val
             .success()
     );
     responses
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wide_vaults_list_addressable_notes_with_bounded_directory_handles() {
+    use rustix::process::{Resource, getrlimit, setrlimit};
+    let vault = temporary_vault();
+    let mut expected = vec!["note.md".to_owned()];
+    for i in 0..128 {
+        let dir = format!("folder-{i}");
+        std::fs::create_dir(vault.path().join(&dir)).unwrap();
+        let note = format!("{dir}/leaf.md");
+        std::fs::write(vault.path().join(&note), "real note").unwrap();
+        expected.push(note);
+    }
+    expected.sort();
+    // The literal backslash cannot represent an MCP path. Its contents
+    // must never acquire the identity of the real file in folder-0.
+    std::fs::write(vault.path().join(r"folder-0\leaf.md"), "unaddressable").unwrap();
+    std::fs::create_dir(vault.path().join(".obsidian")).unwrap();
+    std::fs::write(
+        vault.path().join(".obsidian/daily-notes.json"),
+        r#"{"folder":"","format":"[.days]/YYYY-MM-DD"}"#,
+    )
+    .unwrap();
+    std::fs::create_dir(vault.path().join(".days")).unwrap();
+    std::fs::write(vault.path().join(".days/2026-11-06.md"), "daily").unwrap();
+    let mut command = server_command(&vault);
+    command
+        .env("TOKIO_WORKER_THREADS", "1")
+        .env("OBSIDIAN_TANTIVY", "false");
+    let mut limit = getrlimit(Resource::Nofile);
+    limit.current = Some(limit.current.unwrap_or(64).min(64));
+    // SAFETY: only setrlimit runs between fork and exec in the test child.
+    unsafe {
+        command.pre_exec(move || setrlimit(Resource::Nofile, limit).map_err(Into::into));
+    }
+    let messages = [
+        modern_stdio_request(
+            1,
+            "tools/call",
+            json!({"name":"vault_list", "arguments":{"recursive":true,"glob":"**/*.md"}}),
+        ),
+        modern_stdio_request(
+            2,
+            "tools/call",
+            json!({"name":"search_text", "arguments":{"query":"unaddressable"}}),
+        ),
+        modern_stdio_request(
+            3,
+            "tools/call",
+            json!({"name":"periodic", "arguments":{"action":"list","period":"daily"}}),
+        ),
+    ];
+    let responses = exchange_stdio(command, &messages, false).await;
+    assert_eq!(
+        stdio_response(&responses, 1)["result"]["structuredContent"]["results"],
+        json!(expected)
+    );
+    assert_eq!(
+        stdio_response(&responses, 2)["result"]["structuredContent"]["results"],
+        json!([])
+    );
+    assert_eq!(
+        stdio_response(&responses, 3)["result"]["structuredContent"]["results"],
+        json!([{"path": ".days/2026-11-06.md", "date": "2026-11-06"}])
+    );
 }
 
 fn legacy_stdio_messages() -> [Value; 4] {
@@ -1192,6 +1263,7 @@ async fn note_mutations_cannot_reach_outside_through_vault_links() {
     if alias.is_symlink() {
         cases.extend([
             ("note_read", json!({"path":"External.md"})),
+            ("note_delete", json!({"path":"External.md","confirm":true})),
             (
                 "note_insert",
                 json!({"path":"External.md","content":"outside append"}),
@@ -1232,5 +1304,27 @@ async fn note_mutations_cannot_reach_outside_through_vault_links() {
         assert!(!outside.path().join("moved.md").exists());
     }
     assert!(server.vault.path().join("note.md").is_file());
+    if dangling.is_symlink() {
+        let reply = rpc_response(
+            server
+                .request(
+                    "tools/call",
+                    json!({"name":"note_delete","arguments":{"path":"Dangling.md","confirm":true}}),
+                    MODERN,
+                )
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            reply.get("error").is_none() && reply["result"]["isError"] != true,
+            "{reply}"
+        );
+        assert!(!dangling.is_symlink());
+        assert!(!missing.exists());
+        assert!(alias.is_symlink());
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "external marker");
+    }
     server.stop().await;
 }

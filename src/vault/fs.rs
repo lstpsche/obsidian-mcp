@@ -15,7 +15,6 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use cap_fs_ext::DirExt;
 use cap_std::fs::{Dir, OpenOptions};
 use globset::Glob;
 
@@ -41,6 +40,21 @@ fn map_not_found(path: &Path) -> impl FnOnce(io::Error) -> VaultError + '_ {
         io::ErrorKind::NotFound => VaultError::NoteNotFound(path.to_owned()),
         _ => VaultError::Io(e),
     }
+}
+
+pub(super) fn is_missing_entry(error: &VaultError) -> bool {
+    error.is_not_found()
+        || matches!(error, VaultError::Io(err) if err.kind() == io::ErrorKind::NotADirectory)
+}
+
+/// Only for no-follow opens or stats of a previously validated native name.
+/// An invalid physical path here means a component became a symlink or reparse point.
+pub(super) fn skip_changed_entry(error: &VaultError) -> bool {
+    if matches!(error, VaultError::InvalidPath(_)) {
+        tracing::warn!(%error, "skipping a vault entry replaced during traversal");
+        return true;
+    }
+    is_missing_entry(error)
 }
 
 fn file_times(
@@ -178,7 +192,7 @@ impl VaultRoot {
         let (parent, name) = self.parent(&actual, false)?;
         let metadata = parent.symlink_metadata(name).map_err(map_not_found(path))?;
         if is_link(&metadata) {
-            self.resolve_existing(path)?;
+            self.link_target(&actual, path)?;
         }
         remove_entry(&parent, name, metadata.is_dir())?;
         Ok(actual)
@@ -197,6 +211,15 @@ impl VaultRoot {
             )));
         }
         let destination = self.resolve_entry(to, true)?;
+        if source.parent() != destination.parent()
+            && is_link(&source_dir.symlink_metadata(source_name)?)
+            && source_dir.read_link_contents(source_name)?.is_relative()
+        {
+            return Err(VaultError::InvalidPath(format!(
+                "cannot move a relative note symlink to another directory: {}",
+                from.display()
+            )));
+        }
         let (destination_dir, destination_name) = self.parent(&destination, true)?;
         rename_exclusive(&source_dir, source_name, &destination_dir, destination_name).map_err(
             |error| match error.kind() {
@@ -223,12 +246,6 @@ impl VaultRoot {
                 error => error,
             })?
             .relative;
-        let directory = self.open_dir_exact(&actual).map_err(|e| match e {
-            VaultError::Io(error) if error.kind() == io::ErrorKind::NotADirectory => {
-                VaultError::DirectoryNotFound(relative.to_owned())
-            }
-            error => error,
-        })?;
         let matcher = glob
             .map(|pattern| {
                 Glob::new(pattern)
@@ -237,30 +254,74 @@ impl VaultRoot {
             })
             .transpose()?;
         let mut results = Vec::new();
-        let mut pending = vec![(actual, directory)];
-        while let Some((base, current)) = pending.pop() {
-            for entry in dir_entries(&current)? {
-                let entry = entry?;
-                let name = entry.file_name();
-                if name.to_str().is_none_or(|name| name.starts_with('.')) {
-                    continue;
+        self.visit_entries(
+            &actual,
+            recursive,
+            super::exclude::is_visible_path,
+            || Ok(()),
+            |path, _| {
+                if matcher.as_ref().is_none_or(|m| m.is_match(path)) {
+                    results.push(path.to_owned());
                 }
-                let path = vault_path::portable_native(&base.join(&name))?;
-                if recursive && entry.file_type()?.is_dir() {
-                    let dir = current.open_dir_nofollow(&name)?;
-                    #[cfg(windows)]
-                    if is_link(&dir.dir_metadata()?) {
-                        continue;
-                    }
-                    pending.push((path.clone(), dir));
-                }
-                if matcher.as_ref().is_none_or(|m| m.is_match(&path)) {
-                    results.push(path);
-                }
+                Ok(())
+            },
+        )
+        .map_err(|error| {
+            if is_missing_entry(&error) {
+                VaultError::DirectoryNotFound(relative.to_owned())
+            } else {
+                error
             }
-        }
+        })?;
         results.sort();
         Ok(results)
+    }
+
+    /// Walk addressable entries without following links. Queue native relative
+    /// paths so a wide directory never holds all its children's handles open.
+    pub(super) fn visit_entries(
+        &self,
+        directory: &Path,
+        recursive: bool,
+        include_name: impl Fn(&Path) -> bool,
+        check: impl Fn() -> VaultResult<()>,
+        mut visit: impl FnMut(&Path, bool) -> VaultResult<()>,
+    ) -> VaultResult<()> {
+        let mut pending = vec![directory.to_owned()];
+        while let Some(base) = pending.pop() {
+            check()?;
+            let current = match self.open_dir_exact(&base) {
+                Err(error) if base != directory && skip_changed_entry(&error) => continue,
+                other => other?,
+            };
+            #[cfg(test)]
+            crate::test_helpers::count_io(&crate::test_helpers::INDEX_DIRECTORY_VISITS);
+            for entry in dir_entries(&current)? {
+                check()?;
+                let entry = entry?;
+                let name = entry.file_name();
+                if !include_name(Path::new(&name)) {
+                    continue;
+                }
+                let native = base.join(name);
+                let path = match vault_path::portable_native(&native) {
+                    Err(error @ VaultError::InvalidPath(_)) => {
+                        tracing::warn!(path = %native.display(), %error, "skipping an unrepresentable vault entry");
+                        continue;
+                    }
+                    other => other?,
+                };
+                let kind = match entry.file_type() {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    other => other?,
+                };
+                if recursive && kind.is_dir() {
+                    pending.push(path.clone());
+                }
+                visit(&path, kind.is_file())?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -886,6 +947,61 @@ mod tests {
 #[cfg(test)]
 mod confinement_tests {
     use super::*;
+
+    #[test]
+    fn traversal_continues_when_an_enumerated_directory_disappears() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = VaultRoot::open(temp.path()).unwrap();
+        std::fs::create_dir(temp.path().join("removed")).unwrap();
+        root.create_file(Path::new("kept/note.md"), "visible")
+            .unwrap();
+        let mut files = Vec::new();
+        root.visit_entries(
+            Path::new(""),
+            true,
+            |_| true,
+            || Ok(()),
+            |path, is_file| {
+                if path == Path::new("removed") {
+                    std::fs::remove_dir(temp.path().join(path))?;
+                } else if is_file {
+                    files.push(path.to_owned());
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(files, [Path::new("kept/note.md")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn moving_a_note_alias_preserves_its_target() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = VaultRoot::open(temp.path()).unwrap();
+        root.create_file(Path::new("note.md"), "first").unwrap();
+        root.create_file(Path::new("other/note.md"), "second")
+            .unwrap();
+        let alias = Path::new("alias.md");
+        symlink("note.md", temp.path().join(alias)).unwrap();
+        for destination in ["other/alias.md", "missing/alias.md"] {
+            assert!(matches!(
+                root.move_file(alias, Path::new(destination)),
+                Err(VaultError::InvalidPath(_))
+            ));
+            assert_eq!(root.read_file(alias).unwrap(), "first");
+            assert!(!temp.path().join(destination).is_symlink());
+        }
+        assert!(!temp.path().join("missing").exists());
+
+        let absolute = Path::new("absolute.md");
+        symlink(temp.path().join("note.md"), temp.path().join(absolute)).unwrap();
+        let moved = Path::new("other/moved.md");
+        root.move_file(absolute, moved).unwrap();
+        assert!(temp.path().join(moved).is_symlink());
+        assert_eq!(root.read_file(moved).unwrap(), "first");
+    }
 
     #[test]
     fn racing_moves_never_replace_the_destination() {

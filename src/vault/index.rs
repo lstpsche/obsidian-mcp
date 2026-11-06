@@ -2,16 +2,74 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use regex::Regex;
 
 use crate::error::{VaultError, VaultResult};
 use crate::models::{FileStat, NoteMetadata, SearchMatch, SearchResult, VaultStats, WikiLink};
 use crate::vault::wikilink::{LinkResolver, build_link_resolver};
-use crate::vault::{frontmatter, fs, parser, path as vault_path};
+use crate::vault::{frontmatter, fs, parser};
 
 use super::exclude::ExcludeSet;
+
+/// Native spellings for each case-folded path prefix in the tracked inventory.
+/// A directory stays present until its last tracked descendant is removed.
+#[derive(Default)]
+pub(super) struct WatchPaths {
+    spellings: std::collections::BTreeMap<(PathBuf, PathBuf), usize>,
+}
+
+impl WatchPaths {
+    fn folded(path: &Path) -> PathBuf {
+        super::path::canonical_unicode_key(&path.to_string_lossy())
+            .to_uppercase()
+            .into()
+    }
+
+    fn prefixes(path: &Path) -> impl Iterator<Item = (PathBuf, PathBuf)> {
+        path.ancestors()
+            .take_while(|p| !p.as_os_str().is_empty())
+            .map(|p| (Self::folded(p), p.to_owned()))
+    }
+
+    fn insert(&mut self, path: &Path) {
+        for key in Self::prefixes(path) {
+            *self.spellings.entry(key).or_default() += 1;
+        }
+    }
+
+    fn remove(&mut self, path: &Path) {
+        for key in Self::prefixes(path) {
+            if let std::collections::btree_map::Entry::Occupied(mut entry) =
+                self.spellings.entry(key)
+            {
+                *entry.get_mut() -= 1;
+                if *entry.get() == 0 {
+                    entry.remove();
+                }
+            }
+        }
+    }
+
+    pub(super) fn matching<'a>(
+        &'a self,
+        path: &Path,
+        descendants: bool,
+    ) -> impl Iterator<Item = &'a PathBuf> + use<'a> {
+        let folded = Self::folded(path);
+        self.spellings
+            .range((folded.clone(), PathBuf::new())..)
+            .take_while(move |((key, _), _)| {
+                if descendants {
+                    key.starts_with(&folded)
+                } else {
+                    key == &folded
+                }
+            })
+            .map(|((_, native), _)| native)
+    }
+}
 
 pub struct VaultIndex {
     notes: HashMap<PathBuf, NoteMetadata>,
@@ -24,6 +82,7 @@ pub struct VaultIndex {
     filesystem: Option<fs::VaultRoot>,
     exclude: Arc<ExcludeSet>,
     excluded_note_paths: HashSet<PathBuf>,
+    watch_paths: OnceLock<WatchPaths>,
     #[cfg(has_embeddings)]
     waiting_for_lexical: HashMap<PathBuf, tantivy::Opstamp>,
 }
@@ -49,6 +108,7 @@ impl VaultIndex {
             filesystem: None,
             exclude: Arc::default(),
             excluded_note_paths: HashSet::new(),
+            watch_paths: OnceLock::new(),
             #[cfg(has_embeddings)]
             waiting_for_lexical: HashMap::new(),
         }
@@ -97,7 +157,7 @@ impl VaultIndex {
                 FileClass::Attachment => {
                     let metadata = match filesystem.entry_metadata_exact(path) {
                         Ok(metadata) => metadata,
-                        Err(error) if is_missing(&error) => return Ok(()),
+                        Err(error) if fs::skip_changed_entry(&error) => return Ok(()),
                         Err(error) => return Err(error),
                     };
                     if metadata.is_file() && !fs::is_link(&metadata) {
@@ -201,6 +261,9 @@ impl VaultIndex {
         #[cfg(has_embeddings)]
         self.waiting_for_lexical.remove(path);
         let was_existing = self.notes.contains_key(path);
+        if !self.tracks(path) {
+            self.track_watch_path(path);
+        }
         let old_links = self.notes.get(path).map(|n| n.links.clone());
         self.excluded_note_paths.remove(path);
         if let Some(size) = self.attachments.remove(path) {
@@ -229,6 +292,11 @@ impl VaultIndex {
 
     /// Remove all contributions for a deleted file.
     pub fn remove_file(&mut self, path: &Path) {
+        if self.tracks(path)
+            && let Some(paths) = self.watch_paths.get_mut()
+        {
+            paths.remove(path);
+        }
         #[cfg(has_embeddings)]
         self.waiting_for_lexical.remove(path);
         if self.excluded_note_paths.remove(path) {
@@ -287,7 +355,7 @@ impl VaultIndex {
                 self.remove_file(path);
                 return Ok(None);
             }
-            Err(error) if !require_existing && is_missing(&error) => {
+            Err(error) if !require_existing && fs::is_missing_entry(&error) => {
                 self.remove_file(path);
                 return Ok(None);
             }
@@ -307,6 +375,7 @@ impl VaultIndex {
                 let size = metadata.len();
                 if self.attachments.get(path) != Some(&size) {
                     self.remove_file(path);
+                    self.track_watch_path(path);
                     self.attachments.insert(path.to_owned(), size);
                     self.attachment_bytes += size;
                     self.stats.total_files += 1;
@@ -400,6 +469,22 @@ impl VaultIndex {
             .keys()
             .chain(&self.excluded_note_paths)
             .chain(self.attachments.keys())
+    }
+
+    pub(super) fn watch_paths(&self) -> &WatchPaths {
+        self.watch_paths.get_or_init(|| {
+            let mut paths = WatchPaths::default();
+            for path in self.tracked_paths() {
+                paths.insert(path);
+            }
+            paths
+        })
+    }
+
+    fn track_watch_path(&mut self, path: &Path) {
+        if let Some(paths) = self.watch_paths.get_mut() {
+            paths.insert(path);
+        }
     }
 
     pub(crate) fn tracks(&self, path: &Path) -> bool {
@@ -505,6 +590,7 @@ impl VaultIndex {
         }
         self.remove_file(path);
         if super::exclude::is_visible_path(path) && is_markdown(path) {
+            self.track_watch_path(path);
             self.excluded_note_paths.insert(path.to_owned());
             self.stats.excluded_notes += 1;
         }
@@ -779,11 +865,6 @@ fn classify(path: &Path, exclude: &ExcludeSet) -> FileClass {
     }
 }
 
-pub(crate) fn is_missing(error: &VaultError) -> bool {
-    matches!(error, VaultError::NoteNotFound(_))
-        || matches!(error, VaultError::Io(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory))
-}
-
 /// A blocking task cannot be aborted once started. Keep the receiver in the
 /// requesting future so dropping that future withdraws the ongoing disk scan.
 async fn run_cold_build<T: Send + 'static>(
@@ -815,29 +896,18 @@ pub(crate) fn visit_files(
     check: impl Fn() -> VaultResult<()>,
     mut visit: impl FnMut(&Path) -> VaultResult<()>,
 ) -> VaultResult<()> {
-    let mut directories = vec![directory.to_owned()];
-    while let Some(relative) = directories.pop() {
-        check()?;
-        let directory = root.open_dir_exact(&relative)?;
-        #[cfg(test)]
-        crate::test_helpers::count_io(&crate::test_helpers::INDEX_DIRECTORY_VISITS);
-        for entry in fs::dir_entries(&directory)? {
-            check()?;
-            let entry = entry?;
-            let name = entry.file_name();
-            if !super::exclude::is_visible_path(Path::new(&name)) {
-                continue;
+    root.visit_entries(
+        directory,
+        true,
+        super::exclude::is_visible_path,
+        check,
+        |path, is_file| {
+            if is_file {
+                visit(path)?;
             }
-            let child = vault_path::portable_native(&relative.join(name))?;
-            let kind = entry.file_type()?;
-            if kind.is_dir() {
-                directories.push(child);
-            } else if kind.is_file() {
-                visit(&child)?;
-            }
-        }
-    }
-    Ok(())
+            Ok(())
+        },
+    )
 }
 
 fn read_indexed_note(root: &fs::VaultRoot, path: &Path) -> VaultResult<(NoteMetadata, String)> {
@@ -1106,6 +1176,31 @@ mod tests {
         assert_eq!(index.get_note(path).unwrap().tags, ["retained"]);
     }
 
+    #[test]
+    fn watched_prefixes_keep_distinct_native_names_until_their_last_file_is_removed() {
+        let mut paths = WatchPaths::default();
+        let first = Path::new("Café/one.md");
+        let second = Path::new("Café/two.png");
+        let alternate = Path::new("Cafe\u{301}/three.md");
+        let other = Path::new("Cafés/unrelated.md");
+        for path in [first, second, alternate, other] {
+            paths.insert(path);
+        }
+        let folder = Path::new("CAFÉ");
+        assert_eq!(paths.matching(folder, false).count(), 2);
+        assert_eq!(paths.matching(folder, true).count(), 5);
+        paths.remove(first);
+        assert_eq!(paths.matching(folder, false).count(), 2);
+        paths.remove(second);
+        assert_eq!(
+            paths.matching(folder, false).collect::<Vec<_>>(),
+            [alternate.parent().unwrap()]
+        );
+        paths.remove(alternate);
+        assert_eq!(paths.matching(folder, true).count(), 0);
+        assert_eq!(paths.matching(other, false).count(), 1);
+    }
+
     #[cfg(unix)]
     #[test]
     fn exact_observed_name_cannot_redirect_after_directory_enumeration() {
@@ -1123,7 +1218,7 @@ mod tests {
             || Ok(()),
             |path| {
                 stdfs::remove_file(&file)?;
-                assert!(is_missing(&root.open_exact(path).unwrap_err()));
+                assert!(fs::is_missing_entry(&root.open_exact(path).unwrap_err()));
                 symlink(&sentinel, &file)?;
                 assert!(read_indexed_note(&root, path).is_err());
                 Ok(())
@@ -1131,6 +1226,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stdfs::read_to_string(sentinel).unwrap(), "outside source");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cold_index_skips_attachments_if_their_open_directory_becomes_a_link() {
+        use crate::test_helpers::INDEX_DIRECTORY_VISITS;
+        use std::cell::Cell;
+        let temp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let assets = temp.path().join("assets");
+        stdfs::create_dir(&assets).unwrap();
+        stdfs::write(assets.join("photo.bin"), b"inside").unwrap();
+        stdfs::write(outside.path().join("photo.bin"), b"outside content").unwrap();
+        stdfs::write(temp.path().join("kept.md"), "# Visible").unwrap();
+        let root = fs::VaultRoot::open(temp.path()).unwrap();
+        let visits = INDEX_DIRECTORY_VISITS.get();
+        let switched = Cell::new(false);
+        let check = || {
+            // With one subdirectory, the second directory visit owns its iterator.
+            if INDEX_DIRECTORY_VISITS.get() == visits + 2 && !switched.replace(true) {
+                stdfs::rename(&assets, temp.path().join(".moved"))?;
+                std::os::unix::fs::symlink(outside.path(), &assets)?;
+            }
+            Ok(())
+        };
+        let index =
+            VaultIndex::build_sync(root, Arc::new(ExcludeSet::default()), &check, |_, _| Ok(()))
+                .unwrap();
+        assert!(switched.get());
+        assert!(index.get_note(Path::new("kept.md")).is_some());
+        assert!(index.attachments.is_empty());
     }
 
     fn setup_vault() -> TempDir {

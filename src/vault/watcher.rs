@@ -232,32 +232,17 @@ fn previous_spelling(
     index: &VaultIndex,
     actual: &Path,
 ) -> Option<(PathBuf, PathBuf)> {
-    let mut checked = std::collections::HashSet::new();
-    for tracked in index.tracked_paths() {
-        let Some((position, (previous, current))) = tracked
-            .iter()
-            .zip(actual)
-            .enumerate()
-            .find(|(_, (previous, current))| previous != current)
-        else {
-            continue;
-        };
-        let (previous_text, current_text) = (previous.to_str()?, current.to_str()?);
-        let equivalent = if previous_text.is_ascii() && current_text.is_ascii() {
-            previous_text.eq_ignore_ascii_case(current_text)
-        } else {
-            vault_path::canonical_unicode_key(previous_text).to_uppercase()
-                == vault_path::canonical_unicode_key(current_text).to_uppercase()
-        };
-        if equivalent {
-            let current: PathBuf = actual.iter().take(position + 1).collect();
-            let previous = current.with_file_name(previous);
-            if checked.insert(previous.clone())
+    let mut current = PathBuf::new();
+    for name in actual {
+        current.push(name);
+        for previous in index.watch_paths().matching(&current, false) {
+            if previous != &current
+                && previous.parent() == current.parent()
                 && filesystem
-                    .resolve_existing(&previous)
+                    .resolve_existing(previous)
                     .is_ok_and(|entry| entry.relative == current)
             {
-                return Some((previous, current));
+                return Some((previous.clone(), current));
             }
         }
     }
@@ -275,7 +260,7 @@ fn event_paths(
     let metadata = match filesystem.entry_metadata_exact(relative) {
         Ok(meta) if !super::fs::is_link(&meta) && (meta.is_dir() || meta.is_file()) => Some(meta),
         Ok(_) => None,
-        Err(error) if super::index::is_missing(&error) => None,
+        Err(error) if super::fs::skip_changed_entry(&error) => None,
         Err(error) => return Err(error),
     };
     let actual = match &metadata {
@@ -304,13 +289,12 @@ fn event_paths(
         None => (None, actual, metadata),
     };
     let relative = previous.as_deref().unwrap_or(relative);
-    for tracked in index.tracked_paths().filter(|path| {
-        path.starts_with(relative)
-            || actual
-                .as_ref()
-                .is_some_and(|current| path.starts_with(current))
-    }) {
-        paths.insert(tracked.to_owned(), Change::Remove);
+    for prefix in std::iter::once(relative).chain(actual.as_deref().filter(|p| *p != relative)) {
+        for tracked in index.watch_paths().matching(prefix, true) {
+            if tracked.starts_with(prefix) && index.tracks(tracked) {
+                paths.insert(tracked.clone(), Change::Remove);
+            }
+        }
     }
     if let (Some(metadata), Some(actual)) = (metadata, actual) {
         if metadata.is_dir() {

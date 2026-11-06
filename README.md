@@ -597,6 +597,8 @@ Always available. Full regex syntax for pattern matching across all notes.
 
 `vault_list` keeps its default JSON string-array response. With `include_metadata: true` in list mode, each indexed Markdown note instead includes `path`, filename-stem `title`, `tags`, `size`, and available filesystem timestamps from the existing index without loading note bodies. Directories, non-Markdown files, and unindexed or excluded notes remain path-only objects. Metadata is not supported in tree mode.
 
+Listings and indexes expose paths that MCP clients can address. On Unix, discovery skips a filename containing a literal backslash and logs its path. A real note with the corresponding directory separators keeps its own identity.
+
 ### Note CRUD
 
 | Tool | Parameters | Description |
@@ -611,6 +613,10 @@ Always available. Full regex syntax for pattern matching across all notes.
 | `note_move` | `from`, `to` | Move or rename a note |
 
 `note_move` checks that the source resolves to a regular file before creating destination directories and refuses to overwrite an existing destination. On macOS and Linux the source check and the atomic rename are separate kernel operations. If an external editor replaces the file with a directory between them, the move can rename that directory within the vault.
+
+Moving a note symlink moves the link itself. A relative link can be renamed within its directory. Moving it to a different directory would change where its target is resolved, so that operation returns an error. Absolute links to notes inside the vault can move across directories.
+
+`note_delete` can remove a symlink whose target is missing. Links to existing targets outside the vault still return a path error.
 
 Every tool advertises an object-shaped `outputSchema` and returns matching `structuredContent`. Existing calls retain their text format: Markdown for full note reads, JSON arrays for searches and listings, and confirmation messages for writes. Extended revision/range reads emit their typed page as JSON text as well so text-only clients see revision and continuation metadata. Structured results use `content` for text, `results` for collections, and `message` for confirmations. `vault_info`, `note_inspect`, and `note_read_many` retain their domain-specific fields; `periodic` includes an `action` discriminator.
 

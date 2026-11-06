@@ -107,25 +107,13 @@ impl VaultRoot {
                 // Absolute in-vault symlinks are supported. Native canonicalization
                 // translates their target (including intervening links) into a
                 // relative spelling. Its ambient result is never opened directly.
-                let absolute = self.path().join(&physical).join(&name);
-                let canonical = absolute.canonicalize().map_err(|error| {
-                    if error.kind() == ErrorKind::NotFound {
+                physical = self
+                    .link_target(&physical.join(&name), relative)?
+                    .ok_or_else(|| {
                         VaultError::InvalidPath(format!(
                             "dangling vault link: {}",
                             relative.display()
                         ))
-                    } else {
-                        VaultError::Io(error)
-                    }
-                })?;
-                physical =
-                    path::relative_from_absolute(self.path(), &canonical).map_err(|error| {
-                        match error {
-                            VaultError::OutsideVault(_) => {
-                                VaultError::OutsideVault(relative.to_owned())
-                            }
-                            error => error,
-                        }
                     })?;
                 if !last {
                     directory = self.open_dir_exact(&physical)?;
@@ -142,6 +130,25 @@ impl VaultRoot {
             absolute: self.path().join(&relative),
             relative,
         })
+    }
+
+    /// Validate an existing link target. Unlink can also operate on a broken leaf.
+    pub(super) fn link_target(
+        &self,
+        entry: &Path,
+        requested: &Path,
+    ) -> VaultResult<Option<PathBuf>> {
+        let target = match self.path().join(entry).canonicalize() {
+            Ok(target) => target,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        path::relative_from_absolute(self.path(), &target)
+            .map(Some)
+            .map_err(|error| match error {
+                VaultError::OutsideVault(_) => VaultError::OutsideVault(requested.to_owned()),
+                other => other,
+            })
     }
 
     /// Open a physical directory obtained from a confined walk. Intermediate

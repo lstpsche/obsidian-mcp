@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use super::fs::VaultRoot;
-use cap_fs_ext::DirExt;
 use chrono::{Datelike, Local, NaiveDate};
 use regex::Regex;
 use serde::Deserialize;
@@ -385,24 +384,24 @@ pub(super) fn list_rooted(
     limit: usize,
 ) -> VaultResult<Vec<PathBuf>> {
     let folder = Path::new(config.folder.as_deref().unwrap_or(""));
-    let scan_dir = match root.open_dir(folder) {
-        Ok(dir) => dir,
+    let directory = match root.resolve_existing(folder) {
+        Ok(resolved) => resolved.relative,
         Err(error) if error.is_not_found() => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
     let chrono_fmt = momentjs_to_chrono(&config.format);
     let has_quarter = chrono_fmt.contains(QUARTER_PLACEHOLDER);
     let mut dated_paths = Vec::new();
-    let mut dirs = vec![(PathBuf::new(), scan_dir)];
-    while let Some((prefix, dir)) = dirs.pop() {
-        for entry in super::fs::dir_entries(&dir)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let relative = prefix.join(&name);
-            let ty = entry.file_type()?;
-            if ty.is_dir() {
-                dirs.push((relative, dir.open_dir_nofollow(&name)?));
-            } else if ty.is_file() && relative.extension().is_some_and(|ext| ext == "md") {
+    root.visit_entries(
+        &directory,
+        true,
+        |_| true, // Explicit date formats can include dot-prefixed directories.
+        || Ok(()),
+        |path, is_file| {
+            if is_file && path.extension().is_some_and(|ext| ext == "md") {
+                let relative = path
+                    .strip_prefix(&directory)
+                    .map_err(|_| VaultError::OutsideVault(path.to_owned()))?;
                 let stem = relative.with_extension("");
                 let text = stem
                     .to_string_lossy()
@@ -411,8 +410,9 @@ pub(super) fn list_rooted(
                     dated_paths.push((date, folder.join(relative)));
                 }
             }
-        }
-    }
+            Ok(())
+        },
+    )?;
     dated_paths.sort_by_key(|x| std::cmp::Reverse(x.0));
     dated_paths.truncate(limit);
 
