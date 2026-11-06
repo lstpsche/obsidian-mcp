@@ -2121,10 +2121,6 @@ impl CacheFile {
             .transpose()
     }
 
-    fn parent_and_name(&self) -> VaultResult<(cap_std::fs::Dir, &std::ffi::OsStr)> {
-        self.root.parent(&self.relative, true)
-    }
-
     pub(crate) fn publish(
         &self,
         bytes: &[u8],
@@ -2137,7 +2133,7 @@ impl CacheFile {
         if !active() {
             return Ok(false);
         }
-        let (dir, name) = self.parent_and_name()?;
+        let (dir, name) = self.root.parent(&self.relative, true)?;
         match dir.symlink_metadata(name) {
             Ok(meta) if super::fs::is_link(&meta) => {
                 return Err(VaultError::InvalidPath(format!(
@@ -2149,10 +2145,7 @@ impl CacheFile {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err.into()),
         }
-        let temp = CheckpointTemp::write_in(&dir, |file| {
-            file.write_all(bytes)?;
-            Ok(())
-        })?;
+        let temp = CheckpointTemp::write_in(&dir, bytes)?;
         // Retirement only waits for the atomic replacement. Preparing and syncing
         // a large checkpoint cannot stall withdrawal of a connection's rights.
         let _commit = owner.map(|(_, gate)| gate.lock().unwrap_or_else(|error| error.into_inner()));
@@ -2172,10 +2165,7 @@ struct CheckpointTemp<'a> {
 }
 
 impl<'a> CheckpointTemp<'a> {
-    fn write_in(
-        dir: &'a cap_std::fs::Dir,
-        write: impl FnOnce(&mut cap_std::fs::File) -> VaultResult<()>,
-    ) -> VaultResult<Self> {
+    fn write_in(dir: &'a cap_std::fs::Dir, bytes: &[u8]) -> VaultResult<Self> {
         let mut id = [0u8; 16];
         getrandom::fill(&mut id)
             .map_err(|err| cache_error(format!("cannot name temporary checkpoint: {err}")))?;
@@ -2193,7 +2183,7 @@ impl<'a> CheckpointTemp<'a> {
             name,
             cleanup: true,
         };
-        write(&mut file)?;
+        file.write_all(bytes)?;
         file.flush()?;
         file.sync_all()?;
         Ok(guard)
@@ -2215,70 +2205,6 @@ impl Drop for CheckpointTemp<'_> {
             tracing::warn!(error = %err, "failed to remove temporary checkpoint");
         }
     }
-}
-
-// ── Legacy cache relocation ────────────────────────────────────────────
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LegacyCacheMigration {
-    NotFound,
-    AlreadyPresent(PathBuf),
-    Migrated(PathBuf),
-}
-
-pub fn migrate_legacy_cache_to_daemon_store(
-    vault_root: &Path,
-    semantic_home: &Path,
-) -> VaultResult<LegacyCacheMigration> {
-    let vault_id = crate::daemon::home::compute_vault_id(vault_root)?;
-    let source_root = super::fs::VaultRoot::open(vault_root)?;
-    std::fs::create_dir_all(semantic_home)?;
-    let target_root = super::fs::VaultRoot::open(semantic_home)?;
-    let target_rel = Path::new("vaults").join(vault_id).join("embeddings.bin");
-    let target_path = semantic_home.join(&target_rel);
-    let target = CacheFile::new(target_root, target_rel);
-    let sources = [
-        ".obsidian-mcp/embeddings/embeddings.bin",
-        ".obsidian/obsidian-mcp/embeddings.bin",
-    ]
-    .map(|name| CacheFile::new(source_root.clone(), name.into()));
-    migrate_cache_candidates(&sources, &target, &target_path)
-}
-
-fn migrate_cache_candidates(
-    sources: &[CacheFile],
-    target: &CacheFile,
-    target_path: &Path,
-) -> VaultResult<LegacyCacheMigration> {
-    if target.open_optional()?.is_some() {
-        return Ok(LegacyCacheMigration::AlreadyPresent(target_path.to_owned()));
-    }
-    for source in sources {
-        let Some(file) = source.open_optional()? else {
-            continue;
-        };
-        if file.metadata()?.len() > MAX_CACHE_BYTES {
-            return Err(cache_error("embedding cache is too large to relocate"));
-        }
-        let (dir, name) = target.parent_and_name()?;
-        let temp = CheckpointTemp::write_in(&dir, |tempfile| {
-            let copied = std::io::copy(&mut file.take(MAX_CACHE_BYTES + 1), tempfile)?;
-            if copied > MAX_CACHE_BYTES {
-                return Err(cache_error("embedding cache is too large to relocate"));
-            }
-            Ok(())
-        })?;
-        // A same-directory hard link publishes atomically without replacing a
-        // concurrently created destination. The guard unlinks the staging name.
-        return match dir.hard_link(&temp.name, &dir, name) {
-            Ok(()) => Ok(LegacyCacheMigration::Migrated(target_path.to_owned())),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                Ok(LegacyCacheMigration::AlreadyPresent(target_path.to_owned()))
-            }
-            Err(err) => Err(err.into()),
-        };
-    }
-    Ok(LegacyCacheMigration::NotFound)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -3332,211 +3258,6 @@ mod tests {
         assert!(cache.publish(b"must stay inside", None).is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"outside sentinel");
         assert_eq!(std::fs::read_dir(external.path()).unwrap().count(), 1);
-    }
-
-    fn migrate_cache_candidates_to_path(
-        sources: &[PathBuf],
-        target: &Path,
-    ) -> VaultResult<LegacyCacheMigration> {
-        let base = target.parent().unwrap().parent().unwrap();
-        let root = super::super::fs::VaultRoot::open(base)?;
-        let sources = sources
-            .iter()
-            .map(|p| CacheFile::new(root.clone(), p.strip_prefix(base).unwrap().to_owned()))
-            .collect::<Vec<_>>();
-        let destination = CacheFile::new(root, target.strip_prefix(base).unwrap().to_owned());
-        migrate_cache_candidates(&sources, &destination, target)
-    }
-
-    #[test]
-    fn migrate_legacy_cache_copies_once_and_keeps_source() {
-        let vault_root = tempfile::tempdir().expect("temp vault root");
-        let semantic_home = tempfile::tempdir().expect("temp semantic home");
-        std::fs::create_dir_all(vault_root.path().join(".obsidian")).expect("create .obsidian");
-
-        let source = vault_root
-            .path()
-            .join(".obsidian")
-            .join("obsidian-mcp")
-            .join("embeddings.bin");
-        std::fs::create_dir_all(source.parent().expect("source parent"))
-            .expect("create source dir");
-        std::fs::write(&source, b"legacy-cache-bytes").expect("write legacy cache");
-
-        let first = migrate_legacy_cache_to_daemon_store(vault_root.path(), semantic_home.path())
-            .expect("first migration should succeed");
-        let migrated_path = match first {
-            LegacyCacheMigration::Migrated(path) => path,
-            other => panic!("expected migrated outcome, got: {other:?}"),
-        };
-        assert!(source.exists(), "source cache should not be deleted");
-        assert!(migrated_path.exists(), "target cache should be created");
-        assert_eq!(
-            std::fs::read(&source).expect("read source bytes"),
-            std::fs::read(&migrated_path).expect("read target bytes")
-        );
-
-        let second = migrate_legacy_cache_to_daemon_store(vault_root.path(), semantic_home.path())
-            .expect("second migration should succeed");
-        assert_eq!(second, LegacyCacheMigration::AlreadyPresent(migrated_path));
-    }
-
-    #[test]
-    fn migrate_legacy_cache_without_source_is_noop() {
-        let vault_root = tempfile::tempdir().expect("temp vault root");
-        let semantic_home = tempfile::tempdir().expect("temp semantic home");
-        std::fs::create_dir_all(vault_root.path().join(".obsidian")).expect("create .obsidian");
-
-        let outcome = migrate_legacy_cache_to_daemon_store(vault_root.path(), semantic_home.path())
-            .expect("migration should succeed");
-        assert_eq!(outcome, LegacyCacheMigration::NotFound);
-    }
-
-    #[test]
-    fn migrate_legacy_cache_rejects_oversized_source_before_copying() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let source = directory.path().join("oversized.bin");
-        let target = directory.path().join("target").join("embeddings.bin");
-        let source_file = std::fs::File::create(&source).expect("create sparse source");
-        source_file
-            .set_len(MAX_CACHE_BYTES + 1)
-            .expect("extend sparse source");
-
-        let error = migrate_cache_candidates_to_path(&[source], &target)
-            .expect_err("oversized migration must fail");
-
-        assert!(error.to_string().contains("too large to relocate"));
-        assert!(!target.exists(), "oversized cache must not be published");
-    }
-
-    #[test]
-    fn migrate_legacy_cache_checks_daemon_store_first() {
-        let vault_root = tempfile::tempdir().expect("temp vault root");
-        let semantic_home = tempfile::tempdir().expect("temp semantic home");
-        let vault_id = crate::daemon::home::compute_vault_id(vault_root.path()).unwrap();
-        let target = semantic_home
-            .path()
-            .join("vaults")
-            .join(vault_id)
-            .join("embeddings.bin");
-        std::fs::create_dir_all(target.parent().expect("target parent"))
-            .expect("create target dir");
-        std::fs::write(&target, b"daemon-cache-bytes").expect("write target cache");
-
-        let outcome = migrate_legacy_cache_to_daemon_store(vault_root.path(), semantic_home.path())
-            .expect("migration should succeed");
-
-        assert_eq!(outcome, LegacyCacheMigration::AlreadyPresent(target));
-    }
-
-    #[test]
-    fn migrate_legacy_cache_uses_active_local_source() {
-        let vault_root = tempfile::tempdir().expect("temp vault root");
-        let semantic_home = tempfile::tempdir().expect("temp semantic home");
-
-        let new_source = vault_root
-            .path()
-            .join(".obsidian-mcp")
-            .join("embeddings")
-            .join("embeddings.bin");
-        std::fs::create_dir_all(new_source.parent().expect("parent")).expect("create new dir");
-        std::fs::write(&new_source, b"new-cache-bytes").expect("write new cache");
-
-        let result = migrate_legacy_cache_to_daemon_store(vault_root.path(), semantic_home.path())
-            .expect("migration should succeed");
-        let migrated_path = match result {
-            LegacyCacheMigration::Migrated(path) => path,
-            other => panic!("expected Migrated, got: {other:?}"),
-        };
-        assert!(new_source.exists(), "new source should not be deleted");
-        assert_eq!(
-            std::fs::read(&new_source).expect("read new source"),
-            std::fs::read(&migrated_path).expect("read target"),
-        );
-    }
-
-    #[test]
-    fn migrate_legacy_cache_prefers_active_location_over_older_legacy_location() {
-        let vault_root = tempfile::tempdir().expect("temp vault root");
-        let semantic_home = tempfile::tempdir().expect("temp semantic home");
-
-        let legacy_source = vault_root
-            .path()
-            .join(".obsidian")
-            .join("obsidian-mcp")
-            .join("embeddings.bin");
-        std::fs::create_dir_all(legacy_source.parent().expect("parent"))
-            .expect("create legacy dir");
-        std::fs::write(&legacy_source, b"legacy-bytes").expect("write legacy");
-
-        let new_source = vault_root
-            .path()
-            .join(".obsidian-mcp")
-            .join("embeddings")
-            .join("embeddings.bin");
-        std::fs::create_dir_all(new_source.parent().expect("parent")).expect("create new dir");
-        std::fs::write(&new_source, b"new-bytes").expect("write new");
-
-        let result = migrate_legacy_cache_to_daemon_store(vault_root.path(), semantic_home.path())
-            .expect("migration should succeed");
-        let migrated_path = match result {
-            LegacyCacheMigration::Migrated(path) => path,
-            other => panic!("expected Migrated, got: {other:?}"),
-        };
-        assert_eq!(
-            std::fs::read(&migrated_path).expect("read target"),
-            b"new-bytes",
-            "the active local cache should be preferred over the older legacy location"
-        );
-    }
-
-    #[test]
-    fn concurrent_cache_migrations_publish_one_complete_source_without_overwrite() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let first_source = directory.path().join("first.bin");
-        let second_source = directory.path().join("second.bin");
-        let target = directory.path().join("target").join("embeddings.bin");
-        let first_bytes = vec![0x11; 512 * 1024];
-        let second_bytes = vec![0x22; 512 * 1024];
-        std::fs::write(&first_source, &first_bytes).expect("write first source");
-        std::fs::write(&second_source, &second_bytes).expect("write second source");
-
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
-        let workers = [first_source, second_source]
-            .into_iter()
-            .map(|source| {
-                let barrier = std::sync::Arc::clone(&barrier);
-                let target = target.clone();
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    migrate_cache_candidates_to_path(&[source], &target)
-                        .expect("migration should resolve atomically")
-                })
-            })
-            .collect::<Vec<_>>();
-
-        barrier.wait();
-        let outcomes = workers
-            .into_iter()
-            .map(|worker| worker.join().expect("migration worker should join"))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            outcomes
-                .iter()
-                .filter(|outcome| matches!(outcome, LegacyCacheMigration::Migrated(_)))
-                .count(),
-            1
-        );
-        assert_eq!(
-            outcomes
-                .iter()
-                .filter(|outcome| matches!(outcome, LegacyCacheMigration::AlreadyPresent(_)))
-                .count(),
-            1
-        );
-
-        let published = std::fs::read(&target).expect("read published target");
-        assert!(published == first_bytes || published == second_bytes);
     }
 
     // ── resolve_provider ──────────────────────────────────────────

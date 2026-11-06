@@ -73,6 +73,8 @@ API base URLs are now validated as HTTP(S) URLs with a host and optional path. P
 
 The daemon remains on API v2 and adds `semantic_source_evidence_v1` to health capabilities. Existing v2 upgraders can still verify the newly installed daemon using their compiled handshake. New clients require the capability after any ownership-verified old-daemon reconciliation. External daemons without it are reported as unsupported and remain under their existing owner. A downgrade can rebuild an older cache projection; cross-schema vector reuse is not guaranteed.
 
+Rust library callers that used `load_ignore_patterns` can open the vault with `Vault::open(&config).await?` and read its merged rules with `vault.exclude().patterns()`. Remove calls to `migrate_legacy_cache_to_daemon_store` and matches on `LegacyCacheMigration`. The scoped daemon creates its checkpoint from the notes its active attachment permits. Legacy checkpoint files stay available for manual recovery.
+
 ## Manual smoke test for maintainers
 
 Use a temporary Cargo root, vault, semantic home, service definition, and non-default port—never a personal production service.
