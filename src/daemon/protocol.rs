@@ -8,6 +8,25 @@ pub const JSONRPC_VERSION: &str = "2.0";
 pub const DAEMON_API_VERSION: u32 = 2;
 pub const SEMANTIC_SOURCE_EVIDENCE_CAPABILITY: &str = "semantic_source_evidence_v1";
 
+pub const SCOPED_INDEXING_CAPABILITY: &str = "scoped_indexing_v1";
+pub const SEMANTIC_CAPABILITIES: [&str; 2] = [
+    SEMANTIC_SOURCE_EVIDENCE_CAPABILITY,
+    SCOPED_INDEXING_CAPABILITY,
+];
+
+pub fn semantic_capabilities() -> Vec<String> {
+    SEMANTIC_CAPABILITIES
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+pub fn missing_semantic_capability(capabilities: &[String]) -> Option<&'static str> {
+    SEMANTIC_CAPABILITIES
+        .into_iter()
+        .find(|required| !capabilities.iter().any(|reported| reported == required))
+}
+
 pub const ERR_PARSE: i64 = -32700;
 pub const ERR_INVALID_REQUEST: i64 = -32600;
 pub const ERR_METHOD_NOT_FOUND: i64 = -32601;
@@ -139,8 +158,52 @@ pub struct ShutdownResult {
     pub accepted: bool,
 }
 
+/// Client restrictions on background document processing. An explicit empty list
+/// accepts the portable and daemon operator policies.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct IndexScope {
+    pub version: u32,
+    pub exclude_patterns: Vec<String>,
+}
+
+impl IndexScope {
+    pub fn new(patterns: &[String]) -> Self {
+        Self {
+            version: 1,
+            exclude_patterns: patterns.to_vec(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != 1 {
+            return Err(format!(
+                "unsupported indexing scope version {}",
+                self.version
+            ));
+        }
+        if self.exclude_patterns.len() > 4096
+            || self
+                .exclude_patterns
+                .iter()
+                .try_fold(0usize, |size, pattern| size.checked_add(pattern.len()))
+                .is_none_or(|size| size > 256 * 1024)
+        {
+            return Err("indexing scope exceeds 4096 patterns or 256 KiB of pattern text".into());
+        }
+        Ok(())
+    }
+}
+
+impl Default for IndexScope {
+    fn default() -> Self {
+        Self::new(&[])
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct EnsureVaultParams {
+    pub index_scope: IndexScope,
     pub vault_root: String,
     #[serde(default)]
     pub watch: Option<bool>,
@@ -171,10 +234,16 @@ pub struct SemanticStatus {
 #[serde(deny_unknown_fields)]
 pub struct VaultStatusParams {
     pub vault_root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_scope: Option<IndexScope>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct EnsureVaultResult {
+    pub scope_id: String,
+    pub attachment_id: String,
     pub vault_id: String,
     pub ready: bool,
     pub watch_enabled: bool,
@@ -193,19 +262,21 @@ pub struct EnsureVaultResult {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct SearchSemanticParams {
+    pub attachment_id: String,
     pub vault_root: String,
     pub query: String,
     #[serde(default)]
     pub top_k: Option<usize>,
     #[serde(default)]
     pub include_content: Option<bool>,
-    /// Restrict ranking to these vault-relative paths; absent means the entire index.
+    /// Restrict ranking to these vault-relative paths; absent means the attached view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct SearchHybridParams {
+    pub attachment_id: String,
     pub vault_root: String,
     pub query: String,
     #[serde(default)]
@@ -216,13 +287,14 @@ pub struct SearchHybridParams {
     pub alpha: Option<f32>,
     #[serde(default)]
     pub include_content: Option<bool>,
-    /// Restrict ranking to these vault-relative paths; absent means the entire index.
+    /// Restrict ranking to these vault-relative paths; absent means the attached view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct OpenHintParams {
+    pub attachment_id: String,
     pub vault_root: String,
     pub path: String,
 }
@@ -349,26 +421,24 @@ mod tests {
     }
 
     #[test]
-    fn ensure_vault_decodes_legacy_v1_without_progress_fields() {
-        let result: EnsureVaultResult = serde_json::from_value(serde_json::json!({
-            "vault_id": "legacy",
-            "ready": true,
-            "watch_enabled": true,
-            "model_name": "legacy-model"
-        }))
-        .unwrap();
-
-        assert!(result.ready);
-        assert_eq!(result.phase, None);
-        assert_eq!(result.indexed_notes, None);
-        assert_eq!(result.total_notes, None);
-        assert_eq!(result.pending_notes, None);
-        assert_eq!(result.last_error, None);
+    fn attach_rejects_a_legacy_result_without_a_scoped_holder() {
+        let legacy = serde_json::json!({
+            "vault_id": "legacy", "ready": true, "watch_enabled": true, "model_name": "model"
+        });
+        assert!(serde_json::from_value::<EnsureVaultResult>(legacy).is_err());
+        assert!(
+            serde_json::from_value::<EnsureVaultParams>(
+                serde_json::json!({"vault_root": "/vault"})
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn ensure_vault_round_trips_additive_progress_fields() {
         let expected = EnsureVaultResult {
+            scope_id: "scope".into(),
+            attachment_id: "holder".into(),
             vault_id: "current".into(),
             ready: false,
             watch_enabled: true,

@@ -16,7 +16,7 @@ use crate::vault::embedding_runtime::{EmbeddingRuntime, EmbeddingRuntimeStatus};
 #[cfg(has_embeddings)]
 use crate::vault::embeddings::Embedder;
 
-use super::watcher;
+use crate::vault::{fs::VaultRoot, watcher::PendingWatcher};
 
 #[cfg(has_embeddings)]
 pub(crate) type EmbeddingLoaderFuture = std::pin::Pin<
@@ -25,7 +25,8 @@ pub(crate) type EmbeddingLoaderFuture = std::pin::Pin<
 
 pub struct VaultContext {
     vault_id: String,
-    vault_root: PathBuf,
+    root: VaultRoot,
+    exclude: Arc<ExcludeSet>,
     model_name: String,
     index: Arc<RwLock<VaultIndex>>,
     tantivy: Arc<TantivyIndex>,
@@ -37,53 +38,47 @@ pub struct VaultContext {
 impl VaultContext {
     pub(crate) async fn open(
         vault_id: String,
-        vault_root: PathBuf,
+        root: VaultRoot,
         model_name: String,
-        state_dir: PathBuf,
+        exclude: Arc<ExcludeSet>,
         watch_enabled: bool,
+        #[cfg(has_embeddings)] cache: crate::vault::embeddings::CacheFile,
         #[cfg(has_embeddings)] embedding_loader: EmbeddingLoaderFuture,
     ) -> VaultResult<Self> {
-        std::fs::create_dir_all(&state_dir)?;
-
-        let index = Arc::new(RwLock::new(
-            VaultIndex::build(&vault_root, Arc::new(ExcludeSet::build(vec![])?)).await?,
-        ));
-        let tantivy = {
-            let index_guard = index
-                .read()
-                .map_err(|err| VaultError::Other(format!("daemon index lock poisoned: {err}")))?;
-            TantivyIndex::build(&vault_root, index_guard.notes())?
+        let pending_watcher = if watch_enabled {
+            let watch_root = root.clone();
+            Some(
+                tokio::task::spawn_blocking(move || PendingWatcher::register(watch_root.path()))
+                    .await
+                    .map_err(|error| {
+                        VaultError::Watcher(format!("daemon watcher startup failed: {error}"))
+                    })??,
+            )
+        } else {
+            None
         };
+        let (index, tantivy) = VaultIndex::build_ranked(root.clone(), Arc::clone(&exclude)).await?;
+        let index = Arc::new(RwLock::new(index));
         let tantivy = Arc::new(tantivy);
 
         #[cfg(has_embeddings)]
         let embedding_runtime = {
             let batch_size =
                 crate::config::embedding_batch_size_from_env().map_err(VaultError::Embedding)?;
-            let cache_migration_sources = vec![
-                vault_root
-                    .join(".obsidian-mcp")
-                    .join("embeddings")
-                    .join("embeddings.bin"),
-                vault_root
-                    .join(".obsidian")
-                    .join("obsidian-mcp")
-                    .join("embeddings.bin"),
-            ];
-            EmbeddingRuntime::spawn_with_cache_sources(
-                vault_root.clone(),
+            EmbeddingRuntime::spawn_with_scoped_cache(
+                root.clone(),
                 Arc::clone(&index),
-                state_dir.join("embeddings.bin"),
-                cache_migration_sources,
+                cache,
                 batch_size,
-                true,
+                false,
                 embedding_loader,
             )
         };
 
         let context = Self {
             vault_id,
-            vault_root,
+            root,
+            exclude,
             model_name,
             index,
             tantivy,
@@ -91,12 +86,17 @@ impl VaultContext {
             embedding_runtime,
             watcher: Mutex::new(None),
         };
-
-        if watch_enabled {
-            context.ensure_watcher()?;
+        match pending_watcher {
+            Some(pending) => tokio::task::spawn_blocking(move || {
+                context.install_watcher(context.start_watcher(pending));
+                context
+            })
+            .await
+            .map_err(|error| {
+                VaultError::Watcher(format!("daemon watcher catch-up failed: {error}"))
+            }),
+            None => Ok(context),
         }
-
-        Ok(context)
     }
 
     pub fn vault_id(&self) -> &str {
@@ -104,58 +104,71 @@ impl VaultContext {
     }
 
     pub fn vault_root(&self) -> &Path {
-        &self.vault_root
+        self.root.path()
     }
 
     pub fn model_name(&self) -> &str {
         &self.model_name
     }
 
-    pub fn watch_enabled(&self) -> VaultResult<bool> {
-        let guard = self
-            .watcher
+    pub fn watch_enabled(&self) -> bool {
+        self.watcher
             .lock()
-            .map_err(|err| VaultError::Other(format!("daemon watcher lock poisoned: {err}")))?;
-        Ok(guard.is_some())
+            .unwrap_or_else(|err| err.into_inner())
+            .is_some()
     }
 
-    pub fn ensure_watcher(&self) -> VaultResult<bool> {
-        let mut guard = self
-            .watcher
+    fn start_watcher(&self, pending: PendingWatcher) -> Debouncer<ChangeWatcher> {
+        pending.start(
+            Arc::clone(&self.index),
+            Some(Arc::clone(&self.tantivy)),
+            #[cfg(has_embeddings)]
+            Some(self.embedding_runtime.clone()),
+            Arc::clone(&self.exclude),
+        )
+    }
+
+    /// A view can acquire its first watching holder after an unwatched interval.
+    /// Register before scanning so edits during catch-up are also reconciled.
+    pub(crate) async fn resume_watcher(self: &Arc<Self>) -> VaultResult<Debouncer<ChangeWatcher>> {
+        let context = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let mut pending = PendingWatcher::register(context.root.path())?;
+            pending.request_rescan();
+            Ok(context.start_watcher(pending))
+        })
+        .await
+        .map_err(|error| VaultError::Watcher(format!("daemon watcher startup failed: {error}")))?
+    }
+
+    pub(crate) fn install_watcher(&self, watcher: Debouncer<ChangeWatcher>) {
+        *self.watcher.lock().unwrap_or_else(|err| err.into_inner()) = Some(watcher);
+    }
+
+    pub(crate) fn stop_watcher(&self) {
+        self.watcher
             .lock()
-            .map_err(|err| VaultError::Other(format!("daemon watcher lock poisoned: {err}")))?;
+            .unwrap_or_else(|err| err.into_inner())
+            .take();
+    }
 
-        if guard.is_some() {
-            return Ok(true);
-        }
-
+    pub(crate) fn activate(&self) {
         #[cfg(has_embeddings)]
-        let debouncer = watcher::start_watcher(
-            self.vault_root.clone(),
-            Arc::clone(&self.index),
-            Some(Arc::clone(&self.tantivy)),
-            self.embedding_runtime.clone(),
-            Arc::new(ExcludeSet::build(vec![])?),
-        )?;
+        self.embedding_runtime.activate();
+    }
 
-        #[cfg(not(has_embeddings))]
-        let debouncer = watcher::start_watcher(
-            self.vault_root.clone(),
-            Arc::clone(&self.index),
-            Some(Arc::clone(&self.tantivy)),
-            Arc::new(ExcludeSet::build(vec![])?),
-        )?;
-
-        *guard = Some(debouncer);
-        Ok(true)
+    pub(crate) fn retire(&self) {
+        #[cfg(has_embeddings)]
+        self.embedding_runtime.retire();
+        self.stop_watcher();
     }
 
     pub fn read_note(&self, path: &Path) -> VaultResult<String> {
-        crate::vault::fs::read_file(&self.vault_root, path)
+        self.root.read_file(path)
     }
 
     pub fn canonical_existing_relative_path(&self, path: &Path) -> VaultResult<PathBuf> {
-        Ok(crate::vault::path::resolve_existing(&self.vault_root, path)?.relative)
+        Ok(self.root.resolve_existing(path)?.relative)
     }
 
     #[cfg(has_embeddings)]
@@ -211,8 +224,8 @@ impl VaultContext {
         Ok(hits
             .into_iter()
             .map(|hit| {
-                crate::vault::semantic_results::render(
-                    &self.vault_root,
+                crate::vault::semantic_results::render_rooted(
+                    &self.root,
                     hit,
                     query,
                     include_content,
@@ -257,8 +270,8 @@ impl VaultContext {
         Ok(hits
             .into_iter()
             .map(|hit| {
-                crate::vault::semantic_results::render(
-                    &self.vault_root,
+                crate::vault::semantic_results::render_rooted(
+                    &self.root,
                     hit,
                     query,
                     include_content,

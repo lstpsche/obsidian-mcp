@@ -1,27 +1,25 @@
 //! Wire-level coverage through the shipped HTTP and stdio entry points.
 
-use std::net::TcpListener;
+#[path = "common/http_listening.rs"]
+mod http_listening;
+#[path = "common/http_rpc.rs"]
+mod http_rpc;
+use http_rpc::{MODERN, rpc_response};
 use std::process::Stdio;
 use std::time::Duration;
 
-use reqwest::{Client, RequestBuilder, Response, StatusCode};
+use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::time::{Instant, sleep, timeout};
+use tokio::time::timeout;
 
-const MODERN: &str = "2026-07-28";
 const LEGACY: &str = "2025-11-25";
 const NOTE: &str = "# Transport test\nA note served through MCP.\n";
 
 fn server_command(vault: &TempDir) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_obsidian-mcp"));
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("OBSIDIAN_") {
-            command.env_remove(key);
-        }
-    }
+    let mut command = http_listening::isolated_command(env!("CARGO_BIN_EXE_obsidian-mcp"));
     command
         .arg(vault.path())
         .env("OBSIDIAN_WATCH", "false")
@@ -54,18 +52,20 @@ impl HttpServer {
     }
 
     async fn start_on_host(filter: &str, host: &str) -> Self {
-        let vault = temporary_vault();
-        let port = TcpListener::bind((host, 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let child = server_command(&vault)
-            .args(["--http", "--host", host, "--port", &port.to_string()])
+        Self::start_with_vault(filter, host, temporary_vault()).await
+    }
+
+    async fn start_with_vault(filter: &str, host: &str, vault: TempDir) -> Self {
+        let mut child = server_command(&vault)
+            .args(["--http", "--host", host, "--port", "0"])
             .env("OBSIDIAN_TOOLS", filter)
+            .env("OBSIDIAN_LOG_LEVEL", "info")
+            .env("NO_COLOR", "1")
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut server = Self {
+        let address = http_listening::ready(&mut child).await.unwrap();
+        Self {
             child,
             vault,
             client: Client::builder()
@@ -73,65 +73,12 @@ impl HttpServer {
                 .timeout(Duration::from_secs(10))
                 .build()
                 .unwrap(),
-            url: format!(
-                "http://{}",
-                std::net::SocketAddr::new(host.parse().unwrap(), port)
-            ),
-        };
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            assert!(server.child.try_wait().unwrap().is_none(), "server exited");
-            match server
-                .client
-                .get(format!("{}/health", server.url))
-                .send()
-                .await
-            {
-                Ok(response) => {
-                    assert_eq!(response.status(), StatusCode::OK);
-                    let health: Value =
-                        serde_json::from_str(&response.text().await.unwrap()).unwrap();
-                    assert_eq!(health["server"], "obsidian-mcp");
-                    assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
-                    break;
-                }
-                Err(error) if error.is_connect() && Instant::now() < deadline => {
-                    sleep(Duration::from_millis(25)).await;
-                }
-                Err(error) => panic!("server health probe failed: {error}"),
-            }
+            url: format!("http://{address}"),
         }
-        server
     }
 
-    fn request(&self, method: &str, mut params: Value, version: &str) -> RequestBuilder {
-        if version == MODERN {
-            params["_meta"] = json!({
-                "io.modelcontextprotocol/protocolVersion": MODERN,
-                "io.modelcontextprotocol/clientInfo": {"name": "openai-mcp", "version": "1.0.0"},
-                "io.modelcontextprotocol/clientCapabilities": {
-                    "experimental": {"openai/visibility": {"enabled": true}},
-                    "extensions": {"io.modelcontextprotocol/ui": {"mimeTypes": ["text/html;profile=mcp-app"]}}
-                }
-            });
-        }
-        let mut request = self
-            .client
-            .post(format!("{}/mcp", self.url))
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json, text/event-stream")
-            .header("Mcp-Protocol-Version", version)
-            .header("User-Agent", "openai-mcp/1.0.0");
-        if version == MODERN {
-            request = request.header("Mcp-Method", method);
-            if method == "tools/call" {
-                request = request.header("Mcp-Name", params["name"].as_str().unwrap());
-            }
-        }
-        request.body(
-            json!({"jsonrpc": "2.0", "id": "transport-test", "method": method, "params": params})
-                .to_string(),
-        )
+    fn request(&self, method: &str, params: Value, version: &str) -> RequestBuilder {
+        http_rpc::request(&self.client, &self.url, method, params, version)
     }
 
     async fn initialize(&self, filter: &str) -> String {
@@ -176,32 +123,6 @@ impl HttpServer {
     }
 }
 
-async fn rpc_response(response: Response) -> Value {
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .map(|value| value.to_str().unwrap().to_owned());
-    let body = response.text().await.unwrap();
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let value = match content_type.as_deref() {
-        Some("application/json") => serde_json::from_str::<Value>(&body).unwrap(),
-        Some("text/event-stream") => {
-            let messages: Vec<Value> = body
-                .lines()
-                .filter_map(|line| line.strip_prefix("data: "))
-                .filter(|data| !data.is_empty())
-                .map(|data| serde_json::from_str(data).unwrap())
-                .collect();
-            assert_eq!(messages.len(), 1, "{body}");
-            messages.into_iter().next().unwrap()
-        }
-        other => panic!("unexpected content type {other:?}: {body}"),
-    };
-    assert_eq!(value["id"], "transport-test");
-    value
-}
-
 fn tool_names(response: &Value) -> Vec<&str> {
     let mut names: Vec<_> = response["result"]["tools"]
         .as_array()
@@ -211,6 +132,124 @@ fn tool_names(response: &Value) -> Vec<&str> {
         .collect();
     names.sort_unstable();
     names
+}
+
+#[tokio::test]
+async fn simultaneous_http_children_serve_their_respective_vaults() {
+    async fn check(host: &str, marker: &str) {
+        let vault = temporary_vault();
+        std::fs::write(vault.path().join("identity.md"), marker).unwrap();
+        let server = HttpServer::start_with_vault("read", host, vault).await;
+        let read = rpc_response(
+            server
+                .request(
+                    "tools/call",
+                    json!({
+                        "name": "note_read", "arguments": {"path": "identity.md"}
+                    }),
+                    MODERN,
+                )
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(read["result"]["content"][0]["text"], marker);
+        server.stop().await;
+    }
+
+    tokio::join!(
+        check("127.0.0.1", "first"),
+        check("127.0.0.1", "second"),
+        check("::1", "third")
+    );
+}
+
+#[tokio::test]
+async fn http_child_exit_reports_startup_diagnostics() {
+    let vault = temporary_vault();
+    let mut child = server_command(&vault)
+        .args(["--http"])
+        .env("OBSIDIAN_HTTP_PORT", "invalid-port")
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let error = http_listening::ready(&mut child)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("OBSIDIAN_HTTP_PORT"), "{error}");
+    assert!(!child.wait().await.unwrap().success());
+}
+
+#[tokio::test]
+async fn invalid_lifecycle_options_leave_the_configured_listener_running() {
+    let mut server = HttpServer::start("read").await;
+    let endpoint = reqwest::Url::parse(&server.url).unwrap();
+    let port = endpoint.port_or_known_default().unwrap().to_string();
+    for (command, flags) in [
+        ("stop", &["--port", "invalid-port"][..]),
+        ("restart", &["--host", "localhost"][..]),
+        ("serve", &["--port"][..]),
+        ("stop", &["--prot", "8080"][..]),
+    ] {
+        let output = http_listening::isolated_command(env!("CARGO_BIN_EXE_obsidian-mcp"))
+            .arg(command)
+            .args(flags)
+            .env("OBSIDIAN_HTTP_PORT", &port)
+            .env("OBSIDIAN_VAULT_PATH", server.vault.path())
+            .output()
+            .await
+            .unwrap();
+        assert!(!output.status.success(), "{command} {flags:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains(flags[0]));
+        assert!(server.child.try_wait().unwrap().is_none());
+    }
+    let health = server
+        .client
+        .get(format!("{}/health", server.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+    server.stop().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn local_startup_preserves_native_vault_paths_from_arguments_and_environment() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    for (name, positional) in [(b"vault-\xff", true), (b"vault-\xfe", false)] {
+        let root = temp.path().join(OsStr::from_bytes(name));
+        std::fs::create_dir(&root).unwrap();
+        let mut command = http_listening::isolated_command(env!("CARGO_BIN_EXE_obsidian-mcp"));
+        if positional {
+            command.arg(&root);
+        } else {
+            command.env("OBSIDIAN_VAULT_PATH", &root);
+        }
+        let mut child = command
+            .args(["--http", "--host", "127.0.0.1", "--port", "0"])
+            .env("OBSIDIAN_MCP_DATA", &data)
+            .env("OBSIDIAN_SEMANTIC_MODE", "local")
+            .env("OBSIDIAN_WATCH", "false")
+            .env("NO_COLOR", "1")
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        http_listening::ready(&mut child).await.unwrap();
+        assert!(root.join(".obsidian-mcp/ignore").is_file());
+        child.kill().await.unwrap();
+    }
+    assert_eq!(
+        std::fs::read_dir(data.join("vaults-v2")).unwrap().count(),
+        2
+    );
 }
 
 #[tokio::test]
@@ -428,7 +467,11 @@ async fn http_rejects_invalid_routing_headers_and_untrusted_hosts() {
 
 async fn exchange_stdio_messages(messages: &[Value], pipelined: bool) -> Vec<Value> {
     let vault = temporary_vault();
-    let mut child = server_command(&vault)
+    exchange_stdio(server_command(&vault), messages, pipelined).await
+}
+
+async fn exchange_stdio(mut command: Command, messages: &[Value], pipelined: bool) -> Vec<Value> {
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -462,6 +505,73 @@ async fn exchange_stdio_messages(messages: &[Value], pipelined: bool) -> Vec<Val
             .success()
     );
     responses
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wide_vaults_list_addressable_notes_with_bounded_directory_handles() {
+    use rustix::process::{Resource, getrlimit, setrlimit};
+    let vault = temporary_vault();
+    let mut expected = vec!["note.md".to_owned()];
+    for i in 0..128 {
+        let dir = format!("folder-{i}");
+        std::fs::create_dir(vault.path().join(&dir)).unwrap();
+        let note = format!("{dir}/leaf.md");
+        std::fs::write(vault.path().join(&note), "real note").unwrap();
+        expected.push(note);
+    }
+    expected.sort();
+    // The literal backslash cannot represent an MCP path. Its contents
+    // must never acquire the identity of the real file in folder-0.
+    std::fs::write(vault.path().join(r"folder-0\leaf.md"), "unaddressable").unwrap();
+    std::fs::create_dir(vault.path().join(".obsidian")).unwrap();
+    std::fs::write(
+        vault.path().join(".obsidian/daily-notes.json"),
+        r#"{"folder":"","format":"[.days]/YYYY-MM-DD"}"#,
+    )
+    .unwrap();
+    std::fs::create_dir(vault.path().join(".days")).unwrap();
+    std::fs::write(vault.path().join(".days/2026-11-06.md"), "daily").unwrap();
+    let mut command = server_command(&vault);
+    command
+        .env("TOKIO_WORKER_THREADS", "1")
+        .env("OBSIDIAN_TANTIVY", "false");
+    let mut limit = getrlimit(Resource::Nofile);
+    limit.current = Some(limit.current.unwrap_or(64).min(64));
+    // SAFETY: only setrlimit runs between fork and exec in the test child.
+    unsafe {
+        command.pre_exec(move || setrlimit(Resource::Nofile, limit).map_err(Into::into));
+    }
+    let messages = [
+        modern_stdio_request(
+            1,
+            "tools/call",
+            json!({"name":"vault_list", "arguments":{"recursive":true,"glob":"**/*.md"}}),
+        ),
+        modern_stdio_request(
+            2,
+            "tools/call",
+            json!({"name":"search_text", "arguments":{"query":"unaddressable"}}),
+        ),
+        modern_stdio_request(
+            3,
+            "tools/call",
+            json!({"name":"periodic", "arguments":{"action":"list","period":"daily"}}),
+        ),
+    ];
+    let responses = exchange_stdio(command, &messages, false).await;
+    assert_eq!(
+        stdio_response(&responses, 1)["result"]["structuredContent"]["results"],
+        json!(expected)
+    );
+    assert_eq!(
+        stdio_response(&responses, 2)["result"]["structuredContent"]["results"],
+        json!([])
+    );
+    assert_eq!(
+        stdio_response(&responses, 3)["result"]["structuredContent"]["results"],
+        json!([{"path": ".days/2026-11-06.md", "date": "2026-11-06"}])
+    );
 }
 
 fn legacy_stdio_messages() -> [Value; 4] {
@@ -901,4 +1011,320 @@ async fn stop_uses_the_configured_ipv6_host_from_cli_and_environment() {
                 .is_err()
         );
     }
+}
+
+#[test]
+fn foreign_http_listener_fixture() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    let Ok(bind) = std::env::var("OBSIDIAN_TEST_FOREIGN_HTTP_BIND") else {
+        return;
+    };
+    let listener = TcpListener::bind(bind).unwrap();
+    eprintln!(
+        "HTTP MCP server listening addr={}",
+        listener.local_addr().unwrap()
+    );
+    let body = json!({
+        "status":"ok", "server":"obsidian-mcp", "version":env!("CARGO_PKG_VERSION")
+    })
+    .to_string();
+    for mut stream in listener.incoming().map(Result::unwrap) {
+        let reader = BufReader::new(&mut stream);
+        for line in reader.lines() {
+            if line.unwrap().is_empty() {
+                break;
+            }
+        }
+        let _ = write!(
+            stream,
+            "HTTP/1.0 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+    }
+}
+
+#[tokio::test]
+async fn serve_and_restart_replace_the_selected_http_instance() {
+    struct StopOnDrop(String);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new(env!("CARGO_BIN_EXE_obsidian-mcp"))
+                .args(["stop", "--host", "127.0.0.1", "--port", &self.0])
+                .output();
+        }
+    }
+
+    let mut initial = HttpServer::start("full").await;
+    let port = reqwest::Url::parse(&initial.url)
+        .unwrap()
+        .port()
+        .unwrap()
+        .to_string();
+    let _cleanup = StopOnDrop(port.clone());
+    let mut other = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "foreign_http_listener_fixture", "--nocapture"])
+        .env("OBSIDIAN_TEST_FOREIGN_HTTP_BIND", format!("[::1]:{port}"))
+        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let other_addr = http_listening::ready(&mut other).await.unwrap();
+    let log_home = tempfile::tempdir().unwrap();
+    let vaults = [temporary_vault(), temporary_vault()];
+    for (cmd, vault) in ["serve", "restart"].into_iter().zip(&vaults) {
+        std::fs::write(vault.path().join("identity.md"), cmd).unwrap();
+        let mut launcher = http_listening::isolated_command(env!("CARGO_BIN_EXE_obsidian-mcp"))
+            .args([cmd, "--host", "127.0.0.1", "--port", &port])
+            .arg(vault.path())
+            .env("HOME", log_home.path())
+            .env("XDG_STATE_HOME", log_home.path())
+            .env("LOCALAPPDATA", log_home.path())
+            .env("OBSIDIAN_WATCH", "false")
+            .env("OBSIDIAN_EMBEDDINGS", "false")
+            .env("OBSIDIAN_SEMANTIC_MODE", "local")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        timeout(Duration::from_secs(30), launcher.wait())
+            .await
+            .expect("HTTP launcher must exit after startup")
+            .unwrap();
+        let output = timeout(Duration::from_secs(5), launcher.wait_with_output())
+            .await
+            .expect("an exited HTTP launcher must release its caller's output pipes")
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let read = rpc_response(
+            initial
+                .request(
+                    "tools/call",
+                    json!({
+                        "name": "note_read", "arguments": {"path": "identity.md"}
+                    }),
+                    MODERN,
+                )
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(read["result"]["content"][0]["text"], cmd);
+        assert!(other.try_wait().unwrap().is_none());
+        assert_eq!(
+            initial
+                .client
+                .get(format!("http://{other_addr}/health"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+    initial.child.wait().await.unwrap();
+    for expected in ["stopped", "no server running"] {
+        let output = http_listening::isolated_command(env!("CARGO_BIN_EXE_obsidian-mcp"))
+            .args(["stop", "--host", "127.0.0.1", "--port", &port])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(expected),
+            "{output:?}"
+        );
+    }
+    assert!(other.try_wait().unwrap().is_none());
+    other.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn lifecycle_commands_leave_a_foreign_health_listener_running() {
+    let mut foreign = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "foreign_http_listener_fixture", "--nocapture"])
+        .env("OBSIDIAN_TEST_FOREIGN_HTTP_BIND", "127.0.0.1:0")
+        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let bind = http_listening::ready(&mut foreign).await.unwrap();
+    let vault = temporary_vault();
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    for (command, host) in [
+        ("stop", "127.0.0.1"),
+        ("serve", "127.0.0.1"),
+        ("restart", "127.0.0.1"),
+        ("stop", "0.0.0.0"),
+    ] {
+        let output = http_listening::isolated_command(env!("CARGO_BIN_EXE_obsidian-mcp"))
+            .args([command, "--host", host, "--port", &bind.port().to_string()])
+            .arg(vault.path())
+            .env("HOME", vault.path())
+            .output()
+            .await
+            .unwrap();
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{command}: {output:?}");
+        assert!(
+            error.contains("executable")
+                || error.contains("inspect")
+                || error.contains("access")
+                || error.contains("exact bind address"),
+            "{command}: {error}"
+        );
+        assert!(foreign.try_wait().unwrap().is_none());
+        assert_eq!(
+            client
+                .get(format!("http://{bind}/health"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+    foreign.kill().await.unwrap();
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn note_mutations_cannot_reach_outside_through_vault_links() {
+    let server = HttpServer::start("full").await;
+    let outside = tempfile::tempdir().unwrap();
+    let marker = outside.path().join("secret.md");
+    let missing = outside.path().join("missing.md");
+    std::fs::write(&marker, "external marker").unwrap();
+    let alias = server.vault.path().join("External.md");
+    let dangling = server.vault.path().join("Dangling.md");
+    let directory = server.vault.path().join("Linked");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        symlink(&marker, &alias).unwrap();
+        symlink(&missing, &dangling).unwrap();
+        symlink(outside.path(), &directory).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::symlink_file;
+        // Junction creation is available to standard users on NTFS.
+        let status = std::process::Command::new("cmd")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&directory)
+            .arg(outside.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        match symlink_file(&marker, &alias) {
+            Ok(()) => symlink_file(&missing, &dangling).unwrap(),
+            Err(error) if error.raw_os_error() == Some(1314) => {
+                eprintln!("file symlink privilege unavailable; exercising directory junctions");
+            }
+            Err(error) => panic!("cannot create symlink fixture: {error}"),
+        }
+    }
+    let alternate_case_link = server.vault.path().join("external.MD").is_symlink();
+    #[cfg(windows)]
+    if std::env::var_os("GITHUB_ACTIONS").is_some() {
+        assert!(
+            alternate_case_link,
+            "Windows CI must exercise file symlinks on a case-insensitive vault"
+        );
+    }
+    let mut cases = vec![
+        (
+            "note_write",
+            json!({"path":"Linked/secret.md","content":"outside write"}),
+        ),
+        (
+            "note_create",
+            json!({"path":"Linked/child/new.md","content":"outside create"}),
+        ),
+        (
+            "note_move",
+            json!({"from":"note.md","to":"Linked/moved.md"}),
+        ),
+        (
+            "note_delete",
+            json!({"path":"Linked/secret.md","confirm":true}),
+        ),
+    ];
+    if alias.is_symlink() {
+        cases.extend([
+            ("note_read", json!({"path":"External.md"})),
+            ("note_delete", json!({"path":"External.md","confirm":true})),
+            (
+                "note_insert",
+                json!({"path":"External.md","content":"outside append"}),
+            ),
+            (
+                "note_write",
+                json!({"path":"Dangling.md","content":"outside create"}),
+            ),
+        ]);
+        if alternate_case_link {
+            cases.push((
+                "note_write",
+                json!({"path":"external.MD","content":"wrong case"}),
+            ));
+        }
+    }
+    for (name, arguments) in cases {
+        let reply = rpc_response(
+            server
+                .request(
+                    "tools/call",
+                    json!({"name":name,"arguments":arguments}),
+                    MODERN,
+                )
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            reply["error"].is_object() || reply["result"]["isError"] == true,
+            "{name}: {reply}"
+        );
+        assert!(!reply.to_string().contains("external marker"));
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "external marker");
+        assert!(!missing.exists());
+        assert!(!outside.path().join("child").exists());
+        assert!(!outside.path().join("moved.md").exists());
+    }
+    assert!(server.vault.path().join("note.md").is_file());
+    if dangling.is_symlink() {
+        let reply = rpc_response(
+            server
+                .request(
+                    "tools/call",
+                    json!({"name":"note_delete","arguments":{"path":"Dangling.md","confirm":true}}),
+                    MODERN,
+                )
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            reply.get("error").is_none() && reply["result"]["isError"] != true,
+            "{reply}"
+        );
+        assert!(!dangling.is_symlink());
+        assert!(!missing.exists());
+        assert!(alias.is_symlink());
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "external marker");
+    }
+    server.stop().await;
 }

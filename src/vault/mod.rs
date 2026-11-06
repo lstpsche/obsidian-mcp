@@ -3,6 +3,7 @@
 //! Knows nothing about MCP; provides the data model and I/O primitives
 //! that tool handlers delegate to.
 
+mod data;
 pub mod exclude;
 pub mod frontmatter;
 pub mod fs;
@@ -59,7 +60,8 @@ type EmbeddingLoaderFuture = ();
 
 /// Internal shared state wrapped in `Arc` for cheap cloning.
 struct VaultInner {
-    root: PathBuf,
+    filesystem: fs::VaultRoot,
+    watch_enabled: bool,
     mcp_home: PathBuf,
     mcp_data: PathBuf,
     exclude: Arc<ExcludeSet>,
@@ -116,92 +118,34 @@ impl Vault {
         _embedding_loader: Option<EmbeddingLoaderFuture>,
         _embeddings_active: bool,
     ) -> VaultResult<Self> {
-        let root = config.vault_path.canonicalize().map_err(|_| {
-            VaultError::InvalidPath(format!(
-                "vault path does not exist: {}",
-                config.vault_path.display()
-            ))
-        })?;
-
-        if !root.join(".obsidian").is_dir() {
-            tracing::warn!(
-                path = %root.display(),
-                "vault has no .obsidian/ directory — this may be a fresh vault"
-            );
-        }
-
-        let ensure_dir = |p: &Path| -> VaultResult<()> {
-            std::fs::create_dir_all(p).map_err(|e| {
-                VaultError::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("failed to create {}: {e}", p.display()),
-                ))
-            })
-        };
-
-        // ── metadata folder setup ──
+        let filesystem = fs::VaultRoot::open(&config.vault_path)?;
+        let root = filesystem.path().to_path_buf();
+        let (data, exclude) = data::initialize(
+            &filesystem,
+            config.mcp_data_dir.as_deref(),
+            &config.exclude_patterns,
+        )?;
         let mcp_home = root.join(".obsidian-mcp");
-        ensure_dir(&mcp_home)?;
-
-        let mcp_home_canonical = mcp_home.canonicalize().ok();
-        let mcp_data = if let Some(ref data_dir) = config.mcp_data_dir {
-            let data_dir_canonical = data_dir.canonicalize().ok();
-            if data_dir == &mcp_home || data_dir_canonical.as_ref() == mcp_home_canonical.as_ref() {
-                tracing::debug!("OBSIDIAN_MCP_DATA resolves to .obsidian-mcp, treating as unset");
-                mcp_home.clone()
-            } else {
-                let slug = crate::config::vault_slug(&root);
-                let candidate = data_dir.join("vaults").join(&slug);
-                if candidate.starts_with(&root) {
-                    tracing::warn!(
-                        path = %candidate.display(),
-                        "OBSIDIAN_MCP_DATA resolves to inside the vault — \
-                         consider a path outside the vault for cloud sync benefits"
-                    );
-                }
-                candidate
-            }
-        } else {
-            mcp_home.clone()
-        };
-
-        let ignore_path = mcp_home.join("ignore");
-        if !ignore_path.exists()
-            && let Err(e) = std::fs::write(&ignore_path, "")
-        {
-            tracing::warn!(path = %ignore_path.display(), error = %e,
-                "failed to create default ignore file");
-        }
-
-        if mcp_data != mcp_home {
-            ensure_dir(&mcp_data)?;
-        }
-
-        ensure_dir(&mcp_data.join("embeddings"))?;
-
-        // ── exclusion patterns ──
-        let mut patterns = exclude::load_ignore_patterns(&mcp_home, &mcp_data);
-        patterns.extend(config.exclude_patterns.iter().cloned());
-        patterns.sort();
-        patterns.dedup();
-
-        let exclude = Arc::new(exclude::ExcludeSet::build(patterns)?);
-
+        let mcp_data = data.path();
+        let exclude = Arc::new(exclude);
         if !exclude.is_empty() {
-            tracing::info!(
-                patterns = ?exclude.patterns(),
-                "path exclusion active"
-            );
+            tracing::info!(rules = exclude.patterns().len(), "path exclusion active");
         }
 
-        let vi = VaultIndex::build(&root, Arc::clone(&exclude)).await?;
-
-        let tantivy = if config.tantivy {
-            let tv = TantivyIndex::build(&root, vi.notes())?;
+        let pending_watcher = config
+            .watch
+            .then(|| watcher::PendingWatcher::register(&root))
+            .transpose()?;
+        let (vi, tantivy) = if config.tantivy {
+            let (vi, tv) =
+                VaultIndex::build_ranked(filesystem.clone(), Arc::clone(&exclude)).await?;
             tracing::info!(notes = vi.notes().len(), "tantivy BM25 index built");
-            Some(Arc::new(tv))
+            (vi, Some(Arc::new(tv)))
         } else {
-            None
+            (
+                VaultIndex::build_rooted(filesystem.clone(), Arc::clone(&exclude)).await?,
+                None,
+            )
         };
 
         let index = Arc::new(RwLock::new(vi));
@@ -212,12 +156,12 @@ impl Vault {
                 crate::config::embedding_batch_size_from_env().map_err(VaultError::Embedding)?;
             let model_name = config.embeddings_model.clone();
             let provider = config.embedding_provider;
-            let cache_path = Self::embedding_cache_path(&mcp_data);
-            let cache_migration_sources = vec![
-                root.join(".obsidian")
-                    .join("obsidian-mcp")
-                    .join("embeddings.bin"),
-            ];
+            let relative = data
+                .directory
+                .join("embeddings/scopes")
+                .join(exclude.scope_id(&root))
+                .join("embeddings.bin");
+            let cache = embeddings::CacheFile::new(data.root, relative);
             let loader = _embedding_loader.unwrap_or_else(|| {
                 Box::pin(async move {
                     let model = embeddings::EmbeddingModel::load(&model_name, provider).await?;
@@ -225,11 +169,10 @@ impl Vault {
                 })
             });
             Some(
-                embedding_runtime::EmbeddingRuntime::spawn_with_cache_sources(
-                    root.clone(),
+                embedding_runtime::EmbeddingRuntime::spawn_with_scoped_cache(
+                    filesystem.clone(),
                     Arc::clone(&index),
-                    cache_path,
-                    cache_migration_sources,
+                    cache,
                     batch_size,
                     _embeddings_active,
                     loader,
@@ -239,30 +182,20 @@ impl Vault {
             None
         };
 
-        let watcher_handle = if config.watch {
-            #[cfg(has_embeddings)]
-            let debouncer = watcher::start_watcher(
-                root.clone(),
+        let watcher_handle = pending_watcher.map(|watcher| {
+            watcher.start(
                 Arc::clone(&index),
                 tantivy.clone(),
+                #[cfg(has_embeddings)]
                 embedding_runtime.clone(),
                 Arc::clone(&exclude),
-            )?;
-            #[cfg(not(has_embeddings))]
-            let debouncer = watcher::start_watcher(
-                root.clone(),
-                Arc::clone(&index),
-                tantivy.clone(),
-                Arc::clone(&exclude),
-            )?;
-            Some(debouncer)
-        } else {
-            None
-        };
+            )
+        });
 
         Ok(Self {
             inner: Arc::new(VaultInner {
-                root,
+                filesystem,
+                watch_enabled: config.watch,
                 mcp_home,
                 mcp_data,
                 exclude,
@@ -308,7 +241,16 @@ impl Vault {
 
     /// Vault root path (canonicalized).
     pub fn root(&self) -> &Path {
-        &self.inner.root
+        self.inner.filesystem.path()
+    }
+
+    #[cfg(has_embeddings)]
+    pub(crate) fn filesystem(&self) -> &fs::VaultRoot {
+        &self.inner.filesystem
+    }
+
+    pub fn watch_enabled(&self) -> bool {
+        self.inner.watch_enabled
     }
 
     /// Always `{vault_root}/.obsidian-mcp`. Auto-created on startup.
@@ -339,39 +281,43 @@ impl Vault {
         recursive: bool,
         glob: Option<&str>,
     ) -> VaultResult<Vec<PathBuf>> {
-        fs::list_files(&self.inner.root, dir, recursive, glob)
+        self.inner.filesystem.list_files(dir, recursive, glob)
     }
 
     pub fn read_note(&self, path: &Path) -> VaultResult<String> {
-        fs::read_file(&self.inner.root, path)
+        self.inner.filesystem.read_file(path)
     }
 
     /// Observe one bounded raw note revision for source-bound context reads.
     pub fn read_source_snapshot(&self, path: &Path) -> VaultResult<source::SourceSnapshot> {
-        source::read_snapshot(&self.inner.root, path)
+        Ok(source::SourceSnapshot::new(
+            self.inner
+                .filesystem
+                .read_file_bounded(path, source::MAX_SOURCE_BYTES)?,
+        ))
     }
 
     pub fn file_stat(&self, path: &Path) -> VaultResult<FileStat> {
-        fs::file_stat(&self.inner.root, path)
+        self.inner.filesystem.file_stat(path)
     }
 
     pub fn write_note(&self, path: &Path, content: &str) -> VaultResult<()> {
         let _mutation = self.lock_mutations()?;
         frontmatter::parse_frontmatter(content)?;
-        let actual_path = fs::write_file(&self.inner.root, path, content)?;
+        let actual_path = self.inner.filesystem.write_file(path, content)?;
         self.reindex(&actual_path)?;
         Ok(())
     }
 
     pub fn append_note(&self, path: &Path, content: &str) -> VaultResult<()> {
         let _mutation = self.lock_mutations()?;
-        let combined = match fs::read_file(&self.inner.root, path) {
+        let combined = match self.inner.filesystem.read_file(path) {
             Ok(existing) => existing + content,
             Err(VaultError::NoteNotFound(_)) => content.to_owned(),
             Err(error) => return Err(error),
         };
         frontmatter::parse_frontmatter(&combined)?;
-        let actual_path = fs::append_file(&self.inner.root, path, content)?;
+        let actual_path = self.inner.filesystem.append_file(path, content)?;
         self.reindex(&actual_path)?;
         Ok(())
     }
@@ -395,7 +341,7 @@ impl Vault {
         }
         let full_content = frontmatter::rebuild_content(frontmatter, content);
         frontmatter::parse_frontmatter(&full_content)?;
-        let actual_path = fs::create_file(&self.inner.root, path, &full_content)?;
+        let actual_path = self.inner.filesystem.create_file(path, &full_content)?;
         self.reindex(&actual_path)?;
         Ok(())
     }
@@ -403,7 +349,7 @@ impl Vault {
     /// Prepend content after frontmatter (or at the start if none exists).
     pub fn prepend_note(&self, path: &Path, content: &str) -> VaultResult<()> {
         let _mutation = self.lock_mutations()?;
-        let existing = fs::read_file(&self.inner.root, path)?;
+        let existing = self.inner.filesystem.read_file(path)?;
         let new_content = match frontmatter::extract_raw_frontmatter(&existing) {
             Some((_, body_start)) => {
                 let mut result = String::with_capacity(existing.len() + content.len());
@@ -415,52 +361,34 @@ impl Vault {
             None => format!("{content}{existing}"),
         };
         frontmatter::parse_frontmatter(&new_content)?;
-        let actual_path = fs::write_file(&self.inner.root, path, &new_content)?;
+        let actual_path = self.inner.filesystem.write_file(path, &new_content)?;
         self.reindex(&actual_path)?;
         Ok(())
     }
 
     pub fn delete_note(&self, path: &Path) -> VaultResult<()> {
         let _mutation = self.lock_mutations()?;
-        let actual_path = fs::delete_file(&self.inner.root, path)?;
-        self.write_index().remove_file(&actual_path);
-        if let Some(tv) = &self.inner.tantivy {
-            tv.remove_file(&actual_path)?;
-        }
-        #[cfg(has_embeddings)]
-        if let Some(runtime) = &self.inner.embedding_runtime {
-            runtime.submit_remove(&actual_path);
-        }
-        Ok(())
+        let actual_path = self.inner.filesystem.delete_file(path)?;
+        self.reindex(&actual_path)
     }
 
     pub fn move_note(&self, from: &Path, to: &Path) -> VaultResult<PathBuf> {
         let _mutation = self.lock_mutations()?;
-        let move_result = fs::move_file(&self.inner.root, from, to)?;
-        let old_path = move_result.from;
-        let new_path = move_result.to;
-
-        self.write_index().remove_file(&old_path);
-        if let Some(tv) = &self.inner.tantivy {
-            tv.remove_file(&old_path)?;
-        }
-        #[cfg(has_embeddings)]
-        if let Some(runtime) = &self.inner.embedding_runtime {
-            runtime.submit_remove(&old_path);
-        }
-        self.reindex(&new_path)?;
-
-        Ok(new_path)
+        let move_result = self.inner.filesystem.move_file(from, to)?;
+        let old_result = self.reindex(&move_result.from);
+        let new_result = self.reindex(&move_result.to);
+        old_result.and(new_result)?;
+        Ok(move_result.to)
     }
 
     // ── patch delegation ───────────────────────────────────────────────
 
     pub fn patch_note(&self, path: &Path, request: &PatchRequest) -> VaultResult<()> {
         let _mutation = self.lock_mutations()?;
-        let content = fs::read_file(&self.inner.root, path)?;
+        let content = self.inner.filesystem.read_file(path)?;
         let patched = patch::apply_patch(&content, request, path)?;
         frontmatter::parse_frontmatter(&patched)?;
-        let actual_path = fs::write_file(&self.inner.root, path, &patched)?;
+        let actual_path = self.inner.filesystem.write_file(path, &patched)?;
         self.reindex(&actual_path)?;
         Ok(())
     }
@@ -468,7 +396,7 @@ impl Vault {
     // ── frontmatter delegation ─────────────────────────────────────────
 
     pub fn get_frontmatter(&self, path: &Path) -> VaultResult<Option<serde_json::Value>> {
-        let content = fs::read_file(&self.inner.root, path)?;
+        let content = self.inner.filesystem.read_file(path)?;
         frontmatter::parse_frontmatter(&content)
     }
 
@@ -479,20 +407,20 @@ impl Vault {
         value: serde_json::Value,
     ) -> VaultResult<()> {
         let _mutation = self.lock_mutations()?;
-        let content = fs::read_file(&self.inner.root, path)?;
+        let content = self.inner.filesystem.read_file(path)?;
         let updated = frontmatter::set_frontmatter_field(&content, key, value)?;
         frontmatter::parse_frontmatter(&updated)?;
-        let actual_path = fs::write_file(&self.inner.root, path, &updated)?;
+        let actual_path = self.inner.filesystem.write_file(path, &updated)?;
         self.reindex(&actual_path)?;
         Ok(())
     }
 
     pub fn remove_frontmatter_field(&self, path: &Path, key: &str) -> VaultResult<()> {
         let _mutation = self.lock_mutations()?;
-        let content = fs::read_file(&self.inner.root, path)?;
+        let content = self.inner.filesystem.read_file(path)?;
         let updated = frontmatter::remove_frontmatter_field(&content, key)?;
         frontmatter::parse_frontmatter(&updated)?;
-        let actual_path = fs::write_file(&self.inner.root, path, &updated)?;
+        let actual_path = self.inner.filesystem.write_file(path, &updated)?;
         self.reindex(&actual_path)?;
         Ok(())
     }
@@ -538,16 +466,19 @@ impl Vault {
     }
 
     pub fn get_document_map(&self, path: &Path) -> VaultResult<DocumentMap> {
-        let content = fs::read_file(&self.inner.root, path)?;
+        let content = self.inner.filesystem.read_file(path)?;
         Ok(parser::build_document_map(&content))
     }
 
     pub fn search_text(&self, query: &str, context_len: usize) -> VaultResult<Vec<SearchResult>> {
         match &self.inner.tantivy {
             Some(tv) => self.tantivy_search_with_context(tv, query, context_len, 200, false, None),
-            None => self
-                .read_index()
-                .search_text(&self.inner.root, query, context_len),
+            None => self.read_index().search_text_limited(
+                &self.inner.filesystem,
+                query,
+                context_len,
+                None,
+            ),
         }
     }
 
@@ -567,14 +498,47 @@ impl Vault {
             Some(tv) => {
                 self.tantivy_search_with_context(tv, query, context_len, max_results, fuzzy, fields)
             }
-            None => {
-                let mut results =
-                    self.read_index()
-                        .search_text(&self.inner.root, query, context_len)?;
-                results.truncate(max_results);
-                Ok(results)
-            }
+            None => self.read_index().search_text_limited(
+                &self.inner.filesystem,
+                query,
+                context_len,
+                Some(max_results),
+            ),
         }
+    }
+
+    pub(crate) fn search_text_with_limit(
+        &self,
+        query: &str,
+        context_len: usize,
+        max_results: usize,
+        fuzzy: bool,
+        fields: Option<&[SearchField]>,
+    ) -> VaultResult<Vec<SearchResult>> {
+        // The default MCP query validates its syntax even when the caller requests no hits.
+        if max_results == 0
+            && !fuzzy
+            && fields.is_none()
+            && let Some(tv) = &self.inner.tantivy
+        {
+            tv.parse_default_query(query)?;
+            return Ok(Vec::new());
+        }
+        self.search_text_with_options(query, context_len, max_results, fuzzy, fields)
+    }
+
+    pub(crate) fn search_regex_with_limit(
+        &self,
+        pattern: &str,
+        context_len: usize,
+        max_results: usize,
+    ) -> VaultResult<Vec<SearchResult>> {
+        self.read_index().search_regex_limited(
+            &self.inner.filesystem,
+            pattern,
+            context_len,
+            Some(max_results),
+        )
     }
 
     pub fn search_regex(
@@ -583,7 +547,7 @@ impl Vault {
         context_len: usize,
     ) -> VaultResult<Vec<SearchResult>> {
         self.read_index()
-            .search_regex(&self.inner.root, pattern, context_len, 0)
+            .search_regex_limited(&self.inner.filesystem, pattern, context_len, None)
     }
 
     /// Semantic search via embedding cosine similarity (Layer 2).
@@ -825,12 +789,12 @@ impl Vault {
     }
 
     pub(crate) fn canonical_existing_relative_path(&self, path: &Path) -> VaultResult<PathBuf> {
-        Ok(path::resolve_existing(&self.inner.root, path)?.relative)
+        Ok(self.inner.filesystem.resolve_existing(path)?.relative)
     }
 
     /// Validate that a relative path doesn't escape the vault root.
     pub fn validate_path(&self, path: &Path) -> VaultResult<()> {
-        fs::resolve_path(&self.inner.root, path)?;
+        self.inner.filesystem.resolve_for_write(path)?;
         Ok(())
     }
 
@@ -841,10 +805,10 @@ impl Vault {
         period: &NotePeriod,
         date: Option<NaiveDate>,
     ) -> VaultResult<String> {
-        let config = periodic::read_periodic_config(&self.inner.root, period)?;
+        let config = periodic::read_config_rooted(&self.inner.filesystem, period)?;
         let date = date.unwrap_or_else(|| Local::now().date_naive());
         let path = periodic::periodic_note_path(&config, &date)?;
-        fs::read_file(&self.inner.root, &path)
+        self.inner.filesystem.read_file(&path)
     }
 
     pub fn create_periodic_note(
@@ -854,7 +818,7 @@ impl Vault {
         content_override: Option<&str>,
     ) -> VaultResult<PathBuf> {
         let _mutation = self.lock_mutations()?;
-        let config = periodic::read_periodic_config(&self.inner.root, period)?;
+        let config = periodic::read_config_rooted(&self.inner.filesystem, period)?;
         let date = date.unwrap_or_else(|| Local::now().date_naive());
         let path = periodic::periodic_note_path(&config, &date)?;
 
@@ -867,8 +831,12 @@ impl Vault {
                         .file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or_default();
-                    match periodic::expand_template(&self.inner.root, Path::new(tmpl), &date, title)
-                    {
+                    match periodic::expand_rooted(
+                        &self.inner.filesystem,
+                        Path::new(tmpl),
+                        &date,
+                        title,
+                    ) {
                         Ok(c) => c,
                         Err(VaultError::NoteNotFound(_)) => String::new(),
                         Err(e) => return Err(e),
@@ -879,7 +847,7 @@ impl Vault {
         };
 
         frontmatter::parse_frontmatter(&content)?;
-        let actual_path = fs::create_file(&self.inner.root, &path, &content)?;
+        let actual_path = self.inner.filesystem.create_file(&path, &content)?;
         self.reindex(&actual_path)?;
         Ok(actual_path)
     }
@@ -889,8 +857,8 @@ impl Vault {
         period: &NotePeriod,
         limit: usize,
     ) -> VaultResult<Vec<PathBuf>> {
-        let config = periodic::read_periodic_config(&self.inner.root, period)?;
-        periodic::list_recent_periodic_notes(&self.inner.root, &config, limit)
+        let config = periodic::read_config_rooted(&self.inner.filesystem, period)?;
+        periodic::list_rooted(&self.inner.filesystem, &config, limit)
     }
 
     // ── private helpers ────────────────────────────────────────────────
@@ -918,13 +886,16 @@ impl Vault {
             tv.search(query, max_results)?
         };
 
-        let word_re = search_utils::compile_query_word_regex(query);
+        let word_re = (context_len > 0 && !hits.is_empty())
+            .then(|| search_utils::compile_query_word_regex(query))
+            .flatten();
 
         let mut results = Vec::with_capacity(hits.len());
         for (path, score) in hits {
-            let matches = match (word_re.as_ref(), fs::read_file(&self.inner.root, &path)) {
-                (Some(re), Ok(content)) if context_len > 0 => re
-                    .find_iter(&content)
+            let matches = if let Some(re) = &word_re
+                && let Ok(content) = self.inner.filesystem.read_observed(&path)
+            {
+                re.find_iter(&content)
                     .map(|m| {
                         let (context, match_start, match_end, line) =
                             index::extract_match_context(&content, m.start(), m.end(), context_len);
@@ -935,8 +906,9 @@ impl Vault {
                             match_end,
                         }
                     })
-                    .collect(),
-                _ => Vec::new(),
+                    .collect()
+            } else {
+                Vec::new()
             };
 
             results.push(SearchResult {
@@ -965,24 +937,38 @@ impl Vault {
     }
 
     fn reindex(&self, path: &Path) -> VaultResult<()> {
-        let actual_path = self.canonical_existing_relative_path(path)?;
-        let mut idx = self.write_index();
-        let result = idx.refresh_file(
-            &self.inner.root,
-            &actual_path,
+        let mut index = self.write_index();
+        let was_note = index.get_note(path).is_some();
+        let result = index.refresh_file(
+            &self.inner.filesystem,
+            path,
             &self.inner.exclude,
             self.inner.tantivy.as_deref(),
+            #[cfg(has_embeddings)]
+            self.inner.embedding_runtime.is_some(),
         );
         #[cfg(has_embeddings)]
-        if let Some(runtime) = &self.inner.embedding_runtime {
-            if idx.get_note(&actual_path).is_some() {
-                runtime.submit_upsert(&actual_path);
-            } else {
-                runtime.submit_remove(&actual_path);
-            }
+        if let Some(runtime) = &self.inner.embedding_runtime
+            && let Some(change) = index.embedding_change(path, was_note)
+        {
+            runtime.submit(path, change);
         }
-        drop(idx);
-        let flush = self.inner.tantivy.as_ref().map(|tv| tv.flush()).transpose();
+        drop(index);
+        let dirty = result.as_ref().copied().unwrap_or(was_note);
+        let flush = self
+            .inner
+            .tantivy
+            .as_ref()
+            .filter(|_| dirty)
+            .map(|tv| tv.publish())
+            .transpose();
+        #[cfg(has_embeddings)]
+        if let Ok(Some(committed)) = &flush
+            && let Some(runtime) = &self.inner.embedding_runtime
+        {
+            self.write_index()
+                .publish_embedding_upserts(*committed, |path| runtime.submit_upsert(path));
+        }
         match (result, flush) {
             (Err(error), Err(flush)) => Err(VaultError::Other(format!(
                 "{error}; search flush failed: {flush}"
@@ -993,11 +979,6 @@ impl Vault {
     }
 
     // ── embedding helpers (feature-gated) ─────────────────────────────
-
-    #[cfg(has_embeddings)]
-    fn embedding_cache_path(mcp_data: &Path) -> PathBuf {
-        mcp_data.join("embeddings").join("embeddings.bin")
-    }
 }
 
 #[cfg(test)]
@@ -1575,12 +1556,8 @@ mod tests {
 
         let results = vault.search_text("Rust", 40).unwrap();
         assert!(!results.is_empty());
-        assert!(
-            results
-                .iter()
-                .any(|r| r.path == PathBuf::from("searchable.md"))
-        );
-        assert!(!results.iter().any(|r| r.path == PathBuf::from("other.md")));
+        assert!(results.iter().any(|r| r.path == Path::new("searchable.md")));
+        assert!(!results.iter().any(|r| r.path == Path::new("other.md")));
     }
 
     #[tokio::test]
@@ -1623,7 +1600,7 @@ mod tests {
         assert!(links.iter().any(|l| l.target == "b"));
 
         let bl = vault.backlinks(Path::new("b.md")).unwrap();
-        assert!(bl.iter().any(|m| m.path == PathBuf::from("a.md")));
+        assert!(bl.iter().any(|m| m.path == Path::new("a.md")));
     }
 
     #[tokio::test]
@@ -1895,7 +1872,7 @@ mod tests {
             .search_text_with_options("algorihm", 40, 10, true, None)
             .unwrap();
         assert!(
-            results.iter().any(|r| r.path == PathBuf::from("target.md")),
+            results.iter().any(|r| r.path == Path::new("target.md")),
             "fuzzy search should find 'algorithm' from typo 'algorihm'"
         );
     }
@@ -1925,7 +1902,7 @@ mod tests {
         assert!(
             heading_only
                 .iter()
-                .any(|r| r.path == PathBuf::from("headingmatch.md"))
+                .any(|r| r.path == Path::new("headingmatch.md"))
         );
     }
 
@@ -1968,9 +1945,7 @@ mod tests {
             .search_text_with_options("fallback", 40, 10, true, None)
             .unwrap();
         assert!(
-            results
-                .iter()
-                .any(|r| r.path == PathBuf::from("fallback.md")),
+            results.iter().any(|r| r.path == Path::new("fallback.md")),
             "should still find results via regex fallback when tantivy is disabled"
         );
         assert!(
@@ -2141,10 +2116,10 @@ mod tests {
 
         let excluded_path = Path::new("Excluded/hidden.md");
         vault.write_note(excluded_path, "# Hidden\n").unwrap();
-        assert_eq!(
-            runtime.pending_kind(excluded_path),
-            Some(PendingKind::Remove)
-        );
+        assert_eq!(runtime.pending_kind(excluded_path), None);
+        let attachment = Path::new("plain.txt");
+        vault.write_note(attachment, "attachment").unwrap();
+        assert_eq!(runtime.pending_kind(attachment), None);
 
         let old_path = Path::new("old.md");
         let new_path = Path::new("nested/new.md");
@@ -2152,6 +2127,11 @@ mod tests {
         vault.move_note(old_path, new_path).unwrap();
         assert_eq!(runtime.pending_kind(old_path), Some(PendingKind::Remove));
         assert_eq!(runtime.pending_kind(new_path), Some(PendingKind::Upsert));
+
+        let now_excluded = Path::new("Excluded/moved.md");
+        vault.move_note(new_path, now_excluded).unwrap();
+        assert_eq!(runtime.pending_kind(new_path), Some(PendingKind::Remove));
+        assert_eq!(runtime.pending_kind(now_excluded), None);
     }
 
     #[cfg(has_embeddings)]
@@ -2171,7 +2151,8 @@ mod tests {
         let cache_path = dir
             .path()
             .join(".obsidian-mcp")
-            .join("embeddings")
+            .join("embeddings/scopes")
+            .join(ExcludeSet::default().scope_id(&dir.path().canonicalize().unwrap()))
             .join("embeddings.bin");
         std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
         store.save(&cache_path).unwrap();
@@ -2455,6 +2436,146 @@ mod tests {
             !new_cache.exists(),
             "no cache file should be created when no legacy exists"
         );
+    }
+
+    #[tokio::test]
+    async fn replacement_at_an_unlinked_source_survives_direct_reconciliation() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = Vault::open(&crate::test_helpers::tantivy_config(directory.path()))
+            .await
+            .unwrap();
+        let source = Path::new("source.md");
+        let on_disk = directory.path().join(source);
+        for moving in [false, true] {
+            vault.write_note(source, "departed").unwrap();
+            // Hold the metadata lock until the filesystem operation has finished.
+            // A watcher can then observe the replacement before the tool gets the lock.
+            let mut index = vault.write_index();
+            let writer = vault.clone();
+            let operation = std::thread::spawn(move || {
+                if moving {
+                    writer.move_note(source, Path::new("moved.md")).map(|_| ())
+                } else {
+                    writer.delete_note(source)
+                }
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while on_disk.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "source was never unlinked"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            std::fs::write(&on_disk, "#replacement presentagain").unwrap();
+            assert!(
+                index
+                    .refresh_file(
+                        &vault.inner.filesystem,
+                        source,
+                        &vault.inner.exclude,
+                        vault.inner.tantivy.as_deref(),
+                        #[cfg(has_embeddings)]
+                        false,
+                    )
+                    .unwrap()
+            );
+            drop(index);
+            operation.join().unwrap().unwrap();
+
+            assert_eq!(
+                vault.get_note_metadata(source).unwrap().tags,
+                ["replacement"]
+            );
+            let hits = vault.search_text("presentagain", 0).unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].path, source);
+            if moving {
+                assert_eq!(
+                    std::fs::read_to_string(directory.path().join("moved.md")).unwrap(),
+                    "departed"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn note_and_attachment_mutations_match_a_cold_vault() {
+        async fn assert_matches_disk(live: &Vault, config: &Config) {
+            let cold = Vault::open(config).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(live.vault_stats().unwrap()).unwrap(),
+                serde_json::to_value(cold.vault_stats().unwrap()).unwrap()
+            );
+            let projection = |vault: &Vault| {
+                let index = vault.read_index();
+                let mut notes: Vec<_> = index
+                    .notes()
+                    .iter()
+                    .map(|(path, note)| {
+                        let mut backlinks: Vec<_> = index
+                            .backlinks_to(path)
+                            .iter()
+                            .map(|n| n.path.clone())
+                            .collect();
+                        backlinks.sort();
+                        (path.clone(), note.tags.clone(), backlinks)
+                    })
+                    .collect();
+                notes.sort();
+                drop(index);
+                let mut lexical: Vec<_> = vault
+                    .search_text("needle", 20)
+                    .unwrap()
+                    .into_iter()
+                    .map(|hit| hit.path)
+                    .collect();
+                lexical.sort();
+                let mut literal: Vec<_> = vault
+                    .search_regex("need.e", 20)
+                    .unwrap()
+                    .into_iter()
+                    .map(|hit| hit.path)
+                    .collect();
+                literal.sort();
+                (notes, lexical, literal)
+            };
+            assert_eq!(projection(live), projection(&cold));
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let mut config = crate::test_helpers::tantivy_config(root);
+        config.exclude_patterns = vec!["Archive/**".into()];
+        std::fs::write(root.join("existing.bin"), [0xff, 0, 0x80]).unwrap();
+        let live = Vault::open(&config).await.unwrap();
+        live.create_note(Path::new("folder/anchor.md"), "#anchor needle", None)
+            .unwrap();
+        assert!(
+            live.move_note(Path::new("folder"), Path::new("unused/subdir"))
+                .is_err()
+        );
+        assert!(root.join("folder/anchor.md").is_file());
+        assert!(!root.join("unused").exists());
+        live.write_note(Path::new("item.txt"), "needle #tag [[anchor]]")
+            .unwrap();
+        assert!(live.get_note_metadata(Path::new("item.txt")).is_err());
+        assert_matches_disk(&live, &config).await;
+        live.append_note(Path::new("item.txt"), " more").unwrap();
+        assert_matches_disk(&live, &config).await;
+        for (from, to) in [
+            ("item.txt", "item.MD"),
+            ("item.MD", "Archive/hidden.md"),
+            ("Archive/hidden.md", "visible.md"),
+            ("visible.md", "last.txt"),
+            ("last.txt", ".private/last.txt"),
+            (".private/last.txt", "last.txt"),
+        ] {
+            live.move_note(Path::new(from), Path::new(to)).unwrap();
+            assert_matches_disk(&live, &config).await;
+        }
+        live.delete_note(Path::new("last.txt")).unwrap();
+        live.delete_note(Path::new("existing.bin")).unwrap();
+        assert_matches_disk(&live, &config).await;
     }
 
     fn test_config_with_exclusions(vault_root: &Path, patterns: Vec<String>) -> Config {

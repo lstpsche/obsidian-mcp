@@ -2,7 +2,7 @@
 
 This document defines the local JSON-RPC contract for `obsidian-semanticd`.
 
-API v2 health responses advertise `semantic_source_evidence_v1` when the daemon implements automatic complete-body chunking and revision-bound evidence. Clients requiring these semantics validate that capability after ownership-aware daemon reconciliation. An older compatible v2 daemon can be inspected for activation, but must not be silently used for the new search contract. Keeping v2 allows an already installed upgrader to verify a newly activated daemon with its compiled API range.
+The v2 health and shutdown handshake remains compatible with existing upgraders. Semantic clients must also verify `semantic_source_evidence_v1` and `scoped_indexing_v1` after ownership-aware daemon reconciliation. These capabilities cover revision-bound source evidence and document indexing under an explicit exclusion policy. Older content clients must upgrade to attach a vault.
 
 ## Transport
 
@@ -64,6 +64,7 @@ Standard JSON-RPC:
 Daemon-specific server errors:
 
 - `-32010` incompatible API version
+- `-32011` required capability unavailable
 - `-32020` daemon unavailable
 - `-32030` vault warming or degraded
 - `-32031` vault not attached
@@ -151,7 +152,7 @@ Response result:
   "uptime_ms": 1234,
   "model_name": "BAAI/bge-small-en-v1.5",
   "semantic_home": "/path/to/home",
-  "capabilities": ["semantic_source_evidence_v1"]
+  "capabilities": ["semantic_source_evidence_v1", "scoped_indexing_v1"]
 }
 ```
 
@@ -160,18 +161,19 @@ Behavior:
 - Daemon validates client API range.
 - If daemon API is outside range, returns `-32010`.
 - `pid` identifies the responding process. Lifecycle callers verify executable identity before stopping it.
-- `capabilities` is additive within v2. Old clients may ignore it. New clients requiring revision-bound semantic evidence must verify it after any owned-old-daemon activation and reject missing required result fields.
+- A content client checks both required capabilities on the connection that will carry a vault policy or query. A replacement daemon can appear at an existing endpoint, and older v2 implementations can ignore extra JSON fields.
 - Accepted capability observations are shared across client clones. Unsupported observations are rechecked, and explicit health probes replace the cached observation, so upgrading the daemon can repair an existing client. These probes do not attach a vault or start inference.
 
 ## `ensure_vault`
 
-Creates or attaches daemon runtime state for a vault namespace.
+Attaches an effective indexing policy for one vault. Keep this IPC connection open for the lifetime of the attachment. Queries and status can use separate connections.
 
 Request params:
 
 ```json
 {
   "vault_root": "/abs/path/to/vault",
+  "index_scope": {"version": 1, "exclude_patterns": ["Private/**"]},
   "watch": true,
   "model_name": "BAAI/bge-small-en-v1.5"
 }
@@ -182,6 +184,8 @@ Response result:
 ```json
 {
   "vault_id": "sha256-hex",
+  "scope_id": "scope-digest",
+  "attachment_id": "opaque-live-handle",
   "ready": true,
   "watch_enabled": true,
   "model_name": "BAAI/bge-small-en-v1.5"
@@ -190,9 +194,14 @@ Response result:
 
 Rules:
 
-- `vault_root` must be absolute.
+- `vault_root` is an absolute UTF-8 path. The Rust client rejects native paths that cannot be represented in this JSON field.
 - `vault_id` derivation follows `README.md` in this directory.
-- Multiple clients calling `ensure_vault` for same vault must converge to the same runtime context.
+- The descriptor is required. Version 1 accepts up to 4,096 glob patterns totaling at most 256 KiB of UTF-8 text. An empty array accepts the owner’s floor. The owner always adds the portable vault ignore and any daemon-operator restrictions. Invalid or unreadable policy fails before indexing.
+- Clients with identical normalized effective policies share the index, progress and watcher. A private scope can index only its own permitted notes. The daemon still shares one configured model and provider across scopes.
+- The returned `scope_id` identifies the effective policy and vault. Use the separate `attachment_id` for content calls. It is bound to the vault root and the holder’s lifetime. Repeating the same attachment on its existing connection reuses that holder.
+- A cold scan may outlast an MCP request. The MCP runtime retains the acquisition across timed-out or cancelled calls, and later searches resume the same attachment. Closing the last runtime also closes an in-progress attachment.
+- On final disconnect the daemon retires that view and stops new document dispatches. An already dispatched provider request may finish. Only a new explicit attachment can reactivate the view. A watcher runs while at least one active holder requests watching.
+- Earlier unscoped caches are preserved. The first attachment to scoped storage rebuilds from eligible files.
 
 ## `vault_status`
 
@@ -203,7 +212,8 @@ Request params:
 
 ```json
 {
-  "vault_root": "/abs/path/to/vault"
+  "vault_root": "/abs/path/to/vault",
+  "index_scope": {"version": 1, "exclude_patterns": ["Private/**"]}
 }
 ```
 
@@ -219,7 +229,7 @@ Response result:
 }
 ```
 
-The response may include `last_error`. `ready` means a compatible snapshot is
+Send exactly one selector. `index_scope` looks up an already active matching view, while `attachment_id` inspects that live holder. The response may include `last_error`. `ready` means a compatible snapshot is
 queryable; `phase` independently describes reconciliation as `warming`, `ready`,
 or `degraded`. Existing vectors may still need refresh, so `indexed_notes` is not
 a completed-work counter.
@@ -264,6 +274,7 @@ Request params:
 ```json
 {
   "vault_root": "/abs/path/to/vault",
+  "attachment_id": "opaque-live-handle",
   "query": "memory safe programming",
   "top_k": 10,
   "include_content": false
@@ -296,6 +307,7 @@ Request params:
 ```json
 {
   "vault_root": "/abs/path/to/vault",
+  "attachment_id": "opaque-live-handle",
   "query": "memory safe programming",
   "top_k": 10,
   "prefetch": 50,
@@ -330,6 +342,7 @@ Request params:
 ```json
 {
   "vault_root": "/abs/path/to/vault",
+  "attachment_id": "opaque-live-handle",
   "path": "Projects/rust-mcp.md"
 }
 ```
@@ -354,8 +367,8 @@ Any incompatible combination must fail fast at `health` with `-32010`.
 
 ## Search scope and attachment recovery
 
-`search_semantic` and `search_hybrid` accept optional `allowed_paths`, an array of exact vault-relative index paths. Omission searches the full vault; an empty array permits no results. The daemon intersects the scope with its current index before semantic ranking or lexical prefetch. Scopes belong to individual requests and do not change the shared vault index.
+`search_semantic` and `search_hybrid` accept optional `allowed_paths`, an array of exact vault-relative index paths. Omission searches the attached indexing scope. An empty array permits no results. The daemon intersects request paths with that view before semantic ranking or lexical prefetch. A request can narrow its results without changing the attached view’s document permissions.
 
-An absent vault context returns `-32031` (`ERR_VAULT_NOT_ATTACHED`). Clients reattach with `ensure_vault` and may retry the query once. Warming or degraded contexts retain `-32030` (`ERR_VAULT_NOT_READY`) and their structured status; they must not trigger a competing local index.
+An expired holder or unattached view returns `-32031` (`ERR_VAULT_NOT_ATTACHED`). Clients reattach with `ensure_vault` and may retry the query once. Warming or degraded contexts retain `-32030` (`ERR_VAULT_NOT_READY`) and their structured status; they must not trigger a competing local index.
 
-API v2 requires a compatible exact version handshake plus any feature capability required by the caller. An external daemon lacking `semantic_source_evidence_v1` returns an explicit unsupported-contract error through the client, without owner replacement or local fallback. Ownership-aware reconciliation can upgrade an older locally owned daemon before that capability is required. Older clients that only require v2 retain their existing handshake contract.
+Health and shutdown remain available to old v2 maintenance clients. A content client requiring scoped indexing surfaces a capability error for an older external owner. A capability, policy or version failure cannot trigger a competing local index. After observing an owner with stricter rules than the local vault, MCP also refuses to widen its indexing policy following an outage.

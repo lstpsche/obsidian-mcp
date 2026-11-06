@@ -122,6 +122,13 @@ pub enum VaultError {
 
 pub type VaultResult<T> = Result<T, VaultError>;
 
+impl VaultError {
+    pub(crate) fn is_not_found(&self) -> bool {
+        matches!(self, Self::NoteNotFound(_) | Self::DirectoryNotFound(_))
+            || matches!(self, Self::Io(err) if err.kind() == std::io::ErrorKind::NotFound)
+    }
+}
+
 impl From<VaultError> for rmcp::ErrorData {
     fn from(err: VaultError) -> Self {
         let code = match &err {

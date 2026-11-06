@@ -1,8 +1,6 @@
 //! IPC server skeleton for `obsidian-semanticd`.
 
 use std::future::Future;
-#[cfg(unix)]
-use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -15,7 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::sync::watch;
 
 #[cfg(unix)]
-use tokio::net::UnixListener;
+mod unix_endpoint;
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
@@ -28,7 +26,7 @@ use super::protocol::{
     SearchSemanticParams, ShutdownParams, ShutdownResult,
 };
 use super::query;
-use super::vault_registry::VaultRegistry;
+use super::vault_registry::{VaultAttachment, VaultRegistry};
 
 type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -127,12 +125,15 @@ where
         }
     });
 
-    match config.endpoint {
+    let result = match config.endpoint {
         #[cfg(unix)]
-        IpcEndpoint::UnixSocket(path) => run_unix_socket(path, state, shutdown).await,
+        IpcEndpoint::UnixSocket(path) => run_unix_socket(path, Arc::clone(&state), shutdown).await,
         #[cfg(windows)]
-        IpcEndpoint::NamedPipe(name) => run_named_pipe(name, state, shutdown).await,
-    }
+        IpcEndpoint::NamedPipe(name) => run_named_pipe(name, Arc::clone(&state), shutdown).await,
+    };
+    state.registry.close();
+    state.shutdown_tx.send_replace(true);
+    result
 }
 
 #[cfg(unix)]
@@ -141,25 +142,7 @@ async fn run_unix_socket(
     state: Arc<ServerState>,
     mut shutdown: ShutdownSignal,
 ) -> VaultResult<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    if path.exists() {
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == ErrorKind::NotFound => {}
-            Err(err) => return Err(VaultError::Io(err)),
-        }
-    }
-
-    let listener = UnixListener::bind(&path).map_err(VaultError::Io)?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        if let Err(err) = std::fs::set_permissions(&path, perms) {
-            tracing::warn!(error = %err, "failed to restrict socket permissions to 0600");
-        }
-    }
+    let (owner, listener) = unix_endpoint::UnixEndpoint::bind(&path)?;
     tracing::info!(endpoint = %path.display(), "semantic daemon IPC listening");
 
     loop {
@@ -186,16 +169,8 @@ async fn run_unix_socket(
         }
     }
 
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == ErrorKind::NotFound => {}
-        Err(err) => tracing::warn!(
-            error = %err,
-            endpoint = %path.display(),
-            "failed to remove daemon socket during shutdown"
-        ),
-    }
-
+    drop(listener);
+    owner.close()?;
     Ok(())
 }
 
@@ -205,11 +180,11 @@ async fn run_named_pipe(
     state: Arc<ServerState>,
     mut shutdown: ShutdownSignal,
 ) -> VaultResult<()> {
-    let mut current = create_pipe_server(&name)?;
+    let mut current = create_pipe_server(&name, true)?;
     tracing::info!(endpoint = %name, "semantic daemon IPC listening");
 
     loop {
-        let next = create_pipe_server(&name)?;
+        let next = create_pipe_server(&name, false)?;
         tokio::select! {
             _ = &mut shutdown => {
                 tracing::info!("semantic daemon shutdown requested");
@@ -236,8 +211,9 @@ async fn run_named_pipe(
 }
 
 #[cfg(windows)]
-fn create_pipe_server(name: &str) -> VaultResult<NamedPipeServer> {
+fn create_pipe_server(name: &str, first: bool) -> VaultResult<NamedPipeServer> {
     ServerOptions::new()
+        .first_pipe_instance(first)
         .create(name)
         .map_err(|err| VaultError::DaemonIpc(format!("failed to create named pipe server: {err}")))
 }
@@ -246,30 +222,87 @@ async fn handle_connection<S>(stream: S, state: Arc<ServerState>) -> VaultResult
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
+    let mut shutdown = state.shutdown_tx.subscribe();
+    tokio::select! {
+        _ = shutdown.wait_for(|stopped| *stopped) => Ok(()),
+        result = handle_requests(stream, state) => result,
+    }
+}
+
+#[cfg(all(test, has_embeddings))]
+pub(super) async fn serve_test_connection(
+    stream: tokio::io::DuplexStream,
+    semantic_home: PathBuf,
+    registry: Arc<VaultRegistry>,
+) -> VaultResult<()> {
+    let (shutdown_tx, _) = watch::channel(false);
+    let state = ServerState::new(
+        registry.model_name().into(),
+        semantic_home,
+        registry,
+        shutdown_tx,
+    );
+    handle_connection(stream, Arc::new(state)).await
+}
+
+async fn handle_requests<S>(stream: S, state: Arc<ServerState>) -> VaultResult<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
+    let mut attachment = None;
+    let mut pending = std::collections::VecDeque::new();
 
-    while let Some(line) = lines.next_line().await? {
+    loop {
+        let line = match pending.pop_front() {
+            Some(line) => line,
+            None => match lines.next_line().await? {
+                Some(line) => line,
+                None => return Ok(()),
+            },
+        };
         if line.trim().is_empty() {
             continue;
         }
-
-        let outcome = match serde_json::from_str::<RpcRequest>(&line) {
-            Ok(request) => route_request_with_control(request, Arc::clone(&state)).await,
-            Err(err) => RouteOutcome {
-                response: RpcResponse::error(None, ERR_PARSE, format!("parse error: {err}")),
-                shutdown_after_response: false,
-            },
+        let request: RpcRequest = match serde_json::from_str(&line) {
+            Ok(request) => request,
+            Err(error) => {
+                write_response(
+                    &mut writer,
+                    &RpcResponse::error(None, ERR_PARSE, format!("parse error: {error}")),
+                )
+                .await?;
+                continue;
+            }
+        };
+        let owns_scope = attachment.is_some() || request.method == "ensure_vault";
+        let dispatch = route_request_with_control(request, Arc::clone(&state), &mut attachment);
+        let outcome = if owns_scope {
+            // Keep observing the holder while its index initializes or another request runs.
+            // Dropping dispatch releases its provisional grant before inference can activate.
+            tokio::pin!(dispatch);
+            loop {
+                tokio::select! {
+                    biased;
+                    incoming = lines.next_line() => match incoming? {
+                        None => return Ok(()),
+                        Some(line) if pending.len() < 16 => pending.push_back(line),
+                        Some(_) => return Err(VaultError::DaemonProtocol("too many pipelined attachment requests".into())),
+                    },
+                    outcome = &mut dispatch => break outcome,
+                }
+            }
+        } else {
+            dispatch.await
         };
 
         write_response(&mut writer, &outcome.response).await?;
         if outcome.shutdown_after_response {
-            let _ = state.shutdown_tx.send(true);
-            break;
+            state.shutdown_tx.send_replace(true);
+            return Ok(());
         }
     }
-
-    Ok(())
 }
 
 async fn write_response<W>(writer: &mut W, response: &RpcResponse) -> VaultResult<()>
@@ -287,7 +320,9 @@ where
 
 #[cfg(test)]
 async fn route_request(request: RpcRequest, state: Arc<ServerState>) -> RpcResponse {
-    route_request_with_control(request, state).await.response
+    route_request_with_control(request, state, &mut None)
+        .await
+        .response
 }
 
 struct RouteOutcome {
@@ -304,7 +339,11 @@ impl RouteOutcome {
     }
 }
 
-async fn route_request_with_control(request: RpcRequest, state: Arc<ServerState>) -> RouteOutcome {
+async fn route_request_with_control(
+    request: RpcRequest,
+    state: Arc<ServerState>,
+    attachment: &mut Option<VaultAttachment>,
+) -> RouteOutcome {
     if request.jsonrpc != JSONRPC_VERSION {
         return RouteOutcome::response(RpcResponse::error(
             request.id,
@@ -337,7 +376,7 @@ async fn route_request_with_control(request: RpcRequest, state: Arc<ServerState>
                 Ok(params) => params,
                 Err(err) => return RouteOutcome::response(*err),
             };
-            match query::ensure_vault(&state.registry, params).await {
+            match query::ensure_vault(&state.registry, params, attachment).await {
                 Ok(result) => response_from_result(request.id, &result),
                 Err(err) => response_from_query_error(request.id, err),
             }
@@ -444,7 +483,7 @@ fn route_health(
         uptime_ms,
         model_name: state.model_name.clone(),
         semantic_home: state.semantic_home.display().to_string(),
-        capabilities: vec![protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY.to_string()],
+        capabilities: protocol::semantic_capabilities(),
     };
 
     match serde_json::to_value(result) {
@@ -539,7 +578,7 @@ mod tests {
         assert_eq!(result["daemon_api_version"], 2);
         assert_eq!(
             result["capabilities"],
-            json!([protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY])
+            json!(protocol::SEMANTIC_CAPABILITIES)
         );
     }
 
@@ -617,7 +656,7 @@ mod tests {
         assert_eq!(health_response["result"]["pid"], json!(std::process::id()));
         assert_eq!(
             health_response["result"]["capabilities"],
-            json!([protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY])
+            json!(protocol::SEMANTIC_CAPABILITIES)
         );
 
         shutdown_tx
@@ -637,7 +676,7 @@ mod tests {
                 jsonrpc: JSONRPC_VERSION.to_string(),
                 id: Some(json!(1)),
                 method: "vault_status".to_string(),
-                params: json!({"vault_root": vault_root}),
+                params: json!({"vault_root": vault_root, "index_scope": protocol::IndexScope::default()}),
             },
             Arc::clone(&state),
         )
@@ -646,10 +685,23 @@ mod tests {
             response.error.expect("unattached error expected").code,
             protocol::ERR_VAULT_NOT_ATTACHED
         );
+        let invalid = route_request(
+            RpcRequest {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: Some(json!(2)),
+                method: "vault_status".to_string(),
+                params: json!({"vault_root": vault_root, "index_scope": {"version": 1, "exclude_patterns": ["[unclosed"]}}),
+            },
+            Arc::clone(&state),
+        ).await;
+        assert_eq!(
+            invalid.error.expect("invalid exclusion").code,
+            protocol::ERR_INVALID_PARAMS
+        );
         assert!(
             state
                 .registry
-                .get_context_by_root(&vault_root)
+                .context_for_policy(&vault_root, protocol::IndexScope::default())
                 .await
                 .unwrap()
                 .is_none()
@@ -675,6 +727,7 @@ mod tests {
                 method: "ensure_vault".to_string(),
                 params: json!({
                     "vault_root": "relative/path",
+                    "index_scope": protocol::IndexScope::default(),
                     "watch": true
                 }),
             },
@@ -719,6 +772,7 @@ mod tests {
                 params: json!({}),
             },
             state,
+            &mut None,
         )
         .await;
 

@@ -161,7 +161,7 @@ async fn assert_reconciles_owned_daemon(old_version: &'static str) {
     let health = client.health("previous-upgrader", "3.2.1").await.unwrap();
     assert_eq!(health.daemon_api_version, 2);
     assert!(health.supports_source_evidence());
-    client.require_source_evidence().await.unwrap();
+    client.require_semantic_capabilities().await.unwrap();
     assert!(
         client
             .shutdown()
@@ -376,7 +376,7 @@ async fn assert_bootstraps_owned_daemon(old_version: &'static str) {
         DaemonConnectPolicy::default(),
         result.health,
     );
-    client.require_source_evidence().await.unwrap();
+    client.require_semantic_capabilities().await.unwrap();
     shutdown(result.endpoint).await;
 }
 
@@ -405,13 +405,6 @@ async fn same_version_sibling_without_capability_does_not_restart_the_owner() {
     );
     let candidate = temp.path().join("old-candidate");
     std::fs::write(
-        temp.path().join("candidate-info.json"),
-        obsidian_mcp::upgrade::BuildIdentity::embedded()
-            .to_json()
-            .unwrap(),
-    )
-    .unwrap();
-    std::fs::write(
         &candidate,
         format!(
             "#!/bin/sh\ncase \"$1\" in\n--version) printf '%s\\n' 'obsidian-semanticd {}';;\n--__build-info) /bin/cat \"${{0%/*}}/candidate-info.json\";;\n*) : > \"${{0%/*}}/started\"; exit 77;;\nesac\n",
@@ -421,7 +414,15 @@ async fn same_version_sibling_without_capability_does_not_restart_the_owner() {
     .unwrap();
     std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    for _ in 0..2 {
+    let mut identity =
+        serde_json::to_value(obsidian_mcp::upgrade::BuildIdentity::embedded()).unwrap();
+    for capabilities in [json!([]), json!(["semantic_source_evidence_v1"])] {
+        identity["capabilities"] = capabilities;
+        std::fs::write(
+            temp.path().join("candidate-info.json"),
+            identity.to_string(),
+        )
+        .unwrap();
         let result = bootstrap::ensure_daemon_from_sibling(&test_config(&paths), &candidate)
             .await
             .unwrap();
@@ -433,7 +434,7 @@ async fn same_version_sibling_without_capability_does_not_restart_the_owner() {
             result.health,
         );
         assert!(matches!(
-            client.require_source_evidence().await.unwrap_err(),
+            client.require_semantic_capabilities().await.unwrap_err(),
             obsidian_mcp::error::VaultError::DaemonRpc {
                 code: obsidian_mcp::daemon::protocol::ERR_UNSUPPORTED_CAPABILITY,
                 ..
@@ -471,7 +472,7 @@ async fn same_version_sibling_without_capability_does_not_restart_the_owner() {
         pending_daemon_bootstrap: None,
         daemon_unavailable_reason: None,
         prefetch_count: 1,
-        vault_ensured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        attachments: Default::default(),
         local_fallback_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         daemon_health_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
@@ -515,7 +516,7 @@ async fn external_old_daemon_is_inspected_before_rejecting_semantic_capability()
         result.health,
     );
     let error = client
-        .search_semantic(Path::new("/tmp/vault"), "query", 10, false)
+        .attach_vault(Path::new("/tmp/vault"), &Default::default(), true, None)
         .await
         .unwrap_err();
     assert!(matches!(

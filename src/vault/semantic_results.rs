@@ -1,7 +1,9 @@
 //! Source-bound semantic ranking and result construction shared by both transports.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::error::{VaultError, VaultResult};
@@ -125,8 +127,8 @@ pub(crate) fn rank_hybrid(
 }
 
 /// Render only text observed at the exact revision whose vector was scored.
-pub(crate) fn render(
-    root: &Path,
+pub(crate) fn render_rooted(
+    root: &super::fs::VaultRoot,
     hit: RankedNote,
     query: &str,
     include_content: bool,
@@ -145,7 +147,10 @@ pub(crate) fn render(
         preview: None,
         context_error: None,
     };
-    match source::read_snapshot(root, &hit.path) {
+    match root
+        .read_exact_bounded(&hit.path, source::MAX_SOURCE_BYTES)
+        .map(source::SourceSnapshot::new)
+    {
         Ok(snapshot) if snapshot.source_revision != result.source_revision => {
             result.source_status = SourceStatus::Changed;
             result.context_error = Some(SemanticContextError {
@@ -201,6 +206,21 @@ pub(crate) fn render(
         }
     }
     result
+}
+
+#[cfg(test)]
+pub(crate) fn render(
+    root: &Path,
+    hit: RankedNote,
+    query: &str,
+    include_content: bool,
+) -> SemanticNoteResult {
+    render_rooted(
+        &super::fs::VaultRoot::open(root).unwrap(),
+        hit,
+        query,
+        include_content,
+    )
 }
 
 fn preview_range(raw: &str, evidence: SourceRange, query: &str) -> SourceRange {

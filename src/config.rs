@@ -2,6 +2,7 @@
 //! transport selection, and optional search features (Tantivy BM25, embeddings).
 
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
@@ -311,33 +312,38 @@ pub struct CliArgs {
     pub vault_path: Option<PathBuf>,
 }
 
-/// Parse CLI args after the binary name, ignoring --help/--version (handled earlier).
-pub fn parse_cli_args() -> CliArgs {
+/// Parse the arguments following the executable or lifecycle subcommand.
+pub fn parse_cli_args(mut args: impl Iterator<Item = OsString>) -> Result<CliArgs, String> {
     let mut result = CliArgs::default();
-    let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--http" => result.http = true,
-            "--port" => {
-                if let Some(val) = args.next() {
-                    result.port = val.parse().ok();
-                }
+        match arg.to_str() {
+            Some("--http") => result.http = true,
+            Some("--port") => result.port = Some(parse_endpoint_arg("--port", args.next())?),
+            Some("--host") => result.host = Some(parse_endpoint_arg("--host", args.next())?),
+            _ if arg.as_encoded_bytes().starts_with(b"-") => {
+                return Err(format!("unknown option: {}", arg.to_string_lossy()));
             }
-            "--host" => {
-                if let Some(val) = args.next() {
-                    result.host = val.parse().ok();
-                }
-            }
-            s if s.starts_with('-') => {}
-            _ => {
-                if result.vault_path.is_none() {
-                    result.vault_path = Some(normalize_vault_path(&arg));
-                }
-            }
+            _ if result.vault_path.is_some() => return Err("expected only one vault path".into()),
+            _ => result.vault_path = Some(normalize_native_path(arg)),
         }
     }
-    result
+    Ok(result)
+}
+
+fn parse_endpoint_arg<T: std::str::FromStr>(
+    name: &str,
+    value: Option<OsString>,
+) -> Result<T, String>
+where
+    T::Err: std::fmt::Display,
+{
+    let value = value.ok_or_else(|| format!("missing value for {name}"))?;
+    value
+        .to_str()
+        .ok_or_else(|| format!("invalid value for {name}: expected UTF-8"))?
+        .parse()
+        .map_err(|error| format!("invalid value for {name}: {error}"))
 }
 
 /// Resolve the HTTP endpoint consistently for serving and lifecycle commands.
@@ -377,11 +383,7 @@ impl Config {
         let vault_path = cli
             .vault_path
             .clone()
-            .or_else(|| {
-                std::env::var("OBSIDIAN_VAULT_PATH")
-                    .ok()
-                    .map(|raw| normalize_vault_path(&raw))
-            })
+            .or_else(|| normalize_optional_path_env("OBSIDIAN_VAULT_PATH"))
             .ok_or_else(|| {
                 "Vault path required: pass as first argument or set OBSIDIAN_VAULT_PATH".to_string()
             })?;
@@ -432,12 +434,7 @@ impl Config {
 
         let mcp_data_dir = normalize_optional_path_env("OBSIDIAN_MCP_DATA");
 
-        let exclude_patterns: Vec<String> = std::env::var("OBSIDIAN_EXCLUDE_PATHS")
-            .unwrap_or_default()
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let exclude_patterns = exclusion_env()?;
 
         Ok(Self {
             vault_path,
@@ -458,12 +455,40 @@ impl Config {
     }
 }
 
+/// Storage identity of a canonical native vault path. The legacy daemon ID
+/// remains part of the IPC contract and is derived independently.
+pub fn vault_storage_key(canonical_root: &Path) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"obsidian-mcp/vault-path/v2\0");
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hash.update(canonical_root.as_os_str().as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        for unit in canonical_root.as_os_str().encode_wide() {
+            hash.update(unit.to_le_bytes());
+        }
+    }
+    digest_hex(hash)
+}
+
+pub(crate) fn digest_hex(hash: Sha256) -> String {
+    let mut result = String::with_capacity(64);
+    for byte in hash.finalize() {
+        let _ = write!(result, "{byte:02x}");
+    }
+    result
+}
+
 const SLUG_MAX_LEN: usize = 200;
 const SLUG_HASH_SUFFIX_LEN: usize = 8;
 
 /// Convert a canonical vault path to a human-readable kebab-case slug.
 ///
-/// Used for per-vault namespacing under `OBSIDIAN_MCP_DATA`. The caller must
+/// Used to locate legacy data under `OBSIDIAN_MCP_DATA/vaults`. The caller must
 /// provide a canonical (absolute, resolved) path.
 pub fn vault_slug(path: &Path) -> String {
     let raw = path.to_string_lossy();
@@ -632,11 +657,31 @@ fn normalize_vault_path(raw: &str) -> PathBuf {
     PathBuf::from(final_value)
 }
 
-fn normalize_optional_path_env(var_name: &str) -> Option<PathBuf> {
-    std::env::var(var_name)
-        .ok()
-        .map(|raw| normalize_vault_path(&raw))
-        .filter(|path| !path.as_os_str().is_empty())
+fn normalize_native_path(raw: OsString) -> PathBuf {
+    match raw.to_str() {
+        Some(s) => normalize_vault_path(s),
+        None => PathBuf::from(raw),
+    }
+}
+
+pub(crate) fn normalize_optional_path_env(var_name: &str) -> Option<PathBuf> {
+    let path = normalize_native_path(std::env::var_os(var_name)?);
+    (!path.as_os_str().is_empty()).then_some(path)
+}
+
+pub(crate) fn exclusion_env() -> Result<Vec<String>, String> {
+    match std::env::var("OBSIDIAN_EXCLUDE_PATHS") {
+        Ok(raw) => Ok(raw
+            .split(',')
+            .map(str::trim)
+            .filter(|rule| !rule.is_empty())
+            .map(str::to_owned)
+            .collect()),
+        Err(std::env::VarError::NotPresent) => Ok(Vec::new()),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("OBSIDIAN_EXCLUDE_PATHS must contain valid UTF-8".into())
+        }
+    }
 }
 
 fn normalize_optional_string_env(var_name: &str) -> Option<String> {
@@ -674,6 +719,16 @@ fn strip_matching_outer_quotes(mut value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn positional_vault_preserves_native_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = OsString::from_vec(b"/vault-\xff".to_vec());
+        let cli = parse_cli_args([path.clone()].into_iter()).unwrap();
+        assert_eq!(cli.vault_path, Some(PathBuf::from(path)));
+    }
 
     #[test]
     fn normalize_vault_path_keeps_plain_value() {

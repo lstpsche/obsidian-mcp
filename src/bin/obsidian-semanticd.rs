@@ -2,7 +2,7 @@ use tracing_subscriber::EnvFilter;
 
 use obsidian_mcp::config::DEFAULT_MODEL_NAME;
 use obsidian_mcp::daemon::home::{self, semantic_home_paths};
-use obsidian_mcp::daemon::protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY;
+use obsidian_mcp::daemon::protocol::SEMANTIC_CAPABILITIES;
 use obsidian_mcp::daemon::server::{self, DaemonServerConfig, IpcEndpoint};
 use obsidian_mcp::upgrade::BuildIdentity;
 
@@ -20,8 +20,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let semantic_home = home::resolve_semantic_home()?;
     let paths = semantic_home_paths(&semantic_home);
-    home::ensure_home_layout(&paths)?;
-
     let endpoint =
         resolve_endpoint_from_env().unwrap_or_else(|| home::default_ipc_endpoint(&paths));
     let model_name =
@@ -99,11 +97,11 @@ fn daemon_build_info() -> Result<String, serde_json::Error> {
     struct DaemonBuildInfo {
         #[serde(flatten)]
         identity: BuildIdentity,
-        capabilities: [&'static str; 1],
+        capabilities: [&'static str; SEMANTIC_CAPABILITIES.len()],
     }
     serde_json::to_string(&DaemonBuildInfo {
         identity: BuildIdentity::embedded(),
-        capabilities: [SEMANTIC_SOURCE_EVIDENCE_CAPABILITY],
+        capabilities: SEMANTIC_CAPABILITIES,
     })
 }
 
@@ -136,7 +134,7 @@ mod tests {
         let info: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(
             info["capabilities"],
-            serde_json::json!([SEMANTIC_SOURCE_EVIDENCE_CAPABILITY])
+            serde_json::json!(SEMANTIC_CAPABILITIES)
         );
     }
 }

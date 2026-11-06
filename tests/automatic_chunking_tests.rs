@@ -160,7 +160,7 @@ mod local_retrieval {
             pending_daemon_bootstrap: None,
             daemon_unavailable_reason: None,
             prefetch_count: 50,
-            vault_ensured: Arc::new(AtomicBool::new(false)),
+            attachments: Default::default(),
             local_fallback_active: Arc::new(AtomicBool::new(false)),
             daemon_health_pending: Arc::new(AtomicBool::new(false)),
         }

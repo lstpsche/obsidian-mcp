@@ -6,6 +6,16 @@ use rmcp::model::CallToolResult;
 
 use crate::config::{Config, ToolFilter};
 
+thread_local! {
+    pub(crate) static EXACT_FILE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static NAME_LOOKUP_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static INDEX_DIRECTORY_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn count_io(counter: &'static std::thread::LocalKey<std::cell::Cell<usize>>) {
+    counter.set(counter.get() + 1);
+}
+
 pub fn test_config(vault_root: &Path) -> Config {
     Config {
         vault_path: vault_root.to_path_buf(),

@@ -6,7 +6,7 @@ This directory defines the shared local semantic-search runtime contract used by
 - `obsidian-semanticd` (Rust daemon)
 - Obsidian semantic-search plugin client(s)
 
-The goal is one local runtime, one model cache, and isolated per-vault semantic state.
+The daemon shares its model across live attachments and isolates index state by vault and effective exclusion policy.
 
 The daemon shares one embedding provider/model across its vault contexts. Its
 launch environment controls the API endpoint, credentials, model, request timeout
@@ -30,7 +30,7 @@ must accommodate slow query embedding when using a self-hosted endpoint.
 Bootstrap timeouts retain a continuation for later semantic searches. Existing
 manifest resolution repeats its ownership/version checks; a newly started daemon
 resumes health verification and manifest publication for that exact process
-without spawning again. Handler clones share the resolved client. Passive status
+without spawning again. A cold vault scan can also exceed a caller’s deadline. Later searches share the same pending attachment until it completes or the last MCP runtime exits. Handler clones share the resolved client. Passive status
 only observes resolved clients and never resumes bootstrap or attaches a vault.
 
 ## Runtime Topology
@@ -40,9 +40,9 @@ Obsidian plugin client(s)  ----\
                                 \ local JSON-RPC over IPC
 obsidian-mcp client -----------> obsidian-semanticd
                                  - model lifecycle (fastembed)
-                                 - per-vault indexing state
+                                 - per-vault, per-policy indexing state
                                  - semantic/hybrid query API
-                                 - watcher ownership (enabled)
+                                 - watcher ownership by live attachments
 ```
 
 ## Shared Home Layout
@@ -72,9 +72,12 @@ Layout:
     socket / named-pipe metadata
   vaults/
     <vault_id>/
-      embeddings.bin
-      state.json
+      scopes/
+        <scope_id>/
+          embeddings.bin
 ```
+
+A custom Unix socket must have a parent protected against other writers. This includes write or delete access granted through macOS ACLs. Keep the adjacent `<socket>.lock` in place across restarts. Windows uses an exclusive first named-pipe instance.
 
 ## Vault Namespace Rule
 
@@ -84,7 +87,7 @@ Layout:
 2. Lowercased on Windows only
 3. SHA-256 hex digest of the resulting string
 
-This guarantees stable per-vault isolation and prevents cross-vault embedding reads/writes.
+The public `vault_id` supports existing IPC and manifest consumers. The registry and scope fingerprint also use the canonical native vault path without lossy string conversion. The scope fingerprint includes normalized exclusion rules. Each scope loads only its own checkpoint after an explicit attachment. The portable ignore and any separately configured daemon restrictions apply to every scope for that vault.
 
 ## Versioning And Compatibility
 
@@ -100,11 +103,11 @@ Compatibility policy:
 - Same major API version is required.
 - If daemon API is outside client-supported range, daemon returns a version mismatch error.
 - Clients must not proceed with `ensure_vault` or search calls after mismatch.
-- New semantic clients also require the additive health capability `semantic_source_evidence_v1`. Validate it against the final daemon after ownership-aware reconciliation; old API2 activation clients remain compatible with the version handshake.
+- New semantic clients also require both health capabilities `semantic_source_evidence_v1` and `scoped_indexing_v1`. Validate both against the final daemon after ownership-aware reconciliation. Older API2 activation clients remain compatible with the version handshake.
 - An owned equal-version daemon missing that capability can be replaced only after the installed sibling advertises support in its additive `--__build-info` capabilities. An old sibling without support is not restarted repeatedly; newer running versions and external owners remain preserved.
 - A missing capability on an external/override daemon is an unsupported semantic contract, not evidence of an outage and not permission to start competing local inference.
 
-Embedding cache schema 2 records complete per-note collections, exact source revisions, prepared-input hashes, tokenizer fingerprints and effective capacity/preparation/partition identity. Old schema-1 prefix vectors rebuild automatically; relocation alone does not make them complete. The new cache replaces its predecessor atomically after a durable checkpoint. During the first rebuild, status is warming and API deployments can send substantially more source text than before. No vault files, provider settings, models or launcher definitions are rewritten by cache rebuilding.
+Embedding cache schema 2 records complete per-note collections, exact source revisions, prepared-input hashes, tokenizer fingerprints and effective capacity/preparation/partition identity. A scoped view begins cold if only unscoped checkpoints exist. Existing cache files remain available for operator recovery. The new cache replaces its predecessor atomically after a durable checkpoint. During the first rebuild, status is warming and API deployments can send substantially more source text than before. No vault files, provider settings, models or launcher definitions are rewritten by cache rebuilding.
 
 Reconciliation publishes one complete note revision at a time. Changed pieces use bounded inference requests; exact unchanged inputs reuse vectors. A later request failure retains the prior complete note collection, and note-level status counters keep their original units. Inactive retry drafts are bounded so failed notes cannot prevent healthy notes/removes from progressing. Permanent profile/source/resource failures are visible and do not trigger an endless submission loop.
 
@@ -139,7 +142,7 @@ Rules:
 - Exact package versions are required when activating a locally owned sibling; API compatibility remains sufficient for external runtimes.
 - Manifest is the authority for endpoint/binary metadata after successful handshake.
 - Model download remains daemon-owned and lazy at runtime; bootstrap only ensures daemon availability.
-- MCP initializes daemon runtime only when `OBSIDIAN_WATCH=true`; with watch disabled, daemon startup is skipped.
+- With watching disabled, `auto` uses local processing. Explicit `daemon` mode supports snapshot attachments. Index and watcher lifetime follow the active attachments, including a lost connection.
 
 ## Contract Documents
 

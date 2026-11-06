@@ -49,20 +49,9 @@ pub async fn search_text(
     let max_results = params.max_results.unwrap_or(20).min(MAX_RESULTS_CAP);
     let fuzzy = params.fuzzy.unwrap_or(false);
 
-    let results = if fuzzy || params.fields.is_some() {
-        let fields_slice = params.fields.as_deref();
-        vault.search_text_with_options(
-            &params.query,
-            context_length,
-            max_results,
-            fuzzy,
-            fields_slice,
-        )?
-    } else {
-        let all = vault.search_text(&params.query, context_length)?;
-        all.into_iter().take(max_results).collect()
-    };
-
+    let fields = params.fields.as_deref();
+    let results =
+        vault.search_text_with_limit(&params.query, context_length, max_results, fuzzy, fields)?;
     super::output::results(results)
 }
 
@@ -90,10 +79,8 @@ pub async fn search_regex(
         .min(MAX_CONTEXT_LEN_CAP);
     let max_results = params.max_results.unwrap_or(20).min(MAX_RESULTS_CAP);
 
-    let results = vault.search_regex(&params.pattern, context_length)?;
-    let limited: Vec<_> = results.into_iter().take(max_results).collect();
-
-    super::output::results(limited)
+    let results = vault.search_regex_with_limit(&params.pattern, context_length, max_results)?;
+    super::output::results(results)
 }
 
 // ── search_metadata ─────────────────────────────────────────────────
@@ -325,70 +312,39 @@ async fn search_semantic_daemon(
     }
     let client = runtime.resolve_daemon_client().await?;
     runtime.ensure_daemon_health().await?;
-    if runtime.uses_local_backend() {
-        return Err(VaultError::DaemonUnavailable(
-            "local fallback is already selected".into(),
-        ));
-    }
-    if !runtime
-        .vault_ensured
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        match client.ensure_vault(vault.root(), true, None).await {
-            Ok(_) => {
-                runtime
-                    .vault_ensured
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-            Err(err) => return Err(err),
-        }
-    }
-
+    let handle = runtime
+        .attachments
+        .handle(vault, client, &runtime.local_fallback_active, None)
+        .await?;
     let allowed_paths = vault.indexed_paths();
-    let query = async || {
-        if lexical_prefetch {
-            client
-                .call::<_, protocol::SearchResult>(
-                    "search_hybrid",
-                    protocol::SearchHybridParams {
-                        vault_root: vault.root().display().to_string(),
-                        query: params.query.clone(),
-                        top_k: Some(top_k),
-                        prefetch: Some(runtime.prefetch_count.max(top_k)),
-                        alpha: Some(alpha),
-                        include_content: Some(include_content),
-                        allowed_paths: Some(allowed_paths.clone()),
-                    },
-                )
-                .await
-        } else {
-            client
-                .call::<_, protocol::SearchResult>(
-                    "search_semantic",
-                    protocol::SearchSemanticParams {
-                        vault_root: vault.root().display().to_string(),
-                        query: params.query.clone(),
-                        top_k: Some(top_k),
-                        include_content: Some(include_content),
-                        allowed_paths: Some(allowed_paths.clone()),
-                    },
-                )
-                .await
-        }
+    let hybrid = lexical_prefetch.then_some((runtime.prefetch_count.max(top_k), alpha));
+    let query = async |attachment: &crate::client::semantic_daemon::VaultAttachment| {
+        client
+            .search(
+                attachment,
+                &params.query,
+                top_k,
+                include_content,
+                Some(&allowed_paths),
+                hybrid,
+            )
+            .await
     };
-    let daemon_result = match query().await {
+    let daemon_result = match query(&handle).await {
         Err(VaultError::DaemonRpc {
             code: protocol::ERR_VAULT_NOT_ATTACHED,
             ..
-        }) if !runtime.uses_local_backend() => {
-            runtime
-                .vault_ensured
-                .store(false, std::sync::atomic::Ordering::Relaxed);
-            client.ensure_vault(vault.root(), true, None).await?;
-            runtime
-                .vault_ensured
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            query().await?
+        }) => {
+            let replacement = runtime
+                .attachments
+                .handle(
+                    vault,
+                    client,
+                    &runtime.local_fallback_active,
+                    Some(&handle.result.attachment_id),
+                )
+                .await?;
+            query(&replacement).await?
         }
         result => result?,
     };
@@ -459,7 +415,12 @@ fn search_semantic_local_blocking(
     Ok(hits
         .into_iter()
         .map(|hit| {
-            crate::vault::semantic_results::render(vault.root(), hit, query, include_content)
+            crate::vault::semantic_results::render_rooted(
+                vault.filesystem(),
+                hit,
+                query,
+                include_content,
+            )
         })
         .collect())
 }
@@ -528,7 +489,7 @@ mod tests {
     #[cfg(unix)]
     use serde_json::json;
     #[cfg(unix)]
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncWriteExt, BufReader};
 
     #[cfg(unix)]
     fn inspected_daemon_client(socket_path: PathBuf) -> SemanticDaemonClient {
@@ -543,7 +504,7 @@ mod tests {
                 uptime_ms: 1,
                 model_name: "test-model".into(),
                 semantic_home: "/tmp/semantic".into(),
-                capabilities: vec![protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY.into()],
+                capabilities: protocol::semantic_capabilities(),
             },
         )
     }
@@ -561,10 +522,8 @@ mod tests {
                 let (stream, _) = listener.accept().await.expect("accept client");
                 let (reader, mut writer) = tokio::io::split(stream);
                 let mut reader = BufReader::new(reader);
-                let mut line = String::new();
-                reader.read_line(&mut line).await.expect("read request");
-                let request: serde_json::Value =
-                    serde_json::from_str(&line).expect("request should be valid JSON");
+                let request =
+                    crate::test_daemon_rpc::scoped_request(&mut reader, &mut writer).await;
                 let id = request
                     .get("id")
                     .cloned()
@@ -580,6 +539,7 @@ mod tests {
                         "id": id,
                         "result": {
                             "vault_id": "test-vault",
+                            "scope_id": "scope", "attachment_id": "holder",
                             "ready": true,
                             "watch_enabled": true,
                             "model_name": "BAAI/bge-small-en-v1.5"
@@ -642,10 +602,8 @@ mod tests {
                 let (stream, _) = listener.accept().await.expect("accept client");
                 let (reader, mut writer) = tokio::io::split(stream);
                 let mut reader = BufReader::new(reader);
-                let mut line = String::new();
-                reader.read_line(&mut line).await.expect("read request");
-                let request: serde_json::Value =
-                    serde_json::from_str(&line).expect("request should be valid JSON");
+                let request =
+                    crate::test_daemon_rpc::scoped_request(&mut reader, &mut writer).await;
                 let id = request
                     .get("id")
                     .cloned()
@@ -661,6 +619,7 @@ mod tests {
                         "id": id,
                         "result": {
                             "vault_id": "test-vault",
+                            "scope_id": "scope", "attachment_id": "holder",
                             "ready": true,
                             "watch_enabled": true,
                             "model_name": "BAAI/bge-small-en-v1.5"
@@ -741,10 +700,8 @@ mod tests {
                 let (stream, _) = listener.accept().await.expect("accept client");
                 let (reader, mut writer) = tokio::io::split(stream);
                 let mut reader = BufReader::new(reader);
-                let mut line = String::new();
-                reader.read_line(&mut line).await.expect("read request");
-                let request: serde_json::Value =
-                    serde_json::from_str(&line).expect("request should be valid JSON");
+                let request =
+                    crate::test_daemon_rpc::scoped_request(&mut reader, &mut writer).await;
                 let id = request
                     .get("id")
                     .cloned()
@@ -760,6 +717,7 @@ mod tests {
                         "id": id,
                         "result": {
                             "vault_id": "warming-vault",
+                            "scope_id": "scope", "attachment_id": "holder",
                             "ready": false,
                             "watch_enabled": true,
                             "model_name": "test-model",
@@ -836,6 +794,7 @@ mod tests {
         (dir, vault)
     }
 
+    #[cfg(unix)]
     async fn setup_excluded_search_vault() -> (tempfile::TempDir, Vault) {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
@@ -895,6 +854,99 @@ mod tests {
 
         let parsed: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         assert_eq!(parsed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn file_limits_bound_search_reads_and_preserve_matches() {
+        use crate::test_helpers::{EXACT_FILE_OPENS, test_config};
+        let dir = tempfile::tempdir().unwrap();
+        for n in 0..205 {
+            std::fs::write(dir.path().join(format!("note-{n}.md")), "needle needle").unwrap();
+        }
+        for ranked in [true, false] {
+            let mut config = test_config(dir.path());
+            config.tantivy = ranked;
+            let vault = Vault::open(&config).await.unwrap();
+            for limit in [None, Some(0), Some(1), Some(200), Some(300)] {
+                let expected = limit.unwrap_or(20).min(200);
+                for (fuzzy, fields) in [
+                    (false, None),
+                    (true, None),
+                    (false, Some(vec![SearchField::Body])),
+                ] {
+                    EXACT_FILE_OPENS.set(0);
+                    let result = search_text(
+                        &vault,
+                        SearchTextParams {
+                            query: "needle".into(),
+                            max_results: limit,
+                            fuzzy: Some(fuzzy),
+                            fields,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    let output = result.structured_content.unwrap();
+                    let hits = output["results"].as_array().unwrap();
+                    assert_eq!(hits.len(), expected);
+                    assert!(
+                        hits.iter()
+                            .all(|hit| hit["matches"].as_array().unwrap().len() == 2)
+                    );
+                    assert_eq!(EXACT_FILE_OPENS.get(), expected);
+                }
+                EXACT_FILE_OPENS.set(0);
+                let result = search_regex(
+                    &vault,
+                    SearchRegexParams {
+                        pattern: "need.e".into(),
+                        max_results: limit,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    result.structured_content.unwrap()["results"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    expected
+                );
+                assert_eq!(EXACT_FILE_OPENS.get(), expected);
+            }
+            EXACT_FILE_OPENS.set(0);
+            let hits = vault
+                .search_text_with_limit("needle", 0, 1, false, None)
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(EXACT_FILE_OPENS.get(), usize::from(!ranked));
+
+            EXACT_FILE_OPENS.set(0);
+            assert!(vault.search_regex_with_limit("[", 10, 0).is_err());
+            if ranked {
+                assert!(
+                    vault
+                        .search_text_with_limit("\"", 10, 0, false, None)
+                        .is_err()
+                );
+                assert!(
+                    vault
+                        .search_text_with_limit("\"", 10, 0, true, None)
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            assert_eq!(EXACT_FILE_OPENS.get(), 0);
+            let all = vault.search_text("needle", 0).unwrap();
+            assert_eq!(all.len(), if ranked { 200 } else { 205 });
+            let first = vault
+                .search_text_with_limit("needle", 0, 1, false, None)
+                .unwrap();
+            assert_eq!(first[0].path, all[0].path);
+            assert_eq!(vault.search_regex("needle", 0).unwrap().len(), 205);
+        }
     }
 
     #[tokio::test]
@@ -1436,7 +1488,7 @@ mod tests {
             daemon_client: Some(inspected_daemon_client(socket_path)),
             daemon_unavailable_reason: None,
             prefetch_count: 7,
-            vault_ensured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            attachments: Default::default(),
             local_fallback_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             daemon_health_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
@@ -1485,7 +1537,7 @@ mod tests {
             daemon_client: Some(inspected_daemon_client(socket_path)),
             daemon_unavailable_reason: None,
             prefetch_count: 50,
-            vault_ensured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            attachments: Default::default(),
             local_fallback_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             daemon_health_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
@@ -1532,7 +1584,7 @@ mod tests {
             daemon_client: Some(inspected_daemon_client(socket_path)),
             daemon_unavailable_reason: None,
             prefetch_count: 50,
-            vault_ensured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            attachments: Default::default(),
             local_fallback_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             daemon_health_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
@@ -1581,7 +1633,7 @@ mod tests {
             daemon_client: Some(inspected_daemon_client(socket_path)),
             daemon_unavailable_reason: None,
             prefetch_count: 50,
-            vault_ensured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            attachments: Default::default(),
             local_fallback_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             daemon_health_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
@@ -1610,10 +1662,13 @@ mod tests {
         assert_eq!(data["phase"], "warming");
         assert_eq!(data["ready"], false);
         assert!(
-            runtime
-                .vault_ensured
-                .load(std::sync::atomic::Ordering::Relaxed),
+            runtime.attachments.is_attached(),
             "successful attachment must remain cached even while semantic warm-up continues"
+        );
+        // The fixture returned a different effective scope. A later outage cannot
+        // authorize the local runtime to index more documents.
+        assert!(
+            !runtime.activate_local_fallback(&VaultError::DaemonUnavailable("disconnected".into()))
         );
         server.await.expect("server join");
     }
@@ -1636,14 +1691,14 @@ mod tests {
         .await
         .expect("invalid local backend should fail deterministically");
 
-        let ensured = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let attachments = std::sync::Arc::<crate::tools::RuntimeAttachments>::default();
         let runtime = SemanticRuntime {
             mode: SemanticMode::Auto,
             pending_daemon_bootstrap: None,
             daemon_client: None,
             daemon_unavailable_reason: Some("semantic daemon is offline".into()),
             prefetch_count: 50,
-            vault_ensured: std::sync::Arc::clone(&ensured),
+            attachments: std::sync::Arc::clone(&attachments),
             local_fallback_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             daemon_health_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
@@ -1672,7 +1727,7 @@ mod tests {
             "the local backend should have been attempted"
         );
         assert!(
-            !ensured.load(std::sync::atomic::Ordering::Relaxed),
+            !attachments.is_attached(),
             "transport failure should invalidate the cached attachment"
         );
     }

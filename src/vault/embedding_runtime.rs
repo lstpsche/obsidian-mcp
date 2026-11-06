@@ -21,8 +21,8 @@ use super::embedding_chunks::{PreparedNote, prepare_note_with_budget};
 #[cfg(test)]
 use super::embeddings::prepared_text_hash;
 use super::embeddings::{
-    ChunkEmbedding, Embedder, EmbeddingStore, LegacyCacheMigration, NoteEmbeddingEntry,
-    migrate_cache_candidates_to_path, validate_embedding_batch,
+    CacheFile, ChunkEmbedding, Embedder, EmbeddingStore, NoteEmbeddingEntry,
+    validate_embedding_batch,
 };
 use super::index::VaultIndex;
 
@@ -80,12 +80,12 @@ struct RuntimeControl {
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
-impl Drop for RuntimeControl {
-    fn drop(&mut self) {
+impl RuntimeControl {
+    fn retire(&self) {
         self.shared.live.store(false, Ordering::Release);
         // Synchronize with the final store commit or atomic cache publication.
         // An operation that already passed its liveness check may finish before
-        // Drop returns, but it cannot mutate observable state afterward.
+        // retirement returns, but it cannot mutate observable state afterward.
         drop(
             self.shared
                 .lifecycle_gate
@@ -104,11 +104,16 @@ impl Drop for RuntimeControl {
     }
 }
 
+impl Drop for RuntimeControl {
+    fn drop(&mut self) {
+        self.retire();
+    }
+}
+
 struct RuntimeShared {
-    vault_root: PathBuf,
+    vault_root: super::fs::VaultRoot,
     index: Arc<RwLock<VaultIndex>>,
-    cache_path: PathBuf,
-    cache_migration_sources: Vec<PathBuf>,
+    cache: CacheFile,
     batch_size: usize,
     active: AtomicBool,
     state: Mutex<RuntimeState>,
@@ -139,6 +144,9 @@ struct RuntimeState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PendingKind {
+    /// Invalidates older work and keeps the last published evidence queryable.
+    /// It becomes runnable only after the corresponding lexical commit.
+    AwaitingLexical,
     Upsert,
     Remove,
 }
@@ -266,22 +274,33 @@ impl EmbeddingRuntime {
     where
         F: Future<Output = VaultResult<Arc<dyn Embedder>>> + Send + 'static,
     {
-        Self::spawn_with_cache_sources(
-            vault_root,
-            index,
-            cache_path,
-            Vec::new(),
-            TEST_BATCH_SIZE,
-            true,
-            loader,
-        )
+        Self::spawn_for_test(vault_root, index, cache_path, TEST_BATCH_SIZE, true, loader)
     }
 
-    pub(crate) fn spawn_with_cache_sources<F>(
+    #[cfg(test)]
+    fn spawn_for_test<F>(
         vault_root: PathBuf,
         index: Arc<RwLock<VaultIndex>>,
         cache_path: PathBuf,
-        cache_migration_sources: Vec<PathBuf>,
+        batch_size: usize,
+        initially_active: bool,
+        loader: F,
+    ) -> Self
+    where
+        F: Future<Output = VaultResult<Arc<dyn Embedder>>> + Send + 'static,
+    {
+        let root = super::fs::VaultRoot::open(&vault_root).unwrap();
+        let cache = CacheFile::new(
+            root.clone(),
+            cache_path.strip_prefix(vault_root).unwrap().to_owned(),
+        );
+        Self::spawn_with_scoped_cache(root, index, cache, batch_size, initially_active, loader)
+    }
+
+    pub(crate) fn spawn_with_scoped_cache<F>(
+        vault_root: super::fs::VaultRoot,
+        index: Arc<RwLock<VaultIndex>>,
+        cache: CacheFile,
         batch_size: usize,
         initially_active: bool,
         loader: F,
@@ -292,8 +311,7 @@ impl EmbeddingRuntime {
         #[cfg(test)]
         tests::initialize_test_logging();
         debug_assert!(batch_size > 0);
-        let mut initial_paths = current_paths(&index).into_iter().collect::<Vec<_>>();
-        initial_paths.sort_unstable();
+        let initial_paths = initial_embedding_work(&index);
         let total_notes = initial_paths.len();
         let mut state = RuntimeState {
             status: EmbeddingRuntimeStatus {
@@ -302,14 +320,14 @@ impl EmbeddingRuntime {
             },
             ..RuntimeState::default()
         };
-        for path in initial_paths {
+        for (path, kind) in initial_paths {
             let generation = next_generation(&mut state);
             state.pending.insert(
                 path.clone(),
                 PendingWork {
                     path,
                     generation,
-                    kind: PendingKind::Upsert,
+                    kind,
                     attempt: 0,
                     not_before: Instant::now(),
                 },
@@ -319,8 +337,7 @@ impl EmbeddingRuntime {
         let shared = Arc::new(RuntimeShared {
             vault_root,
             index,
-            cache_path,
-            cache_migration_sources,
+            cache,
             batch_size,
             active: AtomicBool::new(initially_active),
             state: Mutex::new(state),
@@ -330,7 +347,8 @@ impl EmbeddingRuntime {
             first_load_error: OnceLock::new(),
         });
         let worker_shared = Arc::clone(&shared);
-        let span = tracing::info_span!("embedding_runtime", vault = %shared.vault_root.display());
+        let span =
+            tracing::info_span!("embedding_runtime", vault = %shared.vault_root.path().display());
         let worker = tokio::spawn(
             async move {
                 let coordinator = run_coordinator(Arc::clone(&worker_shared), loader);
@@ -355,8 +373,16 @@ impl EmbeddingRuntime {
         }
     }
 
+    /// Withdraw document dispatch and cache publication even if a query still owns this runtime.
+    pub(crate) fn retire(&self) {
+        self.control.retire();
+    }
+
     /// Activate the existing coordinator once, preserving queued mutation intents.
     pub(crate) fn activate(&self) -> bool {
+        if !self.control.shared.live.load(Ordering::Acquire) {
+            return false;
+        }
         let activated = !self.control.shared.active.swap(true, Ordering::AcqRel);
         if activated {
             self.control.shared.notify.notify_one();
@@ -372,6 +398,7 @@ impl EmbeddingRuntime {
         self.submit(path, PendingKind::Upsert);
     }
 
+    #[cfg(test)]
     pub(crate) fn submit_remove(&self, path: &Path) {
         self.submit(path, PendingKind::Remove);
     }
@@ -382,7 +409,10 @@ impl EmbeddingRuntime {
         }
     }
 
-    fn submit(&self, path: &Path, kind: PendingKind) {
+    pub(super) fn submit(&self, path: &Path, kind: PendingKind) {
+        if !self.control.shared.live.load(Ordering::Acquire) {
+            return;
+        }
         let normalized = match super::path::normalize_relative(path) {
             Ok(path) if !path.as_os_str().is_empty() => path,
             Ok(_) => return,
@@ -412,7 +442,9 @@ impl EmbeddingRuntime {
         );
         update_pending_status(&mut state);
         drop(state);
-        self.control.shared.notify.notify_one();
+        if kind != PendingKind::AwaitingLexical {
+            self.control.shared.notify.notify_one();
+        }
     }
 
     pub(crate) fn status(&self) -> EmbeddingRuntimeStatus {
@@ -490,11 +522,7 @@ impl EmbeddingRuntimeWeak {
         self.submit(path, PendingKind::Upsert);
     }
 
-    pub(crate) fn submit_remove(&self, path: &Path) {
-        self.submit(path, PendingKind::Remove);
-    }
-
-    fn submit(&self, path: &Path, kind: PendingKind) {
+    pub(super) fn submit(&self, path: &Path, kind: PendingKind) {
         let Some(control) = self.control.upgrade() else {
             return;
         };
@@ -528,7 +556,7 @@ where
     let model = match loader.await {
         Ok(model) => model,
         Err(error) => {
-            record_initialization_failure(&shared, error);
+            record_terminal_failure(&shared, error);
             return;
         }
     };
@@ -538,49 +566,16 @@ where
 
     let current_paths = current_paths(&shared.index);
     let expected_identity = model.space_identity().clone();
-    let cache_path = shared.cache_path.clone();
-    let cache_migration_sources = shared.cache_migration_sources.clone();
-    let live = Arc::clone(&shared.live);
-    let lifecycle_gate = Arc::clone(&shared.lifecycle_gate);
+    let cache = shared.cache.clone();
     let current_count = current_paths.len();
-    let load_cache = move || -> VaultResult<Option<EmbeddingStore>> {
-        if !cache_migration_sources.is_empty() {
-            let _guard = lifecycle_gate
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if !live.load(Ordering::Acquire) {
-                return Ok(None);
-            }
-            match migrate_cache_candidates_to_path(&cache_migration_sources, &cache_path)? {
-                LegacyCacheMigration::Migrated(path) => {
-                    tracing::info!(path = %path.display(), "relocated embedding cache in background");
-                }
-                LegacyCacheMigration::AlreadyPresent(_) | LegacyCacheMigration::NotFound => {}
-            }
-        }
-        if !live.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        match std::fs::metadata(&cache_path) {
-            Ok(metadata) if metadata.is_file() => {
-                let store =
-                    EmbeddingStore::load_for_space(&cache_path, &expected_identity, current_count)?;
-                Ok(Some(store))
-            }
-            Ok(_) => {
-                let message = format!(
-                    "embedding cache is not a regular file: {}",
-                    cache_path.display()
-                );
-                Err(VaultError::Embedding(message))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(VaultError::Io(error)),
-        }
-    };
+    let load_cache = move || cache.load(&expected_identity, current_count);
     let loaded = tokio::task::spawn_blocking(load_cache).await;
     let (loaded, cache_error) = match loaded {
         Ok(Ok(store)) => (store, None),
+        Ok(Err(error @ (VaultError::OutsideVault(_) | VaultError::InvalidPath(_)))) => {
+            record_terminal_failure(&shared, error);
+            return;
+        }
         Ok(Err(VaultError::EmbeddingCacheIncompatible(reason))) => {
             tracing::info!(reason = %reason, "rebuilding incompatible embedding cache");
             (None, None)
@@ -606,7 +601,7 @@ where
     let mut dirty = match store.retain_paths(&current_paths) {
         Ok(dirty) => dirty,
         Err(error) => {
-            record_initialization_failure(&shared, error);
+            record_terminal_failure(&shared, error);
             return;
         }
     };
@@ -614,6 +609,7 @@ where
     let store = Arc::new(RwLock::new(store));
 
     {
+        let initial_paths = initial_embedding_work(&shared.index);
         let mut state = shared
             .state
             .lock()
@@ -624,10 +620,8 @@ where
         state.store_queryable =
             previously_publishable && (current_paths.is_empty() || has_cached_vectors);
         state.initial_started = true;
-        state.initial_remaining = current_paths.clone();
-        let mut initial_paths = current_paths.into_iter().collect::<Vec<_>>();
-        initial_paths.sort_unstable();
-        for path in initial_paths {
+        state.initial_remaining = initial_paths.iter().map(|(path, _)| path.clone()).collect();
+        for (path, kind) in initial_paths {
             if !state.pending.contains_key(&path) {
                 let generation = next_generation(&mut state);
                 state.pending.insert(
@@ -635,7 +629,7 @@ where
                     PendingWork {
                         path,
                         generation,
-                        kind: PendingKind::Upsert,
+                        kind,
                         attempt: 0,
                         not_before: Instant::now(),
                     },
@@ -729,7 +723,7 @@ where
     }
 }
 
-fn record_initialization_failure(shared: &RuntimeShared, error: VaultError) {
+fn record_terminal_failure(shared: &RuntimeShared, error: VaultError) {
     let message = error.to_string();
     let _ = shared.first_load_error.set(message.clone());
     let total_notes = current_paths(&shared.index).len();
@@ -737,6 +731,11 @@ fn record_initialization_failure(shared: &RuntimeShared, error: VaultError) {
         .state
         .lock()
         .unwrap_or_else(|lock_error| lock_error.into_inner());
+    // A confinement failure can also occur after a snapshot became queryable.
+    // Drop the coordinator's published model and store before reporting it.
+    state.model = None;
+    state.store = None;
+    state.store_queryable = false;
     let pending_notes = distinct_pending_count(&state);
     replace_status(
         &mut state,
@@ -772,6 +771,10 @@ async fn persist_dirty(
             state.persistence_error = None;
         }
         Ok(false) => return false,
+        Err(error @ (VaultError::OutsideVault(_) | VaultError::InvalidPath(_))) => {
+            record_terminal_failure(shared, error);
+            return false;
+        }
         Err(error) => {
             *persist_attempt = persist_attempt.saturating_add(1);
             *persist_retry_at = Instant::now() + retry_delay(*persist_attempt);
@@ -795,7 +798,7 @@ fn take_due_batch(shared: &RuntimeShared) -> (Vec<PendingWork>, Option<Instant>,
     let mut due = state
         .pending
         .iter()
-        .filter(|(_, work)| work.not_before <= now)
+        .filter(|(_, work)| work.kind != PendingKind::AwaitingLexical && work.not_before <= now)
         .map(|(path, work)| (path.clone(), work.kind, work.generation))
         .collect::<Vec<_>>();
     due.sort_unstable_by(
@@ -817,7 +820,12 @@ fn take_due_batch(shared: &RuntimeShared) -> (Vec<PendingWork>, Option<Instant>,
             batch.push(work);
         }
     }
-    let next_pending = state.pending.values().map(|work| work.not_before).min();
+    let next_pending = state
+        .pending
+        .values()
+        .filter(|work| work.kind != PendingKind::AwaitingLexical)
+        .map(|work| work.not_before)
+        .min();
     let pending_empty = state.pending.is_empty() && state.inflight.is_empty();
     state.batch_started_at = (!batch.is_empty()).then_some(now);
     update_pending_status(&mut state);
@@ -998,6 +1006,7 @@ async fn process_batch(
             break;
         }
         let embedder = Arc::clone(model);
+        let owner_live = Arc::clone(&shared.live);
         let started = Instant::now();
         let dispatcher = tracing::dispatcher::get_default(Clone::clone);
         let span = tracing::Span::current();
@@ -1009,7 +1018,7 @@ async fn process_batch(
                         .map(|(prepared, chunk)| prepared.chunks[*chunk].text.as_str())
                         .collect::<Vec<_>>();
                     tracing::debug!(pending_inputs = texts.len(), "embedding batch started");
-                    let (count, result) = embedder.embed_next_batch(&texts);
+                    let (count, result) = embedder.embed_next_batch(&texts, &owner_live);
                     let result = result.and_then(|vectors| {
                         validate_embedding_batch(vectors, count, embedder.dimension())
                     });
@@ -1158,7 +1167,7 @@ async fn prepare_work(
                 {
                     return Ok(PreparationOutcome::Missing);
                 }
-                let raw = super::fs::read_file_bounded(&vault_root, &path, read_limit)?;
+                let raw = vault_root.read_exact_bounded(&path, read_limit)?;
                 if previous.as_ref().is_some_and(|previous| {
                     super::source::source_revision_matches(&raw, &previous.source_revision)
                 }) {
@@ -1535,6 +1544,14 @@ fn finalize_reconciliation_if_complete(
     shared: &RuntimeShared,
     store: &Arc<RwLock<EmbeddingStore>>,
 ) -> bool {
+    // A last watcher submission may retire the runtime while holding metadata.
+    // Release the index before acquiring either runtime lock.
+    let empty_vault = shared
+        .index
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .notes()
+        .is_empty();
     let _lifecycle_guard = shared
         .lifecycle_gate
         .lock()
@@ -1559,13 +1576,7 @@ fn finalize_reconciliation_if_complete(
     store_guard.set_first_pass_complete(true);
     let has_vectors = !store_guard.is_empty();
     drop(store_guard);
-    let total_notes = shared
-        .index
-        .read()
-        .unwrap_or_else(|error| error.into_inner())
-        .notes()
-        .len();
-    if !state.store_queryable && (total_notes == 0 || has_vectors) {
+    if !state.store_queryable && (empty_vault || has_vectors) {
         state.store_queryable = true;
     }
     changed
@@ -1576,7 +1587,7 @@ async fn persist_store(
     store: &Arc<RwLock<EmbeddingStore>>,
 ) -> VaultResult<bool> {
     let store = Arc::clone(store);
-    let cache_path = shared.cache_path.clone();
+    let cache = shared.cache.clone();
     let live = Arc::clone(&shared.live);
     let lifecycle_gate = Arc::clone(&shared.lifecycle_gate);
     tokio::task::spawn_blocking(move || {
@@ -1584,10 +1595,7 @@ async fn persist_store(
             let store = store.read().unwrap_or_else(|error| error.into_inner());
             store.encode_cache()?
         };
-        let _guard = lifecycle_gate
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        EmbeddingStore::persist_cache_bytes_if_live(&cache_path, &bytes, &live)
+        cache.publish(&bytes, Some((&live, &lifecycle_gate)))
     })
     .await
     .map_err(|error| VaultError::Embedding(format!("cache write task failed: {error}")))?
@@ -1722,6 +1730,21 @@ fn replace_status(state: &mut RuntimeState, next: EmbeddingRuntimeStatus) {
     }
 
     state.status = next;
+}
+
+fn initial_embedding_work(index: &RwLock<VaultIndex>) -> Vec<(PathBuf, PendingKind)> {
+    let index = index.read().unwrap_or_else(|error| error.into_inner());
+    let mut paths: Vec<_> = index
+        .notes()
+        .keys()
+        .filter_map(|path| {
+            index
+                .embedding_change(path, false)
+                .map(|kind| (path.clone(), kind))
+        })
+        .collect();
+    paths.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    paths
 }
 
 fn current_paths(index: &Arc<RwLock<VaultIndex>>) -> HashSet<PathBuf> {
@@ -1885,13 +1908,13 @@ mod tests {
         let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let logs = captured_logs();
-        let marker = directory.path().display().to_string();
+        // The handle's canonical path can expand a Windows short-name ancestor.
+        let marker = directory.path().file_name().unwrap().to_string_lossy();
         let started = Instant::now();
-        let runtime = EmbeddingRuntime::spawn_with_cache_sources(
+        let runtime = EmbeddingRuntime::spawn_for_test(
             directory.path().to_path_buf(),
             index,
             directory.path().join("cache.bin"),
-            Vec::new(),
             1,
             true,
             async move {
@@ -2220,11 +2243,10 @@ mod tests {
         let index = test_index(directory.path()).await;
         let polls = Arc::new(AtomicUsize::new(0));
         let loader_polls = Arc::clone(&polls);
-        let runtime = EmbeddingRuntime::spawn_with_cache_sources(
+        let runtime = EmbeddingRuntime::spawn_for_test(
             directory.path().to_path_buf(),
             index,
             directory.path().join("cache.bin"),
-            Vec::new(),
             32,
             false,
             async move {
@@ -2264,11 +2286,10 @@ mod tests {
         let index = test_index(directory.path()).await;
         let fake = Arc::new(FakeEmbedder::new());
         let loader_fake = Arc::clone(&fake);
-        let runtime = EmbeddingRuntime::spawn_with_cache_sources(
+        let runtime = EmbeddingRuntime::spawn_for_test(
             directory.path().to_path_buf(),
             index,
             directory.path().join("cache.bin"),
-            Vec::new(),
             32,
             false,
             async move { Ok(loader_fake as Arc<dyn Embedder>) },
@@ -2304,11 +2325,10 @@ mod tests {
             .collect::<Vec<_>>();
         let fake = Arc::new(FakeEmbedder::new());
         let loader_fake = Arc::clone(&fake);
-        let runtime = EmbeddingRuntime::spawn_with_cache_sources(
+        let runtime = EmbeddingRuntime::spawn_for_test(
             directory.path().to_path_buf(),
             index,
             directory.path().join("cache.bin"),
-            Vec::new(),
             3,
             true,
             async move { Ok(loader_fake as Arc<dyn Embedder>) },
@@ -2328,11 +2348,10 @@ mod tests {
         for (batch_size, expected) in [(2, vec![2, 2, 1]), (usize::MAX, vec![5])] {
             let fake = Arc::new(FakeEmbedder::new());
             let loader_fake = Arc::clone(&fake);
-            let runtime = EmbeddingRuntime::spawn_with_cache_sources(
+            let runtime = EmbeddingRuntime::spawn_for_test(
                 directory.path().to_path_buf(),
                 Arc::clone(&index),
                 directory.path().join(format!("cache-{batch_size}.bin")),
-                Vec::new(),
                 batch_size,
                 true,
                 async move { Ok(loader_fake as Arc<dyn Embedder>) },
@@ -2341,6 +2360,75 @@ mod tests {
             assert_eq!(*fake.batches.lock().unwrap(), expected);
             assert_eq!(runtime.status().indexed_notes, 5);
         }
+    }
+
+    #[tokio::test]
+    async fn startup_discovers_only_runnable_lexical_revisions() {
+        let directory = tempfile::tempdir().unwrap();
+        let root_path = directory.path().canonicalize().unwrap();
+        let root = super::super::fs::VaultRoot::open(&root_path).unwrap();
+        let exclude = Arc::new(ExcludeSet::default());
+        std::fs::write(root_path.join("ready.md"), "available marker").unwrap();
+        let (index, lexical) = VaultIndex::build_ranked(root.clone(), Arc::clone(&exclude))
+            .await
+            .unwrap();
+        let index = Arc::new(RwLock::new(index));
+        let stage = |path: &Path| {
+            std::fs::write(root_path.join(path), "withheld marker").unwrap();
+            assert!(
+                index
+                    .write()
+                    .unwrap()
+                    .refresh_file(&root, path, &exclude, Some(&lexical), true)
+                    .unwrap()
+            );
+        };
+        let before = Path::new("before-spawn.md");
+        let during = Path::new("during-load.md");
+        stage(before);
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let fake = Arc::new(FakeEmbedder::new());
+        let provider = Arc::clone(&fake);
+        let runtime = EmbeddingRuntime::spawn(
+            root_path.clone(),
+            Arc::clone(&index),
+            root_path.join("cache.bin"),
+            async move {
+                wait.await.unwrap();
+                Ok(provider as Arc<dyn Embedder>)
+            },
+        );
+        assert_eq!(
+            runtime.pending_kind(before),
+            Some(PendingKind::AwaitingLexical)
+        );
+        // The coordinator must also honor stamps discovered after its first seed.
+        stage(during);
+        release.send(()).unwrap();
+        wait_for_status(&runtime, |s| {
+            s.indexed_notes == 1 && s.pending_notes == 2 && s.phase == EmbeddingPhase::Warming
+        })
+        .await;
+        assert_eq!(
+            runtime.pending_kind(during),
+            Some(PendingKind::AwaitingLexical)
+        );
+        {
+            let inputs = fake.inputs.lock().unwrap();
+            assert_eq!(inputs.len(), 1);
+            assert!(inputs[0].contains("available marker"));
+        }
+
+        let committed = lexical.publish().unwrap();
+        index
+            .write()
+            .unwrap()
+            .publish_embedding_upserts(committed, |path| runtime.submit_upsert(path));
+        wait_for_status(&runtime, |s| {
+            s.phase == EmbeddingPhase::Ready && s.indexed_notes == 3
+        })
+        .await;
+        assert_eq!(fake.inputs.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -2516,7 +2604,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compatible_cache_relocation_runs_in_background_and_reuses_vectors() {
+    async fn scoped_checkpoints_rebuild_without_importing_unscoped_vectors() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(directory.path().join(".obsidian")).unwrap();
         std::fs::write(directory.path().join("one.md"), "# One\nsemantic body").unwrap();
@@ -2537,24 +2625,25 @@ mod tests {
         cache.save(&source_path).unwrap();
 
         let loader_fake = Arc::clone(&fake);
-        let runtime = EmbeddingRuntime::spawn_with_cache_sources(
+        let runtime = EmbeddingRuntime::spawn_for_test(
             directory.path().to_path_buf(),
             index,
             target_path.clone(),
-            vec![source_path.clone()],
             32,
             true,
             async move { Ok(loader_fake as Arc<dyn Embedder>) },
         );
-        wait_for_status(&runtime, |status| status.phase == EmbeddingPhase::Ready).await;
+        wait_for_status(&runtime, |status| {
+            status.phase == EmbeddingPhase::Ready && target_path.is_file()
+        })
+        .await;
 
-        assert_eq!(fake.calls.load(AtomicOrdering::SeqCst), 0);
+        assert!(fake.calls.load(AtomicOrdering::SeqCst) > 0);
         assert!(runtime.status().queryable);
         assert!(
             source_path.is_file(),
-            "relocation must not delete its source"
+            "unscoped checkpoint must remain available"
         );
-        assert!(target_path.is_file(), "relocation must publish the target");
         let loaded = EmbeddingStore::load(&target_path).unwrap();
         assert!(loaded.first_pass_complete());
         assert_eq!(loaded.len(), 1);
@@ -2660,7 +2749,8 @@ mod tests {
             snapshot.score_for(Path::new("two.md"), &[0.0, 1.0, 0.0]),
             1.0
         );
-        let output = captured_logs().text_for(&directory.path().display().to_string());
+        let marker = directory.path().file_name().unwrap().to_string_lossy();
+        let output = captured_logs().text_for(&marker);
         assert!(output.contains("outcome=\"failed\""));
         assert!(output.contains("1 vectors for 2 inputs"));
     }
@@ -2734,6 +2824,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retiring_a_scope_cancels_document_retries_with_outstanding_runtime_handles() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("one.md"), "# One\nprivate").unwrap();
+        let model = Arc::new(FakeEmbedder::new());
+        model.fail.store(true, AtomicOrdering::SeqCst);
+        let loader = Arc::clone(&model);
+        let runtime = EmbeddingRuntime::spawn(
+            directory.path().to_path_buf(),
+            test_index(directory.path()).await,
+            directory.path().join("cache.bin"),
+            async move { Ok(loader as Arc<dyn Embedder>) },
+        );
+        let outstanding = runtime.clone();
+        wait_for_status(&runtime, |status| status.phase == EmbeddingPhase::Degraded).await;
+        let retry =
+            runtime.control.shared.state.lock().unwrap().pending[Path::new("one.md")].not_before;
+        runtime.retire();
+        drop(runtime);
+        model.fail.store(false, AtomicOrdering::SeqCst);
+        let calls = model.calls.load(AtomicOrdering::SeqCst);
+        assert!(!outstanding.activate());
+        outstanding.submit_upsert(Path::new("one.md"));
+        tokio::time::sleep_until(
+            tokio::time::Instant::from_std(retry) + Duration::from_millis(100),
+        )
+        .await;
+        assert_eq!(model.calls.load(AtomicOrdering::SeqCst), calls);
+    }
+
+    #[tokio::test]
     async fn failed_refresh_keeps_last_known_good_then_recovers() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(directory.path().join(".obsidian")).unwrap();
@@ -2801,6 +2921,37 @@ mod tests {
         std::fs::create_dir(&blocked_parent).unwrap();
         wait_for_status(&runtime, |status| status.phase == EmbeddingPhase::Ready).await;
         assert!(cache_path.is_file());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replacing_a_ready_cache_directory_with_a_symlink_stops_publication_and_queries() {
+        let vault = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let cache_dir = vault.path().join(".cache");
+        let cache = cache_dir.join("cache.bin");
+        let note = vault.path().join("one.md");
+        std::fs::write(&note, "# One\nfirst revision").unwrap();
+        let runtime = EmbeddingRuntime::spawn(
+            vault.path().to_owned(),
+            test_index(vault.path()).await,
+            cache.clone(),
+            async { Ok(Arc::new(FakeEmbedder::new()) as Arc<dyn Embedder>) },
+        );
+        wait_for_status(&runtime, |status| status.queryable && cache.is_file()).await;
+        assert!(runtime.query_snapshot().is_ok());
+        let protected = outside.path().join("cache.bin");
+        std::fs::write(&protected, b"outside checkpoint").unwrap();
+        std::fs::rename(&cache_dir, vault.path().join(".saved")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &cache_dir).unwrap();
+        std::fs::write(&note, "# One\nsecond revision").unwrap();
+        runtime.submit_upsert(Path::new("one.md"));
+        wait_for_status(&runtime, |status| {
+            status.phase == EmbeddingPhase::Degraded && !status.queryable
+        })
+        .await;
+        assert!(runtime.query_snapshot().is_err());
+        assert_eq!(std::fs::read(&protected).unwrap(), b"outside checkpoint");
     }
 
     #[tokio::test]
@@ -3309,11 +3460,10 @@ mod tests {
             (5, Duration::from_secs(3), Some(Duration::from_secs(30))),
             (0, Duration::MAX, None),
         ] {
-            let runtime = EmbeddingRuntime::spawn_with_cache_sources(
+            let runtime = EmbeddingRuntime::spawn_for_test(
                 directory.path().to_path_buf(),
                 Arc::clone(&index),
                 directory.path().join("cache.bin"),
-                Vec::new(),
                 32,
                 false,
                 async { Ok(Arc::new(FakeEmbedder::new()) as Arc<dyn Embedder>) },
@@ -3379,11 +3529,10 @@ mod tests {
         std::fs::write(directory.path().join("a.md"), "# A\nbody").unwrap();
         std::fs::write(directory.path().join("z.md"), "# Z\nbody").unwrap();
         let index = test_index(directory.path()).await;
-        let runtime = EmbeddingRuntime::spawn_with_cache_sources(
+        let runtime = EmbeddingRuntime::spawn_for_test(
             directory.path().to_path_buf(),
             index,
             directory.path().join("cache.bin"),
-            Vec::new(),
             1,
             false,
             async { Ok(Arc::new(FakeEmbedder::new()) as Arc<dyn Embedder>) },
@@ -3422,11 +3571,10 @@ mod tests {
             std::fs::write(directory.path().join(name), &raw).unwrap();
         }
         let index = test_index(directory.path()).await;
-        let runtime = EmbeddingRuntime::spawn_with_cache_sources(
+        let runtime = EmbeddingRuntime::spawn_for_test(
             directory.path().to_path_buf(),
             index,
             directory.path().join("cache.bin"),
-            Vec::new(),
             32,
             false,
             async { Ok(Arc::new(FakeEmbedder::new()) as Arc<dyn Embedder>) },
@@ -3474,11 +3622,10 @@ mod tests {
         let index = test_index(directory.path()).await;
         let model: Arc<dyn Embedder> = Arc::new(FakeEmbedder::new());
         let loaded = Arc::clone(&model);
-        let runtime = EmbeddingRuntime::spawn_with_cache_sources(
+        let runtime = EmbeddingRuntime::spawn_for_test(
             directory.path().to_path_buf(),
             index,
             directory.path().join("cache.bin"),
-            Vec::new(),
             1,
             false,
             async move { Ok(loaded) },
@@ -3532,11 +3679,10 @@ mod tests {
         let index = test_index(directory.path()).await;
         let model: Arc<dyn Embedder> = Arc::new(FakeEmbedder::new());
         let loader_model = Arc::clone(&model);
-        let runtime = EmbeddingRuntime::spawn_with_cache_sources(
+        let runtime = EmbeddingRuntime::spawn_for_test(
             directory.path().to_path_buf(),
             index,
             directory.path().join("cache.bin"),
-            Vec::new(),
             32,
             false,
             async move { Ok(loader_model) },
@@ -3573,11 +3719,10 @@ mod tests {
         let index = test_index(directory.path()).await;
         let model: Arc<dyn Embedder> = Arc::new(FakeEmbedder::new());
         let loader_model = Arc::clone(&model);
-        let runtime = EmbeddingRuntime::spawn_with_cache_sources(
+        let runtime = EmbeddingRuntime::spawn_for_test(
             directory.path().to_path_buf(),
             index,
             directory.path().join("cache.bin"),
-            Vec::new(),
             32,
             false,
             async move { Ok(loader_model) },

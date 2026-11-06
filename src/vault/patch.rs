@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde_yaml::Value as YamlValue;
 
-use super::parser::{HeadingPos, extract_headings_with_offsets};
+use super::parser::{HeadingPos, extract_headings_with_offsets, find_block_ref};
 use crate::error::{VaultError, VaultResult};
 use crate::models::{PatchOperation, PatchRequest, PatchTargetType};
 
@@ -24,69 +24,6 @@ pub fn apply_patch(content: &str, request: &PatchRequest, path: &Path) -> VaultR
 // ============================================================
 // Shared helpers
 // ============================================================
-
-/// Returns byte offset of the start of each line.
-fn line_byte_offsets(content: &str) -> Vec<usize> {
-    let mut offsets = vec![0usize];
-    for (i, b) in content.bytes().enumerate() {
-        if b == b'\n' {
-            offsets.push(i + 1);
-        }
-    }
-    offsets
-}
-
-fn line_offset(offsets: &[usize], n: usize, content_len: usize) -> usize {
-    offsets.get(n).copied().unwrap_or(content_len)
-}
-
-/// Iterate lines outside fenced code blocks and frontmatter,
-/// calling `f(line_index, line_str)` for each relevant line.
-fn for_each_non_code_line<'a>(content: &'a str, mut f: impl FnMut(usize, &'a str)) {
-    let mut in_code_block = false;
-    let mut fence_char: u8 = b'`';
-    let mut fence_len: usize = 0;
-    let mut in_frontmatter = false;
-    let mut past_frontmatter = false;
-
-    for (idx, line) in content.lines().enumerate() {
-        if !past_frontmatter {
-            if idx == 0 && line.trim() == "---" {
-                in_frontmatter = true;
-                continue;
-            }
-            if in_frontmatter {
-                if line.trim() == "---" {
-                    past_frontmatter = true;
-                }
-                continue;
-            }
-            past_frontmatter = true;
-        }
-
-        let stripped = line.trim();
-
-        if in_code_block {
-            if !stripped.is_empty()
-                && stripped.len() >= fence_len
-                && stripped.bytes().all(|b| b == fence_char)
-            {
-                in_code_block = false;
-            }
-            continue;
-        }
-
-        let left = line.trim_start();
-        if left.starts_with("```") || left.starts_with("~~~") {
-            fence_char = left.as_bytes()[0];
-            fence_len = left.bytes().take_while(|&b| b == fence_char).count();
-            in_code_block = true;
-            continue;
-        }
-
-        f(idx, line);
-    }
-}
 
 /// Parse an ATX heading line into `(level, text)`.
 fn parse_heading(line: &str) -> Option<(u8, &str)> {
@@ -209,80 +146,46 @@ fn patch_heading(content: &str, request: &PatchRequest, path: &Path) -> VaultRes
 // Block ref patching
 // ============================================================
 
-/// Find the first line (outside code blocks / frontmatter) ending with `^{block_id}`.
-fn find_block_ref_line(content: &str, block_id: &str) -> Option<usize> {
-    let suffix = format!("^{block_id}");
-    let mut found = None;
-    for_each_non_code_line(content, |idx, line| {
-        if found.is_some() {
-            return;
-        }
-        let trimmed = line.trim_end();
-        if trimmed.ends_with(&suffix) {
-            let before = &trimmed[..trimmed.len() - suffix.len()];
-            if before.is_empty() || before.ends_with(' ') {
-                found = Some(idx);
-            }
-        }
-    });
-    found
-}
-
 fn patch_block(content: &str, request: &PatchRequest, path: &Path) -> VaultResult<String> {
     let block_id = request.target.strip_prefix('^').unwrap_or(&request.target);
-    let block_line =
-        find_block_ref_line(content, block_id).ok_or_else(|| VaultError::PatchTargetNotFound {
+    let block =
+        find_block_ref(content, block_id).ok_or_else(|| VaultError::PatchTargetNotFound {
             path: path.to_path_buf(),
             target_type: "block".into(),
             target: request.target.clone(),
         })?;
-
-    let offsets = line_byte_offsets(content);
-    let line_start = offsets[block_line];
-    let line_end = line_offset(&offsets, block_line + 1, content.len());
-
-    let mut result = String::with_capacity(content.len() + request.content.len() + 2);
-
+    let mut result = String::with_capacity(content.len() + request.content.len() + 4);
     match request.operation {
-        PatchOperation::Prepend => {
-            result.push_str(&content[..line_start]);
-            result.push_str(&request.content);
-            ensure_trailing_newline(&mut result);
-            result.push_str(&content[line_start..]);
-        }
-        PatchOperation::Append => {
-            result.push_str(&content[..line_end]);
-            ensure_trailing_newline(&mut result);
-            result.push_str(&request.content);
-            ensure_trailing_newline(&mut result);
-            result.push_str(&content[line_end..]);
-        }
         PatchOperation::Replace => {
-            let line_text = &content[line_start..line_end];
-            let trimmed = line_text.trim_end_matches(['\r', '\n']);
-            let ref_marker = format!("^{block_id}");
-            let ref_pos =
-                trimmed
-                    .rfind(&ref_marker)
-                    .ok_or_else(|| VaultError::PatchTargetNotFound {
-                        path: path.to_path_buf(),
-                        target_type: "block".into(),
-                        target: request.target.clone(),
-                    })?;
-            let block_ref_part = &trimmed[ref_pos..];
-            let line_ending = &content[line_start + trimmed.len()..line_end];
-
-            result.push_str(&content[..line_start]);
+            result.push_str(&content[..block.line.start]);
             if !request.content.is_empty() {
                 result.push_str(&request.content);
                 result.push(' ');
             }
-            result.push_str(block_ref_part);
-            result.push_str(line_ending);
-            result.push_str(&content[line_end..]);
+            result.push_str(&content[block.marker_start..]);
+        }
+        PatchOperation::Prepend | PatchOperation::Append => {
+            let insertion = if matches!(request.operation, PatchOperation::Prepend) {
+                block.line.start
+            } else {
+                block.end_with_newline
+            };
+            let newline = match &content[block.line.end..block.end_with_newline] {
+                "" if content[..block.line.start].ends_with("\r\n") => "\r\n",
+                "" => "\n",
+                terminator => terminator,
+            };
+            result.push_str(&content[..insertion]);
+            if !result.is_empty() && !result.ends_with('\n') {
+                result.push_str(newline);
+            }
+            result.push_str(&request.content);
+            if !result.is_empty() && !result.ends_with('\n') {
+                result.push_str(newline);
+            }
+            result.push_str(&content[insertion..]);
         }
     }
-
     Ok(result)
 }
 
@@ -896,7 +799,68 @@ Final thoughts.
     #[test]
     fn block_inside_code_block_ignored() {
         let content = "Start\n```\nfake ^block9\n```\nReal ^block9\n";
-        assert_eq!(find_block_ref_line(content, "block9"), Some(4));
+        let block = find_block_ref(content, "block9").unwrap();
+        assert_eq!(&content[block.line], "Real ^block9");
+    }
+
+    #[test]
+    fn inspection_range_and_patches_select_the_same_prose_marker() {
+        let excluded = "---\nkey: ^a-1\n---\n\n    example ^a-1\n\n```md\ncode ^a-1\n```\n\n> ~~~\n> quoted ^a-1\n> ~~~\n\n- item\n\n      nested ^a-1\n\n`inline ^a-1\ncontinued`\n\n";
+        for eol in ["\n", "\r\n"] {
+            let before = excluded.replace('\n', eol);
+            let after = format!("{eol}second ^a-1");
+            let line = "Пример^a-1  ";
+            let content = format!("{before}{line}{eol}{after}");
+            assert_eq!(
+                super::super::parser::extract_block_refs(&content),
+                ["a-1", "a-1"]
+            );
+            assert_eq!(
+                super::super::parser::find_block_ref_range(&content, "a-1"),
+                Some((before.len(), before.len() + line.len()))
+            );
+            for (operation, middle) in [
+                (PatchOperation::Prepend, format!("new{eol}{line}{eol}")),
+                (PatchOperation::Append, format!("{line}{eol}new{eol}")),
+                (PatchOperation::Replace, format!("new ^a-1  {eol}")),
+            ] {
+                let request = req(operation, PatchTargetType::Block, "^a-1", "new");
+                assert_eq!(
+                    apply_patch(&content, &request, p()).unwrap(),
+                    format!("{before}{middle}{after}")
+                );
+            }
+            let only_examples = req(
+                PatchOperation::Replace,
+                PatchTargetType::Block,
+                "a-1",
+                "new",
+            );
+            assert!(matches!(
+                apply_patch(&before, &only_examples, p()),
+                Err(VaultError::PatchTargetNotFound { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn standalone_marker_at_eof_keeps_the_preceding_crlf_line() {
+        let content = "preceding text\r\n^abc";
+        let replace = req(
+            PatchOperation::Replace,
+            PatchTargetType::Block,
+            "abc",
+            "new",
+        );
+        assert_eq!(
+            apply_patch(content, &replace, p()).unwrap(),
+            "preceding text\r\nnew ^abc"
+        );
+        let append = req(PatchOperation::Append, PatchTargetType::Block, "abc", "new");
+        assert_eq!(
+            apply_patch(content, &append, p()).unwrap(),
+            "preceding text\r\n^abc\r\nnew\r\n"
+        );
     }
 
     #[test]
@@ -1020,6 +984,6 @@ Final thoughts.
         )
         .unwrap();
         assert_eq!(result, "text ^id\nNEW\n");
-        assert_eq!(find_block_ref_line(&result, "id"), Some(0));
+        assert_eq!(find_block_ref(&result, "id").unwrap().line.start, 0);
     }
 }

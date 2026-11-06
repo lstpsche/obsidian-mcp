@@ -1,13 +1,20 @@
 #![cfg(all(unix, feature = "embeddings"))]
 
+#[path = "isolated_command.rs"]
+mod command;
+
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use obsidian_mcp::daemon::protocol::{
-    DAEMON_API_VERSION, EnsureVaultResult, OpenHintResult, SearchResult,
+use obsidian_mcp::client::semantic_daemon::{
+    DaemonConnectPolicy, SemanticDaemonClient, VaultAttachment,
 };
-use obsidian_mcp::daemon::server::{self, DaemonServerConfig, IpcEndpoint};
+use obsidian_mcp::daemon::protocol::{
+    DAEMON_API_VERSION, IndexScope, OpenHintResult, SearchResult,
+};
+use obsidian_mcp::daemon::server::IpcEndpoint;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -17,8 +24,8 @@ static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 pub struct DaemonTestServer {
     _semantic_home: tempfile::TempDir,
     endpoint_path: PathBuf,
-    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    task: tokio::task::JoinHandle<obsidian_mcp::error::VaultResult<()>>,
+    client: SemanticDaemonClient,
+    child: tokio::process::Child,
 }
 
 impl DaemonTestServer {
@@ -26,38 +33,45 @@ impl DaemonTestServer {
         let semantic_home = tempfile::tempdir().expect("semantic home tempdir should be created");
         let endpoint_path = semantic_home.path().join("ipc").join("semanticd.sock");
 
-        let config = DaemonServerConfig {
-            endpoint: IpcEndpoint::UnixSocket(endpoint_path.clone()),
-            model_name: model_name.to_string(),
-            semantic_home: semantic_home.path().to_path_buf(),
-        };
+        let binary = std::env::var_os("OBSIDIAN_TEST_DAEMON_BINARY")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_obsidian-semanticd").into());
+        let mut child = command::isolated_command(binary)
+            .env("OBSIDIAN_SEMANTIC_HOME", semantic_home.path())
+            .env("OBSIDIAN_SEMANTIC_ENDPOINT", &endpoint_path)
+            .env("OBSIDIAN_SEMANTIC_MODEL", model_name)
+            .env("OBSIDIAN_EMBEDDING_PROVIDER", "local")
+            .env("OBSIDIAN_LOG_LEVEL", "error")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("start local-model daemon");
 
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let task = tokio::spawn(async move {
-            server::run_with_shutdown(config, async move {
-                let _ = shutdown_rx.await;
-            })
-            .await
-        });
-
-        let mut ready = false;
-        for _ in 0..150 {
-            if tokio::net::UnixStream::connect(&endpoint_path)
-                .await
-                .is_ok()
-            {
-                ready = true;
-                break;
+        let client = SemanticDaemonClient::new(
+            IpcEndpoint::UnixSocket(endpoint_path.clone()),
+            DaemonConnectPolicy::default(),
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "local-model daemon exited during startup"
+                );
+                if client.health("daemon-test", "1").await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(ready, "daemon test server did not become ready in time");
+        })
+        .await
+        .expect("local-model daemon must serve health");
 
         Self {
             _semantic_home: semantic_home,
+            client,
             endpoint_path,
-            shutdown_tx: Some(shutdown_tx),
-            task,
+            child,
         }
     }
 
@@ -66,14 +80,18 @@ impl DaemonTestServer {
     }
 
     pub async fn shutdown(mut self) {
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
-        }
-        let joined = self
-            .task
+        assert!(
+            self.client
+                .shutdown()
+                .await
+                .expect("request daemon shutdown")
+                .accepted
+        );
+        let status = tokio::time::timeout(Duration::from_secs(10), self.child.wait())
             .await
-            .expect("daemon test server task should join");
-        joined.expect("daemon test server should exit cleanly");
+            .expect("daemon should shut down")
+            .expect("wait for local-model daemon");
+        assert!(status.success(), "daemon shutdown failed: {status}");
     }
 
     pub async fn request_value(&self, method: &str, params: Value) -> Value {
@@ -109,15 +127,11 @@ impl DaemonTestServer {
             .expect("daemon_api_version should be present") as u32
     }
 
-    pub async fn ensure_vault(&self, vault_root: &Path, watch: bool) -> EnsureVaultResult {
-        self.request_typed(
-            "ensure_vault",
-            json!({
-                "vault_root": vault_root.display().to_string(),
-                "watch": watch
-            }),
-        )
-        .await
+    pub async fn ensure_vault(&self, vault_root: &Path, watch: bool) -> VaultAttachment {
+        self.client
+            .attach_vault(vault_root, &IndexScope::default(), watch, None)
+            .await
+            .expect("scoped attachment should be established")
     }
 
     pub async fn ensure_vault_ready(
@@ -125,68 +139,67 @@ impl DaemonTestServer {
         vault_root: &Path,
         watch: bool,
         timeout: Duration,
-    ) -> EnsureVaultResult {
+    ) -> VaultAttachment {
+        let attachment = self.ensure_vault(vault_root, watch).await;
+        let scope = IndexScope::default();
         let deadline = std::time::Instant::now() + timeout;
-        let mut last = self.ensure_vault(vault_root, watch).await;
-        while !last.ready {
+        loop {
+            let status = self
+                .client
+                .vault_status(vault_root, &scope)
+                .await
+                .expect("read scope status");
+            if status.ready {
+                return attachment;
+            }
             assert!(
                 std::time::Instant::now() < deadline,
-                "timed out waiting for semantic readiness: {last:?}"
+                "timed out waiting for semantic readiness: {status:?}"
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
-            last = self.ensure_vault(vault_root, watch).await;
         }
-        last
     }
 
     pub async fn search_semantic(
         &self,
-        vault_root: &Path,
+        attachment: &VaultAttachment,
         query: &str,
         top_k: usize,
         include_content: bool,
     ) -> SearchResult {
-        self.request_typed(
-            "search_semantic",
-            json!({
-                "vault_root": vault_root.display().to_string(),
-                "query": query,
-                "top_k": top_k,
-                "include_content": include_content
-            }),
-        )
-        .await
+        self.client
+            .search_semantic(attachment, query, top_k, include_content)
+            .await
+            .expect("semantic search should succeed")
     }
 
     pub async fn search_hybrid(
         &self,
-        vault_root: &Path,
+        attachment: &VaultAttachment,
         query: &str,
         top_k: usize,
         prefetch: usize,
         alpha: f32,
         include_content: bool,
     ) -> SearchResult {
-        self.request_typed(
-            "search_hybrid",
-            json!({
-                "vault_root": vault_root.display().to_string(),
-                "query": query,
-                "top_k": top_k,
-                "prefetch": prefetch,
-                "alpha": alpha,
-                "include_content": include_content
-            }),
-        )
-        .await
+        self.client
+            .search_hybrid(attachment, query, top_k, prefetch, alpha, include_content)
+            .await
+            .expect("hybrid search should succeed")
     }
 
-    pub async fn open_hint(&self, vault_root: &Path, path: &str) -> OpenHintResult {
+    pub async fn open_hint(
+        &self,
+        vault_root: &Path,
+        attachment: &VaultAttachment,
+        path: &str,
+    ) -> OpenHintResult {
         self.request_typed(
             "open_hint",
             json!({
                 "vault_root": vault_root.display().to_string(),
-                "path": path
+                "path": path,
+                "attachment_id": attachment.result.attachment_id
             }),
         )
         .await

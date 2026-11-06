@@ -1,3 +1,5 @@
+mod http_process;
+
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -18,12 +20,15 @@ use obsidian_mcp::upgrade::BuildIdentity;
 use obsidian_mcp::upgrade::orchestrator::{self, UpgradeOptions, UpgradeRunOutcome};
 use obsidian_mcp::vault::Vault;
 
+#[cfg(all(test, unix))]
+mod test_daemon_rpc;
+
 tokio::task_local! {
     static REQUEST_DISABLED_TOOLS: HashSet<String>;
 }
 
-const DAEMON_DISABLED_BY_WATCH_REASON: &str =
-    "semantic daemon disabled because OBSIDIAN_WATCH is false";
+const AUTO_WATCH_DISABLED: &str =
+    "automatic semantic daemon startup is disabled when OBSIDIAN_WATCH is false";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -31,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(code);
     }
 
-    let cli = parse_cli_args();
+    let cli = parse_cli_args(std::env::args_os().skip(1))?;
     let config = Config::load(&cli)?;
     let semantic_runtime_config = SemanticRuntimeConfig::load_from_env();
 
@@ -135,6 +140,7 @@ async fn serve_http(
 
     let addr = std::net::SocketAddr::new(config.http_host, config.http_port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let addr = listener.local_addr()?;
     tracing::info!(%addr, "HTTP MCP server listening");
 
     axum::serve(listener, app)
@@ -248,7 +254,7 @@ async fn init_semantic_runtime(
         daemon_client: None,
         daemon_unavailable_reason: None,
         prefetch_count: runtime_cfg.prefetch_count,
-        vault_ensured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        attachments: Default::default(),
         local_fallback_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         daemon_health_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
@@ -256,14 +262,13 @@ async fn init_semantic_runtime(
     if runtime_cfg.mode == SemanticMode::Local {
         return runtime;
     }
-    if !config.watch {
-        runtime.daemon_unavailable_reason = Some(DAEMON_DISABLED_BY_WATCH_REASON.to_string());
+    if !config.watch && runtime_cfg.mode == SemanticMode::Auto {
+        runtime.daemon_unavailable_reason = Some(AUTO_WATCH_DISABLED.into());
         if cfg!(has_embeddings) && config.embeddings {
             runtime.activate_local_fallback(&VaultError::DaemonUnavailable(
-                DAEMON_DISABLED_BY_WATCH_REASON.to_string(),
+                AUTO_WATCH_DISABLED.into(),
             ));
         }
-        tracing::info!("semantic daemon disabled because OBSIDIAN_WATCH=false");
         return runtime;
     }
 
@@ -272,7 +277,7 @@ async fn init_semantic_runtime(
             client,
             health_pending,
         }) => {
-            if !health_pending && let Err(error) = client.require_source_evidence().await {
+            if !health_pending && let Err(error) = client.require_semantic_capabilities().await {
                 // Retain the inspected client so a later semantic call preserves
                 // this contract error rather than classifying it as an outage.
                 runtime.daemon_unavailable_reason = Some(error.to_string());
@@ -387,8 +392,9 @@ async fn initialize_daemon_client(
 }
 
 async fn handle_cli_flags() -> Option<i32> {
-    let arg = std::env::args().nth(1)?;
-    match arg.as_str() {
+    let first = std::env::args_os().nth(1)?;
+    let arg = first.to_str()?;
+    match arg {
         "--__build-info" => {
             match BuildIdentity::embedded().to_json() {
                 Ok(identity) => println!("{identity}"),
@@ -415,7 +421,7 @@ async fn handle_cli_flags() -> Option<i32> {
                 print_help();
                 return Some(0);
             }
-            let result = match arg.as_str() {
+            let result = match arg {
                 "stop" => stop_server(),
                 _ => daemonize(),
             };
@@ -432,7 +438,7 @@ async fn handle_cli_flags() -> Option<i32> {
 }
 
 fn subcommand_wants_help() -> bool {
-    std::env::args().any(|a| a == "--help" || a == "-h")
+    std::env::args_os().any(|a| a == "--help" || a == "-h")
 }
 
 fn print_help() {
@@ -494,7 +500,7 @@ fn print_help() {
 }
 
 async fn run_upgrade_command() -> i32 {
-    let args = std::env::args().skip(2).collect::<Vec<_>>();
+    let args = std::env::args_os().skip(2).collect::<Vec<_>>();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_upgrade_help();
         return 0;
@@ -663,54 +669,32 @@ async fn run_windows_upgrade_helper() -> i32 {
 
 /// Resolve the HTTP bind endpoint without requiring a vault path.
 fn resolve_endpoint_from_args() -> Result<std::net::SocketAddr, Box<dyn std::error::Error>> {
-    obsidian_mcp::config::resolve_http_endpoint(&parse_cli_args()).map_err(Into::into)
-}
-
-fn connect_address(endpoint: std::net::SocketAddr) -> std::net::SocketAddr {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-    let ip = match endpoint.ip() {
-        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
-        ip => ip,
-    };
-    SocketAddr::new(ip, endpoint.port())
+    let cli = parse_cli_args(std::env::args_os().skip(2))?;
+    obsidian_mcp::config::resolve_http_endpoint(&cli).map_err(Into::into)
 }
 
 fn stop_server() -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = resolve_endpoint_from_args()?;
-    if !is_port_in_use(endpoint) {
+    if http_process::stop(endpoint, &std::env::current_exe()?)? {
+        println!("server on {endpoint} stopped");
+    } else {
         println!("no server running on {endpoint}");
-        return Ok(());
     }
-    stop_existing_server(endpoint)?;
-    println!("server on {endpoint} stopped");
     Ok(())
 }
 
 /// Spawn a detached child running `--http` and exit the parent.
-/// Kills any existing server on the target port first.
+/// Replace a running instance of this installation at the requested bind address.
 fn daemonize() -> Result<(), Box<dyn std::error::Error>> {
     let exe = std::env::current_exe()?;
 
-    let mut child_args = vec!["--http".to_string()];
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == "serve" || arg == "restart" {
-            continue;
-        }
-        let takes_value = arg == "--port" || arg == "--host";
-        if takes_value {
-            if let Some(val) = args.next() {
-                child_args.push(arg);
-                child_args.push(val);
-            }
-        } else {
-            child_args.push(arg);
-        }
-    }
-
     let endpoint = resolve_endpoint_from_args()?;
-    stop_existing_server(endpoint)?;
+    if endpoint.port() == 0 {
+        return Err(
+            "serve and restart require a fixed port; use --http for an ephemeral port".into(),
+        );
+    }
+    http_process::stop(endpoint, &exe)?;
 
     let log_file = daemon_log_path()?;
     if let Some(parent) = log_file.parent() {
@@ -722,7 +706,8 @@ fn daemonize() -> Result<(), Box<dyn std::error::Error>> {
         .open(&log_file)?;
 
     let mut cmd = std::process::Command::new(&exe);
-    cmd.args(&child_args)
+    cmd.arg("--http")
+        .args(std::env::args_os().skip(2))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr_file));
@@ -732,208 +717,110 @@ fn daemonize() -> Result<(), Box<dyn std::error::Error>> {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{
+            HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+        };
 
+        // CreateProcess inherits other inheritable handles alongside the
+        // explicitly redirected stdio. A background child retaining the
+        // launcher's original output pipes would keep its caller waiting for EOF.
+        for handle in [
+            std::io::stdin().as_raw_handle(),
+            std::io::stdout().as_raw_handle(),
+            std::io::stderr().as_raw_handle(),
+        ] {
+            if !handle.is_null()
+                && handle != INVALID_HANDLE_VALUE
+                && unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+    }
     let mut child = cmd.spawn()?;
     let child_pid = child.id();
-
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    if let Some(status) = child.try_wait()? {
+    if let Err(reason) = wait_for_http_child(&mut child, endpoint) {
+        if child.try_wait()?.is_none() {
+            // Only this directly spawned child is eligible for cleanup.
+            child.kill().and_then(|()| child.wait()).map_err(|error| {
+                format!(
+                    "{reason}; failed to clean up child {child_pid}: {error} (log: {})",
+                    log_file.display()
+                )
+            })?;
+        }
         return Err(format!(
-            "server exited immediately (exit code: {status})\ncheck logs: {}",
+            "HTTP server {child_pid} failed startup: {reason}\ncheck logs: {}",
             log_file.display()
         )
         .into());
     }
 
-    let mut healthy = false;
-    for tick in 0..60 {
-        std::thread::sleep(std::time::Duration::from_millis(250));
-        if let Some(status) = child.try_wait()? {
-            return Err(format!(
-                "server exited during startup (exit code: {status})\ncheck logs: {}",
-                log_file.display()
-            )
-            .into());
-        }
-        if probe_health(endpoint) {
-            healthy = true;
-            break;
-        }
-        if tick == 19 {
-            eprintln!("waiting for server to become healthy…");
-        }
-    }
-
-    if healthy {
-        eprintln!(
-            "{name} {version} HTTP server started (PID {pid})\nlogs: {log}",
-            name = env!("CARGO_PKG_NAME"),
-            version = env!("CARGO_PKG_VERSION"),
-            pid = child_pid,
-            log = log_file.display(),
-        );
-        Ok(())
-    } else {
-        Err(format!(
-            "server started (PID {child_pid}) but /health not responding after 15s\n\
-             check logs: {}",
-            log_file.display()
-        )
-        .into())
-    }
-}
-
-fn is_port_in_use(endpoint: std::net::SocketAddr) -> bool {
-    std::net::TcpStream::connect_timeout(
-        &connect_address(endpoint),
-        std::time::Duration::from_millis(200),
-    )
-    .is_ok()
-}
-
-fn probe_health(endpoint: std::net::SocketAddr) -> bool {
-    obsidian_mcp::upgrade::health::probe(&endpoint.ip().to_string(), endpoint.port()).is_ok()
-}
-
-/// Stop the listener at the selected endpoint, failing if it cannot be freed.
-fn stop_existing_server(endpoint: std::net::SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-    use std::net::TcpStream;
-    use std::time::Duration;
-
-    let addr = connect_address(endpoint);
-    let port = endpoint.port();
-
-    for round in 0..5 {
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err() {
-            return Ok(());
-        }
-
-        let Some(pid) = find_pid_on_port(endpoint) else {
-            if round == 0 {
-                return Err(format!(
-                    "port {port} is already in use but could not identify the process"
-                )
-                .into());
-            }
-            std::thread::sleep(Duration::from_secs(1));
-            if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err() {
-                return Ok(());
-            }
-            return Err(format!("port {port} is still in use").into());
-        };
-
-        if pid == std::process::id() {
-            return Ok(());
-        }
-
-        println!("stopping existing server on port {port} (PID {pid})");
-        stop_process(pid)?;
-    }
-
-    if TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_err() {
-        return Ok(());
-    }
-    Err(format!("port {port} is still in use after stopping 5 processes").into())
-}
-
-fn stop_process(pid: u32) -> Result<(), Box<dyn std::error::Error>> {
-    send_signal(pid, false);
-    if !wait_for_process_exit(pid, 50) {
-        println!("process did not exit after SIGTERM, sending SIGKILL (PID {pid})");
-        send_signal(pid, true);
-        if !wait_for_process_exit(pid, 20) {
-            return Err(format!("could not stop process (PID {pid})").into());
-        }
-    }
+    eprintln!(
+        "{name} {version} HTTP server started (PID {child_pid})\nlogs: {log}",
+        name = env!("CARGO_PKG_NAME"),
+        version = env!("CARGO_PKG_VERSION"),
+        log = log_file.display(),
+    );
     Ok(())
 }
 
-fn wait_for_process_exit(pid: u32, ticks: u32) -> bool {
-    for _ in 0..ticks {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if !is_process_alive(pid) {
-            return true;
+fn wait_for_http_child(
+    child: &mut std::process::Child,
+    endpoint: std::net::SocketAddr,
+) -> std::io::Result<()> {
+    use std::io;
+    use std::time::{Duration, Instant};
+
+    let start = Instant::now();
+    let mut waiting_message = false;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Err(io::Error::other(format!("child exited with {status}")));
         }
-    }
-    false
-}
-
-#[cfg(unix)]
-fn is_process_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
-#[cfg(windows)]
-fn is_process_alive(pid: u32) -> bool {
-    std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-        .stderr(Stdio::null())
-        .output()
-        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
-}
-
-#[cfg(unix)]
-fn find_pid_on_port(endpoint: std::net::SocketAddr) -> Option<u32> {
-    let selector = if endpoint.ip().is_unspecified() {
-        format!(
-            "-i{}TCP:{}",
-            if endpoint.is_ipv6() { 6 } else { 4 },
-            endpoint.port()
-        )
-    } else {
-        format!("-iTCP@{endpoint}")
-    };
-    let output = std::process::Command::new("lsof")
-        .args(["-nP", "-t", &selector, "-sTCP:LISTEN"])
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .filter_map(|s| s.parse::<u32>().ok())
-        .find(|&pid| pid != std::process::id())
-}
-
-#[cfg(windows)]
-fn find_pid_on_port(endpoint: std::net::SocketAddr) -> Option<u32> {
-    let output = std::process::Command::new("netstat")
-        .args(["-ano"])
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find_map(|line| {
-            let fields: Vec<_> = line.split_whitespace().collect();
-            if fields.len() != 5 || fields[0] != "TCP" || fields[3] != "LISTENING" {
-                return None;
+        let pending = match http_process::listener_pid(endpoint)? {
+            None => "child has not bound its listener".to_string(),
+            Some(owner) if owner != child.id() => {
+                return Err(io::Error::other(format!(
+                    "another process owns {endpoint} (PID {owner})"
+                )));
             }
-            let address: std::net::SocketAddr = fields[1].parse().ok()?;
-            (address == endpoint)
-                .then(|| fields[4].parse::<u32>().ok())
-                .flatten()
-        })
-        .filter(|&pid| pid != std::process::id())
-}
-
-#[cfg(unix)]
-fn send_signal(pid: u32, force: bool) {
-    let sig = if force { "-KILL" } else { "-TERM" };
-    let _ = std::process::Command::new("kill")
-        .args([sig, &pid.to_string()])
-        .status();
-}
-
-#[cfg(windows)]
-fn send_signal(pid: u32, force: bool) {
-    let mut args = vec!["/PID".to_string(), pid.to_string()];
-    if force {
-        args.push("/F".to_string());
+            Some(_) => match obsidian_mcp::upgrade::health::probe(
+                &endpoint.ip().to_string(),
+                endpoint.port(),
+            ) {
+                Ok(health) => {
+                    if health.version != env!("CARGO_PKG_VERSION") {
+                        return Err(io::Error::other(format!(
+                            "unexpected child HTTP version {}",
+                            health.version
+                        )));
+                    }
+                    if http_process::listener_pid(endpoint)? != Some(child.id()) {
+                        return Err(io::Error::other(
+                            "HTTP listener changed during health check",
+                        ));
+                    }
+                    return Ok(());
+                }
+                Err(error) => error.to_string(),
+            },
+        };
+        if start.elapsed() >= Duration::from_secs(15) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("child did not own a healthy listener on {endpoint} within 15s: {pending}"),
+            ));
+        }
+        if !waiting_message && start.elapsed() >= Duration::from_secs(5) {
+            eprintln!("waiting for server to become healthy…");
+            waiting_message = true;
+        }
+        std::thread::sleep(Duration::from_millis(250));
     }
-    let _ = std::process::Command::new("taskkill").args(&args).status();
 }
 
 fn daemon_log_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
@@ -1013,13 +900,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watch_disabled_skips_daemon_initialization() {
+    async fn watch_disabled_skips_automatic_daemon_initialization() {
         let config = test_config();
-        let runtime = init_semantic_runtime(&config, &runtime_config(SemanticMode::Daemon)).await;
+        let runtime = init_semantic_runtime(&config, &runtime_config(SemanticMode::Auto)).await;
         assert!(runtime.daemon_client.is_none());
         assert_eq!(
             runtime.daemon_unavailable_reason.as_deref(),
-            Some(DAEMON_DISABLED_BY_WATCH_REASON)
+            Some(AUTO_WATCH_DISABLED)
         );
     }
 
@@ -1094,8 +981,8 @@ mod tests {
     async fn manifest_health_timeout_resumes_once_on_search_and_status_stays_passive() {
         use obsidian_mcp::daemon::{home, manifest};
         use obsidian_mcp::tools::{search, utility};
-        use serde_json::{Value, json};
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use serde_json::json;
+        use tokio::io::{AsyncWriteExt, BufReader};
 
         let directory = tempfile::tempdir().unwrap();
         let endpoint = directory.path().join("daemon.sock");
@@ -1132,9 +1019,12 @@ mod tests {
             for request_index in 0..5 {
                 let (stream, _) = listener.accept().await.unwrap();
                 let (read, mut write) = stream.into_split();
-                let mut line = String::new();
-                BufReader::new(read).read_line(&mut line).await.unwrap();
-                let request: Value = serde_json::from_str(&line).unwrap();
+                let mut reader = BufReader::new(read);
+                let request = if request_index >= 2 {
+                    crate::test_daemon_rpc::scoped_request(&mut reader, &mut write).await
+                } else {
+                    crate::test_daemon_rpc::request(&mut reader).await
+                };
                 let method = request["method"].as_str().unwrap();
                 server_methods.lock().unwrap().push(method.to_string());
                 if request_index == 0 {
@@ -1143,13 +1033,13 @@ mod tests {
                 }
                 let result = match method {
                     "health" => {
-                        json!({"daemon_version":"3.1.0", "daemon_api_version":2, "pid":1, "status":"ok", "uptime_ms":1, "model_name":"probe", "semantic_home":"/tmp/test", "capabilities":["semantic_source_evidence_v1"]})
+                        json!({"daemon_version":"3.1.0", "daemon_api_version":2, "pid":1, "status":"ok", "uptime_ms":1, "model_name":"probe", "semantic_home":"/tmp/test", "capabilities":["semantic_source_evidence_v1","scoped_indexing_v1"]})
                     }
                     "vault_status" => {
                         json!({"phase":"ready", "ready":true, "indexed_notes":0, "total_notes":0, "pending_notes":0})
                     }
                     "ensure_vault" => {
-                        json!({"vault_id":"test", "ready":true, "watch_enabled":true, "model_name":"probe"})
+                        json!({"scope_id":"scope","attachment_id":"holder","vault_id":"test", "ready":true, "watch_enabled":true, "model_name":"probe"})
                     }
                     "search_semantic" => json!({"results":[]}),
                     other => panic!("unexpected request {other}"),
@@ -1228,9 +1118,9 @@ mod tests {
     async fn deferred_bootstrap_retains_unsupported_owner_until_health_recovers() {
         use obsidian_mcp::daemon::{home, manifest, protocol};
         use obsidian_mcp::tools::{search, utility};
-        use serde_json::{Value, json};
+        use serde_json::json;
         use std::sync::atomic::{AtomicBool, Ordering};
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::io::{AsyncWriteExt, BufReader};
 
         let directory = tempfile::tempdir().unwrap();
         let endpoint = directory.path().join("daemon.sock");
@@ -1269,9 +1159,12 @@ mod tests {
             for request_index in 0..9 {
                 let (stream, _) = listener.accept().await.unwrap();
                 let (read, mut write) = stream.into_split();
-                let mut line = String::new();
-                BufReader::new(read).read_line(&mut line).await.unwrap();
-                let request: Value = serde_json::from_str(&line).unwrap();
+                let mut reader = BufReader::new(read);
+                let request = if request_index >= 6 {
+                    crate::test_daemon_rpc::scoped_request(&mut reader, &mut write).await
+                } else {
+                    crate::test_daemon_rpc::request(&mut reader).await
+                };
                 let method = request["method"].as_str().unwrap();
                 server_methods.lock().unwrap().push(method.to_string());
                 if request_index == 0 {
@@ -1287,7 +1180,7 @@ mod tests {
                     let result = match method {
                         "health" => {
                             let capabilities = if server_supports_evidence.load(Ordering::Acquire) {
-                                vec![protocol::SEMANTIC_SOURCE_EVIDENCE_CAPABILITY]
+                                protocol::SEMANTIC_CAPABILITIES.to_vec()
                             } else {
                                 Vec::new()
                             };
@@ -1299,7 +1192,7 @@ mod tests {
                             })
                         }
                         "ensure_vault" => {
-                            json!({"vault_id":"test", "ready":true, "watch_enabled":true, "model_name":"probe"})
+                            json!({"scope_id":"scope","attachment_id":"holder","vault_id":"test", "ready":true, "watch_enabled":true, "model_name":"probe"})
                         }
                         "search_semantic" => json!({"results":[]}),
                         other => panic!("unexpected request {other}"),
@@ -1374,7 +1267,6 @@ mod tests {
             info.structured_content.unwrap()["embeddings"]["availability"],
             "unattached"
         );
-        assert!(!runtime.vault_ensured.load(Ordering::Acquire));
         assert_eq!(
             std::fs::read(&paths.manifest_path).unwrap(),
             manifest_after_resume
@@ -1418,7 +1310,7 @@ mod tests {
     #[tokio::test]
     async fn startup_health_timeout_recovers_without_local_indexing() {
         use obsidian_mcp::tools::{search, utility};
-        use serde_json::{Value, json};
+        use serde_json::json;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let directory = tempfile::tempdir().unwrap();
         let endpoint = directory.path().join("daemon.sock");
@@ -1434,22 +1326,25 @@ mod tests {
             drop(reader);
             server_recovered.notify_one();
             let mut methods = Vec::new();
-            for _ in 0..4 {
+            for request_index in 0..4 {
                 let (stream, _) = listener.accept().await.unwrap();
                 let (read, mut write) = stream.into_split();
-                let mut line = String::new();
-                BufReader::new(read).read_line(&mut line).await.unwrap();
-                let request: Value = serde_json::from_str(&line).unwrap();
+                let mut reader = BufReader::new(read);
+                let request = if request_index != 0 {
+                    crate::test_daemon_rpc::scoped_request(&mut reader, &mut write).await
+                } else {
+                    crate::test_daemon_rpc::request(&mut reader).await
+                };
                 let method = request["method"].as_str().unwrap();
                 let result = match method {
                     "health" => {
-                        json!({"daemon_version":"3.1.0", "daemon_api_version":2, "pid":1, "status":"ok", "uptime_ms":1, "model_name":"probe", "semantic_home":"/tmp/test", "capabilities":["semantic_source_evidence_v1"]})
+                        json!({"daemon_version":"3.1.0", "daemon_api_version":2, "pid":1, "status":"ok", "uptime_ms":1, "model_name":"probe", "semantic_home":"/tmp/test", "capabilities":["semantic_source_evidence_v1","scoped_indexing_v1"]})
                     }
                     "vault_status" => {
                         json!({"phase":"ready", "ready":true, "indexed_notes":0, "total_notes":0, "pending_notes":0})
                     }
                     "ensure_vault" => {
-                        json!({"vault_id":"test", "ready":true, "watch_enabled":true, "model_name":"probe"})
+                        json!({"scope_id":"scope","attachment_id":"holder","vault_id":"test", "ready":true, "watch_enabled":true, "model_name":"probe"})
                     }
                     "search_semantic" => json!({"results":[]}),
                     other => panic!("unexpected request {other}"),
