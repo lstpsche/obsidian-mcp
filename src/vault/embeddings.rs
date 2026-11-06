@@ -8,6 +8,7 @@
 //!   (`--features embeddings`) and OpenAI-compatible API (`--features embeddings-api`).
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -234,7 +235,7 @@ impl NoteEmbeddingEntry {
 
 /// Complete note projections; snapshots clone immutable entry references.
 pub struct EmbeddingStore {
-    embeddings: HashMap<PathBuf, NoteArc<NoteEmbeddingEntry>>,
+    embeddings: HashMap<OsString, NoteArc<NoteEmbeddingEntry>>,
     dim: usize,
     identity: Option<EmbeddingSpaceIdentity>,
     first_pass_complete: bool,
@@ -289,7 +290,7 @@ impl EmbeddingStore {
         validate_cache_path(path_text)?;
         validate_note_entry(&entry, self.dim)?;
         let entry_bytes = encoded_entry_len(path_text, &entry)?;
-        let old = self.embeddings.get(&path);
+        let old = self.embeddings.get(path.as_os_str());
         let old_bytes = old
             .map(|old| encoded_entry_len(path_text, old))
             .transpose()?
@@ -320,20 +321,21 @@ impl EmbeddingStore {
         if entries_bytes.saturating_add(header_size) as u64 > MAX_CACHE_BYTES {
             return Err(cache_error("embedding cache is too large to persist"));
         }
-        self.embeddings.insert(path, NoteArc::new(entry));
+        self.embeddings
+            .insert(path.into_os_string(), NoteArc::new(entry));
         self.encoded_entries_bytes = entries_bytes;
         self.total_chunks = chunks;
         Ok(())
     }
 
     pub(crate) fn note(&self, path: &Path) -> Option<NoteArc<NoteEmbeddingEntry>> {
-        self.embeddings.get(path).map(NoteArc::clone)
+        self.embeddings.get(path.as_os_str()).map(NoteArc::clone)
     }
 
     pub(crate) fn capture_entries(
         &self,
-        allowed: &HashSet<PathBuf>,
-    ) -> HashMap<PathBuf, NoteArc<NoteEmbeddingEntry>> {
+        allowed: &HashSet<OsString>,
+    ) -> HashMap<OsString, NoteArc<NoteEmbeddingEntry>> {
         self.embeddings
             .iter()
             .filter(|(path, _)| allowed.contains(*path))
@@ -348,7 +350,8 @@ impl EmbeddingStore {
         }
         let mut entry = fixture_note(&path, [0; 32], vector);
         entry.source_revision.clear();
-        self.embeddings.insert(path, NoteArc::new(entry));
+        self.embeddings
+            .insert(path.into_os_string(), NoteArc::new(entry));
         self.first_pass_complete = false;
         self.recount_fixture_entries();
     }
@@ -362,7 +365,7 @@ impl EmbeddingStore {
     ) -> VaultResult<()> {
         validate_vector(&vector, self.dim)?;
         self.embeddings.insert(
-            path.clone(),
+            path.as_os_str().to_owned(),
             NoteArc::new(fixture_note(&path, content_hash, vector)),
         );
         self.recount_fixture_entries();
@@ -384,7 +387,7 @@ impl EmbeddingStore {
     }
 
     pub fn remove(&mut self, path: &Path) -> VaultResult<bool> {
-        let Some(old) = self.embeddings.get(path) else {
+        let Some(old) = self.embeddings.get(path.as_os_str()) else {
             return Ok(false);
         };
         let path_text = path
@@ -399,7 +402,7 @@ impl EmbeddingStore {
             .encoded_entries_bytes
             .checked_sub(old_bytes)
             .ok_or_else(|| cache_error("embedding cache size accounting underflow"))?;
-        self.embeddings.remove(path);
+        self.embeddings.remove(path.as_os_str());
         self.total_chunks = total_chunks;
         self.encoded_entries_bytes = encoded_entries_bytes;
         Ok(true)
@@ -408,7 +411,7 @@ impl EmbeddingStore {
     /// Returns the first vector for callers checking entry availability.
     pub fn get(&self, path: &Path) -> Option<&[f32]> {
         self.embeddings
-            .get(path)
+            .get(path.as_os_str())
             .and_then(|entry| entry.chunks.first())
             .map(|chunk| chunk.vector.as_slice())
     }
@@ -416,7 +419,7 @@ impl EmbeddingStore {
     #[cfg(test)]
     pub(crate) fn content_hash(&self, path: &Path) -> Option<&[u8; 32]> {
         self.embeddings
-            .get(path)
+            .get(path.as_os_str())
             .and_then(|entry| entry.chunks.first())
             .map(|chunk| &chunk.input_hash)
     }
@@ -441,7 +444,7 @@ impl EmbeddingStore {
         self.first_pass_complete = complete;
     }
 
-    pub(crate) fn retain_paths(&mut self, paths: &HashSet<PathBuf>) -> VaultResult<bool> {
+    pub(crate) fn retain_paths(&mut self, paths: &HashSet<OsString>) -> VaultResult<bool> {
         let removed = self
             .embeddings
             .keys()
@@ -449,7 +452,7 @@ impl EmbeddingStore {
             .cloned()
             .collect::<Vec<_>>();
         for path in &removed {
-            self.remove(path)?;
+            self.remove(Path::new(path))?;
         }
         Ok(!removed.is_empty())
     }
@@ -461,7 +464,7 @@ impl EmbeddingStore {
             .filter_map(|(path, entry)| {
                 entry
                     .best_chunk(query_vec)
-                    .map(|(_, score)| (path.clone(), score))
+                    .map(|(_, score)| (PathBuf::from(path), score))
             })
             .collect();
         Self::rank_scores(scored, top_k)
@@ -471,7 +474,7 @@ impl EmbeddingStore {
     pub(crate) fn query_paths(
         &self,
         query_vec: &[f32],
-        allowed: &HashSet<PathBuf>,
+        allowed: &HashSet<OsString>,
         top_k: usize,
     ) -> Vec<(PathBuf, f32)> {
         let scored = self
@@ -481,7 +484,7 @@ impl EmbeddingStore {
             .filter_map(|(path, entry)| {
                 entry
                     .best_chunk(query_vec)
-                    .map(|(_, score)| (path.clone(), score))
+                    .map(|(_, score)| (PathBuf::from(path), score))
             })
             .collect();
         Self::rank_scores(scored, top_k)
@@ -492,7 +495,7 @@ impl EmbeddingStore {
             right
                 .1
                 .total_cmp(&left.1)
-                .then_with(|| left.0.cmp(&right.0))
+                .then_with(|| left.0.as_os_str().cmp(right.0.as_os_str()))
         };
         if top_k == 0 {
             return Vec::new();
@@ -627,7 +630,7 @@ impl EmbeddingStore {
             let path_text = input.string(MAX_CACHE_PATH_BYTES)?;
             let path = validate_cache_path(&path_text)?;
             // Canonically equivalent spellings can identify distinct native files.
-            if store.embeddings.contains_key(&path) {
+            if store.embeddings.contains_key(path.as_os_str()) {
                 return Err(cache_error(format!(
                     "embedding cache contains duplicate path '{path_text}'"
                 )));
@@ -1150,16 +1153,15 @@ fn validate_cache_path(path: &str) -> VaultResult<PathBuf> {
             "invalid embedding cache path '{path}'"
         )));
     }
-    let original = Path::new(path);
-    let normalized = super::path::normalize_relative(original).map_err(|error| {
+    let normalized = super::path::VaultPath::parse(path).map_err(|error| {
         VaultError::Embedding(format!("invalid embedding cache path '{path}': {error}"))
     })?;
-    if normalized != original || normalized.to_string_lossy() != path {
+    if normalized.as_str() != path {
         return Err(VaultError::Embedding(format!(
             "embedding cache path is not normalized: '{path}'"
         )));
     }
-    Ok(normalized)
+    Ok(PathBuf::from(normalized.as_str()))
 }
 
 fn validate_vector(vector: &[f32], expected_dim: usize) -> VaultResult<()> {
@@ -2366,11 +2368,15 @@ mod tests {
     #[test]
     fn query_paths_ranks_only_authoritative_members() {
         let store = make_store();
-        let allowed = HashSet::from([PathBuf::from("b.md"), PathBuf::from("c.md")]);
+        let allowed = HashSet::from([OsString::from("b.md"), OsString::from("c.md")]);
         let results = store.query_paths(&[1.0, 0.0, 0.0], &allowed, 10);
 
         assert_eq!(results.len(), 2);
-        assert!(results.iter().all(|(path, _)| allowed.contains(path)));
+        assert!(
+            results
+                .iter()
+                .all(|(path, _)| allowed.contains(path.as_os_str()))
+        );
         assert_eq!(results[0].0, PathBuf::from("c.md"));
     }
 
@@ -2436,6 +2442,31 @@ mod tests {
         assert!(store.is_empty());
         let results = store.query(&[1.0, 0.0, 0.0], 10);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn cache_preserves_case_distinct_server_drive_like_names() {
+        let mut store = EmbeddingStore::new_with_identity(test_identity(3));
+        for (name, hash, vector) in [
+            ("a:b.md", [1; 32], vec![1.0, 0.0, 0.0]),
+            ("A:b.md", [2; 32], vec![0.0, 1.0, 0.0]),
+            ("CON.md", [3; 32], vec![0.0, 0.0, 1.0]),
+        ] {
+            store
+                .insert_hashed(PathBuf::from(name), hash, vector)
+                .unwrap();
+        }
+        assert_eq!(store.len(), 3);
+        let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().join("embeddings.bin");
+        store.save(&cache).unwrap();
+        let mut loaded = EmbeddingStore::load(&cache).unwrap();
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded.content_hash(Path::new("a:b.md")), Some(&[1; 32]));
+        assert_eq!(loaded.content_hash(Path::new("A:b.md")), Some(&[2; 32]));
+        loaded.remove(Path::new("a:b.md")).unwrap();
+        assert!(loaded.get(Path::new("a:b.md")).is_none());
+        assert!(loaded.get(Path::new("A:b.md")).is_some());
     }
 
     #[test]
@@ -3071,16 +3102,21 @@ mod tests {
     fn captured_entries_survive_complete_generation_replacement() {
         let mut store = EmbeddingStore::new_with_identity(test_identity(3));
         store.insert_note("long.md".into(), passage_note()).unwrap();
-        let captured = store.capture_entries(&HashSet::from([PathBuf::from("long.md")]));
-        let old_revision = captured[Path::new("long.md")].source_revision.clone();
+        let captured = store.capture_entries(&HashSet::from([OsString::from("long.md")]));
+        let old_revision = captured[std::ffi::OsStr::new("long.md")]
+            .source_revision
+            .clone();
         let mut replacement = passage_note();
         replacement.source_revision = "a".repeat(64);
         replacement.chunks[1].vector = vec![0.0, 0.0, 1.0];
         store.insert_note("long.md".into(), replacement).unwrap();
         store.remove(Path::new("long.md")).unwrap();
-        assert_eq!(captured[Path::new("long.md")].source_revision, old_revision);
         assert_eq!(
-            captured[Path::new("long.md")].best_chunk(&[0.0, 1.0, 0.0]),
+            captured[std::ffi::OsStr::new("long.md")].source_revision,
+            old_revision
+        );
+        assert_eq!(
+            captured[std::ffi::OsStr::new("long.md")].best_chunk(&[0.0, 1.0, 0.0]),
             Some((1, 1.0))
         );
     }
@@ -3133,7 +3169,7 @@ mod tests {
         assert!(!store.remove(Path::new("missing.md")).unwrap());
         assert!(
             store
-                .retain_paths(&HashSet::from([PathBuf::from("third.md")]))
+                .retain_paths(&HashSet::from([OsString::from("third.md")]))
                 .unwrap()
         );
         assert_eq!(store.total_chunks, 2);

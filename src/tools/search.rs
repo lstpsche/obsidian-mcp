@@ -50,8 +50,9 @@ pub async fn search_text(
     let fuzzy = params.fuzzy.unwrap_or(false);
 
     let fields = params.fields.as_deref();
-    let results =
-        vault.search_text_with_limit(&params.query, context_length, max_results, fuzzy, fields)?;
+    let results = vault
+        .search_text_with_limit(&params.query, context_length, max_results, fuzzy, fields)
+        .await?;
     super::output::results(results)
 }
 
@@ -79,7 +80,9 @@ pub async fn search_regex(
         .min(MAX_CONTEXT_LEN_CAP);
     let max_results = params.max_results.unwrap_or(20).min(MAX_RESULTS_CAP);
 
-    let results = vault.search_regex_with_limit(&params.pattern, context_length, max_results)?;
+    let results = vault
+        .search_regex_with_limit(&params.pattern, context_length, max_results)
+        .await?;
     super::output::results(results)
 }
 
@@ -249,7 +252,14 @@ pub async fn search_semantic(
     let lexical_prefetch = params.lexical_prefetch.unwrap_or(false);
     let alpha = params.alpha.unwrap_or(default_alpha).clamp(0.0, 1.0);
 
-    let results = if runtime.uses_local_backend() {
+    if vault.is_remote() && runtime.mode == crate::config::SemanticMode::Daemon {
+        return Err(rmcp::ErrorData::new(
+            ErrorCode::INVALID_REQUEST,
+            "SFTP vaults do not support the shared semantic daemon",
+            None::<serde_json::Value>,
+        ));
+    }
+    let results = if vault.is_remote() || runtime.uses_local_backend() {
         search_semantic_local(
             vault,
             &params.query,
@@ -359,7 +369,7 @@ async fn search_semantic_daemon(
     }
     let mut seen = std::collections::HashSet::new();
     for hit in &daemon_result.results {
-        if !allowed_paths.contains(&hit.path) || !seen.insert(&hit.path) {
+        if !allowed_paths.contains(&hit.path) || !seen.insert(hit.path.as_str()) {
             return Err(VaultError::DaemonProtocol(
                 "semantic daemon returned duplicate notes or a note outside the requested scope"
                     .into(),
@@ -373,6 +383,7 @@ async fn search_semantic_daemon(
         .collect())
 }
 
+#[cfg(has_embeddings)]
 async fn search_semantic_local(
     vault: &Vault,
     query: &str,
@@ -381,52 +392,43 @@ async fn search_semantic_local(
     lexical_prefetch: bool,
     alpha: f32,
 ) -> Result<Vec<SemanticSearchResult>, VaultError> {
-    let vault = vault.clone();
-    let query = query.to_owned();
-    tokio::task::spawn_blocking(move || {
-        search_semantic_local_blocking(
-            &vault,
-            &query,
-            top_k,
-            include_content,
-            lexical_prefetch,
-            alpha,
-        )
+    let storage = vault.storage().await?;
+    let scoring_vault = vault.clone();
+    let scoring_query = query.to_owned();
+    let hits = tokio::task::spawn_blocking(move || {
+        scoring_vault.activate_embeddings();
+        if lexical_prefetch {
+            scoring_vault.search_hybrid_ranked(
+                &scoring_query,
+                top_k,
+                DEFAULT_PREFETCH_COUNT.max(top_k),
+                alpha,
+            )
+        } else {
+            scoring_vault.search_semantic_ranked(&scoring_query, top_k)
+        }
     })
     .await
-    .map_err(|error| VaultError::Other(format!("local semantic search worker failed: {error}")))?
-}
-
-#[cfg(has_embeddings)]
-fn search_semantic_local_blocking(
-    vault: &Vault,
-    query: &str,
-    top_k: usize,
-    include_content: bool,
-    lexical_prefetch: bool,
-    alpha: f32,
-) -> Result<Vec<SemanticSearchResult>, VaultError> {
-    vault.activate_embeddings();
-    let hits = if lexical_prefetch {
-        vault.search_hybrid_ranked(query, top_k, DEFAULT_PREFETCH_COUNT.max(top_k), alpha)?
+    .map_err(|error| {
+        VaultError::Other(format!("local semantic search worker failed: {error}"))
+    })??;
+    let timeout = if vault.is_remote() {
+        Some(crate::config::source::SftpSettings::from_env()?.timeout)
     } else {
-        vault.search_semantic_ranked(query, top_k)?
+        None
     };
-    Ok(hits
-        .into_iter()
-        .map(|hit| {
-            crate::vault::semantic_results::render_rooted(
-                vault.filesystem(),
-                hit,
-                query,
-                include_content,
-            )
-        })
-        .collect())
+    crate::vault::semantic_results::render_many_source(
+        &storage,
+        hits,
+        query,
+        include_content,
+        timeout,
+    )
+    .await
 }
 
 #[cfg(not(has_embeddings))]
-fn search_semantic_local_blocking(
+async fn search_semantic_local(
     _vault: &Vault,
     _query: &str,
     _top_k: usize,
@@ -771,24 +773,28 @@ mod tests {
                 Path::new("rust.md"),
                 "---\ntags: [lang, systems]\nstatus: stable\n---\n# Rust\nRust is a systems language.\n",
             )
+            .await
             .unwrap();
         vault
             .write_note(
                 Path::new("python.md"),
                 "---\ntags: [lang, scripting]\nstatus: in progress\n---\n# Python\nPython is dynamic.\n",
             )
+            .await
             .unwrap();
         vault
             .write_note(
                 Path::new("notes.md"),
                 "# Notes\nSome random notes about #inbox stuff.\n\n#inbox/read #inbox/todo\n",
             )
+            .await
             .unwrap();
         vault
             .write_note(
                 Path::new("empty.md"),
                 "# Empty\nNothing interesting here.\n",
             )
+            .await
             .unwrap();
 
         (dir, vault)
@@ -919,33 +925,37 @@ mod tests {
             EXACT_FILE_OPENS.set(0);
             let hits = vault
                 .search_text_with_limit("needle", 0, 1, false, None)
+                .await
                 .unwrap();
             assert_eq!(hits.len(), 1);
             assert_eq!(EXACT_FILE_OPENS.get(), usize::from(!ranked));
 
             EXACT_FILE_OPENS.set(0);
-            assert!(vault.search_regex_with_limit("[", 10, 0).is_err());
+            assert!(vault.search_regex_with_limit("[", 10, 0).await.is_err());
             if ranked {
                 assert!(
                     vault
                         .search_text_with_limit("\"", 10, 0, false, None)
+                        .await
                         .is_err()
                 );
                 assert!(
                     vault
                         .search_text_with_limit("\"", 10, 0, true, None)
+                        .await
                         .unwrap()
                         .is_empty()
                 );
             }
             assert_eq!(EXACT_FILE_OPENS.get(), 0);
-            let all = vault.search_text("needle", 0).unwrap();
+            let all = vault.search_text("needle", 0).await.unwrap();
             assert_eq!(all.len(), if ranked { 200 } else { 205 });
             let first = vault
                 .search_text_with_limit("needle", 0, 1, false, None)
+                .await
                 .unwrap();
             assert_eq!(first[0].path, all[0].path);
-            assert_eq!(vault.search_regex("needle", 0).unwrap().len(), 205);
+            assert_eq!(vault.search_regex("needle", 0).await.unwrap().len(), 205);
         }
     }
 
@@ -1240,6 +1250,7 @@ mod tests {
         let (_dir, vault) = setup_search_vault().await;
         vault
             .set_frontmatter_field(Path::new("rust.md"), "reviewed_at", serde_json::Value::Null)
+            .await
             .unwrap();
         let params: SearchMetadataParams = serde_json::from_value(serde_json::json!({
             "type": "frontmatter",
@@ -1298,18 +1309,21 @@ mod tests {
                 Path::new("rust.md"),
                 "---\ntags: [lang, systems]\nstatus: stable\n---\n# Rust\nRust is a systems programming language.\n",
             )
+            .await
             .unwrap();
         vault
             .write_note(
                 Path::new("python.md"),
                 "---\ntags: [lang, scripting]\nstatus: in progress\n---\n# Python\nPython is a dynamic scripting language.\n",
             )
+            .await
             .unwrap();
         vault
             .write_note(
                 Path::new("cooking.md"),
                 "# Cooking Tips\nHow to make a great pasta dish.\n",
             )
+            .await
             .unwrap();
 
         (dir, vault)
@@ -1528,7 +1542,7 @@ mod tests {
         let server = start_semantic_filter_server(
             socket_path.clone(),
             "missing-hidden.md",
-            vault.read_note(Path::new("rust.md")).unwrap(),
+            vault.read_note(Path::new("rust.md")).await.unwrap(),
         );
 
         let runtime = SemanticRuntime {
@@ -1575,7 +1589,7 @@ mod tests {
         let server = start_semantic_filter_server(
             socket_path.clone(),
             "Archive/hidden.md",
-            vault.read_note(Path::new("rust.md")).unwrap(),
+            vault.read_note(Path::new("rust.md")).await.unwrap(),
         );
 
         let runtime = SemanticRuntime {

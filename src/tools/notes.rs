@@ -8,7 +8,7 @@ use rmcp::model::{CallToolResult, ErrorCode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::error::VaultError;
+use crate::error::{StorageErrorKind, VaultError};
 use crate::models::{PatchOperation, PatchRequest, PatchTargetType, SourceRange};
 use crate::vault::Vault;
 
@@ -184,7 +184,7 @@ pub struct NoteMoveParams {
 
 pub async fn note_read(vault: &Vault, params: NoteReadParams) -> Result<CallToolResult, ErrorData> {
     if params.expected_revision.is_none() && params.range.is_none() && params.max_bytes.is_none() {
-        let content = vault.read_note(Path::new(&params.path))?;
+        let content = vault.read_note(Path::new(&params.path)).await?;
         return super::output::with_text(
             &NoteReadOutput {
                 content: content.clone(),
@@ -211,10 +211,10 @@ pub async fn note_read(vault: &Vault, params: NoteReadParams) -> Result<CallTool
             "max_bytes",
         )?;
     }
-    let vault = vault.clone();
+    let snapshot = vault.read_source_snapshot(Path::new(&params.path)).await?;
     let page = tokio::task::spawn_blocking(move || {
         let path = Path::new(&params.path);
-        vault.read_source_snapshot(path)?.page(
+        snapshot.page(
             path,
             params.expected_revision.as_deref(),
             params.range,
@@ -273,7 +273,7 @@ pub async fn note_read_many(
             }
 
             for path in &paths {
-                vault.validate_path(Path::new(path))?;
+                vault.validate_path(Path::new(path)).await?;
             }
 
             paths
@@ -284,24 +284,28 @@ pub async fn note_read_many(
                 })
                 .collect()
         }
-        (None, Some(dir)) => vault
-            .list_files(
-                Path::new(&dir),
-                params.recursive.unwrap_or(false),
-                params.glob.as_deref(),
-            )?
-            .into_iter()
-            .filter(|path| {
-                path.extension()
-                    .and_then(|extension| extension.to_str())
+        (None, Some(dir)) => {
+            let mut candidates = Vec::new();
+            for path in vault
+                .list_files(
+                    Path::new(&dir),
+                    params.recursive.unwrap_or(false),
+                    params.glob.as_deref(),
+                )
+                .await?
+            {
+                if !crate::vault::path::logical_extension(&path)
                     .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
-                    && vault.root().join(path).is_file()
-            })
-            .filter_map(|path| {
-                let display_path = path.to_str()?.to_owned();
-                Some(ReadCandidate { path, display_path })
-            })
-            .collect(),
+                    || !vault.is_file(&path).await?
+                {
+                    continue;
+                }
+                if let Some(display_path) = path.to_str().map(str::to_owned) {
+                    candidates.push(ReadCandidate { path, display_path });
+                }
+            }
+            candidates
+        }
     };
 
     let inspected_count = candidates.len().min(max_files);
@@ -309,9 +313,13 @@ pub async fn note_read_many(
     let mut skipped = Vec::new();
     let mut skipped_count = 0;
     let mut content_bytes = 0;
+    let storage = vault.storage().await?;
 
     for candidate in candidates.iter().take(inspected_count) {
-        let actual_path = match vault.canonical_existing_relative_path(&candidate.path) {
+        let actual_path = match vault
+            .canonical_existing_relative_path(&candidate.path)
+            .await
+        {
             Ok(path) => path,
             Err(error) => {
                 record_file_error(
@@ -329,7 +337,7 @@ pub async fn note_read_many(
             .unwrap_or_else(|| candidate.display_path.clone());
         let remaining_bytes = max_bytes - content_bytes;
 
-        let stat = match vault.file_stat(&actual_path) {
+        let stat = match vault.file_stat(&actual_path).await {
             Ok(stat) => stat,
             Err(error) => {
                 record_file_error(error, &display_path, &mut skipped, &mut skipped_count)?;
@@ -346,8 +354,20 @@ pub async fn note_read_many(
             continue;
         }
 
-        let content = match vault.read_note(&actual_path) {
+        let content = match storage
+            .read_file_bounded(&actual_path, remaining_bytes)
+            .await
+        {
             Ok(content) => content,
+            Err(VaultError::SemanticResourceLimit { .. }) => {
+                record_skipped(
+                    &mut skipped,
+                    &mut skipped_count,
+                    display_path,
+                    NoteReadManySkipReason::ByteLimit,
+                );
+                continue;
+            }
             Err(error) => {
                 record_file_error(error, &display_path, &mut skipped, &mut skipped_count)?;
                 continue;
@@ -425,6 +445,21 @@ fn record_file_error(
     let reason = match error {
         VaultError::NoteNotFound(_) => NoteReadManySkipReason::NotFound,
         VaultError::Io(_) => NoteReadManySkipReason::Unreadable,
+        VaultError::Storage {
+            kind: StorageErrorKind::InvalidSource,
+            ..
+        } => NoteReadManySkipReason::Unreadable,
+        VaultError::Storage {
+            kind: StorageErrorKind::PermissionDenied,
+            operation,
+            ..
+        } if matches!(
+            operation.as_str(),
+            "open" | "read" | "stat" | "lstat" | "fstat" | "opendir" | "readdir"
+        ) =>
+        {
+            NoteReadManySkipReason::Unreadable
+        }
         other => return Err(other.into()),
     };
     record_skipped(skipped, skipped_count, path.to_owned(), reason);
@@ -444,16 +479,20 @@ fn record_skipped(
 }
 
 pub async fn note_create(vault: &Vault, params: NoteCreateParams) -> Result<String, ErrorData> {
-    vault.create_note(
-        Path::new(&params.path),
-        params.content.as_deref().unwrap_or(""),
-        params.frontmatter.as_ref(),
-    )?;
+    vault
+        .create_note(
+            Path::new(&params.path),
+            params.content.as_deref().unwrap_or(""),
+            params.frontmatter.as_ref(),
+        )
+        .await?;
     Ok(format!("Created note: {}", params.path))
 }
 
 pub async fn note_write(vault: &Vault, params: NoteWriteParams) -> Result<String, ErrorData> {
-    vault.write_note(Path::new(&params.path), &params.content)?;
+    vault
+        .write_note(Path::new(&params.path), &params.content)
+        .await?;
     Ok(format!("Written to: {}", params.path))
 }
 
@@ -461,10 +500,14 @@ pub async fn note_insert(vault: &Vault, params: NoteInsertParams) -> Result<Stri
     let position = params.position.as_deref().unwrap_or("end");
 
     if position.eq_ignore_ascii_case("end") {
-        vault.append_note(Path::new(&params.path), &params.content)?;
+        vault
+            .append_note(Path::new(&params.path), &params.content)
+            .await?;
         Ok(format!("Inserted into: {}", params.path))
     } else if position.eq_ignore_ascii_case("beginning") {
-        vault.prepend_note(Path::new(&params.path), &params.content)?;
+        vault
+            .prepend_note(Path::new(&params.path), &params.content)
+            .await?;
         Ok(format!("Inserted into: {}", params.path))
     } else {
         Err(ErrorData::new(
@@ -482,7 +525,7 @@ pub async fn note_patch(vault: &Vault, params: NotePatchParams) -> Result<String
         target: params.target,
         content: params.content,
     };
-    vault.patch_note(Path::new(&params.path), &request)?;
+    vault.patch_note(Path::new(&params.path), &request).await?;
     Ok(format!("Patched: {}", params.path))
 }
 
@@ -494,12 +537,14 @@ pub async fn note_delete(vault: &Vault, params: NoteDeleteParams) -> Result<Stri
             None::<serde_json::Value>,
         ));
     }
-    vault.delete_note(Path::new(&params.path))?;
+    vault.delete_note(Path::new(&params.path)).await?;
     Ok(format!("Deleted: {}", params.path))
 }
 
 pub async fn note_move(vault: &Vault, params: NoteMoveParams) -> Result<String, ErrorData> {
-    let new_path = vault.move_note(Path::new(&params.from), Path::new(&params.to))?;
+    let new_path = vault
+        .move_note(Path::new(&params.from), Path::new(&params.to))
+        .await?;
     Ok(format!("Moved to: {}", new_path.display()))
 }
 
@@ -521,6 +566,7 @@ mod tests {
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
         vault
             .write_note(Path::new("hello.md"), "# Hello\nWorld")
+            .await
             .unwrap();
 
         let content = note_read(
@@ -564,7 +610,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
-        vault.write_note(Path::new("page.md"), "αβ😀tail").unwrap();
+        vault
+            .write_note(Path::new("page.md"), "αβ😀tail")
+            .await
+            .unwrap();
         let result = note_read(
             &vault,
             NoteReadParams {
@@ -585,6 +634,7 @@ mod tests {
         let range: SourceRange = serde_json::from_value(value["next_range"].clone()).unwrap();
         vault
             .write_note(Path::new("page.md"), "new source")
+            .await
             .unwrap();
         let error = note_read(
             &vault,
@@ -982,7 +1032,7 @@ mod tests {
         let msg = note_create(&vault, params).await.unwrap();
         assert!(msg.contains("new.md"));
 
-        let content = vault.read_note(Path::new("new.md")).unwrap();
+        let content = vault.read_note(Path::new("new.md")).await.unwrap();
         let frontmatter = crate::vault::frontmatter::parse_frontmatter(&content)
             .unwrap()
             .unwrap();
@@ -1055,6 +1105,7 @@ mod tests {
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
         vault
             .write_note(Path::new("note.md"), "old content")
+            .await
             .unwrap();
 
         note_write(
@@ -1067,7 +1118,7 @@ mod tests {
         .await
         .unwrap();
 
-        let content = vault.read_note(Path::new("note.md")).unwrap();
+        let content = vault.read_note(Path::new("note.md")).await.unwrap();
         assert_eq!(content, "new content");
     }
 
@@ -1078,7 +1129,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
-        vault.write_note(Path::new("note.md"), "start").unwrap();
+        vault
+            .write_note(Path::new("note.md"), "start")
+            .await
+            .unwrap();
 
         note_insert(
             &vault,
@@ -1091,7 +1145,7 @@ mod tests {
         .await
         .unwrap();
 
-        let content = vault.read_note(Path::new("note.md")).unwrap();
+        let content = vault.read_note(Path::new("note.md")).await.unwrap();
         assert!(content.ends_with("more"));
         assert!(content.starts_with("start"));
     }
@@ -1101,7 +1155,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
-        vault.write_note(Path::new("note.md"), "start").unwrap();
+        vault
+            .write_note(Path::new("note.md"), "start")
+            .await
+            .unwrap();
 
         note_insert(
             &vault,
@@ -1114,7 +1171,7 @@ mod tests {
         .await
         .unwrap();
 
-        let content = vault.read_note(Path::new("note.md")).unwrap();
+        let content = vault.read_note(Path::new("note.md")).await.unwrap();
         assert!(content.ends_with("more"));
         assert!(content.starts_with("start"));
     }
@@ -1126,6 +1183,7 @@ mod tests {
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
         vault
             .write_note(Path::new("note.md"), "---\ntags: [a]\n---\n# Heading\n")
+            .await
             .unwrap();
 
         note_insert(
@@ -1139,7 +1197,7 @@ mod tests {
         .await
         .unwrap();
 
-        let content = vault.read_note(Path::new("note.md")).unwrap();
+        let content = vault.read_note(Path::new("note.md")).await.unwrap();
         assert!(content.starts_with("---\ntags:"));
         assert!(content.contains("injected"));
         assert!(content.contains("# Heading"));
@@ -1150,7 +1208,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
-        vault.write_note(Path::new("note.md"), "content").unwrap();
+        vault
+            .write_note(Path::new("note.md"), "content")
+            .await
+            .unwrap();
 
         let result = note_insert(
             &vault,
@@ -1171,7 +1232,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
-        vault.write_note(Path::new("note.md"), "start").unwrap();
+        vault
+            .write_note(Path::new("note.md"), "start")
+            .await
+            .unwrap();
 
         note_insert(
             &vault,
@@ -1184,7 +1248,7 @@ mod tests {
         .await
         .unwrap();
 
-        let content = vault.read_note(Path::new("note.md")).unwrap();
+        let content = vault.read_note(Path::new("note.md")).await.unwrap();
         assert!(content.ends_with("more"));
     }
 
@@ -1197,6 +1261,7 @@ mod tests {
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
         vault
             .write_note(Path::new("patched.md"), "# Title\nBody\n## Sub\nSub body\n")
+            .await
             .unwrap();
 
         note_patch(
@@ -1212,7 +1277,7 @@ mod tests {
         .await
         .unwrap();
 
-        let content = vault.read_note(Path::new("patched.md")).unwrap();
+        let content = vault.read_note(Path::new("patched.md")).await.unwrap();
         assert!(content.contains("Sub body"));
         assert!(content.contains("appended"));
     }
@@ -1224,7 +1289,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
-        vault.write_note(Path::new("note.md"), "content").unwrap();
+        vault
+            .write_note(Path::new("note.md"), "content")
+            .await
+            .unwrap();
 
         let result = note_delete(
             &vault,
@@ -1235,7 +1303,7 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
-        assert!(vault.read_note(Path::new("note.md")).is_ok());
+        assert!(vault.read_note(Path::new("note.md")).await.is_ok());
     }
 
     #[tokio::test]
@@ -1243,7 +1311,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
-        vault.write_note(Path::new("note.md"), "content").unwrap();
+        vault
+            .write_note(Path::new("note.md"), "content")
+            .await
+            .unwrap();
 
         note_delete(
             &vault,
@@ -1254,7 +1325,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(vault.read_note(Path::new("note.md")).is_err());
+        assert!(vault.read_note(Path::new("note.md")).await.is_err());
     }
 
     // ── note_move ───────────────────────────────────────────────────
@@ -1264,7 +1335,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
-        vault.write_note(Path::new("old.md"), "content").unwrap();
+        vault
+            .write_note(Path::new("old.md"), "content")
+            .await
+            .unwrap();
 
         let msg = note_move(
             &vault,
@@ -1277,7 +1351,10 @@ mod tests {
         .unwrap();
         assert!(msg.contains("new.md"));
 
-        assert!(vault.read_note(Path::new("old.md")).is_err());
-        assert_eq!(vault.read_note(Path::new("new.md")).unwrap(), "content");
+        assert!(vault.read_note(Path::new("old.md")).await.is_err());
+        assert_eq!(
+            vault.read_note(Path::new("new.md")).await.unwrap(),
+            "content"
+        );
     }
 }

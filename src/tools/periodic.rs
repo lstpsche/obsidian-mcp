@@ -65,7 +65,7 @@ pub async fn periodic(
     match params.action.to_ascii_lowercase().as_str() {
         "get" => {
             let date = params.date.map(|s| parse_date(&s)).transpose()?;
-            let content = vault.get_periodic_note(&params.period, date)?;
+            let content = vault.get_periodic_note(&params.period, date).await?;
             super::output::with_text(
                 &PeriodicOutput::Get {
                     content: content.clone(),
@@ -75,8 +75,9 @@ pub async fn periodic(
         }
         "create" => {
             let date = params.date.map(|s| parse_date(&s)).transpose()?;
-            let path =
-                vault.create_periodic_note(&params.period, date, params.content.as_deref())?;
+            let path = vault
+                .create_periodic_note(&params.period, date, params.content.as_deref())
+                .await?;
             let message = format!("Created: {}", path.display());
             super::output::with_text(
                 &PeriodicOutput::Create {
@@ -88,14 +89,14 @@ pub async fn periodic(
         }
         "list" => {
             let limit = params.limit.unwrap_or(10);
-            let paths = vault.list_recent_periodic_notes(&params.period, limit)?;
+            let paths = vault
+                .list_recent_periodic_notes(&params.period, limit)
+                .await?;
 
             let items: Vec<PeriodicEntry> = paths
                 .into_iter()
                 .map(|p| {
-                    let date = p
-                        .file_stem()
-                        .and_then(|s| s.to_str())
+                    let date = crate::vault::path::logical_file_stem(&p)
                         .unwrap_or_default()
                         .to_string();
                     PeriodicEntry { path: p, date }

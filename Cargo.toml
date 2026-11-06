@@ -42,6 +42,9 @@ tar = ">=0.4.45, <0.5"
 zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 zeroize = "1"
 tempfile = { version = "3", optional = true }
+openssh-sftp-client-lowlevel = "0.7.4"
+bytes = "1"
+futures-util = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

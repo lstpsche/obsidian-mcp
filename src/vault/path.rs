@@ -14,6 +14,92 @@ pub struct ResolvedPath {
     pub absolute: PathBuf,
 }
 
+/// A logical key in a vault namespace, independent of the client's native OS.
+/// Server names are serialized unchanged; only the local adapter applies native
+/// filename restrictions.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct VaultPath(String);
+
+impl VaultPath {
+    pub fn parse(value: &str) -> VaultResult<Self> {
+        if value.starts_with(['/', '\\']) || value.chars().any(char::is_control) {
+            return Err(VaultError::InvalidPath(
+                "expected a vault-relative UTF-8 path".into(),
+            ));
+        }
+        let spelling = value.replace('\\', "/");
+        let mut names = Vec::new();
+        for name in spelling.split('/') {
+            match name {
+                "" | "." => {}
+                ".." => {
+                    if names.pop().is_none() {
+                        return Err(VaultError::OutsideVault(value.into()));
+                    }
+                }
+                _ => names.push(name),
+            }
+        }
+        Ok(Self(names.join("/")))
+    }
+
+    /// Accept a single name from directory enumeration without reinterpreting it.
+    pub fn entry(name: &str) -> VaultResult<Self> {
+        if name.is_empty()
+            || matches!(name, "." | "..")
+            || name.contains(['/', '\\'])
+            || name.chars().any(char::is_control)
+        {
+            return Err(VaultError::InvalidPath(
+                "unrepresentable vault directory entry".into(),
+            ));
+        }
+        Ok(Self(name.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Inspect a relative vault key without interpreting a Windows drive prefix.
+pub(crate) fn logical_file_name(path: &Path) -> Option<&str> {
+    path.to_str()?
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+}
+
+pub(crate) fn logical_file_stem(path: &Path) -> Option<&str> {
+    let name = logical_file_name(path)?;
+    Some(match name.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem,
+        _ => name,
+    })
+}
+
+pub(crate) fn logical_extension(path: &Path) -> Option<&str> {
+    let (stem, extension) = logical_file_name(path)?.rsplit_once('.')?;
+    (!stem.is_empty()).then_some(extension)
+}
+
+pub(crate) fn logical_join(parent: &Path, child: &Path) -> VaultResult<PathBuf> {
+    let text = |path: &Path| {
+        path.to_str()
+            .ok_or_else(|| VaultError::InvalidPath("vault paths must be UTF-8".into()))
+            .and_then(VaultPath::parse)
+    };
+    let parent = text(parent)?;
+    let child = text(child)?;
+    Ok(PathBuf::from(if parent.as_str().is_empty() {
+        child.as_str().to_owned()
+    } else if child.as_str().is_empty() {
+        parent.as_str().to_owned()
+    } else {
+        format!("{}/{}", parent.as_str(), child.as_str())
+    }))
+}
+
 /// Normalize a caller-supplied path, including its accepted separator spelling,
 /// before checking traversal. Paths discovered from the filesystem use
 /// `relative_from_absolute` and never reinterpret a literal filename.
@@ -147,6 +233,40 @@ mod tests {
 
     use tempfile::TempDir;
     use unicode_normalization::UnicodeNormalization;
+
+    #[test]
+    fn logical_server_paths_do_not_apply_client_filename_rules() {
+        assert_eq!(
+            VaultPath::parse("Folder/CON.md").unwrap().as_str(),
+            "Folder/CON.md"
+        );
+        assert_eq!(VaultPath::parse("a:b.md").unwrap().as_str(), "a:b.md");
+        assert_eq!(VaultPath::parse("a\\b/../c.md").unwrap().as_str(), "a/c.md");
+        assert!(VaultPath::parse("../secret").is_err());
+        assert!(VaultPath::parse("/absolute").is_err());
+        assert!(VaultPath::parse("\\absolute").is_err());
+        assert!(VaultPath::parse("\\\\server\\share").is_err());
+        for name in ["..", "a/b", "a\\b", "", "bad\0name"] {
+            assert!(VaultPath::entry(name).is_err());
+        }
+        assert_ne!(
+            VaultPath::entry("café.md").unwrap(),
+            VaultPath::entry("cafe\u{301}.md").unwrap()
+        );
+    }
+
+    #[test]
+    fn logical_key_helpers_preserve_server_colons_and_reserved_names() {
+        let path = Path::new("a:b.md");
+        assert_eq!(logical_file_name(path), Some("a:b.md"));
+        assert_eq!(logical_file_stem(path), Some("a:b"));
+        assert_eq!(
+            logical_join(Path::new("notes"), path).unwrap(),
+            PathBuf::from("notes/a:b.md")
+        );
+        assert_eq!(logical_file_stem(Path::new(".config")), Some(".config"));
+        assert!(logical_join(Path::new("notes"), Path::new("../escape")).is_err());
+    }
 
     fn setup_vault() -> TempDir {
         let dir = TempDir::new().unwrap();

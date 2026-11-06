@@ -11,12 +11,8 @@ use crate::error::{VaultError, VaultResult};
 
 /// Whether a vault-relative path belongs to the visible indexing namespace.
 pub(crate) fn is_visible_path(path: &Path) -> bool {
-    path.components().all(|component| {
-        component
-            .as_os_str()
-            .to_str()
-            .is_some_and(|name| !name.starts_with('.'))
-    })
+    path.to_str()
+        .is_some_and(|path| path.split(['/', '\\']).all(|name| !name.starts_with('.')))
 }
 
 /// Compiled set of glob patterns for excluding vault paths from indexing.

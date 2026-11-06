@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use super::fs::VaultRoot;
+use super::path::{VaultPath, logical_join};
 use chrono::{Datelike, Local, NaiveDate};
 use regex::Regex;
 use serde::Deserialize;
@@ -238,59 +239,105 @@ pub fn read_periodic_config(
     read_config_rooted(&VaultRoot::open(vault_root)?, period)
 }
 
+const PLUGIN_CONFIG_PATH: &str = ".obsidian/plugins/periodic-notes/data.json";
+const DAILY_CONFIG_PATH: &str = ".obsidian/daily-notes.json";
+
 pub(super) fn read_config_rooted(
     root: &VaultRoot,
     period: &NotePeriod,
 ) -> VaultResult<PeriodicNoteConfig> {
-    let plugin = Path::new(".obsidian/plugins/periodic-notes/data.json");
-    if let Some(config) = try_read_plugin_config(root, plugin, period)? {
-        return Ok(config);
-    }
-    if matches!(period, NotePeriod::Daily)
-        && let Some(config) =
-            try_read_core_daily_config(root, Path::new(".obsidian/daily-notes.json"))?
-    {
-        return Ok(config);
-    }
-    Ok(default_config(period))
+    resolve_config(
+        read_json_config(root, Path::new(PLUGIN_CONFIG_PATH))?,
+        || read_json_config(root, Path::new(DAILY_CONFIG_PATH)),
+        period,
+    )
 }
 
-/// Read and deserialize a JSON config file, returning `None` if missing.
+/// Read and deserialize a JSON config file, returning `None` only if missing.
 fn read_json_config<T: serde::de::DeserializeOwned>(
     root: &VaultRoot,
     path: &Path,
 ) -> VaultResult<Option<T>> {
-    let content = match root.read_file(path) {
-        Ok(c) => c,
-        Err(e) if e.is_not_found() => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    let parsed: T = serde_json::from_str(&content)
-        .map_err(|e| VaultError::Other(format!("Failed to parse {}: {e}", path.display())))?;
-    Ok(Some(parsed))
+    match root.read_file(path) {
+        Ok(content) => parse_json_config(&content, path).map(Some),
+        Err(error) if error.is_not_found() => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
-fn try_read_plugin_config(
-    root: &VaultRoot,
-    path: &Path,
+fn parse_json_config<T: serde::de::DeserializeOwned>(content: &str, path: &Path) -> VaultResult<T> {
+    serde_json::from_str(content)
+        .map_err(|error| VaultError::Other(format!("Failed to parse {}: {error}", path.display())))
+}
+
+/// Parse already-confined source bytes without assuming a native filesystem.
+pub(super) fn read_config_strings(
+    plugin: Option<&str>,
+    daily: Option<&str>,
+    period: &NotePeriod,
+) -> VaultResult<PeriodicNoteConfig> {
+    resolve_config(
+        plugin
+            .map(|content| parse_json_config(content, Path::new(PLUGIN_CONFIG_PATH)))
+            .transpose()?,
+        || {
+            daily
+                .map(|content| parse_json_config(content, Path::new(DAILY_CONFIG_PATH)))
+                .transpose()
+        },
+        period,
+    )
+}
+
+pub(super) fn plugin_config(
+    raw: Option<&str>,
     period: &NotePeriod,
 ) -> VaultResult<Option<PeriodicNoteConfig>> {
-    let Some(parsed): Option<PluginPeriodicConfig> = read_json_config(root, path)? else {
-        return Ok(None);
-    };
+    Ok(raw
+        .map(|content| parse_json_config(content, Path::new(PLUGIN_CONFIG_PATH)))
+        .transpose()?
+        .and_then(|config| config_from_plugin(config, period)))
+}
 
-    let entry = match parsed {
+/// Resolve both source forms through the same precedence and conversion rules.
+/// Core daily configuration is observed only when it can affect this period.
+fn resolve_config(
+    plugin: Option<PluginPeriodicConfig>,
+    daily: impl FnOnce() -> VaultResult<Option<CoreDailyNotesConfig>>,
+    period: &NotePeriod,
+) -> VaultResult<PeriodicNoteConfig> {
+    if let Some(config) = plugin.and_then(|config| config_from_plugin(config, period)) {
+        return Ok(config);
+    }
+    if matches!(period, NotePeriod::Daily)
+        && let Some(config) = daily()?
+    {
+        return Ok(PeriodicNoteConfig {
+            format: config
+                .format
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| default_format(period).into()),
+            folder: config.folder.filter(|value| !value.is_empty()),
+            template: config.template.filter(|value| !value.is_empty()),
+        });
+    }
+    Ok(default_config(period))
+}
+
+fn config_from_plugin(
+    plugin: PluginPeriodicConfig,
+    period: &NotePeriod,
+) -> Option<PeriodicNoteConfig> {
+    let entry = match plugin {
         PluginPeriodicConfig::CalendarSets { calendar_sets } => calendar_sets
             .into_iter()
             .next()
             .and_then(|set| extract_from_calendar_set(set, period)),
         PluginPeriodicConfig::Legacy(legacy) => extract_from_legacy(*legacy, period),
     };
-
-    match entry {
-        Some(e) if e.enabled.unwrap_or(false) => Ok(Some(entry_to_config(e, period))),
-        _ => Ok(None),
-    }
+    entry
+        .filter(|entry| entry.enabled.unwrap_or(false))
+        .map(|entry| entry_to_config(entry, period))
 }
 
 fn extract_from_calendar_set(set: CalendarSet, period: &NotePeriod) -> Option<PluginPeriodEntry> {
@@ -327,22 +374,36 @@ fn entry_to_config(entry: PluginPeriodEntry, period: &NotePeriod) -> PeriodicNot
     }
 }
 
-fn try_read_core_daily_config(
-    root: &VaultRoot,
-    path: &Path,
-) -> VaultResult<Option<PeriodicNoteConfig>> {
-    let Some(parsed): Option<CoreDailyNotesConfig> = read_json_config(root, path)? else {
-        return Ok(None);
-    };
-
-    Ok(Some(PeriodicNoteConfig {
-        format: parsed
-            .format
-            .filter(|f| !f.is_empty())
-            .unwrap_or_else(|| "YYYY-MM-DD".to_string()),
-        folder: parsed.folder.filter(|f| !f.is_empty()),
-        template: parsed.template.filter(|t| !t.is_empty()),
-    }))
+pub(super) fn filter_recent_paths(
+    config: &PeriodicNoteConfig,
+    paths: Vec<PathBuf>,
+    limit: usize,
+) -> VaultResult<Vec<PathBuf>> {
+    let folder = VaultPath::parse(config.folder.as_deref().unwrap_or(""))?;
+    let format = momentjs_to_chrono(&config.format);
+    let quarter = format.contains(QUARTER_PLACEHOLDER);
+    let mut dated = Vec::new();
+    for path in paths {
+        let text = path
+            .to_str()
+            .ok_or_else(|| VaultError::InvalidPath("vault paths must be UTF-8".into()))?;
+        let relative = if folder.as_str().is_empty() {
+            text
+        } else {
+            text.strip_prefix(folder.as_str())
+                .and_then(|suffix| suffix.strip_prefix('/'))
+                .ok_or_else(|| VaultError::OutsideVault(path.clone()))?
+        };
+        let Some(stem) = relative.strip_suffix(".md") else {
+            continue;
+        };
+        if let Some(date) = try_parse_date(stem, &format, quarter) {
+            dated.push((date, path))
+        }
+    }
+    dated.sort_by_key(|(date, _)| std::cmp::Reverse(*date));
+    dated.truncate(limit);
+    Ok(dated.into_iter().map(|(_, path)| path).collect())
 }
 
 // ── Path derivation ────────────────────────────────────────────────────
@@ -351,10 +412,10 @@ fn try_read_core_daily_config(
 /// Returns path relative to vault root.
 pub fn periodic_note_path(config: &PeriodicNoteConfig, date: &NaiveDate) -> VaultResult<PathBuf> {
     let filename = format!("{}.md", format_date(date, &config.format)?);
-    Ok(match &config.folder {
-        Some(folder) if !folder.is_empty() => PathBuf::from(folder).join(filename),
-        _ => PathBuf::from(filename),
-    })
+    logical_join(
+        Path::new(config.folder.as_deref().unwrap_or("")),
+        Path::new(&filename),
+    )
 }
 
 /// Get the file path for the current period's periodic note.
@@ -539,7 +600,11 @@ pub(super) fn expand_rooted(
 static DATE_FORMAT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\{\{date:([^}]+)\}\}").unwrap());
 
-fn expand_template_string(content: &str, date: &NaiveDate, title: &str) -> VaultResult<String> {
+pub(super) fn expand_template_string(
+    content: &str,
+    date: &NaiveDate,
+    title: &str,
+) -> VaultResult<String> {
     let mut result = String::with_capacity(content.len());
     let mut cursor = 0;
     for captures in DATE_FORMAT_RE.captures_iter(content) {
@@ -737,6 +802,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn periodic_paths_preserve_source_names_and_slash_separators() {
+        let config = PeriodicNoteConfig {
+            format: "[a:]YYYY/MM/DD".into(),
+            folder: Some("CON/Journal".into()),
+            template: None,
+        };
+        let date = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap();
+        assert_eq!(
+            periodic_note_path(&config, &date).unwrap().to_str(),
+            Some("CON/Journal/a:2026/03/19.md")
+        );
+        assert_eq!(
+            filter_recent_paths(
+                &config,
+                vec![
+                    PathBuf::from("CON/Journal/a:2026/03/18.md"),
+                    PathBuf::from("CON/Journal/a:2026/03/19.md"),
+                    PathBuf::from("CON/Journal/a:2026/03/20.txt"),
+                ],
+                1,
+            )
+            .unwrap(),
+            vec![PathBuf::from("CON/Journal/a:2026/03/19.md")]
+        );
+    }
+
+    #[test]
+    fn recent_source_paths_require_an_exact_folder_boundary() {
+        let mut config = default_config(&NotePeriod::Daily);
+        config.folder = Some("a:b".into());
+        assert!(matches!(
+            filter_recent_paths(&config, vec![PathBuf::from("a:bc/2026-03-19.md")], 10),
+            Err(VaultError::OutsideVault(_))
+        ));
+        assert_eq!(
+            filter_recent_paths(&config, vec![PathBuf::from("a:b/2026-03-19.md")], 10).unwrap(),
+            vec![PathBuf::from("a:b/2026-03-19.md")]
+        );
+    }
+
     // ── read_periodic_config ───────────────────────────────────────────
 
     #[test]
@@ -885,6 +991,111 @@ mod tests {
         let config = read_periodic_config(tmp.path(), &NotePeriod::Weekly).unwrap();
         assert_eq!(config.format, "gggg-[W]ww");
         assert!(config.folder.is_none());
+    }
+
+    #[test]
+    fn confined_files_and_source_strings_share_configuration_resolution() {
+        let cases = [
+            (None, None),
+            (None, Some(r#"{"format":"","folder":"Core","template":""}"#)),
+            (
+                Some(
+                    r#"{"daily":{"enabled":true,"format":"","folder":"Plugin","templatePath":"Templates/Daily"},"weekly":{"enabled":true,"folder":"Weekly"},"monthly":{"enabled":true},"quarterly":{"enabled":true},"yearly":{"enabled":true}}"#,
+                ),
+                Some("invalid unused daily JSON"),
+            ),
+            (
+                Some(
+                    r#"{"daily":{"enabled":false,"folder":"Disabled"},"weekly":{"format":"YYYY","folder":"NotEnabled"}}"#,
+                ),
+                Some(r#"{"format":"DD-MM-YYYY","folder":"Core","template":"Templates/Core"}"#),
+            ),
+            (
+                Some(
+                    r#"{"calendarSets":[{"day":{"enabled":false},"week":{"enabled":true,"format":"GGGG-[W]WW","folder":"First"}},{"day":{"enabled":true,"folder":"Ignored"},"month":{"enabled":true,"folder":"Ignored"}}]}"#,
+                ),
+                Some(r#"{"format":"YYYY/MM/DD","folder":"Core"}"#),
+            ),
+        ];
+        for (plugin, daily) in cases {
+            let vault = TempDir::new().unwrap();
+            for (path, content) in [(PLUGIN_CONFIG_PATH, plugin), (DAILY_CONFIG_PATH, daily)] {
+                if let Some(content) = content {
+                    let path = vault.path().join(path);
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    fs::write(path, content).unwrap();
+                }
+            }
+            let root = VaultRoot::open(vault.path()).unwrap();
+            for period in [
+                NotePeriod::Daily,
+                NotePeriod::Weekly,
+                NotePeriod::Monthly,
+                NotePeriod::Quarterly,
+                NotePeriod::Yearly,
+            ] {
+                let native = read_config_rooted(&root, &period).unwrap();
+                let source = read_config_strings(plugin, daily, &period).unwrap();
+                assert_eq!(
+                    (native.format, native.folder, native.template),
+                    (source.format, source.folder, source.template),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_and_native_configuration_errors_name_the_same_path() {
+        for (plugin, daily, expected_path) in [
+            (Some("{"), None, PLUGIN_CONFIG_PATH),
+            (None, Some("{"), DAILY_CONFIG_PATH),
+        ] {
+            let vault = TempDir::new().unwrap();
+            let path = vault.path().join(expected_path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "{").unwrap();
+            let root = VaultRoot::open(vault.path()).unwrap();
+            let native = read_config_rooted(&root, &NotePeriod::Daily).unwrap_err();
+            let source = read_config_strings(plugin, daily, &NotePeriod::Daily).unwrap_err();
+            assert_eq!(native.to_string(), source.to_string());
+            assert!(source.to_string().contains(expected_path));
+        }
+    }
+
+    #[test]
+    fn plugin_precedence_avoids_observing_unused_core_configuration() {
+        let vault = TempDir::new().unwrap();
+        let plugin = r#"{"daily":{"enabled":true,"folder":"Plugin"}}"#;
+        let path = vault.path().join(PLUGIN_CONFIG_PATH);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, plugin).unwrap();
+        // Reading a directory as a settings file must fail if it is consulted.
+        fs::create_dir(vault.path().join(DAILY_CONFIG_PATH)).unwrap();
+        let root = VaultRoot::open(vault.path()).unwrap();
+        assert_eq!(
+            read_config_rooted(&root, &NotePeriod::Daily)
+                .unwrap()
+                .folder
+                .as_deref(),
+            Some("Plugin")
+        );
+        assert_eq!(
+            read_config_strings(Some(plugin), Some("{"), &NotePeriod::Daily)
+                .unwrap()
+                .folder
+                .as_deref(),
+            Some("Plugin")
+        );
+        assert_eq!(
+            plugin_config(Some(plugin), &NotePeriod::Daily)
+                .unwrap()
+                .unwrap()
+                .folder
+                .as_deref(),
+            Some("Plugin")
+        );
+        assert!(plugin_config(None, &NotePeriod::Daily).unwrap().is_none());
+        assert!(plugin_config(Some("{"), &NotePeriod::Daily).is_err());
     }
 
     // ── list_recent_periodic_notes ─────────────────────────────────────

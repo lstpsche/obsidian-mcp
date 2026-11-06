@@ -38,7 +38,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = parse_cli_args(std::env::args_os().skip(1))?;
     let config = Config::load(&cli)?;
-    let semantic_runtime_config = SemanticRuntimeConfig::load_from_env();
+    let mut semantic_runtime_config = SemanticRuntimeConfig::load_from_env();
+    select_source_semantic_mode(&config, &mut semantic_runtime_config)?;
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(&config.log_level))
@@ -242,6 +243,22 @@ enum InitializedDaemonClient {
         bootstrap: Arc<PendingDaemonBootstrap>,
         reason: String,
     },
+}
+
+fn select_source_semantic_mode(
+    config: &Config,
+    runtime: &mut SemanticRuntimeConfig,
+) -> Result<(), VaultError> {
+    if config.sftp_location()?.is_some() {
+        if config.embeddings && runtime.mode == SemanticMode::Daemon {
+            return Err(VaultError::InvalidPath(
+                "SFTP vaults use the MCP-local semantic owner; explicit daemon mode is unsupported"
+                    .into(),
+            ));
+        }
+        runtime.mode = SemanticMode::Local;
+    }
+    Ok(())
 }
 
 async fn init_semantic_runtime(
@@ -459,7 +476,8 @@ fn print_help() {
              Windows: %LOCALAPPDATA%/obsidian-mcp/obsidian-mcp.log\n\
          \n\
          ARGUMENTS:\n    \
-             VAULT_PATH    Path to Obsidian vault (or set OBSIDIAN_VAULT_PATH)\n\
+             VAULT_PATH    Local vault path or sftp://[user@]host[:port]/absolute/root\n    \
+                           (or set OBSIDIAN_VAULT_PATH)\n\
          \n\
          OPTIONS:\n    \
              -h, --help           Print this help message\n    \
@@ -473,7 +491,7 @@ fn print_help() {
              OBSIDIAN_TRANSPORT      Transport: stdio | http        [default: stdio]\n    \
              OBSIDIAN_HTTP_PORT      HTTP listen port               [default: 37842]\n    \
              OBSIDIAN_HTTP_HOST      HTTP bind address              [default: 127.0.0.1]\n    \
-             OBSIDIAN_WATCH          Enable filesystem watcher      [default: true]\n    \
+             OBSIDIAN_WATCH          Watch local files or poll SFTP [default: true]\n    \
              OBSIDIAN_LOG_LEVEL      Tracing log level              [default: info]\n    \
              OBSIDIAN_TANTIVY        Enable BM25 full-text index    [default: true]\n    \
              OBSIDIAN_EMBEDDINGS     Enable semantic embeddings     [default: false]\n    \
@@ -491,8 +509,14 @@ fn print_help() {
              OBSIDIAN_EMBEDDING_TLS_VERIFY  Verify API TLS certs    [default: true]\n    \
              OBSIDIAN_TOOLS          Tool filter: profile (full/core/read/minimal),\n    \
                                      comma-separated allow-list, or !-prefixed deny-list\n    \
-             OBSIDIAN_MCP_DATA       External data dir for embeddings  [default: {{vault}}/.obsidian-mcp]\n    \
-             OBSIDIAN_EXCLUDE_PATHS  Comma-separated exclusion globs   [default: none]",
+             OBSIDIAN_MCP_DATA       Local directory for machine data\n    \
+             OBSIDIAN_EXCLUDE_PATHS  Comma-separated exclusion globs   [default: none]\n    \
+             OBSIDIAN_SFTP_TIMEOUT_SECS Source-operation deadline      [default: 30]\n    \
+             OBSIDIAN_SFTP_POLL_INTERVAL_SECS Remote metadata polling  [default: 300]\n    \
+             OBSIDIAN_SFTP_VERIFY_INTERVAL_SECS Full content check    [default: 3600]\n\
+         \n\
+         SFTP sources require an installed OpenSSH client, trusted host key and\n\
+         non-interactive key or agent authentication. Generated data stays local.",
         name = env!("CARGO_PKG_NAME"),
         version = env!("CARGO_PKG_VERSION"),
         description = env!("CARGO_PKG_DESCRIPTION"),
@@ -896,6 +920,42 @@ mod tests {
             tool_filter: obsidian_mcp::config::ToolFilter::Full,
             mcp_data_dir: None,
             exclude_patterns: vec![],
+        }
+    }
+
+    #[test]
+    fn remote_semantics_select_local_without_fallback() {
+        let mut config = test_config();
+        config.vault_path = PathBuf::from("sftp://vault-server/home/alice/notes");
+        config.embeddings = true;
+        let mut runtime = runtime_config(SemanticMode::Auto);
+        select_source_semantic_mode(&config, &mut runtime).unwrap();
+        assert_eq!(runtime.mode, SemanticMode::Local);
+    }
+
+    #[test]
+    fn remote_explicit_daemon_requires_a_supported_owner() {
+        let mut config = test_config();
+        config.vault_path = PathBuf::from("sftp://vault-server/home/alice/notes");
+        config.embeddings = true;
+        let mut runtime = runtime_config(SemanticMode::Daemon);
+        assert!(select_source_semantic_mode(&config, &mut runtime).is_err());
+        config.embeddings = false;
+        select_source_semantic_mode(&config, &mut runtime).unwrap();
+        assert_eq!(runtime.mode, SemanticMode::Local);
+    }
+
+    #[test]
+    fn local_semantic_owner_selection_is_preserved() {
+        let config = test_config();
+        for mode in [
+            SemanticMode::Auto,
+            SemanticMode::Local,
+            SemanticMode::Daemon,
+        ] {
+            let mut runtime = runtime_config(mode);
+            select_source_semantic_mode(&config, &mut runtime).unwrap();
+            assert_eq!(runtime.mode, mode);
         }
     }
 

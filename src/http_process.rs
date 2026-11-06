@@ -727,7 +727,9 @@ mod tests {
             let endpoint = SocketAddr::new(wildcard, bound.port());
             assert!(platform::wildcard_port_in_use(endpoint).unwrap());
             drop(listener);
-            assert!(!platform::wildcard_port_in_use(endpoint).unwrap());
+            // Another thread may reuse a released ephemeral port. Port zero
+            // asks the kernel for a fresh bind to test the available case.
+            assert!(!platform::wildcard_port_in_use(SocketAddr::new(wildcard, 0)).unwrap());
         }
     }
 

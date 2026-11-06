@@ -1,6 +1,7 @@
 //! Backlink, outgoing-link, and graph traversal tools.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use rmcp::model::{CallToolResult, ErrorCode};
@@ -149,10 +150,10 @@ async fn wikilinks_backlinks(
     note_path: &str,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     let path = Path::new(note_path);
-    let target_path = vault.canonical_existing_relative_path(path)?;
-    vault.get_note_metadata(&target_path)?;
+    let target_path = vault.canonical_existing_relative_path(path).await?;
+    vault.get_note_metadata(&target_path).await?;
 
-    let backlink_notes = vault.backlinks(&target_path)?;
+    let backlink_notes = vault.backlinks(&target_path).await?;
 
     let result: Vec<BacklinkSource> = backlink_notes
         .iter()
@@ -160,7 +161,11 @@ async fn wikilinks_backlinks(
             let matching: Vec<BacklinkRef> = source
                 .links
                 .iter()
-                .filter(|link| vault.resolve_link(&link.target).as_deref() == Some(&target_path))
+                .filter(|link| {
+                    vault
+                        .resolve_link(&link.target)
+                        .is_some_and(|resolved| resolved.as_os_str() == target_path.as_os_str())
+                })
                 .map(|link| BacklinkRef {
                     raw: link.raw.clone(),
                     line: link.line,
@@ -186,10 +191,10 @@ async fn wikilinks_outgoing(
     note_path: &str,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     let path = Path::new(note_path);
-    let actual_path = vault.canonical_existing_relative_path(path)?;
-    vault.get_note_metadata(&actual_path)?;
+    let actual_path = vault.canonical_existing_relative_path(path).await?;
+    vault.get_note_metadata(&actual_path).await?;
 
-    let links = vault.outgoing_links(&actual_path)?;
+    let links = vault.outgoing_links(&actual_path).await?;
 
     let result: Vec<OutgoingLink> = links
         .into_iter()
@@ -216,9 +221,9 @@ async fn wikilinks_broken(
     let result: Vec<BrokenLink> = match note_path {
         Some(p) => {
             let path = Path::new(p);
-            let actual_path = vault.canonical_existing_relative_path(path)?;
-            vault.get_note_metadata(&actual_path)?;
-            let links = vault.outgoing_links(&actual_path)?;
+            let actual_path = vault.canonical_existing_relative_path(path).await?;
+            vault.get_note_metadata(&actual_path).await?;
+            let links = vault.outgoing_links(&actual_path).await?;
 
             links
                 .into_iter()
@@ -256,28 +261,33 @@ async fn wikilinks_orphans(vault: &Vault) -> Result<CallToolResult, rmcp::ErrorD
         })
         .collect();
 
-    let mut seen_paths: HashSet<PathBuf> = disconnected.iter().map(|e| e.path.clone()).collect();
+    let mut seen_paths: HashSet<OsString> = disconnected
+        .iter()
+        .map(|entry| entry.path.as_os_str().to_owned())
+        .collect();
 
-    let mut broken_by_source: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    let mut broken_by_source: HashMap<OsString, HashSet<String>> = HashMap::new();
     for (source_path, link) in vault.broken_links()? {
         broken_by_source
-            .entry(source_path)
+            .entry(source_path.into_os_string())
             .or_default()
             .insert(link.target);
     }
 
-    for (source_path, broken_targets) in broken_by_source {
-        if seen_paths.contains(&source_path) {
+    for (source_key, broken_targets) in broken_by_source {
+        if seen_paths.contains(&source_key) {
             continue;
         }
+        let source_path = PathBuf::from(&source_key);
 
-        let has_incoming = !vault.backlinks(&source_path)?.is_empty();
+        let has_incoming = !vault.backlinks(&source_path).await?.is_empty();
         if has_incoming {
             continue;
         }
 
         let has_resolved_outgoing = vault
-            .outgoing_links(&source_path)?
+            .outgoing_links(&source_path)
+            .await?
             .into_iter()
             .any(|link| has_resolved_target(vault, &link.target));
         if has_resolved_outgoing {
@@ -292,10 +302,10 @@ async fn wikilinks_orphans(vault: &Vault) -> Result<CallToolResult, rmcp::ErrorD
             status: OrphanStatus::BrokenOutgoingOnly,
             broken_targets,
         });
-        seen_paths.insert(source_path);
+        seen_paths.insert(source_key);
     }
 
-    disconnected.sort_by(|a, b| a.path.cmp(&b.path));
+    disconnected.sort_by(|a, b| a.path.as_os_str().cmp(b.path.as_os_str()));
     super::output::results(WikilinkEntries::Orphans(disconnected))
 }
 

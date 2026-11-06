@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use super::path::canonical_unicode_key;
+use super::path::{canonical_unicode_key, logical_file_name};
 
 /// Resolves wikilink targets to file paths using Obsidian's
 /// shortest-unique-path algorithm.
@@ -88,7 +88,7 @@ impl LinkResolver {
         self.by_path.remove(&pkey);
 
         if let Some(paths) = self.by_stem.get_mut(&stem) {
-            paths.retain(|p| p != path);
+            paths.retain(|p| p.as_os_str() != path.as_os_str());
             if paths.is_empty() {
                 self.by_stem.remove(&stem);
             }
@@ -126,7 +126,7 @@ impl LinkResolver {
     /// `.md` files: filename without `.md`, lowercased.
     /// Other files: full filename with extension, lowercased.
     fn stem_key(path: &Path) -> String {
-        lookup_key_without_md(&path.file_name().unwrap_or_default().to_string_lossy())
+        lookup_key_without_md(logical_file_name(path).unwrap_or_default())
     }
 }
 
@@ -304,6 +304,14 @@ mod tests {
     fn root_level_note() {
         let r = build_link_resolver(&paths(&["note.md"]));
         assert_eq!(r.resolve("note"), Some(p("note.md")));
+    }
+
+    #[test]
+    fn server_names_resolve_without_native_drive_interpretation() {
+        let r = build_link_resolver(&paths(&["a:b.md", "notes/CON.md"]));
+        assert_eq!(r.resolve("a:b"), Some(p("a:b.md")));
+        assert_eq!(r.resolve("CON"), Some(p("notes/CON.md")));
+        assert_eq!(r.resolve("notes/CON"), Some(p("notes/CON.md")));
     }
 
     #[test]

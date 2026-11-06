@@ -1,6 +1,7 @@
 //! Tantivy BM25 full-text index: schema, indexing, and search.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -152,11 +153,20 @@ impl TantivyBuilder {
 }
 
 impl TantivyIndex {
+    /// Create a published empty lexical index for streamed source observations.
+    pub(crate) fn empty() -> VaultResult<Self> {
+        TantivyBuilder::new()?.finish()
+    }
+
     /// Build a lexical index from an existing set of note metadata.
-    pub fn build(vault_root: &Path, notes: &HashMap<PathBuf, NoteMetadata>) -> VaultResult<Self> {
+    pub fn build<K: AsRef<std::ffi::OsStr>>(
+        vault_root: &Path,
+        notes: &HashMap<K, NoteMetadata>,
+    ) -> VaultResult<Self> {
         let filesystem = fs::VaultRoot::open(vault_root)?;
         let mut builder = TantivyBuilder::new()?;
-        for (path, note) in notes {
+        for (key, note) in notes {
+            let path = Path::new(key.as_ref());
             match filesystem.read_observed(path) {
                 Ok(content) => builder.add(path, note, &content)?,
                 Err(error) => {
@@ -264,15 +274,18 @@ impl TantivyIndex {
         &self,
         query: &str,
         top_k: usize,
-        allowed_paths: Option<&std::collections::HashSet<PathBuf>>,
+        allowed_paths: Option<&std::collections::HashSet<OsString>>,
     ) -> VaultResult<Vec<(PathBuf, f32)>> {
-        if query.is_empty() || top_k == 0 {
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let parsed = self.parse_default_query(query)?;
+        if top_k == 0 {
             return Ok(Vec::new());
         }
 
         let searcher = self.reader.searcher();
-
-        let parsed = self.parse_default_query(query)?;
 
         let query: Box<dyn tantivy::query::Query> = if let Some(paths) = allowed_paths {
             let terms = paths
@@ -770,6 +783,35 @@ mod tests {
     }
 
     // ── search_with_options tests ──────────────────────────────────────
+
+    #[test]
+    fn zero_limit_validates_text_query_before_short_circuiting() {
+        let index = TantivyIndex::empty().unwrap();
+        let allowed = std::collections::HashSet::new();
+        assert!(index.search_for_paths("\"", 0, Some(&allowed)).is_err());
+        assert!(
+            index
+                .search_for_paths("quokka", 0, Some(&allowed))
+                .unwrap()
+                .is_empty()
+        );
+        for fuzzy in [false, true] {
+            for fields in [None, Some(&[SearchField::Title][..])] {
+                assert!(
+                    index
+                        .search_with_options("\"", 0, fuzzy, fields)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    index
+                        .search_with_options("quokka", 0, fuzzy, fields)
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+    }
 
     #[test]
     fn search_with_options_delegates_to_search_when_no_options() {

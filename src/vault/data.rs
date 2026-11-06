@@ -276,7 +276,7 @@ mod tests {
             let b = b.unwrap();
             assert_eq!(a.indexed_paths(), ["visible.md"]);
             assert_eq!(b.indexed_paths().len(), 2);
-            assert!(b.get_note_metadata(Path::new("private.md")).is_ok());
+            assert!(b.get_note_metadata(Path::new("private.md")).await.is_ok());
             assert_eq!(a.mcp_data(), dest_a.canonicalize().unwrap());
             assert_eq!(b.mcp_data(), dest_b.canonicalize().unwrap());
         }

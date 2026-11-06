@@ -414,7 +414,7 @@ fn stage_event(
             index
                 .tracked_paths()
                 .filter(|path| path.starts_with(&relative))
-                .map(|path| (path.clone(), Change::Refresh))
+                .map(|path| (path.to_owned(), Change::Refresh))
                 .collect()
         }
     };
