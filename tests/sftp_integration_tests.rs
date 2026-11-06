@@ -67,7 +67,7 @@ Start-ScheduledTask -TaskName $env:OBSIDIAN_TEST_SSH_TASK
 "#,
             ).unwrap();
             checked(
-                Command::new("powershell.exe")
+                windows_powershell()
                     .args([
                         "-NoProfile",
                         "-NonInteractive",
@@ -125,7 +125,7 @@ if ($task) {
     Unregister-ScheduledTask -InputObject $task -Confirm:$false
 }
 "#;
-                let output = Command::new("powershell.exe")
+                let output = windows_powershell()
                     .args(["-NoProfile", "-NonInteractive", "-Command", cleanup])
                     .env("OBSIDIAN_TEST_SSH_TASK", name.as_str())
                     .output();
@@ -186,6 +186,15 @@ fn checked(command: &mut Command) {
         "fixture command {command:?} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[cfg(windows)]
+fn windows_powershell() -> Command {
+    let mut command = Command::new("powershell.exe");
+    // Cargo can inherit PowerShell 7 module paths. Windows PowerShell must
+    // construct its own paths to load the matching built-in modules.
+    command.env_remove("PSModulePath");
+    command
 }
 
 fn config_path(path: &Path) -> String {
@@ -255,7 +264,7 @@ foreach ($name in 'client_key', 'rejected_key') {
 }
 "#;
     checked(
-        Command::new("powershell.exe")
+        windows_powershell()
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .env("OBSIDIAN_TEST_SSH_ROOT", root),
     );
