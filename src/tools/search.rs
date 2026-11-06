@@ -301,7 +301,13 @@ pub async fn search_semantic(
             result
         }
     }
-    .map_err(to_semantic_tool_error)?;
+    .map_err(|error| {
+        if vault.is_scoped() {
+            scoped_semantic_tool_error(error)
+        } else {
+            to_semantic_tool_error(error)
+        }
+    })?;
 
     super::output::results(results)
 }
@@ -376,6 +382,11 @@ async fn search_semantic_daemon(
             ));
         }
     }
+    for hit in &daemon_result.results {
+        vault
+            .check_result_revision(std::path::Path::new(&hit.path), &hit.source_revision)
+            .await?;
+    }
     Ok(daemon_result
         .results
         .into_iter()
@@ -417,6 +428,11 @@ async fn search_semantic_local(
     } else {
         None
     };
+    for hit in &hits {
+        vault
+            .check_result_revision(&hit.path, &hit.entry.source_revision)
+            .await?;
+    }
     let results = crate::vault::semantic_results::render_many_source(
         &storage,
         hits,
@@ -428,6 +444,11 @@ async fn search_semantic_local(
     // Source context acquisition may discover that the authority which admitted
     // these observations has changed. Ordinary outages can still return hits.
     vault.require_semantic_catalog()?;
+    for result in &results {
+        vault
+            .check_result_revision(&result.path, &result.source_revision)
+            .await?;
+    }
     Ok(results)
 }
 
@@ -475,6 +496,18 @@ fn to_semantic_tool_error(err: VaultError) -> rmcp::ErrorData {
     }
 }
 
+fn scoped_semantic_tool_error(error: VaultError) -> rmcp::ErrorData {
+    if matches!(error, VaultError::EmbeddingInputTooLong { .. }) {
+        return error.into();
+    }
+    tracing::warn!(%error, "scoped semantic search failed");
+    rmcp::ErrorData::new(
+        ErrorCode::INTERNAL_ERROR,
+        "Semantic memory search is unavailable; inspect local service diagnostics.",
+        None::<serde_json::Value>,
+    )
+}
+
 // ── tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -496,6 +529,24 @@ mod tests {
     use serde_json::json;
     #[cfg(unix)]
     use tokio::io::{AsyncWriteExt, BufReader};
+
+    #[test]
+    fn scoped_semantic_failures_do_not_expose_source_inventory_or_other_audiences() {
+        let error = super::scoped_semantic_tool_error(crate::error::VaultError::Embedding(
+            "not ready (17/23, 6 pending): failed Organize/People/another-dm/private-title.md"
+                .into(),
+        ));
+        let response = serde_json::to_string(&error).unwrap();
+        for forbidden in ["17/23", "6 pending", "another-dm", "private-title"] {
+            assert!(!response.contains(forbidden), "{response}");
+        }
+        let input_error =
+            super::scoped_semantic_tool_error(crate::error::VaultError::EmbeddingInputTooLong {
+                tokens: 12,
+                max_tokens: 10,
+            });
+        assert!(input_error.message.contains("12 tokens"));
+    }
 
     #[cfg(unix)]
     fn inspected_daemon_client(socket_path: PathBuf) -> SemanticDaemonClient {

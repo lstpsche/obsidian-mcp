@@ -215,7 +215,13 @@ pub async fn vault_info(
     let mcp_data_dir = vault
         .resolved_mcp_data()
         .and_then(|path| (Some(path) != vault.mcp_home()).then(|| path.display().to_string()));
-    let embeddings = embedding_info(vault, runtime).await;
+    let mut embeddings = embedding_info(vault, runtime).await;
+    if vault.is_scoped() {
+        embeddings.status = None;
+        if embeddings.error.is_some() {
+            embeddings.error = Some("semantic service is unavailable".into());
+        }
+    }
     let catalog_unavailable = matches!(
         &stats,
         Err(VaultError::Storage {
@@ -239,7 +245,11 @@ pub async fn vault_info(
         stats: stats?,
         vault_name,
         vault_path,
-        exclude_patterns: vault.exclude().patterns().to_vec(),
+        exclude_patterns: if vault.is_scoped() {
+            Vec::new()
+        } else {
+            vault.exclude().patterns().to_vec()
+        },
         mcp_data_dir,
         embeddings,
         source,

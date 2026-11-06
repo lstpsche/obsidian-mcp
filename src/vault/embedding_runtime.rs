@@ -1443,9 +1443,17 @@ async fn prepare_work_observed(
             let embedder = Arc::clone(model);
             let previous = previous.clone();
             let raw = observed.read_exact_bounded(&path, read_limit).await;
+            let index = Arc::clone(&shared.index);
             match raw {
                 Err(error) => Err(error),
                 Ok(raw) => tokio::task::spawn_blocking(move || {
+                    if !index
+                        .read()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .allows_source(&path, &raw)
+                    {
+                        return Ok(PreparationOutcome::Missing);
+                    }
                     if previous.as_ref().is_some_and(|previous| {
                         super::source::source_revision_matches(&raw, &previous.source_revision)
                     }) {

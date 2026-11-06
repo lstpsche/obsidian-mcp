@@ -41,6 +41,7 @@ use chrono::{Local, NaiveDate};
 use futures_util::{FutureExt, StreamExt, stream};
 use notify_debouncer_mini::Debouncer;
 
+use crate::access::ReadScope;
 use crate::config::Config;
 use crate::error::{VaultError, VaultResult};
 use crate::models::{
@@ -93,25 +94,29 @@ async fn read_search_matches(
     };
     source_work(move || {
         let _reservation = reservation;
-        Ok(regex
-            .find_iter(&content)
-            .map(|matched| {
-                let (context, match_start, match_end, line) = index::extract_match_context(
-                    &content,
-                    matched.start(),
-                    matched.end(),
-                    context_len,
-                );
-                SearchMatch {
-                    line,
-                    context,
-                    match_start,
-                    match_end,
-                }
-            })
-            .collect())
+        Ok(match_source_content(&content, &regex, context_len))
     })
     .await
+}
+
+fn match_source_content(
+    content: &str,
+    regex: &regex::Regex,
+    context_len: usize,
+) -> Vec<SearchMatch> {
+    regex
+        .find_iter(content)
+        .map(|matched| {
+            let (context, match_start, match_end, line) =
+                index::extract_match_context(content, matched.start(), matched.end(), context_len);
+            SearchMatch {
+                line,
+                context,
+                match_start,
+                match_end,
+            }
+        })
+        .collect()
 }
 
 fn listing_bound_exceeded<T>(read: &VaultResult<T>) -> bool {
@@ -216,6 +221,22 @@ struct VaultInner {
 pub struct Vault {
     inner: Arc<VaultInner>,
     background: Arc<Background>,
+    read_scope: Option<Arc<ReadScope>>,
+}
+
+enum IndexRead<'a> {
+    Shared(std::sync::RwLockReadGuard<'a, VaultIndex>),
+    Scoped(Box<VaultIndex>),
+}
+
+impl std::ops::Deref for IndexRead<'_> {
+    type Target = VaultIndex;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Shared(index) => index,
+            Self::Scoped(index) => index,
+        }
+    }
 }
 
 struct Background {
@@ -485,6 +506,7 @@ impl Vault {
                 _watcher: Mutex::new(watcher_handle),
             }),
             background: Arc::new(Background::default()),
+            read_scope: None,
         };
         *vault
             .background
@@ -520,6 +542,7 @@ impl Vault {
         F: FnOnce(Self) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = VaultResult<T>> + Send + 'static,
     {
+        self.check_mutation_scope()?;
         let admission = Arc::clone(&self.background.admission).acquire_owned();
         let permit = match deadline {
             Some(deadline) => tokio::time::timeout_at(deadline, admission)
@@ -536,8 +559,7 @@ impl Vault {
         let vault = self.clone();
         let task = tokio::spawn(async move {
             let _permit = permit;
-            let inner = Arc::clone(&vault.inner);
-            let lock = inner.mutations.lock();
+            let lock = vault.lock_mutations();
             let _mutation = match deadline {
                 Some(deadline) => tokio::time::timeout_at(deadline, lock).await.map_err(|_| {
                     vault.source_error(
@@ -546,9 +568,9 @@ impl Vault {
                     )
                 })?,
                 None => lock.await,
-            };
+            }?;
             let retained = vault.clone();
-            let result = storage::with_source_deadline(deadline, operation(vault)).await;
+            let result = storage::with_source_deadline(deadline, operation(vault.clone())).await;
             if let Err(error) = &result {
                 retained.reconcile_after_mutation_error(error);
             }
@@ -840,6 +862,7 @@ impl Vault {
                 _watcher: Mutex::new(None),
             }),
             background: Arc::new(Background::default()),
+            read_scope: None,
         };
         *source
             .background
@@ -861,6 +884,7 @@ impl Vault {
                 let service = Self {
                     inner,
                     background: Arc::new(Background::default()),
+                    read_scope: None,
                 };
                 if notified || service.inner.reconcile_needed.load(Ordering::Acquire) {
                     recovering |= service.begin_reconciliation(notified);
@@ -1521,6 +1545,93 @@ impl Vault {
         }
     }
 
+    /// Retain the same source/index with an immutable, read-only audience policy.
+    pub fn with_read_scope(&self, scope: ReadScope) -> VaultResult<Self> {
+        scope.validate()?;
+        if self.is_remote() {
+            return Err(VaultError::Other(
+                "private memory scopes require a local vault".into(),
+            ));
+        }
+        Ok(Self {
+            inner: Arc::clone(&self.inner),
+            background: Arc::clone(&self.background),
+            read_scope: Some(Arc::new(scope)),
+        })
+    }
+
+    pub fn is_scoped(&self) -> bool {
+        self.read_scope.is_some()
+    }
+
+    pub(crate) async fn check_result_revision(
+        &self,
+        path: &Path,
+        revision: &str,
+    ) -> VaultResult<()> {
+        if self.is_scoped() {
+            self.read_source_snapshot(path)
+                .await?
+                .check_revision(path, Some(revision))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(has_embeddings)]
+    fn check_scoped_revision_native(&self, path: &Path, revision: &str) -> VaultResult<()> {
+        let raw = self.read_scoped_native(path, Some(source::MAX_SOURCE_BYTES))?;
+        source::SourceSnapshot::new(raw).check_revision(path, Some(revision))?;
+        Ok(())
+    }
+
+    fn read_scoped_native(&self, path: &Path, max_bytes: Option<usize>) -> VaultResult<String> {
+        self.check_scope_path(path)?;
+        let filesystem = self.inner.filesystem.as_ref().ok_or_else(|| {
+            VaultError::Other("private memory scopes require a local vault".into())
+        })?;
+        let actual = filesystem.resolve_existing(path)?.relative;
+        self.check_scope_path(&actual)?;
+        let content = match max_bytes {
+            Some(max_bytes) => filesystem.read_exact_bounded(&actual, max_bytes)?,
+            None => filesystem.read_observed(&actual)?,
+        };
+        self.check_content_scope(&actual, &content)?;
+        Ok(content)
+    }
+
+    fn check_scope_path(&self, path: &Path) -> VaultResult<()> {
+        if self
+            .read_scope
+            .as_ref()
+            .is_some_and(|scope| !scope.allows_path(path))
+        {
+            return Err(VaultError::NoteNotFound(path.to_owned()));
+        }
+        Ok(())
+    }
+
+    fn check_content_scope(&self, path: &Path, content: &str) -> VaultResult<()> {
+        let Some(scope) = &self.read_scope else {
+            return Ok(());
+        };
+        let metadata = frontmatter::parse_frontmatter(content)
+            .map_err(|_| VaultError::NoteNotFound(path.to_owned()))?;
+        if scope.expires_at <= chrono::Utc::now().timestamp_millis() as f64 / 1000.0
+            || !scope.allows_path(path)
+            || !scope.allows_frontmatter(metadata.as_ref())
+        {
+            return Err(VaultError::NoteNotFound(path.to_owned()));
+        }
+        Ok(())
+    }
+
+    async fn check_read_scope(&self, path: &Path) -> VaultResult<()> {
+        if self.read_scope.is_none() {
+            return Ok(());
+        }
+        self.read_note(path).await.map(|_| ())
+    }
+
     /// Vault root path (canonicalized).
     pub fn root(&self) -> &Path {
         &self.inner.reported_root
@@ -1564,7 +1675,32 @@ impl Vault {
         recursive: bool,
         glob: Option<&str>,
     ) -> VaultResult<Vec<PathBuf>> {
-        self.storage().await?.list_files(dir, recursive, glob).await
+        let files = self
+            .storage()
+            .await?
+            .list_files(dir, recursive, glob)
+            .await?;
+        self.filter_scoped_listing(files).await
+    }
+
+    async fn filter_scoped_listing(&self, files: Vec<PathBuf>) -> VaultResult<Vec<PathBuf>> {
+        if !self.is_scoped() {
+            return Ok(files);
+        }
+        let vault = self.clone();
+        source_work(move || {
+            let index = vault.read_index();
+            Ok(files
+                .into_iter()
+                .filter(|path| {
+                    index.notes().keys().any(|note| {
+                        let note = Path::new(note);
+                        note == path || note.starts_with(path)
+                    })
+                })
+                .collect())
+        })
+        .await
     }
 
     pub(crate) async fn list_regular_files(
@@ -1573,22 +1709,43 @@ impl Vault {
         recursive: bool,
         glob: Option<&str>,
     ) -> VaultResult<Vec<PathBuf>> {
-        self.storage()
+        let files = self
+            .storage()
             .await?
             .list_regular_files(dir, recursive, glob)
-            .await
+            .await?;
+        self.filter_scoped_listing(files).await
     }
 
     pub async fn read_note(&self, path: &Path) -> VaultResult<String> {
+        if self.is_scoped() {
+            let vault = self.clone();
+            let path = path.to_owned();
+            return source_work(move || vault.read_scoped_native(&path, None)).await;
+        }
         self.storage().await?.read_file(path).await
+    }
+
+    pub(crate) async fn read_note_bounded(
+        &self,
+        path: &Path,
+        max_bytes: usize,
+    ) -> VaultResult<String> {
+        if self.is_scoped() {
+            let vault = self.clone();
+            let path = path.to_owned();
+            return source_work(move || vault.read_scoped_native(&path, Some(max_bytes))).await;
+        }
+        self.storage()
+            .await?
+            .read_file_bounded(path, max_bytes)
+            .await
     }
 
     /// Observe one bounded raw note revision for source-bound context reads.
     pub async fn read_source_snapshot(&self, path: &Path) -> VaultResult<source::SourceSnapshot> {
         let raw = self
-            .storage()
-            .await?
-            .read_file_bounded(path, source::MAX_SOURCE_BYTES)
+            .read_note_bounded(path, source::MAX_SOURCE_BYTES)
             .await?;
         tokio::task::spawn_blocking(move || source::SourceSnapshot::new(raw))
             .await
@@ -1596,6 +1753,7 @@ impl Vault {
     }
 
     pub async fn file_stat(&self, path: &Path) -> VaultResult<FileStat> {
+        self.check_read_scope(path).await?;
         self.storage().await?.file_stat(path).await
     }
 
@@ -1837,7 +1995,7 @@ impl Vault {
     // ── frontmatter delegation ─────────────────────────────────────────
 
     pub async fn get_frontmatter(&self, path: &Path) -> VaultResult<Option<serde_json::Value>> {
-        let content = self.storage().await?.read_file(path).await?;
+        let content = self.read_note(path).await?;
         source_work(move || frontmatter::parse_frontmatter(&content)).await
     }
 
@@ -1953,7 +2111,7 @@ impl Vault {
     }
 
     pub async fn get_document_map(&self, path: &Path) -> VaultResult<DocumentMap> {
-        let content = self.storage().await?.read_file(path).await?;
+        let content = self.read_note(path).await?;
         tokio::task::spawn_blocking(move || parser::build_document_map(&content))
             .await
             .map_err(|e| VaultError::Other(format!("document inspection task failed: {e}")))
@@ -2116,7 +2274,8 @@ impl Vault {
             .keys()
             .cloned()
             .collect::<std::collections::HashSet<_>>();
-        let entries = snapshot.capture_entries(&current_paths);
+        let mut entries = snapshot.capture_entries(&current_paths);
+        self.filter_scoped_semantic_entries(&mut entries);
         if entries.is_empty() {
             snapshot.validate_query(query)?;
             self.require_semantic_catalog()?;
@@ -2215,7 +2374,8 @@ impl Vault {
         let snapshot = runtime.query_snapshot()?;
         snapshot.validate_query(query)?;
         let current_paths = self.read_index().notes().keys().cloned().collect();
-        let entries = snapshot.capture_entries(&current_paths);
+        let mut entries = snapshot.capture_entries(&current_paths);
+        self.filter_scoped_semantic_entries(&mut entries);
         if entries.is_empty() {
             self.require_semantic_catalog()?;
             return Ok(Vec::new());
@@ -2348,7 +2508,9 @@ impl Vault {
         &self,
         path: &Path,
     ) -> VaultResult<PathBuf> {
-        Ok(self.storage().await?.resolve_existing(path).await?.relative)
+        let actual = self.storage().await?.resolve_existing(path).await?.relative;
+        self.check_read_scope(&actual).await?;
+        Ok(actual)
     }
 
     /// Validate that a relative path doesn't escape the vault root.
@@ -2367,7 +2529,7 @@ impl Vault {
         let config = self.periodic_config(period).await?;
         let date = date.unwrap_or_else(|| Local::now().date_naive());
         let path = periodic::periodic_note_path(&config, &date)?;
-        self.storage().await?.read_file(&path).await
+        self.read_note(&path).await
     }
 
     pub async fn create_periodic_note(
@@ -2452,11 +2614,26 @@ impl Vault {
         let tv = Arc::clone(tv);
         let search_query = query.to_owned();
         let fields = fields.map(<[SearchField]>::to_vec);
+        let vault = self.clone();
         let hits = source_work(move || {
+            let allowed = vault.read_scope.as_ref().map(|_| {
+                vault
+                    .read_index()
+                    .notes()
+                    .keys()
+                    .cloned()
+                    .collect::<HashSet<_>>()
+            });
             if fuzzy || fields.is_some() {
-                tv.search_with_options(&search_query, max_results, fuzzy, fields.as_deref())
+                tv.search_with_options_for_paths(
+                    &search_query,
+                    max_results,
+                    fuzzy,
+                    fields.as_deref(),
+                    allowed.as_ref(),
+                )
             } else {
-                tv.search(&search_query, max_results)
+                tv.search_for_paths(&search_query, max_results, allowed.as_ref())
             }
         })
         .await?;
@@ -2464,6 +2641,25 @@ impl Vault {
         let word_re = (context_len > 0 && !hits.is_empty())
             .then(|| search_utils::compile_query_word_regex(query))
             .flatten();
+        if self.is_scoped() {
+            let vault = self.clone();
+            return source_work(move || {
+                hits.into_iter()
+                    .map(|(path, score)| {
+                        let content = vault.read_scoped_native(&path, None)?;
+                        let matches = word_re.as_ref().map_or_else(Vec::new, |regex| {
+                            match_source_content(&content, regex, context_len)
+                        });
+                        Ok(SearchResult {
+                            path,
+                            matches,
+                            score: Some(score as f64),
+                        })
+                    })
+                    .collect()
+            })
+            .await;
+        }
         let matches = if let Some(regex) = word_re {
             let source = self.storage().await?;
             let paths = hits.iter().map(|(path, _)| path.clone()).collect();
@@ -2494,6 +2690,26 @@ impl Vault {
         context_len: usize,
         limit: Option<usize>,
     ) -> VaultResult<Vec<(PathBuf, Vec<SearchMatch>)>> {
+        if self.is_scoped() {
+            let vault = self.clone();
+            return source_work(move || {
+                let mut results = Vec::new();
+                let mut matched = 0usize;
+                for path in paths {
+                    let Ok(content) = vault.read_scoped_native(&path, None) else {
+                        continue;
+                    };
+                    let matches = match_source_content(&content, &regex, context_len);
+                    matched += usize::from(!matches.is_empty());
+                    results.push((path, matches));
+                    if limit.is_some_and(|limit| matched >= limit) {
+                        break;
+                    }
+                }
+                Ok(results)
+            })
+            .await;
+        }
         let batch = source.observe_batch(&paths).await?;
         let remote = source.is_remote();
         let candidates = {
@@ -2584,8 +2800,47 @@ impl Vault {
         Ok(results)
     }
 
-    fn read_index(&self) -> std::sync::RwLockReadGuard<'_, VaultIndex> {
-        self.inner.index.read().unwrap_or_else(|e| e.into_inner())
+    fn check_mutation_scope(&self) -> VaultResult<()> {
+        if self.is_scoped() {
+            return Err(VaultError::Other(
+                "private memory scope is read-only".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn lock_mutations(&self) -> VaultResult<tokio::sync::MutexGuard<'_, ()>> {
+        self.check_mutation_scope()?;
+        Ok(self.inner.mutations.lock().await)
+    }
+
+    fn read_index(&self) -> IndexRead<'_> {
+        let index = self.inner.index.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(scope) = &self.read_scope {
+            let contents = index
+                .notes()
+                .iter()
+                .filter(|(_, metadata)| scope.allows_frontmatter(metadata.frontmatter.as_ref()))
+                .filter_map(|(path, _)| {
+                    self.read_scoped_native(Path::new(path), None)
+                        .ok()
+                        .map(|content| (path.clone(), content))
+                })
+                .collect();
+            IndexRead::Scoped(Box::new(index.read_view(contents)))
+        } else {
+            IndexRead::Shared(index)
+        }
+    }
+
+    #[cfg(has_embeddings)]
+    fn filter_scoped_semantic_entries(&self, entries: &mut semantic_results::CapturedEntries) {
+        if self.is_scoped() {
+            entries.retain(|path, entry| {
+                self.check_scoped_revision_native(Path::new(path), &entry.source_revision)
+                    .is_ok()
+            });
+        }
     }
 
     fn write_index(&self) -> std::sync::RwLockWriteGuard<'_, VaultIndex> {
@@ -2818,6 +3073,64 @@ mod tests {
     use crate::models::{PatchOperation, PatchTargetType};
     use crate::test_helpers::{create_test_vault, tantivy_config, test_config};
     use unicode_normalization::UnicodeNormalization;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scoped_reads_reject_aliases_to_ungranted_native_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let scope_id = "slack-t1-dm-u1";
+        let granted = format!("Organize/Work/{scope_id}");
+        let target = PathBuf::from(format!("Capture/Raw/{scope_id}/private.md"));
+        let alias = PathBuf::from(format!("{granted}/alias.md"));
+        std::fs::create_dir_all(directory.path().join(target.parent().unwrap())).unwrap();
+        std::fs::create_dir_all(directory.path().join(&granted)).unwrap();
+        std::fs::write(
+            directory.path().join(&target),
+            "---\nmemory_schema: slack-code/1\nsensitivity: normal\ntenant_id: tenant\nstar_label: star\nworkspace_id: T1\naudience_kind: dm\naudience_id: U1\n---\n# Private\nSame audience, outside the path grant.\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            directory.path().join(&target),
+            directory.path().join(&alias),
+        )
+        .unwrap();
+        let vault = Vault::open(&test_config(directory.path())).await.unwrap();
+        assert!(vault.read_note(&alias).await.unwrap().contains("# Private"));
+        let scoped = vault
+            .with_read_scope(ReadScope {
+                version: 1,
+                tenant_id: "tenant".into(),
+                star_label: "star".into(),
+                workspace_id: "T1".into(),
+                audience_kind: "dm".into(),
+                audience_id: "U1".into(),
+                purpose: "conversation".into(),
+                scope_id: scope_id.into(),
+                allowed_prefixes: vec![format!("{granted}/")],
+                expires_at: 4_000_000_000.0,
+            })
+            .unwrap();
+        assert!(matches!(
+            scoped.read_note(&alias).await,
+            Err(VaultError::NoteNotFound(_))
+        ));
+        assert!(matches!(
+            scoped.read_source_snapshot(&alias).await,
+            Err(VaultError::NoteNotFound(_))
+        ));
+        assert!(matches!(
+            scoped.read_note_bounded(&alias, 1024).await,
+            Err(VaultError::NoteNotFound(_))
+        ));
+        assert!(scoped.write_note(&alias, "overwrite").await.is_err());
+        assert!(
+            vault
+                .read_note(&target)
+                .await
+                .unwrap()
+                .contains("# Private")
+        );
+    }
 
     #[test]
     fn attached_source_protocol_failures_allow_future_reconciliation() {
@@ -4754,6 +5067,80 @@ mod tests {
         vault.move_note(new_path, now_excluded).await.unwrap();
         assert_eq!(runtime.pending_kind(new_path), Some(PendingKind::Remove));
         assert_eq!(runtime.pending_kind(now_excluded), None);
+    }
+
+    #[cfg(has_embeddings)]
+    #[tokio::test]
+    async fn audience_scope_filters_semantic_and_hybrid_candidates_before_top_k() {
+        let directory = tempfile::tempdir().unwrap();
+        let allowed_scope = "slack-t1-dm-zzz";
+        let denied_scope = "slack-t1-dm-aaa";
+        for (scope, user) in [(allowed_scope, "UZ"), (denied_scope, "UA")] {
+            let folder = directory.path().join(format!("Organize/Work/{scope}"));
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(
+                folder.join("decision.md"),
+                format!("---\nmemory_schema: slack-code/1\nsensitivity: normal\ntenant_id: bloomer\nstar_label: bloom\nworkspace_id: T1\naudience_kind: dm\naudience_id: {user}\n---\n# Launch\nlaunch schedule\n"),
+            )
+            .unwrap();
+        }
+        let model = Arc::new(TestEmbedder::new());
+        let loader: EmbeddingLoaderFuture =
+            Box::pin(async move { Ok(model as Arc<dyn embeddings::Embedder>) });
+        let mut config = embedding_config(directory.path());
+        config.tantivy = true;
+        let vault = Vault::open_with_embedding_loader(&config, Some(loader))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !vault
+                .embedding_status()
+                .is_some_and(|status| status.queryable && status.pending_notes == 0)
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let scope = ReadScope {
+            version: 1,
+            tenant_id: "bloomer".into(),
+            star_label: "bloom".into(),
+            workspace_id: "T1".into(),
+            audience_kind: "dm".into(),
+            audience_id: "UZ".into(),
+            purpose: "conversation".into(),
+            scope_id: allowed_scope.into(),
+            allowed_prefixes: vec![format!("Organize/Work/{allowed_scope}/")],
+            expires_at: 4_000_000_000.0,
+        };
+        let scoped = vault.with_read_scope(scope).unwrap();
+        let expected = PathBuf::from(format!("Organize/Work/{allowed_scope}/decision.md"));
+        assert_eq!(
+            vault.search_semantic("launch", 1).unwrap()[0].0,
+            PathBuf::from(format!("Organize/Work/{denied_scope}/decision.md"))
+        );
+        assert_eq!(scoped.search_semantic("launch", 1).unwrap()[0].0, expected);
+        assert_eq!(
+            scoped.search_hybrid("launch", 1, 1, 0.25).unwrap()[0].0,
+            expected
+        );
+        assert!(scoped.write_note(&expected, "overwrite").await.is_err());
+
+        // A cached vector must not become evidence for a replacement source revision.
+        let replacement = scoped
+            .read_note(&expected)
+            .await
+            .unwrap()
+            .replace("schedule", "replacement");
+        std::fs::write(directory.path().join(&expected), replacement).unwrap();
+        assert!(scoped.search_semantic("launch", 1).unwrap().is_empty());
+        assert!(
+            scoped
+                .search_hybrid("launch", 1, 1, 0.25)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[cfg(has_embeddings)]

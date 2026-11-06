@@ -313,13 +313,28 @@ pub async fn note_read_many(
     let mut batch = storage.read_batch().await?;
     if explicit_paths {
         for candidate in &candidates {
-            batch.validate(&candidate.path).await?;
+            if vault.is_scoped() {
+                vault.validate_path(&candidate.path).await?;
+            } else {
+                batch.validate(&candidate.path).await?;
+            }
         }
     }
 
     for candidate in candidates.iter().take(inspected_count) {
-        let target = match batch.prepare(&candidate.path).await {
-            Ok(target) => target,
+        let prepared = if vault.is_scoped() {
+            vault
+                .canonical_existing_relative_path(&candidate.path)
+                .await
+                .map(|path| (path, None))
+        } else {
+            batch
+                .prepare(&candidate.path)
+                .await
+                .map(|target| (target.relative.clone(), Some(target)))
+        };
+        let (actual_path, target) = match prepared {
+            Ok(prepared) => prepared,
             Err(error) => {
                 record_file_error(
                     error,
@@ -330,14 +345,17 @@ pub async fn note_read_many(
                 continue;
             }
         };
-        let display_path = target
-            .relative
+        let display_path = actual_path
             .to_str()
             .map(str::to_owned)
             .unwrap_or_else(|| candidate.display_path.clone());
         let remaining_bytes = max_bytes - content_bytes;
 
-        let stat = match batch.stat(&target).await {
+        let stat = match &target {
+            Some(target) => batch.stat(target).await,
+            None => vault.file_stat(&actual_path).await,
+        };
+        let stat = match stat {
             Ok(stat) => stat,
             Err(error) => {
                 record_file_error(error, &display_path, &mut skipped, &mut skipped_count)?;
@@ -354,7 +372,11 @@ pub async fn note_read_many(
             continue;
         }
 
-        let content = match batch.read(&target, remaining_bytes).await {
+        let content = match &target {
+            Some(target) => batch.read(target, remaining_bytes).await,
+            None => vault.read_note_bounded(&actual_path, remaining_bytes).await,
+        };
+        let content = match content {
             Ok(content) => content,
             Err(VaultError::SemanticResourceLimit { .. }) => {
                 record_skipped(

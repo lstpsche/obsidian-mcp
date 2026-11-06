@@ -83,6 +83,7 @@ pub struct VaultIndex {
     attachments: HashMap<OsString, u64>,
     attachment_bytes: u64,
     filesystem: Option<fs::VaultRoot>,
+    read_contents: Option<HashMap<OsString, String>>,
     exclude: Arc<ExcludeSet>,
     excluded_note_paths: HashSet<OsString>,
     source_batch: bool,
@@ -111,6 +112,7 @@ impl VaultIndex {
             attachments: HashMap::new(),
             attachment_bytes: 0,
             filesystem: None,
+            read_contents: None,
             exclude: Arc::default(),
             excluded_note_paths: HashSet::new(),
             source_batch: false,
@@ -211,6 +213,10 @@ impl VaultIndex {
                         path.display()
                     ))
                 })?;
+                if !exclude.allows_source(path, &content) {
+                    self.add_excluded_file(path);
+                    return Ok(None);
+                }
                 let note = parse_note_metadata(path, &content, stat)?;
                 let (total, _) = self.observed_byte_totals(path, note.stat.size, false)?;
                 self.replace_note(path, note, total);
@@ -266,6 +272,52 @@ impl VaultIndex {
             .and_then(|remaining| remaining.checked_add(if attachment { size } else { 0 }))
             .ok_or_else(|| inventory_size_error(path))?;
         Ok((total, attachment_bytes))
+    }
+
+    /// Build an isolated metadata and graph projection without changing shared state.
+    pub(crate) fn read_view(&self, contents: HashMap<OsString, String>) -> Self {
+        let mut view = Self::empty();
+        view.filesystem = self.filesystem.clone();
+        view.exclude = Arc::clone(&self.exclude);
+        for (path, metadata) in &self.notes {
+            let Some(content) = contents.get(path) else {
+                continue;
+            };
+            let path = Path::new(path);
+            if !self.exclude.allows_source(path, content) {
+                continue;
+            }
+            let Ok(mut metadata) = parse_note_metadata(path, content, metadata.stat.clone()) else {
+                continue;
+            };
+            metadata.links.retain(|link| {
+                self.link_resolver
+                    .resolve(&link.target)
+                    .is_none_or(|target| contents.contains_key(target.as_os_str()))
+            });
+            for tag in &metadata.tags {
+                view.tags
+                    .entry(tag.to_lowercase())
+                    .or_default()
+                    .insert(path.as_os_str().to_owned());
+            }
+            view.source_revisions.insert(
+                path.as_os_str().to_owned(),
+                super::source::source_revision(content),
+            );
+            view.notes.insert(path.as_os_str().to_owned(), metadata);
+        }
+        view.link_resolver = build_link_resolver(
+            &view
+                .notes
+                .values()
+                .map(|note| note.path.clone())
+                .collect::<Vec<_>>(),
+        );
+        view.rebuild_backlinks();
+        view.recompute_stats();
+        view.read_contents = Some(contents);
+        view
     }
 
     /// Build the index by walking the entire vault directory.
@@ -333,6 +385,12 @@ impl VaultIndex {
                 }
                 FileClass::Note => match read_indexed_note(&filesystem, path) {
                     Ok((metadata, content)) => {
+                        if !exclude.allows_source(path, &content) {
+                            index
+                                .excluded_note_paths
+                                .insert(path.as_os_str().to_owned());
+                            return Ok(());
+                        }
                         check()?;
                         observed_bytes = observed_bytes
                             .checked_add(metadata.stat.size)
@@ -718,6 +776,11 @@ impl VaultIndex {
         &self.notes
     }
 
+    #[cfg(has_embeddings)]
+    pub(crate) fn allows_source(&self, path: &Path, content: &str) -> bool {
+        self.exclude.allows_source(path, content)
+    }
+
     pub fn get_note(&self, path: &Path) -> Option<&NoteMetadata> {
         self.notes.get(path.as_os_str())
     }
@@ -1034,7 +1097,14 @@ impl VaultIndex {
                 break;
             }
 
-            let content = match filesystem.read_observed(Path::new(path)) {
+            let observed = match &self.read_contents {
+                Some(contents) => contents
+                    .get(path)
+                    .cloned()
+                    .ok_or_else(|| VaultError::NoteNotFound(PathBuf::from(path))),
+                None => filesystem.read_observed(Path::new(path)),
+            };
+            let content = match observed {
                 Ok(c) => c,
                 Err(_) => continue,
             };
@@ -1573,6 +1643,51 @@ mod tests {
                 )
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn isolated_read_views_preserve_exact_keys_and_retained_source() {
+        let mut index = VaultIndex::for_source(empty_exclude());
+        for (path, content) in [("a:b.md", "source #lower"), ("A:b.md", "source #upper")] {
+            index
+                .apply_observation(
+                    Path::new(path),
+                    Some(content.into()),
+                    observed_stat(content.len()),
+                    None,
+                    false,
+                )
+                .unwrap();
+        }
+        let contents = HashMap::from([
+            (OsString::from("a:b.md"), "view #lower".to_owned()),
+            (OsString::from("A:b.md"), "view #upper".to_owned()),
+        ]);
+        let view = index.read_view(contents);
+        assert_eq!(view.notes().len(), 2);
+        assert_eq!(view.get_note(Path::new("a:b.md")).unwrap().tags, ["lower"]);
+        assert_eq!(view.get_note(Path::new("A:b.md")).unwrap().tags, ["upper"]);
+        let directory = TempDir::new().unwrap();
+        let root = fs::VaultRoot::open(directory.path()).unwrap();
+        let hits = view.search_text_limited(&root, "view", 0, None).unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "a read projection uses its admitted bytes without native reads"
+        );
+        assert!(
+            view.search_text_limited(&root, "source", 0, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(index.notes().len(), 2);
+        let filtered = index.read_view(HashMap::from([(
+            OsString::from("A:b.md"),
+            "view #upper".to_owned(),
+        )]));
+        assert!(filtered.get_note(Path::new("a:b.md")).is_none());
+        assert!(filtered.get_note(Path::new("A:b.md")).is_some());
+        assert_eq!(filtered.stats().total_notes, 1);
     }
 
     #[test]

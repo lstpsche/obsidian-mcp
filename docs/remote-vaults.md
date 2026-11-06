@@ -150,6 +150,8 @@ Names that cannot be represented by the public path API, including non-UTF-8 nam
 
 Ordinary SSH/SFTP accounts are supported even when they can access other server folders. SFTP uses separate path-based requests; another server process can change a parent or symlink after validation but before the next operation. Client-side checks cannot reproduce the local backend's retained-directory protection against that race. The remote server and other processes that can change its namespace are part of the trust boundary. A server-restricted account can enforce a stronger root boundary without requiring an MCP installation remotely.
 
+Private audience-scoped HTTP readers require a local vault source. Combining SFTP with private-memory authorization is rejected before opening the source.
+
 `open_in_obsidian` is unavailable for a remote-only source. A remote folder does not identify an installed local Obsidian vault, and matching a vault by basename could open unrelated content.
 
 ## Rust consumers
