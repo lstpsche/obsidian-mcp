@@ -104,9 +104,15 @@ Restart after changing ignore rules. A reconnect that observes a changed portabl
 
 The first scan reads the included note contents over SFTP. MCP negotiation and HTTP process health do not wait for that full scan. Source status distinguishes initialization, availability and catalog reconciliation from semantic readiness. Unknown aggregate counts remain unknown while the initial catalog is incomplete; they are not presented as a known-empty vault.
 
+Transient connection failures during initialization retry independently of the external-change polling interval. Source-facing requests can wake the same retained initializer within their operation deadline. Passive status and process health do not request another connection.
+
 Direct note reads fetch current remote bytes. Revision-checked note pages and semantic context keep their exact-source contract: if a note changed after it was indexed, the result identifies the changed revision and does not apply old offsets to newer text. If the source is unavailable, stale note bodies are not substituted.
 
 Metadata scans find ordinary creations, edits, deletions, directory renames and attachment changes. A complete content verification also runs because SFTP size and modification time alone can miss same-size edits. Only a complete scan can remove catalog entries that were not seen. An incomplete listing or connection failure cannot become a successful empty vault.
+
+A validated reconnect starts a complete verification while retaining a previously complete catalog. Its freshness remains visible through reconciliation status and the last completed scan. An uncertain mutation withdraws catalog authority until repair completes; a changed source identity or portable policy rejects further use and requires reopening the source.
+
+A malformed or unsupported response fails the affected operation and scan. An initialized service retains its reconciliation owner so later work can recover after the fault is resolved; it does not replay a failed mutation. Temporary memory pressure does not turn a valid note into an invalid document or remove its existing projections.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -134,11 +140,13 @@ Each MCP service serializes its own read/transform/write/index operations. Exter
 
 A lost connection after dispatch can leave a write's outcome unknown. Structured storage errors identify the operation, path, failure kind and destination outcome. A confirmed remote commit and a failed local index update are different from a failure before publication. Do not repeat an insertion, patch or another uncertain mutation merely because its response was lost; inspect the current remote note first. Automatic connection recovery does not replay mutations.
 
-Temporary-file cleanup is limited to entries owned by that operation. A crash can leave a hidden sibling upload. The server does not delete arbitrary matching files on later startups. It does not queue offline changes or synchronize a permanent editable local mirror.
+Temporary-file cleanup is limited to entries owned by that operation and the remaining operation deadline. A process crash, expired deadline or lost connection can leave a hidden sibling upload. Uploads start at `0600`; destination permissions may already have been preserved on a leftover file before publication. Errors identify a known candidate when available; a lost create acknowledgment can leave its existence and ownership uncertain. Inspect a reported path before removing an orphaned upload. Cleanup is not automatically retried after reconnect, and the server does not delete arbitrary matching files on later startups. It does not queue offline changes or synchronize a permanent editable local mirror.
 
 ## Remote path trust
 
 Paths stay relative to the configured vault root in MCP calls. The SFTP backend validates traversal, source types and observed symlink targets, rejects static escapes, and preserves the distinction between an alias entry and its target. Remote POSIX paths are not interpreted using the local machine's Windows filename rules.
+
+Names that cannot be represented by the public path API, including non-UTF-8 names and literal backslashes or control characters, are skipped with a diagnostic. Other representable notes in the directory remain accessible. Malformed server directory entries, such as names containing a path separator, fail the listing rather than becoming a partial successful scan.
 
 Ordinary SSH/SFTP accounts are supported even when they can access other server folders. SFTP uses separate path-based requests; another server process can change a parent or symlink after validation but before the next operation. Client-side checks cannot reproduce the local backend's retained-directory protection against that race. The remote server and other processes that can change its namespace are part of the trust boundary. A server-restricted account can enforce a stronger root boundary without requiring an MCP installation remotely.
 
@@ -146,7 +154,7 @@ Ordinary SSH/SFTP accounts are supported even when they can access other server 
 
 ## Rust consumers
 
-Source I/O through `Vault` is asynchronous. Await source reads, mutations, listing, source-dependent inspection and search calls; pure cached operations retain their synchronous APIs. Native low-level filesystem operations still use `VaultRoot` and local daemon IPC remains local-only. MCP tool parameters and normal local result meanings are preserved, while remote status can represent initialization and unknown aggregates. The public Rust source API change requires a major-version migration before publication.
+Source I/O through `Vault` is asynchronous. Await source reads, mutations, listing, source-dependent inspection and search calls; pure cached operations retain their synchronous APIs. Data-path getters return `Option<&Path>`: `mcp_data()` is absent until remote initialization resolves local derived state, and remote sources have no vault-local `mcp_home()`. Native low-level filesystem operations still use `VaultRoot` and local daemon IPC remains local-only. MCP tool parameters and normal local result meanings are preserved, while remote status can represent initialization and unknown aggregates. The public Rust source API change requires a major-version migration before publication.
 
 ## Native SSH integration checks
 

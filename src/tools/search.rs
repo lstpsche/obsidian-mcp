@@ -417,14 +417,18 @@ async fn search_semantic_local(
     } else {
         None
     };
-    crate::vault::semantic_results::render_many_source(
+    let results = crate::vault::semantic_results::render_many_source(
         &storage,
         hits,
         query,
         include_content,
         timeout,
     )
-    .await
+    .await?;
+    // Source context acquisition may discover that the authority which admitted
+    // these observations has changed. Ordinary outages can still return hits.
+    vault.require_semantic_catalog()?;
+    Ok(results)
 }
 
 #[cfg(not(has_embeddings))]

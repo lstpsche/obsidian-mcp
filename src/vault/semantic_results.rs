@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::{StreamExt, stream::FuturesUnordered};
+
 use crate::error::{VaultError, VaultResult};
 use crate::models::{
     SemanticContextError, SemanticEvidence, SemanticNoteResult, SemanticPreview, SourceRange,
@@ -143,18 +145,17 @@ pub(crate) fn render_rooted(
 }
 
 /// Acquire current bytes asynchronously, preserving the scored revision on failure.
-pub(crate) async fn render_source(
-    storage: &super::storage::Storage,
+async fn render_source(
+    observed: &super::storage::ObservedBatch<'_>,
     hit: RankedNote,
     query: &str,
     include_content: bool,
-) -> SemanticNoteResult {
-    let raw = storage
+) -> VaultResult<SemanticNoteResult> {
+    let raw = observed
         .read_exact_bounded(&hit.path, source::MAX_SOURCE_BYTES)
         .await;
-    let evidence = hit.clone();
     let query = query.to_owned();
-    match tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         render_snapshot(
             raw.map(source::SourceSnapshot::new),
             hit,
@@ -163,20 +164,108 @@ pub(crate) async fn render_source(
         )
     })
     .await
-    {
-        Ok(result) => result,
-        Err(error) => render_snapshot(
-            Err(VaultError::Other(format!(
-                "semantic source rendering task failed: {error}"
-            ))),
-            evidence,
-            "",
-            false,
-        ),
+    .map_err(|error| VaultError::Other(format!("semantic source rendering task failed: {error}")))
+}
+
+const CONCURRENT_SOURCE_READS: usize = 4;
+const CONTEXT_DEADLINE_ERROR: &str = "semantic source context deadline exceeded";
+
+type ContextSender = tokio::sync::mpsc::Sender<(usize, SemanticNoteResult)>;
+
+/// Retain dispatched I/O until its own operation deadline or confirmed completion.
+async fn acquire_source_context(
+    storage: &super::storage::Storage,
+    hits: Vec<RankedNote>,
+    query: &str,
+    include_content: bool,
+    deadline: Option<tokio::time::Instant>,
+    sender: &ContextSender,
+    failure_sender: tokio::sync::oneshot::Sender<VaultError>,
+) {
+    let finished = || {
+        sender.is_closed()
+            || deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+    };
+    if finished() {
+        return;
+    }
+    let paths = hits.iter().map(|hit| hit.path.clone()).collect::<Vec<_>>();
+    let observed = match storage.observe_batch(&paths).await {
+        Ok(observed) => observed,
+        Err(error) => {
+            let message = error.to_string();
+            for (index, hit) in hits.into_iter().enumerate() {
+                if finished() {
+                    break;
+                }
+                let result =
+                    render_snapshot(Err(VaultError::Other(message.clone())), hit, "", false);
+                if sender.send((index, result)).await.is_err() {
+                    break;
+                }
+            }
+            return;
+        }
+    };
+    let render = |(index, hit)| {
+        let observed = &observed;
+        let finished = &finished;
+        async move {
+            let result = if finished() {
+                None
+            } else {
+                Some(render_source(observed, hit, query, include_content).await)
+            };
+            (index, result)
+        }
+    };
+    let mut candidates = hits.into_iter().enumerate();
+    let mut pending = FuturesUnordered::new();
+    for _ in 0..CONCURRENT_SOURCE_READS {
+        if finished() {
+            break;
+        }
+        if let Some(candidate) = candidates.next() {
+            pending.push(render(candidate));
+        }
+    }
+    let mut failure_sender = Some(failure_sender);
+    let mut failed = false;
+    while let Some((index, result)) = pending.next().await {
+        match result {
+            Some(Ok(result)) => {
+                if !finished() {
+                    // A closed receiver stops admission, but never cancels peers
+                    // which already own a remote request or file handle.
+                    let _ = sender.send((index, result)).await;
+                }
+            }
+            Some(Err(error)) => {
+                failed = true;
+                if let Some(failure_sender) = failure_sender.take()
+                    && let Err(error) = failure_sender.send(error)
+                {
+                    tracing::warn!(%error, "semantic context acquisition failed after its caller stopped waiting");
+                }
+            }
+            None => (),
+        }
+        if !failed
+            && !finished()
+            && let Some(candidate) = candidates.next()
+        {
+            pending.push(render(candidate));
+        }
     }
 }
 
-/// Bound all context reads by one deadline without dropping ranked observations.
+async fn finish_context_owner(owner: tokio::task::JoinHandle<()>) -> VaultResult<()> {
+    owner.await.map_err(|error| {
+        VaultError::Other(format!("semantic context acquisition task failed: {error}"))
+    })
+}
+
+/// Bound result presentation without cancelling already-dispatched source reads.
 pub(crate) async fn render_many_source(
     storage: &super::storage::Storage,
     hits: Vec<RankedNote>,
@@ -184,8 +273,9 @@ pub(crate) async fn render_many_source(
     include_content: bool,
     timeout: Option<Duration>,
 ) -> VaultResult<Vec<SemanticNoteResult>> {
-    const CONCURRENT_READS: usize = 4;
-
+    if hits.is_empty() {
+        return Ok(Vec::new());
+    }
     let deadline = timeout
         .map(|timeout| {
             tokio::time::Instant::now()
@@ -193,47 +283,82 @@ pub(crate) async fn render_many_source(
                 .ok_or_else(|| VaultError::Other("semantic context deadline is too large".into()))
         })
         .transpose()?;
+    let storage = storage.clone();
+    let observations = hits.clone();
+    let query = query.to_owned();
+    let source_deadline = super::storage::current_source_deadline();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(CONCURRENT_SOURCE_READS);
+    let (failure_sender, mut failure_receiver) = tokio::sync::oneshot::channel();
+    // Dropping the join handle detaches this bounded read owner. Receiver closure
+    // stops new work while requests and handles already in flight are drained.
+    let mut owner = Some(tokio::spawn(async move {
+        super::storage::with_source_deadline(
+            source_deadline,
+            acquire_source_context(
+                &storage,
+                observations,
+                &query,
+                include_content,
+                deadline,
+                &sender,
+                failure_sender,
+            ),
+        )
+        .await;
+    }));
     let mut results: Vec<Option<SemanticNoteResult>> =
         std::iter::repeat_with(|| None).take(hits.len()).collect();
-    let mut jobs = tokio::task::JoinSet::new();
-    let mut next = 0;
-    while next < hits.len() || !jobs.is_empty() {
+    let mut failure_open = true;
+    loop {
         if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-            jobs.abort_all();
             break;
         }
-        while jobs.len() < CONCURRENT_READS && next < hits.len() {
-            let index = next;
-            let hit = hits[index].clone();
-            let storage = storage.clone();
-            let query = query.to_owned();
-            jobs.spawn(async move {
-                (
-                    index,
-                    render_source(&storage, hit, &query, include_content).await,
-                )
-            });
-            next += 1;
-        }
-        let joined = match deadline {
-            Some(deadline) => match tokio::time::timeout_at(deadline, jobs.join_next()).await {
-                Ok(joined) => joined,
-                Err(_) => {
-                    jobs.abort_all();
-                    break;
+        tokio::select! {
+            biased;
+            failure = &mut failure_receiver, if failure_open => {
+                match failure {
+                    Ok(error) => return Err(error),
+                    Err(_) => failure_open = false,
                 }
-            },
-            None => jobs.join_next().await,
-        };
-        match joined {
-            Some(Ok((index, result))) => results[index] = Some(result),
-            Some(Err(error)) => {
-                return Err(VaultError::Other(format!(
-                    "semantic context acquisition task failed: {error}"
-                )));
             }
-            None => break,
+            received = receiver.recv() => {
+                match received {
+                    Some((index, result)) => results[index] = Some(result),
+                    None => {
+                        if let Some(owner) = owner.take() {
+                            finish_context_owner(owner).await?;
+                        }
+                        break;
+                    }
+                }
+            }
+            _ = async {
+                match deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => break,
         }
+    }
+    // Closing before inspection makes late failures report at their retained
+    // owner instead of racing this caller's final deadline observation.
+    receiver.close();
+    failure_receiver.close();
+    while let Ok((index, result)) = receiver.try_recv() {
+        results[index] = Some(result);
+    }
+    if let Ok(error) = failure_receiver.try_recv() {
+        return Err(error);
+    }
+    if owner.as_ref().is_some_and(|owner| owner.is_finished())
+        && let Some(owner) = owner.take()
+    {
+        finish_context_owner(owner).await?;
+    }
+    if deadline.is_none() && results.iter().any(Option::is_none) {
+        return Err(VaultError::Other(
+            "semantic context acquisition finished without all observations".into(),
+        ));
     }
     Ok(hits
         .into_iter()
@@ -241,10 +366,7 @@ pub(crate) async fn render_many_source(
         .map(|(hit, result)| {
             result.unwrap_or_else(|| {
                 render_snapshot(
-                    Err(VaultError::Io(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "semantic source context deadline exceeded",
-                    ))),
+                    Err(VaultError::Other(CONTEXT_DEADLINE_ERROR.into())),
                     hit,
                     "",
                     false,
@@ -637,7 +759,10 @@ mod tests {
         let hit = rank_semantic(captured.clone(), &[1.0, 0.0], 1)
             .unwrap()
             .remove(0);
-        let current = render_source(&storage, hit, "observation", true).await;
+        let current = render_many_source(&storage, vec![hit], "observation", true, None)
+            .await
+            .unwrap()
+            .remove(0);
         assert_eq!(current.content.as_deref(), Some(original));
         assert_eq!(current.source_status, SourceStatus::Current);
 
@@ -645,7 +770,10 @@ mod tests {
         let hit = rank_semantic(captured.clone(), &[1.0, 0.0], 1)
             .unwrap()
             .remove(0);
-        let changed = render_source(&storage, hit, "observation", true).await;
+        let changed = render_many_source(&storage, vec![hit], "observation", true, None)
+            .await
+            .unwrap()
+            .remove(0);
         assert_eq!(changed.source_status, SourceStatus::Changed);
         assert_eq!(changed.source_revision, source::source_revision(original));
         assert!(changed.content.is_none());
@@ -653,7 +781,10 @@ mod tests {
 
         std::fs::remove_file(&path).unwrap();
         let hit = rank_semantic(captured, &[1.0, 0.0], 1).unwrap().remove(0);
-        let missing = render_source(&storage, hit, "observation", false).await;
+        let missing = render_many_source(&storage, vec![hit], "observation", false, None)
+            .await
+            .unwrap()
+            .remove(0);
         assert_eq!(missing.source_status, SourceStatus::Unavailable);
         assert!(missing.content.is_none() && missing.snippet.is_none());
         assert_eq!(missing.context_error.unwrap().code, "source_unavailable");

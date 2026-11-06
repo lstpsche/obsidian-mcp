@@ -122,6 +122,17 @@ impl VaultRoot {
         self.read_observed_with(path, |file| read_bounded(file, path, max_bytes))
     }
 
+    pub(crate) fn read_exact_bounded_with_stat(
+        &self,
+        path: &Path,
+        max_bytes: usize,
+    ) -> VaultResult<(String, FileStat)> {
+        self.read_observed_with(path, |file| {
+            let content = read_bounded(file, path, max_bytes)?;
+            Ok((content, stat_from_metadata(&file.metadata()?)))
+        })
+    }
+
     fn read_observed_with<T>(
         &self,
         path: &Path,
@@ -239,6 +250,25 @@ impl VaultRoot {
         recursive: bool,
         glob: Option<&str>,
     ) -> VaultResult<Vec<PathBuf>> {
+        self.list_entries(relative, recursive, glob, false)
+    }
+
+    pub(crate) fn list_regular_files(
+        &self,
+        relative: &Path,
+        recursive: bool,
+        glob: Option<&str>,
+    ) -> VaultResult<Vec<PathBuf>> {
+        self.list_entries(relative, recursive, glob, true)
+    }
+
+    fn list_entries(
+        &self,
+        relative: &Path,
+        recursive: bool,
+        glob: Option<&str>,
+        regular_only: bool,
+    ) -> VaultResult<Vec<PathBuf>> {
         let actual = self
             .resolve_existing(relative)
             .map_err(|e| match e {
@@ -254,13 +284,37 @@ impl VaultRoot {
             })
             .transpose()?;
         let mut results = Vec::new();
-        self.visit_entries(
+        self.visit_entries_with_types(
             &actual,
             recursive,
             super::exclude::is_visible_path,
             || Ok(()),
-            |path, _| {
-                if matcher.as_ref().is_none_or(|m| m.is_match(path)) {
+            |path, is_file, is_dir| {
+                if matcher
+                    .as_ref()
+                    .is_some_and(|matcher| !matcher.is_match(path))
+                {
+                    return Ok(());
+                }
+                let alias_file = if regular_only && !is_file && !is_dir {
+                    let metadata = match self.entry_metadata_exact(path) {
+                        Ok(metadata) => metadata,
+                        Err(error) if error.is_not_found() => return Ok(()),
+                        Err(error) => return Err(error),
+                    };
+                    if is_link(&metadata) {
+                        match self.resolve_existing(path) {
+                            Ok(target) => self.entry_metadata_exact(&target.relative)?.is_file(),
+                            Err(error) if error.is_not_found() => false,
+                            Err(error) => return Err(error),
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if !regular_only || is_file || alias_file {
                     results.push(path.to_owned());
                 }
                 Ok(())
@@ -286,6 +340,23 @@ impl VaultRoot {
         include_name: impl Fn(&Path) -> bool,
         check: impl Fn() -> VaultResult<()>,
         mut visit: impl FnMut(&Path, bool) -> VaultResult<()>,
+    ) -> VaultResult<()> {
+        self.visit_entries_with_types(
+            directory,
+            recursive,
+            include_name,
+            check,
+            |path, file, _| visit(path, file),
+        )
+    }
+
+    fn visit_entries_with_types(
+        &self,
+        directory: &Path,
+        recursive: bool,
+        include_name: impl Fn(&Path) -> bool,
+        check: impl Fn() -> VaultResult<()>,
+        mut visit: impl FnMut(&Path, bool, bool) -> VaultResult<()>,
     ) -> VaultResult<()> {
         let mut pending = vec![directory.to_owned()];
         while let Some(base) = pending.pop() {
@@ -318,7 +389,7 @@ impl VaultRoot {
                 if recursive && kind.is_dir() {
                     pending.push(path.clone());
                 }
-                visit(&path, kind.is_file())?;
+                visit(&path, kind.is_file(), kind.is_dir())?;
             }
         }
         Ok(())

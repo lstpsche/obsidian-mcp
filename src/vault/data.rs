@@ -277,8 +277,8 @@ mod tests {
             assert_eq!(a.indexed_paths(), ["visible.md"]);
             assert_eq!(b.indexed_paths().len(), 2);
             assert!(b.get_note_metadata(Path::new("private.md")).await.is_ok());
-            assert_eq!(a.mcp_data(), dest_a.canonicalize().unwrap());
-            assert_eq!(b.mcp_data(), dest_b.canonicalize().unwrap());
+            assert_eq!(a.mcp_data().unwrap(), dest_a.canonicalize().unwrap());
+            assert_eq!(b.mcp_data().unwrap(), dest_b.canonicalize().unwrap());
         }
         assert_eq!(
             std::fs::read_to_string(old.join("ignore")).unwrap(),
@@ -301,8 +301,8 @@ mod tests {
         let mut config = test_config(&vault);
         config.mcp_data_dir = Some(machine);
         let opened = Vault::open(&config).await.unwrap();
-        assert!(opened.mcp_data().join("embeddings").is_dir());
-        assert!(!opened.mcp_data().join("ignore").exists());
+        assert!(opened.mcp_data().unwrap().join("embeddings").is_dir());
+        assert!(!opened.mcp_data().unwrap().join("ignore").exists());
         assert_eq!(
             std::fs::read(old.join("embeddings/embeddings.bin")).unwrap(),
             b"old"
@@ -358,7 +358,10 @@ mod tests {
         let mut config = test_config(vault.path());
         config.mcp_data_dir = Some(alias);
         let opened = Vault::open(&config).await.unwrap();
-        assert_eq!(opened.mcp_data(), &portable.canonicalize().unwrap());
+        assert_eq!(
+            opened.mcp_data().unwrap(),
+            &portable.canonicalize().unwrap()
+        );
         assert!(!portable.join("vaults-v2").exists());
         assert_eq!(opened.exclude().patterns(), ["private.md"]);
     }

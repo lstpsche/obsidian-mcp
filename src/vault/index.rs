@@ -75,6 +75,7 @@ impl WatchPaths {
 
 pub struct VaultIndex {
     notes: HashMap<OsString, NoteMetadata>,
+    source_revisions: HashMap<OsString, String>,
     tags: HashMap<String, HashSet<OsString>>,
     link_resolver: LinkResolver,
     backlinks: HashMap<OsString, HashSet<OsString>>,
@@ -95,6 +96,7 @@ impl VaultIndex {
     pub fn empty() -> Self {
         Self {
             notes: HashMap::new(),
+            source_revisions: HashMap::new(),
             tags: HashMap::new(),
             link_resolver: build_link_resolver(&[]),
             backlinks: HashMap::new(),
@@ -158,6 +160,38 @@ impl VaultIndex {
         self.finish_refresh(path, was_note, update, tantivy, embeddings_enabled)
     }
 
+    /// Refresh stat-only observations whose raw source still matches admitted metadata.
+    /// Pending lexical publication remains pending; this never stages another document
+    /// or releases an embedding upsert. Callers still publish their completed batch.
+    pub(crate) fn refresh_unchanged_note(
+        &mut self,
+        path: &Path,
+        revision: &str,
+        stat: FileStat,
+    ) -> VaultResult<bool> {
+        if !self.notes.contains_key(path.as_os_str())
+            || self
+                .source_revisions
+                .get(path.as_os_str())
+                .map(String::as_str)
+                != Some(revision)
+        {
+            return Ok(false);
+        }
+        let (total, _) = match self.observed_byte_totals(path, stat.size, false) {
+            Ok(totals) => totals,
+            Err(error) => {
+                self.source_revisions.remove(path.as_os_str());
+                return Err(error);
+            }
+        };
+        if let Some(note) = self.notes.get_mut(path.as_os_str()) {
+            note.stat = stat;
+        }
+        self.stats.vault_size_bytes = total;
+        Ok(true)
+    }
+
     fn update_observation(
         &mut self,
         path: &Path,
@@ -180,6 +214,10 @@ impl VaultIndex {
                 let note = parse_note_metadata(path, &content, stat)?;
                 let (total, _) = self.observed_byte_totals(path, note.stat.size, false)?;
                 self.replace_note(path, note, total);
+                self.source_revisions.insert(
+                    path.as_os_str().to_owned(),
+                    super::source::source_revision(&content),
+                );
                 Ok(Some(content))
             }
             FileClass::Excluded => {
@@ -307,6 +345,10 @@ impl VaultIndex {
                                 .or_default()
                                 .insert(path.as_os_str().to_owned());
                         }
+                        index.source_revisions.insert(
+                            path.as_os_str().to_owned(),
+                            super::source::source_revision(&content),
+                        );
                         index.notes.insert(path.as_os_str().to_owned(), metadata);
                     }
                     Err(error) => {
@@ -388,6 +430,9 @@ impl VaultIndex {
         }
         let exclude = Arc::clone(&self.exclude);
         let result = self.update_file(&filesystem, &actual, &exclude, true);
+        if result.is_err() {
+            self.source_revisions.remove(actual.as_os_str());
+        }
         if result.is_err()
             && !matches!(
                 &result,
@@ -447,6 +492,7 @@ impl VaultIndex {
 
     /// Remove all contributions for a deleted file.
     pub fn remove_file(&mut self, path: &Path) {
+        self.source_revisions.remove(path.as_os_str());
         if self.tracks(path)
             && let Some(paths) = self.watch_paths.get_mut()
         {
@@ -566,6 +612,7 @@ impl VaultIndex {
                 ..
             })
         ) {
+            self.source_revisions.remove(path.as_os_str());
             return update.map(|_| false);
         }
         if update.is_err() {
@@ -1155,7 +1202,11 @@ pub(crate) fn extract_match_context(
     context_len: usize,
 ) -> (String, usize, usize, usize) {
     let ctx_start = content.floor_char_boundary(match_byte_start.saturating_sub(context_len));
-    let ctx_end = content.ceil_char_boundary((match_byte_end + context_len).min(content.len()));
+    let ctx_end = content.ceil_char_boundary(
+        match_byte_end
+            .saturating_add(context_len)
+            .min(content.len()),
+    );
 
     let line = content[..match_byte_start]
         .bytes()
@@ -1236,6 +1287,292 @@ mod tests {
             created: None,
             modified: None,
         }
+    }
+
+    #[test]
+    fn unchanged_source_revision_updates_only_stat_inventory() {
+        let mut index = VaultIndex::for_source(empty_exclude());
+        let lexical = super::super::tantivy_index::TantivyIndex::empty().unwrap();
+        let path = Path::new("a:b.md");
+        let content = "# Source\nquokka #kept [[target]]";
+        let revision = super::super::source::source_revision(content);
+        index
+            .apply_observation(
+                path,
+                Some(content.into()),
+                observed_stat(content.len()),
+                Some(&lexical),
+                false,
+            )
+            .unwrap();
+        lexical.flush().unwrap();
+        let before = index.get_note(path).unwrap().clone();
+        let before_stats = serde_json::to_value(index.stats()).unwrap();
+        let updated_stat = FileStat {
+            size: content.len() as u64 + 17,
+            created: Some(chrono::Utc::now()),
+            modified: Some(chrono::Utc::now()),
+        };
+        assert!(
+            index
+                .refresh_unchanged_note(path, &revision, updated_stat.clone())
+                .unwrap()
+        );
+        let mut expected = before;
+        expected.stat = updated_stat;
+        assert_eq!(
+            serde_json::to_value(index.get_note(path).unwrap()).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        let mut expected_stats = before_stats;
+        expected_stats["vault_size_bytes"] = serde_json::json!(content.len() + 17);
+        assert_eq!(serde_json::to_value(index.stats()).unwrap(), expected_stats);
+        assert_eq!(lexical.search("quokka", 10).unwrap().len(), 1);
+        assert!(
+            !index
+                .refresh_unchanged_note(Path::new("A:b.md"), &revision, observed_stat(100))
+                .unwrap()
+        );
+        assert!(
+            !index
+                .refresh_unchanged_note(
+                    path,
+                    &super::super::source::source_revision("changed"),
+                    observed_stat(100)
+                )
+                .unwrap()
+        );
+        assert_eq!(index.stats().vault_size_bytes, content.len() as u64 + 17);
+    }
+
+    #[test]
+    fn rejected_or_removed_source_observations_clear_revision_shortcuts() {
+        let mut index = VaultIndex::for_source(empty_exclude());
+        let path = Path::new("note.md");
+        let content = "# Note\nquokka";
+        let revision = super::super::source::source_revision(content);
+        let admit = |index: &mut VaultIndex| {
+            index
+                .apply_observation(
+                    path,
+                    Some(content.into()),
+                    observed_stat(content.len()),
+                    None,
+                    false,
+                )
+                .unwrap();
+        };
+        admit(&mut index);
+        index.remove_file(path);
+        assert!(
+            !index
+                .refresh_unchanged_note(path, &revision, observed_stat(1))
+                .unwrap()
+        );
+        assert!(!index.source_revisions.contains_key(path.as_os_str()));
+        for invalid in [Some("---\ntags: [unterminated\n---\n".into()), None] {
+            admit(&mut index);
+            assert!(
+                index
+                    .apply_observation(path, invalid, observed_stat(1), None, false)
+                    .is_err()
+            );
+            assert!(
+                !index
+                    .refresh_unchanged_note(path, &revision, observed_stat(1))
+                    .unwrap()
+            );
+            assert!(!index.source_revisions.contains_key(path.as_os_str()));
+        }
+        admit(&mut index);
+        index
+            .apply_observation(
+                Path::new("large.bin"),
+                None,
+                FileStat {
+                    size: u64::MAX - content.len() as u64,
+                    created: None,
+                    modified: None,
+                },
+                None,
+                false,
+            )
+            .unwrap();
+        assert!(matches!(
+            index.refresh_unchanged_note(path, &revision, observed_stat(content.len() + 1)),
+            Err(VaultError::Storage {
+                kind: StorageErrorKind::ResourceLimit,
+                ..
+            })
+        ));
+        assert_eq!(
+            index.get_note(path).unwrap().stat.size,
+            content.len() as u64
+        );
+        assert_eq!(index.stats().vault_size_bytes, u64::MAX);
+        assert!(
+            !index
+                .refresh_unchanged_note(path, &revision, observed_stat(content.len()))
+                .unwrap()
+        );
+        index.remove_file(Path::new("large.bin"));
+        admit(&mut index);
+        index
+            .apply_observation(
+                Path::new("large.bin"),
+                None,
+                FileStat {
+                    size: u64::MAX - content.len() as u64,
+                    created: None,
+                    modified: None,
+                },
+                None,
+                false,
+            )
+            .unwrap();
+        assert!(
+            index
+                .apply_observation(
+                    path,
+                    Some("changed".into()),
+                    observed_stat(content.len() + 1),
+                    None,
+                    false
+                )
+                .is_err()
+        );
+        assert!(index.get_note(path).is_some());
+        assert!(
+            !index
+                .refresh_unchanged_note(path, &revision, observed_stat(content.len()))
+                .unwrap()
+        );
+    }
+
+    #[cfg(has_embeddings)]
+    #[test]
+    fn unchanged_source_revision_preserves_lexical_generation_and_upsert_gate() {
+        use super::super::embedding_runtime::PendingKind;
+
+        let mut index = VaultIndex::for_source(empty_exclude());
+        let lexical = super::super::tantivy_index::TantivyIndex::empty().unwrap();
+        let path = Path::new("remote.md");
+        let content = "# Source\nquokka";
+        let revision = super::super::source::source_revision(content);
+        index
+            .apply_observation(
+                path,
+                Some(content.into()),
+                observed_stat(content.len()),
+                Some(&lexical),
+                true,
+            )
+            .unwrap();
+        let pending = index.waiting_for_lexical[path.as_os_str()];
+        assert!(
+            index
+                .refresh_unchanged_note(path, &revision, observed_stat(content.len() + 1))
+                .unwrap()
+        );
+        assert_eq!(index.waiting_for_lexical[path.as_os_str()], pending);
+        assert!(matches!(
+            index.embedding_change(path, true),
+            Some(PendingKind::AwaitingLexical)
+        ));
+        assert!(lexical.search("quokka", 10).unwrap().is_empty());
+        let mut submitted = Vec::new();
+        index.publish_embedding_upserts(lexical.publish().unwrap(), |path| {
+            submitted.push(path.to_owned())
+        });
+        assert_eq!(submitted, [path.to_owned()]);
+        assert!(
+            index
+                .refresh_unchanged_note(path, &revision, observed_stat(content.len() + 2))
+                .unwrap()
+        );
+        assert!(index.waiting_for_lexical.is_empty());
+        submitted.clear();
+        index.publish_embedding_upserts(lexical.publish().unwrap(), |path| {
+            submitted.push(path.to_owned())
+        });
+        assert!(
+            submitted.is_empty(),
+            "verified unchanged content must not resubmit an upsert"
+        );
+        assert_eq!(lexical.search("quokka", 10).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn native_build_and_refresh_record_exact_raw_source_revisions() {
+        let directory = TempDir::new().unwrap();
+        let path = Path::new("note.md");
+        let original = "# Source\noriginal";
+        stdfs::write(directory.path().join(path), original).unwrap();
+        let mut index = VaultIndex::build(directory.path(), empty_exclude())
+            .await
+            .unwrap();
+        assert!(
+            index
+                .refresh_unchanged_note(
+                    path,
+                    &super::super::source::source_revision(original),
+                    observed_stat(original.len())
+                )
+                .unwrap()
+        );
+        let replacement = "# Source\nreplacement";
+        stdfs::write(directory.path().join(path), replacement).unwrap();
+        let filesystem = index.filesystem(directory.path()).unwrap();
+        index
+            .refresh_file(
+                &filesystem,
+                path,
+                &ExcludeSet::default(),
+                None,
+                #[cfg(has_embeddings)]
+                false,
+            )
+            .unwrap();
+        assert!(
+            !index
+                .refresh_unchanged_note(
+                    path,
+                    &super::super::source::source_revision(original),
+                    observed_stat(original.len())
+                )
+                .unwrap()
+        );
+        assert!(
+            index
+                .refresh_unchanged_note(
+                    path,
+                    &super::super::source::source_revision(replacement),
+                    observed_stat(replacement.len())
+                )
+                .unwrap()
+        );
+        stdfs::write(directory.path().join(path), "---\n[invalid\n---\n").unwrap();
+        assert!(
+            index
+                .refresh_file(
+                    &filesystem,
+                    path,
+                    &ExcludeSet::default(),
+                    None,
+                    #[cfg(has_embeddings)]
+                    false,
+                )
+                .is_err()
+        );
+        assert!(
+            !index
+                .refresh_unchanged_note(
+                    path,
+                    &super::super::source::source_revision(replacement),
+                    observed_stat(replacement.len())
+                )
+                .unwrap()
+        );
     }
 
     #[test]

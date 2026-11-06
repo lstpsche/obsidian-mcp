@@ -212,9 +212,9 @@ pub async fn vault_info(
         .unwrap_or_default()
         .to_owned();
     let vault_path = vault.source_location();
-    let mcp_data_dir = vault.resolved_mcp_data().and_then(|path| {
-        (vault.is_remote() || path != vault.mcp_home()).then(|| path.display().to_string())
-    });
+    let mcp_data_dir = vault
+        .resolved_mcp_data()
+        .and_then(|path| (Some(path) != vault.mcp_home()).then(|| path.display().to_string()));
     let embeddings = embedding_info(vault, runtime).await;
     let catalog_unavailable = matches!(
         &stats,

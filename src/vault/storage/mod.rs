@@ -30,15 +30,85 @@ pub(crate) async fn with_source_deadline<T>(
 
 pub(crate) fn source_deadline(timeout: std::time::Duration) -> tokio::time::Instant {
     let deadline = tokio::time::Instant::now() + timeout;
-    SOURCE_DEADLINE
-        .try_with(|owner| deadline.min(*owner))
+    current_source_deadline()
+        .map(|owner| deadline.min(owner))
         .unwrap_or(deadline)
+}
+
+pub(crate) fn current_source_deadline() -> Option<tokio::time::Instant> {
+    SOURCE_DEADLINE.try_with(|deadline| *deadline).ok()
 }
 
 #[derive(Clone)]
 pub enum Storage {
     Local(VaultRoot),
     Sftp(Arc<sftp::SftpStorage>),
+}
+
+/// One operation's raw-path resolution and bounded source reads.
+pub(crate) enum ReadBatch<'a> {
+    Local(&'a VaultRoot),
+    Sftp(sftp::ReadBatch<'a>),
+}
+
+pub(crate) struct ResolvedRead {
+    pub relative: PathBuf,
+    absolute: PathBuf,
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl ReadBatch<'_> {
+    pub async fn validate(&mut self, path: &Path) -> VaultResult<()> {
+        match self {
+            Self::Local(root) => {
+                let root = (*root).clone();
+                let path = path.to_owned();
+                native(move || root.resolve_for_write(&path).map(|_| ())).await
+            }
+            Self::Sftp(batch) => batch.validate(path).await,
+        }
+    }
+
+    pub async fn prepare(&mut self, path: &Path) -> VaultResult<ResolvedRead> {
+        match self {
+            Self::Local(root) => {
+                let root = (*root).clone();
+                let path = path.to_owned();
+                native(move || {
+                    let target = root.resolve_existing(&path)?;
+                    Ok(ResolvedRead {
+                        relative: target.relative,
+                        absolute: target.absolute,
+                        deadline: None,
+                    })
+                })
+                .await
+            }
+            Self::Sftp(batch) => batch.prepare(path).await,
+        }
+    }
+
+    pub async fn stat(&self, target: &ResolvedRead) -> VaultResult<FileStat> {
+        match self {
+            Self::Local(root) => {
+                let root = (*root).clone();
+                let path = target.relative.clone();
+                native(move || root.file_stat(&path)).await
+            }
+            Self::Sftp(batch) => batch.stat(target).await,
+        }
+    }
+
+    pub async fn read(&self, target: &ResolvedRead, limit: usize) -> VaultResult<String> {
+        match self {
+            Self::Local(root) => {
+                let root = (*root).clone();
+                let path = target.relative.clone();
+                native(move || root.read_file_bounded(&path, limit)).await
+            }
+            Self::Sftp(batch) => batch.read(target, limit).await,
+        }
+    }
 }
 
 /// Exact-name directory observations retained only for one bounded source batch.
@@ -48,6 +118,35 @@ pub enum ObservedBatch<'a> {
 }
 
 impl ObservedBatch<'_> {
+    pub async fn read_with_stat_bounded(
+        &self,
+        path: &Path,
+        limit: usize,
+    ) -> VaultResult<(String, FileStat)> {
+        match self {
+            Self::Local(root) => {
+                let root = (*root).clone();
+                let path = path.to_owned();
+                native(move || root.read_exact_bounded_with_stat(&path, limit)).await
+            }
+            Self::Sftp(batch) => batch.read(path, limit).await,
+        }
+    }
+
+    pub async fn read_observed(&self, path: &Path) -> VaultResult<String> {
+        match self {
+            Self::Local(root) => {
+                let root = (*root).clone();
+                let path = path.to_owned();
+                native(move || root.read_observed(&path)).await
+            }
+            Self::Sftp(batch) => batch
+                .read(path, sftp::MAX_READ_BYTES)
+                .await
+                .map(|(raw, _)| raw),
+        }
+    }
+
     pub async fn read_exact_bounded(&self, path: &Path, limit: usize) -> VaultResult<String> {
         match self {
             Self::Local(root) => {
@@ -76,6 +175,12 @@ pub struct SourceStatus {
 }
 
 impl Storage {
+    pub(crate) async fn read_batch(&self) -> VaultResult<ReadBatch<'_>> {
+        match self {
+            Self::Local(root) => Ok(ReadBatch::Local(root)),
+            Self::Sftp(root) => sftp::ReadBatch::new(root).await.map(ReadBatch::Sftp),
+        }
+    }
     pub async fn observe_batch<'a>(&'a self, paths: &[PathBuf]) -> VaultResult<ObservedBatch<'a>> {
         match self {
             Self::Local(root) => Ok(ObservedBatch::Local(root)),
@@ -105,16 +210,6 @@ impl Storage {
                 native(move || root.read_file(&path)).await
             }
             Self::Sftp(root) => root.read_file(path).await,
-        }
-    }
-    pub async fn read_observed(&self, path: &Path) -> VaultResult<String> {
-        match self {
-            Self::Local(root) => {
-                let root = root.clone();
-                let path = path.to_owned();
-                native(move || root.read_observed(&path)).await
-            }
-            Self::Sftp(root) => root.read_observed(path).await,
         }
     }
     pub async fn read_file_bounded(&self, path: &Path, limit: usize) -> VaultResult<String> {
@@ -186,6 +281,22 @@ impl Storage {
                 native(move || root.list_files(&path, recursive, glob.as_deref())).await
             }
             Self::Sftp(root) => root.list_files(path, recursive, glob).await,
+        }
+    }
+    pub async fn list_regular_files(
+        &self,
+        path: &Path,
+        recursive: bool,
+        glob: Option<&str>,
+    ) -> VaultResult<Vec<PathBuf>> {
+        match self {
+            Self::Local(root) => {
+                let root = root.clone();
+                let path = path.to_owned();
+                let glob = glob.map(str::to_owned);
+                native(move || root.list_regular_files(&path, recursive, glob.as_deref())).await
+            }
+            Self::Sftp(root) => root.list_regular_files(path, recursive, glob).await,
         }
     }
     pub async fn resolve_existing(&self, path: &Path) -> VaultResult<ResolvedPath> {
@@ -260,17 +371,6 @@ impl Storage {
                 native(move || root.create_file(&path, &content)).await
             }
             Self::Sftp(root) => root.create_file(path, content).await,
-        }
-    }
-    pub async fn append_file(&self, path: &Path, content: &str) -> VaultResult<PathBuf> {
-        match self {
-            Self::Local(root) => {
-                let root = root.clone();
-                let path = path.to_owned();
-                let content = content.to_owned();
-                native(move || root.append_file(&path, &content)).await
-            }
-            Self::Sftp(root) => root.append_file(path, content).await,
         }
     }
     pub async fn delete_file(&self, path: &Path) -> VaultResult<PathBuf> {

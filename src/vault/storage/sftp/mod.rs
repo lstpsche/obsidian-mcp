@@ -1,6 +1,9 @@
 //! SFTP-backed source files. Paths are interpreted by the server, never the client OS.
 
+mod read_batch;
 mod session;
+
+pub(crate) use read_batch::ReadBatch;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -9,7 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use globset::Glob;
-use openssh_sftp_client_lowlevel::{FileAttrs, FileType, HandleOwned, Permissions};
+use openssh_sftp_client_lowlevel::{FileAttrs, FileType, Permissions};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
@@ -21,15 +24,43 @@ use crate::models::FileStat;
 use crate::vault::fs::MoveResult;
 use crate::vault::path::{ResolvedPath, VaultPath};
 
-use session::Session;
+use session::{HandleLifetime, Session};
 
-const MAX_READ_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_READ_BYTES: usize = 64 * 1024 * 1024;
 const CHUNK_BYTES: u32 = 32 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct RemoteEntry {
     pub relative: PathBuf,
     pub stat: FileStat,
+}
+
+#[derive(Default)]
+struct PublicationProgress {
+    destination_dispatched: AtomicBool,
+    temporary: Mutex<Option<String>>,
+}
+
+impl PublicationProgress {
+    fn set_temporary(&self, path: Option<&str>) {
+        *self.temporary.lock().unwrap_or_else(|e| e.into_inner()) = path.map(str::to_owned);
+    }
+
+    fn report_residual<T>(&self, result: VaultResult<T>) -> VaultResult<T> {
+        let temporary = self.temporary.lock().unwrap_or_else(|e| e.into_inner());
+        result.map_err(|mut error| {
+            if let Some(temporary) = temporary.as_ref()
+                && let VaultError::Storage { path, message, .. } = &mut error
+            {
+                message.push_str("; temporary upload may remain");
+                if path != temporary {
+                    message.push_str(" at ");
+                    message.push_str(temporary);
+                }
+            }
+            error
+        })
+    }
 }
 
 /// A persistent, authenticated remote source with a pinned connection namespace.
@@ -45,7 +76,7 @@ pub struct SftpStorage {
     read_budget: Semaphore,
     read_admission: Semaphore,
     last_failure: Mutex<Option<(StorageErrorKind, String)>>,
-    reconciliation_owner: OnceLock<(Arc<AtomicBool>, Arc<tokio::sync::Notify>)>,
+    reconciliation_owner: OnceLock<Arc<tokio::sync::Notify>>,
 }
 
 impl std::fmt::Debug for SftpStorage {
@@ -118,19 +149,16 @@ impl SftpStorage {
 
     pub(crate) fn set_reconciliation_owner(
         &self,
-        needed: Arc<AtomicBool>,
         wakeup: Arc<tokio::sync::Notify>,
     ) -> VaultResult<()> {
-        self.reconciliation_owner
-            .set((needed, wakeup))
-            .map_err(|_| {
-                storage_error(
-                    "configure source",
-                    "",
-                    StorageErrorKind::Protocol,
-                    "source reconciliation owner is already configured",
-                )
-            })
+        self.reconciliation_owner.set(wakeup).map_err(|_| {
+            storage_error(
+                "configure source",
+                "",
+                StorageErrorKind::Protocol,
+                "source reconciliation owner is already configured",
+            )
+        })
     }
 
     /// Pin the exact portable policy observation used to authorize indexing.
@@ -143,10 +171,30 @@ impl SftpStorage {
 
     /// The most recent source-wide failure; reading this never contacts the server.
     pub fn last_failure(&self) -> Option<(StorageErrorKind, String)> {
-        self.last_failure
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        let mut failure = self.last_failure.lock().unwrap_or_else(|e| e.into_inner());
+        if failure
+            .as_ref()
+            .is_some_and(|(kind, _)| *kind == StorageErrorKind::IdentityChanged)
+        {
+            return failure.clone();
+        }
+        if let Ok(session) = self.session.try_lock() {
+            match session.failure_snapshot() {
+                Some((StorageErrorKind::Unavailable, _))
+                    if failure
+                        .as_ref()
+                        .is_some_and(|(kind, _)| *kind == StorageErrorKind::Protocol) => {}
+                Some(observed) => *failure = Some(observed),
+                None if failure
+                    .as_ref()
+                    .is_some_and(|(kind, _)| *kind == StorageErrorKind::Unavailable) =>
+                {
+                    return None;
+                }
+                None => (),
+            }
+        }
+        failure.clone()
     }
 
     fn record_result<T>(&self, result: &VaultResult<T>) {
@@ -154,10 +202,27 @@ impl SftpStorage {
         if failure
             .as_ref()
             .is_some_and(|(kind, _)| *kind == StorageErrorKind::IdentityChanged)
+            || (failure
+                .as_ref()
+                .is_some_and(|(kind, _)| *kind == StorageErrorKind::Protocol)
+                && matches!(
+                    result,
+                    Err(VaultError::Storage {
+                        kind: StorageErrorKind::Unavailable,
+                        ..
+                    })
+                ))
         {
             return;
         }
         match result {
+            Err(VaultError::Storage {
+                kind: StorageErrorKind::Unavailable,
+                ..
+            }) if self
+                .session
+                .try_lock()
+                .is_ok_and(|session| session.is_healthy()) => {}
             Err(error @ VaultError::Storage { kind, .. })
                 if matches!(
                     kind,
@@ -247,6 +312,13 @@ impl SftpStorage {
                 "remote root changed; reopen the source",
             ));
         }
+        self.validate_policy_revision(&next).await?;
+        *current = Arc::clone(&next);
+        self.notify_reconnected();
+        Ok(next)
+    }
+
+    async fn validate_policy_revision(&self, session: &Session) -> VaultResult<()> {
         let expected = self
             .policy_revision
             .lock()
@@ -254,19 +326,22 @@ impl SftpStorage {
             .clone();
         if let Some(expected) = expected {
             let absolute = absolute(&self.canonical, ".obsidian-mcp/ignore");
-            let observed = match next.realpath(&absolute).await {
+            let observed = match session.realpath(&absolute).await {
                 Ok(path) => {
-                    relative_under(&self.canonical, &path)?;
-                    Some(crate::vault::source::source_revision(
-                        &read_source(
-                            &next,
-                            &path,
-                            256 * 1024,
-                            &self.read_budget,
-                            &self.read_admission,
-                        )
-                        .await?,
-                    ))
+                    relative_under(&self.canonical, &path).map_err(policy_validation_error)?;
+                    match read_source(
+                        session,
+                        &path,
+                        256 * 1024,
+                        &self.read_budget,
+                        &self.read_admission,
+                    )
+                    .await
+                    {
+                        Ok(raw) => Some(crate::vault::source::source_revision(&raw)),
+                        Err(error) if error.is_not_found() => None,
+                        Err(error) => return Err(policy_validation_error(error)),
+                    }
                 }
                 Err(error) if error.is_not_found() => None,
                 Err(error) => return Err(error),
@@ -280,12 +355,13 @@ impl SftpStorage {
                 ));
             }
         }
-        *current = Arc::clone(&next);
-        if let Some((needed, wakeup)) = self.reconciliation_owner.get() {
-            needed.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn notify_reconnected(&self) {
+        if let Some(wakeup) = self.reconciliation_owner.get() {
             wakeup.notify_one();
         }
-        Ok(next)
     }
 
     pub async fn resolve_existing(&self, path: &Path) -> VaultResult<ResolvedPath> {
@@ -305,39 +381,13 @@ impl SftpStorage {
 
     async fn resolve_with(
         &self,
-        session: &Session,
+        session: &Arc<Session>,
         path: &Path,
         allow_missing: bool,
     ) -> VaultResult<ResolvedPath> {
-        if session.realpath(&self.canonical).await? != self.canonical {
-            return Err(storage_error(
-                "resolve",
-                "",
-                StorageErrorKind::IdentityChanged,
-                "remote root changed; reopen the source",
-            ));
-        }
-        let requested = normalize_relative(path)?;
-        let mut actual = String::new();
-        let components: Vec<&str> = requested.split('/').filter(|s| !s.is_empty()).collect();
-        for (index, name) in components.iter().enumerate() {
-            let parent = absolute(&self.canonical, &actual);
-            let candidate = match find_entry(session, &parent, name).await? {
-                Some((name, _)) => absolute(&parent, &name),
-                None if allow_missing => {
-                    actual = [actual.as_str(), &components[index..].join("/")]
-                        .into_iter()
-                        .filter(|s| !s.is_empty())
-                        .collect::<Vec<_>>()
-                        .join("/");
-                    return Ok(resolved(&self.canonical, actual));
-                }
-                None => return Err(VaultError::NoteNotFound(path.to_owned())),
-            };
-            let canonical = session.realpath(&candidate).await?;
-            actual = relative_under(&self.canonical, &canonical)?;
-        }
-        Ok(resolved(&self.canonical, actual))
+        ReadBatch::with_session(self, Arc::clone(session))
+            .resolve(path, allow_missing)
+            .await
     }
 
     pub async fn read_file(&self, path: &Path) -> VaultResult<String> {
@@ -421,10 +471,6 @@ impl SftpStorage {
         Ok(parent)
     }
 
-    pub async fn read_observed(&self, path: &Path) -> VaultResult<String> {
-        self.read_exact_bounded(path, MAX_READ_BYTES).await
-    }
-
     pub async fn read_observed_with_stat(&self, path: &Path) -> VaultResult<(String, FileStat)> {
         self.operation("read", path, async {
             let session = self.current_session().await?;
@@ -486,55 +532,66 @@ impl SftpStorage {
             let mut pending = vec![String::new()];
             let mut jobs = tokio::task::JoinSet::new();
             let mut observed = HashSet::new();
-            while !pending.is_empty() || !jobs.is_empty() {
-                while jobs.len() < 8 {
-                    let Some(directory) = pending.pop() else {
-                        break;
-                    };
-                    let Some(needed) = children.remove(&directory) else {
-                        continue;
-                    };
-                    let session = Arc::clone(&session);
-                    let remote = absolute(&self.canonical, &directory);
-                    let requested = Arc::clone(&requested);
-                    jobs.spawn(async move {
-                        let mut hits = Vec::new();
-                        visit_directory(&session, &remote, |name, attrs| {
-                            if needed.contains(&name) {
-                                let relative = absolute(&directory, &name);
-                                match attrs.get_filetype() {
-                                    Some(FileType::Directory) => hits.push((relative, true)),
-                                    Some(FileType::RegularFile)
-                                        if requested.contains(&relative) =>
-                                    {
-                                        hits.push((relative, false))
+            let result = async {
+                while !pending.is_empty() || !jobs.is_empty() {
+                    while jobs.len() < 8 {
+                        let Some(directory) = pending.pop() else {
+                            break;
+                        };
+                        let Some(needed) = children.remove(&directory) else {
+                            continue;
+                        };
+                        let session = Arc::clone(&session);
+                        let remote = absolute(&self.canonical, &directory);
+                        let requested = Arc::clone(&requested);
+                        jobs.spawn(async move {
+                            let mut hits = Vec::new();
+                            let result = visit_directory(&session, &remote, |name, attrs| {
+                                if needed.contains(&name) {
+                                    let relative = absolute(&directory, &name);
+                                    match attrs.get_filetype() {
+                                        Some(FileType::Directory) => hits.push((relative, true)),
+                                        Some(FileType::RegularFile)
+                                            if requested.contains(&relative) =>
+                                        {
+                                            hits.push((relative, false))
+                                        }
+                                        _ => (),
                                     }
-                                    _ => (),
                                 }
+                                Ok(())
+                            })
+                            .await;
+                            match result {
+                                Ok(()) => (),
+                                Err(VaultError::DirectoryNotFound(_)) if !directory.is_empty() => {}
+                                Err(error) => return Err(error),
                             }
-                            Ok(())
-                        })
-                        .await?;
-                        Ok::<_, VaultError>(hits)
-                    });
-                }
-                if let Some(result) = jobs.join_next().await {
-                    for (path, directory) in result.map_err(|error| {
-                        storage_error(
-                            "observe",
-                            "",
-                            StorageErrorKind::Unavailable,
-                            &error.to_string(),
-                        )
-                    })?? {
-                        if directory {
-                            pending.push(path);
-                        } else {
-                            observed.insert(path);
+                            Ok::<_, VaultError>(hits)
+                        });
+                    }
+                    if let Some(result) = jobs.join_next().await {
+                        for (path, directory) in result.map_err(|error| {
+                            storage_error(
+                                "observe",
+                                "",
+                                StorageErrorKind::Unavailable,
+                                &error.to_string(),
+                            )
+                        })?? {
+                            if directory {
+                                pending.push(path);
+                            } else {
+                                observed.insert(path);
+                            }
                         }
                     }
                 }
+                Ok::<_, VaultError>(())
             }
+            .await;
+            while jobs.join_next().await.is_some() {}
+            result?;
             Ok(ObservedBatch {
                 storage: self,
                 session,
@@ -627,6 +684,25 @@ impl SftpStorage {
         recursive: bool,
         glob: Option<&str>,
     ) -> VaultResult<Vec<PathBuf>> {
+        self.list_entries(path, recursive, glob, false).await
+    }
+
+    pub async fn list_regular_files(
+        &self,
+        path: &Path,
+        recursive: bool,
+        glob: Option<&str>,
+    ) -> VaultResult<Vec<PathBuf>> {
+        self.list_entries(path, recursive, glob, true).await
+    }
+
+    async fn list_entries(
+        &self,
+        path: &Path,
+        recursive: bool,
+        glob: Option<&str>,
+        regular_only: bool,
+    ) -> VaultResult<Vec<PathBuf>> {
         self.operation("list", path, async {
             let session = self.current_session().await?;
             let resolved = self.resolve_with(&session, path, false).await?;
@@ -639,17 +715,52 @@ impl SftpStorage {
                 .map(|pattern| Glob::new(pattern).map(|g| g.compile_matcher()))
                 .transpose()
                 .map_err(|e| VaultError::InvalidPath(format!("invalid glob: {e}")))?;
-            let mut results = walk_directories(
+            let mut results = Vec::new();
+            for (relative, attrs) in walk_directories(
                 Arc::clone(&session),
                 &self.canonical,
                 path_text(&resolved.relative)?.to_owned(),
                 recursive,
             )
             .await?
-            .into_iter()
-            .filter(|(path, _)| matcher.as_ref().is_none_or(|m| m.is_match(path)))
-            .map(|(path, _)| PathBuf::from(path))
-            .collect::<Vec<_>>();
+            {
+                if matcher
+                    .as_ref()
+                    .is_some_and(|matcher| !matcher.is_match(&relative))
+                {
+                    continue;
+                }
+                if regular_only {
+                    match attrs.get_filetype() {
+                        Some(FileType::RegularFile) => (),
+                        Some(FileType::Symlink) => {
+                            let resolved = match self
+                                .resolve_with(&session, Path::new(&relative), false)
+                                .await
+                            {
+                                Ok(resolved) => resolved,
+                                Err(error) if error.is_not_found() => continue,
+                                Err(error) => return Err(error),
+                            };
+                            let attrs = session.stat(path_text(&resolved.absolute)?).await?;
+                            match attrs.get_filetype() {
+                                Some(FileType::RegularFile) => (),
+                                Some(_) => continue,
+                                None => {
+                                    return Err(storage_error(
+                                        "list",
+                                        &relative,
+                                        StorageErrorKind::Unsupported,
+                                        "server omitted the file type",
+                                    ));
+                                }
+                            }
+                        }
+                        _ => continue,
+                    }
+                }
+                results.push(PathBuf::from(relative));
+            }
             results.sort_by(|a, b| a.as_os_str().cmp(b.as_os_str()));
             Ok(results)
         })
@@ -722,22 +833,6 @@ impl SftpStorage {
         self.publish(path, content, false).await
     }
 
-    pub async fn append_file(&self, path: &Path, content: &str) -> VaultResult<PathBuf> {
-        let dispatched = AtomicBool::new(false);
-        self.timed_operation("append", path, Some(&dispatched), async {
-            let (mut complete, create) = match self.read_file(path).await {
-                Ok(text) => (text, false),
-                Err(error) if error.is_not_found() => (String::new(), true),
-                Err(error) => return Err(error),
-            };
-            let expected = (!create).then(|| crate::vault::source::source_revision(&complete));
-            complete.push_str(content);
-            self.publish_inner(path, &complete, create, expected.as_deref(), &dispatched)
-                .await
-        })
-        .await
-    }
-
     /// Publish a transformation only while its original raw revision still exists.
     pub async fn write_file_if_revision(
         &self,
@@ -745,25 +840,37 @@ impl SftpStorage {
         content: &str,
         expected: &str,
     ) -> VaultResult<PathBuf> {
-        let dispatched = AtomicBool::new(false);
-        self.timed_operation(
-            "write",
-            path,
-            Some(&dispatched),
-            self.publish_inner(path, content, false, Some(expected), &dispatched),
-        )
-        .await
+        let progress = PublicationProgress::default();
+        let result = self
+            .timed_operation(
+                "write",
+                path,
+                Some(&progress.destination_dispatched),
+                async {
+                    self.publish_inner(path, content, false, Some(expected), &progress)
+                        .await
+                        .map_err(|error| publication_error(path, error))
+                },
+            )
+            .await;
+        progress.report_residual(result)
     }
 
     async fn publish(&self, path: &Path, content: &str, create: bool) -> VaultResult<PathBuf> {
-        let dispatched = AtomicBool::new(false);
-        self.timed_operation(
-            "write",
-            path,
-            Some(&dispatched),
-            self.publish_inner(path, content, create, None, &dispatched),
-        )
-        .await
+        let progress = PublicationProgress::default();
+        let result = self
+            .timed_operation(
+                "write",
+                path,
+                Some(&progress.destination_dispatched),
+                async {
+                    self.publish_inner(path, content, create, None, &progress)
+                        .await
+                        .map_err(|error| publication_error(path, error))
+                },
+            )
+            .await;
+        progress.report_residual(result)
     }
 
     async fn publish_inner(
@@ -772,7 +879,7 @@ impl SftpStorage {
         content: &str,
         create: bool,
         expected_revision: Option<&str>,
-        dispatched: &AtomicBool,
+        progress: &PublicationProgress,
     ) -> VaultResult<PathBuf> {
         let session = self.current_session().await?;
         let target = self.resolve_with(&session, path, true).await?;
@@ -840,15 +947,29 @@ impl SftpStorage {
         let temporary = absolute(&self.canonical, &temp_relative);
         let mut temporary_attrs = FileAttrs::new();
         temporary_attrs.set_permissions(Permissions::READ_BY_OWNER | Permissions::WRITE_BY_OWNER);
-        let handle = session
-            .open_create(&temporary, temporary_attrs)
-            .await
-            .map_err(|error| error.with_mutation_outcome(MutationOutcome::NotCommitted))?;
+        progress.set_temporary(Some(&temporary));
+        let handle = match session.open_create(&temporary, temporary_attrs).await {
+            Ok(handle) => session.track_handle(handle),
+            Err(error) => {
+                if error.is_not_found()
+                    || matches!(
+                        &error,
+                        VaultError::Storage {
+                            outcome: MutationOutcome::NotCommitted | MutationOutcome::NotDispatched,
+                            ..
+                        }
+                    )
+                {
+                    progress.set_temporary(None);
+                }
+                return Err(error.with_mutation_outcome(MutationOutcome::NotCommitted));
+            }
+        };
         let upload = self
             .upload(
                 &session,
                 &temporary,
-                &handle,
+                handle,
                 content.as_bytes(),
                 previous.as_ref().map(|(attrs, _)| *attrs),
             )
@@ -857,6 +978,8 @@ impl SftpStorage {
             return Err(cleanup_error(
                 &session,
                 &temporary,
+                progress,
+                path,
                 error.with_mutation_outcome(MutationOutcome::NotCommitted),
             )
             .await);
@@ -876,6 +999,8 @@ impl SftpStorage {
                     return Err(cleanup_error(
                         &session,
                         &temporary,
+                        progress,
+                        path,
                         error.with_mutation_outcome(MutationOutcome::NotCommitted),
                     )
                     .await);
@@ -887,14 +1012,17 @@ impl SftpStorage {
                     expected_revision: raw.clone(),
                     current_revision: crate::vault::source::source_revision(&current),
                 };
-                return Err(cleanup_error(&session, &temporary, error).await);
+                return Err(cleanup_error(&session, &temporary, progress, path, error).await);
             }
         }
         let replacing = previous.is_some();
-        dispatched.store(true, Ordering::Release);
+        progress
+            .destination_dispatched
+            .store(true, Ordering::Release);
         if let Err(error) = session.rename(&temporary, &destination, replacing).await {
-            return Err(cleanup_error(&session, &temporary, error).await);
+            return Err(cleanup_error(&session, &temporary, progress, path, error).await);
         }
+        progress.set_temporary(None);
         Ok(target.relative)
     }
 
@@ -902,14 +1030,18 @@ impl SftpStorage {
         &self,
         session: &Session,
         path: &str,
-        handle: &HandleOwned,
+        handle: HandleLifetime<'_>,
         bytes: &[u8],
         previous: Option<FileAttrs>,
     ) -> VaultResult<()> {
         let result = async {
             for (index, chunk) in bytes.chunks(CHUNK_BYTES as usize).enumerate() {
                 session
-                    .write(handle, (index * CHUNK_BYTES as usize) as u64, chunk)
+                    .write(
+                        handle.handle(),
+                        (index * CHUNK_BYTES as usize) as u64,
+                        chunk,
+                    )
                     .await?;
             }
             if let Some(previous) = previous {
@@ -923,15 +1055,15 @@ impl SftpStorage {
                 {
                     attrs.set_id(uid, gid);
                 }
-                session.fsetstat(handle, attrs).await?;
+                session.fsetstat(handle.handle(), attrs).await?;
             }
             if session.has_fsync() {
-                session.fsync(handle).await?;
+                session.fsync(handle.handle()).await?;
             }
             Ok(())
         }
         .await;
-        let close = session.close(handle).await;
+        let close = handle.close().await;
         result.and(close)
     }
 
@@ -981,8 +1113,9 @@ impl SftpStorage {
                 .trim_start_matches('/')
                 .to_owned();
             let remote_destination = absolute(&self.canonical, &destination);
-            match session.lstat(&remote_destination).await {
-                Ok(_) => return Err(VaultError::AlreadyExists(to.to_owned())),
+            match find_entry(&session, path_text(&parent.absolute)?, destination_name).await {
+                Ok(Some(_)) => return Err(VaultError::AlreadyExists(to.to_owned())),
+                Ok(None) => (),
                 Err(error) if error.is_not_found() => (),
                 Err(error) => return Err(error),
             }
@@ -1016,7 +1149,7 @@ impl SftpStorage {
 
     async fn resolve_entry(
         &self,
-        session: &Session,
+        session: &Arc<Session>,
         path: &Path,
         allow_missing: bool,
     ) -> VaultResult<(String, FileAttrs)> {
@@ -1081,24 +1214,78 @@ impl ObservedBatch<'_> {
     }
 }
 
-async fn cleanup_error(session: &Session, temporary: &str, error: VaultError) -> VaultError {
-    if let Err(cleanup) = session.remove(temporary).await {
-        let (kind, outcome) = match &error {
-            VaultError::Storage { kind, outcome, .. } => (*kind, *outcome),
-            VaultError::SourceChanged { .. } => {
-                (StorageErrorKind::Conflict, MutationOutcome::NotCommitted)
+async fn cleanup_error(
+    session: &Session,
+    temporary: &str,
+    progress: &PublicationProgress,
+    destination: &Path,
+    error: VaultError,
+) -> VaultError {
+    match session.remove(temporary).await {
+        Err(cleanup) if !cleanup.is_not_found() => {
+            let detail = match cleanup {
+                VaultError::Storage {
+                    operation,
+                    kind,
+                    message,
+                    ..
+                } => format!("{operation} ({kind:?}): {message}"),
+                other => other.to_string(),
+            };
+            let mut error = match error {
+                error @ VaultError::Storage { .. } => error,
+                error => {
+                    let kind = if matches!(error, VaultError::SourceChanged { .. }) {
+                        StorageErrorKind::Conflict
+                    } else {
+                        StorageErrorKind::Unavailable
+                    };
+                    storage_error(
+                        "write",
+                        &destination.display().to_string(),
+                        kind,
+                        &error.to_string(),
+                    )
+                    .with_mutation_outcome(MutationOutcome::NotCommitted)
+                }
+            };
+            if let VaultError::Storage { message, .. } = &mut error {
+                message.push_str("; temporary upload cleanup failed: ");
+                message.push_str(&detail);
             }
-            _ => (StorageErrorKind::Unavailable, MutationOutcome::NotCommitted),
-        };
-        storage_error(
-            "cleanup upload",
-            temporary,
+            error
+        }
+        _ => {
+            progress.set_temporary(None);
+            error
+        }
+    }
+}
+
+fn publication_error(destination: &Path, error: VaultError) -> VaultError {
+    match error {
+        VaultError::Storage {
+            operation,
+            path,
             kind,
-            &format!("{error}; temporary upload cleanup failed: {cleanup}"),
-        )
-        .with_mutation_outcome(outcome)
-    } else {
-        error
+            message,
+            outcome,
+        } => {
+            let destination = destination.display().to_string();
+            let message = if operation == "write" && path == destination {
+                message
+            } else {
+                format!("{operation}: {message}")
+            };
+            VaultError::Storage {
+                operation: "write".into(),
+                path: destination,
+                kind,
+                message,
+                outcome,
+            }
+        }
+        other => other,
     }
 }
 
@@ -1129,10 +1316,19 @@ async fn read_source_with_stat(
             "source read admission closed",
         )
     })?;
-    let handle = session.open_read(path).await?;
+    let handle = session.track_handle(session.open_read(path).await?);
     let result = async {
-        let attrs = session.fstat(&handle).await?;
+        let attrs = session.fstat(handle.handle()).await?;
         require_type(&attrs, FileType::RegularFile, path)?;
+        if let Some(size) = attrs.get_size()
+            && size > max_bytes as u64
+        {
+            return Err(limit_error(
+                path,
+                usize::try_from(size).unwrap_or(usize::MAX),
+                max_bytes,
+            ));
+        }
         let hint = attrs
             .get_size()
             .unwrap_or(CHUNK_BYTES as u64)
@@ -1164,7 +1360,10 @@ async fn read_source_with_stat(
             if allowed == 0 {
                 return Err(limit_error(path, bytes.len(), max_bytes));
             }
-            let Some(chunk) = session.read(&handle, offset, allowed as u32).await? else {
+            let Some(chunk) = session
+                .read(handle.handle(), offset, allowed as u32)
+                .await?
+            else {
                 break;
             };
             if chunk.is_empty() || chunk.len() > allowed {
@@ -1214,11 +1413,11 @@ async fn read_source_with_stat(
                 &format!("remote note is not UTF-8: {e}"),
             )
         })?;
-        let stat = file_stat(&session.fstat(&handle).await?, Path::new(path))?;
+        let stat = file_stat(&session.fstat(handle.handle()).await?, Path::new(path))?;
         Ok((content, stat))
     }
     .await;
-    let close = session.close(&handle).await;
+    let close = handle.close().await;
     match (result, close) {
         (Err(error), _) | (_, Err(error)) => Err(error),
         (Ok(text), Ok(())) => Ok(text),
@@ -1237,37 +1436,68 @@ async fn find_entry(
         Err(error) if error.is_not_found() => false,
         Err(error) => return Err(error),
     };
-    let requested = name;
-    let key: String = name.nfc().collect();
-    let folded = key.to_lowercase();
-    let mut exact = None;
-    let mut found = None;
-    let mut ambiguous = false;
+    let mut matcher = EntryMatcher::new(name, native_match);
     visit_directory(session, parent, |name, attrs| {
-        let normalized: String = name.nfc().collect();
-        if name == requested {
-            exact = Some((name, attrs));
-        } else if normalized == key || (native_match && normalized.to_lowercase() == folded) {
-            ambiguous |= found.is_some();
-            found = Some((name, attrs));
-        }
+        matcher.observe(name, attrs);
         Ok(())
     })
     .await?;
-    if exact.is_some() {
-        return Ok(exact);
+    matcher.finish()
+}
+
+struct EntryMatcher<'a> {
+    requested: &'a str,
+    key: String,
+    folded: String,
+    native_match: bool,
+    exact: Option<(String, FileAttrs)>,
+    found: Option<(String, FileAttrs)>,
+    ambiguous: bool,
+}
+
+impl<'a> EntryMatcher<'a> {
+    fn new(requested: &'a str, native_match: bool) -> Self {
+        let key: String = requested.nfc().collect();
+        let folded = key.to_lowercase();
+        Self {
+            requested,
+            key,
+            folded,
+            native_match,
+            exact: None,
+            found: None,
+            ambiguous: false,
+        }
     }
-    if ambiguous {
-        return Err(VaultError::InvalidPath(
-            "ambiguous Unicode-equivalent remote path".into(),
-        ));
+
+    fn observe(&mut self, name: String, attrs: FileAttrs) {
+        let normalized: String = name.nfc().collect();
+        if name == self.requested {
+            self.exact = Some((name, attrs));
+        } else if normalized == self.key
+            || (self.native_match && normalized.to_lowercase() == self.folded)
+        {
+            self.ambiguous |= self.found.is_some();
+            self.found = Some((name, attrs));
+        }
     }
-    if native_match && found.is_none() {
-        return Err(VaultError::InvalidPath(
-            "cannot identify the exact spelling of the native remote match".into(),
-        ));
+
+    fn finish(self) -> VaultResult<Option<(String, FileAttrs)>> {
+        if self.exact.is_some() {
+            return Ok(self.exact);
+        }
+        if self.ambiguous {
+            return Err(VaultError::InvalidPath(
+                "ambiguous Unicode-equivalent remote path".into(),
+            ));
+        }
+        if self.native_match && self.found.is_none() {
+            return Err(VaultError::InvalidPath(
+                "cannot identify the exact spelling of the native remote match".into(),
+            ));
+        }
+        Ok(self.found)
     }
-    Ok(found)
 }
 
 async fn walk_directories(
@@ -1276,54 +1506,66 @@ async fn walk_directories(
     start: String,
     recursive: bool,
 ) -> VaultResult<Vec<(String, FileAttrs)>> {
-    let mut pending = vec![start];
+    let mut pending = vec![start.clone()];
     let mut jobs = tokio::task::JoinSet::new();
     let mut entries = Vec::new();
     let mut name_bytes = 0usize;
-    while !pending.is_empty() || !jobs.is_empty() {
-        while jobs.len() < 8 {
-            let Some(directory) = pending.pop() else {
-                break;
-            };
-            let session = Arc::clone(&session);
-            let remote = absolute(canonical, &directory);
-            jobs.spawn(async move {
-                let mut entries = Vec::new();
-                visit_directory(&session, &remote, |name, attrs| {
-                    if !name.starts_with('.') {
-                        entries.push((absolute(&directory, &name), attrs));
+    let result = async {
+        while !pending.is_empty() || !jobs.is_empty() {
+            while jobs.len() < 8 {
+                let Some(directory) = pending.pop() else {
+                    break;
+                };
+                let session = Arc::clone(&session);
+                let remote = absolute(canonical, &directory);
+                let starting_directory = directory == start;
+                jobs.spawn(async move {
+                    let mut entries = Vec::new();
+                    let result = visit_directory(&session, &remote, |name, attrs| {
+                        if !name.starts_with('.') {
+                            entries.push((absolute(&directory, &name), attrs));
+                        }
+                        Ok(())
+                    })
+                    .await;
+                    match result {
+                        Ok(()) => (),
+                        Err(VaultError::DirectoryNotFound(_)) if !starting_directory => (),
+                        Err(error) => return Err(error),
                     }
-                    Ok(())
-                })
-                .await?;
-                Ok::<_, VaultError>(entries)
-            });
-        }
-        if let Some(result) = jobs.join_next().await {
-            for (path, attrs) in result.map_err(|error| {
-                storage_error(
-                    "list",
-                    "",
-                    StorageErrorKind::Unavailable,
-                    &error.to_string(),
-                )
-            })?? {
-                name_bytes = name_bytes.saturating_add(path.len());
-                if entries.len() >= 1_000_000 || name_bytes > MAX_READ_BYTES {
-                    return Err(storage_error(
+                    Ok::<_, VaultError>(entries)
+                });
+            }
+            if let Some(result) = jobs.join_next().await {
+                for (path, attrs) in result.map_err(|error| {
+                    storage_error(
                         "list",
                         "",
-                        StorageErrorKind::ResourceLimit,
-                        "source directory entry budget exceeded",
-                    ));
+                        StorageErrorKind::Unavailable,
+                        &error.to_string(),
+                    )
+                })?? {
+                    name_bytes = name_bytes.saturating_add(path.len());
+                    if entries.len() >= 1_000_000 || name_bytes > MAX_READ_BYTES {
+                        return Err(storage_error(
+                            "list",
+                            "",
+                            StorageErrorKind::ResourceLimit,
+                            "source directory entry budget exceeded",
+                        ));
+                    }
+                    if recursive && attrs.get_filetype() == Some(FileType::Directory) {
+                        pending.push(path.clone());
+                    }
+                    entries.push((path, attrs));
                 }
-                if recursive && attrs.get_filetype() == Some(FileType::Directory) {
-                    pending.push(path.clone());
-                }
-                entries.push((path, attrs));
             }
         }
+        Ok::<_, VaultError>(())
     }
+    .await;
+    while jobs.join_next().await.is_some() {}
+    result?;
     Ok(entries)
 }
 
@@ -1332,35 +1574,71 @@ async fn visit_directory(
     path: &str,
     mut visit: impl FnMut(String, FileAttrs) -> VaultResult<()>,
 ) -> VaultResult<()> {
-    let handle = session.opendir(path).await?;
+    let handle = session.track_handle(session.opendir(path).await.map_err(|error| {
+        if error.is_not_found() {
+            VaultError::DirectoryNotFound(PathBuf::from(path))
+        } else {
+            error
+        }
+    })?);
+    let mut skipped = 0usize;
     let result = async {
         let mut seen = HashSet::new();
         let mut name_bytes = 0usize;
+        let mut entry_count = 0usize;
         loop {
-            let page = session.readdir(&handle).await?;
-            if page.is_empty() {
+            let page = session.readdir(handle.handle()).await?;
+            skipped = skipped.saturating_add(page.skipped_count);
+            name_bytes = name_bytes.saturating_add(page.skipped_bytes);
+            entry_count = entry_count.saturating_add(page.skipped_count);
+            if entry_count > 1_000_000 || name_bytes > MAX_READ_BYTES {
+                return Err(storage_error(
+                    "list",
+                    path,
+                    StorageErrorKind::ResourceLimit,
+                    "directory entry budget exceeded",
+                ));
+            }
+            if page.entries.is_empty() && page.skipped_count == 0 {
                 break;
             }
-            for entry in page {
+            for entry in page.entries {
                 let name = entry
                     .filename
                     .to_str()
                     .ok_or_else(|| {
-                        VaultError::InvalidPath("remote directory name is not UTF-8".into())
+                        storage_error(
+                            "list",
+                            path,
+                            StorageErrorKind::Protocol,
+                            "directory response contains an undecoded name",
+                        )
                     })?
                     .to_owned();
-                if name == "." || name == ".." {
-                    continue;
-                }
-                validate_entry(&name)?;
                 name_bytes = name_bytes.saturating_add(name.len());
-                if seen.len() >= 1_000_000 || name_bytes > MAX_READ_BYTES {
+                entry_count = entry_count.saturating_add(1);
+                if entry_count > 1_000_000 || name_bytes > MAX_READ_BYTES {
                     return Err(storage_error(
                         "list",
                         path,
                         StorageErrorKind::ResourceLimit,
                         "directory entry budget exceeded",
                     ));
+                }
+                if name.is_empty() || name.contains('/') || name.contains('\0') {
+                    return Err(storage_error(
+                        "list",
+                        path,
+                        StorageErrorKind::Protocol,
+                        "server returned an invalid directory basename",
+                    ));
+                }
+                if name == "." || name == ".." {
+                    continue;
+                }
+                if name.contains('\\') || name.chars().any(char::is_control) {
+                    skipped = skipped.saturating_add(1);
+                    continue;
                 }
                 if !seen.insert(name.clone()) {
                     return Err(storage_error(
@@ -1392,7 +1670,10 @@ async fn visit_directory(
         Ok(())
     }
     .await;
-    let close = session.close(&handle).await;
+    if skipped > 0 {
+        tracing::warn!(path, skipped, "skipping unrepresentable vault entries");
+    }
+    let close = handle.close().await;
     result.and(close)
 }
 
@@ -1403,10 +1684,6 @@ fn normalize_relative(path: &Path) -> VaultResult<String> {
 fn path_text(path: &Path) -> VaultResult<&str> {
     path.to_str()
         .ok_or_else(|| VaultError::InvalidPath("remote paths must be UTF-8".into()))
-}
-
-fn validate_entry(name: &str) -> VaultResult<()> {
-    VaultPath::entry(name).map(|_| ())
 }
 
 fn validate_absolute(path: &str) -> VaultResult<()> {
@@ -1511,6 +1788,24 @@ fn limit_error(path: &str, actual: usize, limit: usize) -> VaultError {
     }
 }
 
+fn policy_validation_error(error: VaultError) -> VaultError {
+    match error {
+        error @ (VaultError::OutsideVault(_)
+        | VaultError::InvalidPath(_)
+        | VaultError::SemanticResourceLimit { .. }
+        | VaultError::Storage {
+            kind: StorageErrorKind::InvalidSource,
+            ..
+        }) => storage_error(
+            "reconnect",
+            ".obsidian-mcp/ignore",
+            StorageErrorKind::IdentityChanged,
+            &format!("authorized portable policy is no longer valid; reopen the source: {error}"),
+        ),
+        other => other,
+    }
+}
+
 fn storage_error(operation: &str, path: &str, kind: StorageErrorKind, message: &str) -> VaultError {
     VaultError::storage(operation, path, kind, message)
 }
@@ -1557,7 +1852,7 @@ async fn effective_connection(location: &SftpLocation, timeout: Duration) -> Vau
             "resolve SSH profile",
             "",
             StorageErrorKind::PermissionDenied,
-            "SSH configuration could not be resolved",
+            &ssh_profile_failure(output.status, &output.stderr),
         ));
     }
     let output = String::from_utf8(output.stdout).map_err(|_| {
@@ -1600,6 +1895,20 @@ async fn effective_connection(location: &SftpLocation, timeout: Duration) -> Vau
     Ok(identity.join("\n"))
 }
 
+fn ssh_profile_failure(status: impl std::fmt::Display, stderr: &[u8]) -> String {
+    let stderr = &stderr[stderr.len().saturating_sub(1024)..];
+    let detail: String = String::from_utf8_lossy(stderr)
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .collect();
+    let detail = detail.trim();
+    if detail.is_empty() {
+        format!("SSH configuration could not be resolved ({status})")
+    } else {
+        format!("SSH configuration could not be resolved ({status}): {detail}")
+    }
+}
+
 fn timeout_from_env() -> VaultResult<Duration> {
     Ok(crate::config::source::SftpSettings::from_env()?.timeout)
 }
@@ -1607,6 +1916,28 @@ fn timeout_from_env() -> VaultResult<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_profile_failure_retains_bounded_sanitized_cause() {
+        let mut stderr = vec![b'x'; 32 * 1024];
+        stderr.extend_from_slice(b"\x1b[31mBad configuration option: broken_fixture_option\x07\n");
+        let message = ssh_profile_failure("exit status: 255", &stderr);
+        assert!(message.contains("exit status: 255"));
+        assert!(message.contains("Bad configuration option: broken_fixture_option"));
+        assert!(!message.contains('\x1b'));
+        assert!(!message.contains('\x07'));
+        assert!(message.len() < 1200);
+        let message = ssh_profile_failure(
+            "exit status: 255",
+            b"Bad configuration option: broken_fixture_option\x07\n",
+        );
+        assert!(message.contains("Bad configuration option: broken_fixture_option"));
+        assert!(!message.contains('\x07'));
+        assert_eq!(
+            ssh_profile_failure("exit status: 255", b"\x07\r\n"),
+            "SSH configuration could not be resolved (exit status: 255)"
+        );
+    }
 
     #[test]
     fn remote_paths_have_server_semantics() {
@@ -1715,7 +2046,11 @@ mod tests {
             .await
             .unwrap();
         storage
-            .append_file(Path::new("folder/note.md"), " third")
+            .write_file_if_revision(
+                Path::new("folder/note.md"),
+                "second third",
+                &crate::vault::source::source_revision("second"),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1753,6 +2088,35 @@ mod tests {
                 .iter()
                 .any(|e| e.relative.to_string_lossy().contains("upload"))
         );
+        child.kill().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires a local OpenSSH sftp-server executable"]
+    async fn missing_portable_policy_in_existing_metadata_directory_is_valid() {
+        let (storage, root, mut child) = local_server_fixture()
+            .await
+            .expect("install OpenSSH sftp-server for this integration test");
+        std::fs::create_dir(root.path().join(".obsidian-mcp")).unwrap();
+        std::fs::write(root.path().join("note.md"), "available").unwrap();
+        storage.pin_policy_revision(None);
+        let session = Arc::clone(&*storage.session.lock().await);
+        storage.validate_policy_revision(&session).await.unwrap();
+        assert_eq!(
+            storage.read_file(Path::new("note.md")).await.unwrap(),
+            "available"
+        );
+        storage.pin_policy_revision(Some(crate::vault::source::source_revision(
+            "previous policy",
+        )));
+        assert!(matches!(
+            storage.validate_policy_revision(&session).await,
+            Err(VaultError::Storage {
+                kind: StorageErrorKind::IdentityChanged,
+                ..
+            })
+        ));
         child.kill().await.unwrap();
     }
 
@@ -1878,7 +2242,7 @@ mod tests {
         child.kill().await.unwrap();
     }
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum Fault {
+    pub(super) enum Fault {
         Normal,
         NoPosix,
         Collision,
@@ -1888,16 +2252,58 @@ mod tests {
         HoldWrite,
         HoldRename,
         SparseAttrs,
+        UnrepresentableNames,
+        EscapingName,
+        AbsoluteName,
+        EmptyName,
+        NulName,
+        UnicodeDestination,
+        UnicodeAliasDestination,
+        NonemptyDirectory,
+        StatFailure,
+        ContainedAliases,
+        EscapingAlias,
+        MissingPolicy,
+        DeniedPolicy,
+        EscapingPolicy,
+        InvalidUtf8Policy,
+        OversizedPolicy,
+        DirectoryPolicy,
+        MissingChild,
+        MissingReadDir,
+        DeniedChild,
+        FailedReadDir,
+        DisconnectWrite,
+        ParallelDeniedChild,
+        ParallelProtocolChild,
+        GrowingRead,
+        UnknownReadSize,
+        RenameCleanupFailure,
+        AttrsCleanupFailure,
+        ConflictCleanupFailure,
+        HeldRead,
     }
 
     #[derive(Default)]
-    struct FakeFiles {
-        target: Vec<u8>,
+    pub(super) struct FakeFiles {
+        pub(super) target: Vec<u8>,
         temporary: Option<Vec<u8>>,
         removed: usize,
         renames: usize,
         writes: usize,
-        listed: HashSet<String>,
+        pub(super) listed: HashMap<String, usize>,
+        pub(super) read_paths: Vec<String>,
+        pub(super) opened_directories: usize,
+        fstats: usize,
+        reads: usize,
+        closed_handles: usize,
+        pub(super) paths: Vec<String>,
+        temporary_path: Option<String>,
+        temporary_mode: Option<u32>,
+        parallel_rejected: bool,
+        parallel_release: Arc<tokio::sync::Notify>,
+        read_blocked: bool,
+        read_release: Arc<tokio::sync::Notify>,
     }
 
     fn fake_string(out: &mut Vec<u8>, value: &[u8]) {
@@ -1916,7 +2322,7 @@ mod tests {
         String::from_utf8(packet[9..9 + len].to_vec()).unwrap()
     }
 
-    async fn fake_storage(
+    pub(super) async fn fake_storage(
         fault: Fault,
     ) -> (
         SftpStorage,
@@ -1925,7 +2331,11 @@ mod tests {
     ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let files = Arc::new(Mutex::new(FakeFiles {
-            target: b"old".to_vec(),
+            target: match fault {
+                Fault::InvalidUtf8Policy => vec![0xff],
+                Fault::OversizedPolicy => vec![b'x'; 256 * 1024 + 1],
+                _ => b"old".to_vec(),
+            },
             ..Default::default()
         }));
         let server_files = Arc::clone(&files);
@@ -1941,6 +2351,10 @@ mod tests {
             }
             server.write_u32(version.len() as u32).await.unwrap();
             server.write_all(&version).await.unwrap();
+            let mut held_directory = None;
+            let mut denied_directory = None;
+            let mut parallel_done = false;
+            let mut read_released = false;
             while let Ok(len) = server.read_u32().await {
                 let mut request = vec![0; len as usize];
                 if server.read_exact(&mut request).await.is_err() {
@@ -1950,61 +2364,187 @@ mod tests {
                 response.extend_from_slice(&request[1..5]);
                 let mut status = 0u32;
                 let mut hold = false;
+                let mut disconnect = false;
+                let mut deferred = 0;
                 {
                     let mut files = server_files.lock().unwrap();
                     match request[0] {
                         16 => {
+                            let path = fake_path(&request);
+                            files.paths.push(path.clone());
+                            let canonical = match (fault, path.as_str()) {
+                                (Fault::ContainedAliases, "/vault/alias.md") => "/vault/note.md",
+                                (Fault::ContainedAliases, "/vault/alias-dir") => "/vault",
+                                (Fault::EscapingAlias, "/vault/alias.md") => "/outside/secret.md",
+                                (Fault::EscapingPolicy, "/vault/.obsidian-mcp/ignore") => {
+                                    "/outside/ignore"
+                                }
+                                _ => &path,
+                            };
                             response[0] = 104;
                             response.extend_from_slice(&1u32.to_be_bytes());
-                            fake_string(&mut response, fake_path(&request).as_bytes());
+                            fake_string(&mut response, canonical.as_bytes());
                             fake_string(&mut response, b"");
                             response.extend_from_slice(&0u32.to_be_bytes());
                         }
                         7 | 17 => {
                             let path = fake_path(&request);
-                            if path == "/vault"
+                            files.paths.push(path.clone());
+                            if fault == Fault::StatFailure && path == "/vault/failing.md" {
+                                status = 4;
+                            } else if path == "/vault"
                                 || path == "/vault/note.md"
+                                || (matches!(
+                                    fault,
+                                    Fault::UnicodeDestination | Fault::UnicodeAliasDestination
+                                ) && path == "/vault/cafe\u{301}.md")
+                                || (fault == Fault::NonemptyDirectory && path == "/vault/folder")
+                                || (matches!(fault, Fault::ContainedAliases | Fault::EscapingAlias)
+                                    && (path == "/vault/alias.md" || path == "/vault/alias-dir"))
                                 || (fault == Fault::SparseAttrs
                                     && (path == "/vault/nested" || path == "/vault/nested/note.md"))
+                                || (matches!(fault, Fault::MissingPolicy | Fault::DeniedPolicy)
+                                    && path == "/vault/.obsidian-mcp")
+                                || (matches!(
+                                    fault,
+                                    Fault::MissingChild
+                                        | Fault::MissingReadDir
+                                        | Fault::DeniedChild
+                                        | Fault::FailedReadDir
+                                        | Fault::ParallelDeniedChild
+                                        | Fault::ParallelProtocolChild
+                                ) && matches!(
+                                    path.as_str(),
+                                    "/vault/kept" | "/vault/gone" | "/vault/kept/note.md"
+                                ))
                                 || (path.contains("upload-") && files.temporary.is_some())
                             {
                                 response[0] = 105;
                                 fake_attrs(
                                     &mut response,
                                     files.target.len(),
-                                    path == "/vault" || path == "/vault/nested",
+                                    path == "/vault"
+                                        || path == "/vault/nested"
+                                        || path == "/vault/folder"
+                                        || path == "/vault/.obsidian-mcp"
+                                        || path == "/vault/kept"
+                                        || path == "/vault/gone",
                                 );
+                                if (fault == Fault::UnicodeAliasDestination
+                                    && path == "/vault/cafe\u{301}.md")
+                                    || (matches!(
+                                        fault,
+                                        Fault::ContainedAliases | Fault::EscapingAlias
+                                    ) && (path == "/vault/alias.md"
+                                        || path == "/vault/alias-dir"))
+                                {
+                                    let end = response.len();
+                                    response[end - 4..].copy_from_slice(&0o120777u32.to_be_bytes());
+                                }
                             } else {
                                 status = 2;
                             }
                         }
                         11 => {
-                            files.listed.remove(&fake_path(&request));
-                            response[0] = 102;
-                            fake_string(&mut response, fake_path(&request).as_bytes());
+                            files.opened_directories += 1;
+                            let path = fake_path(&request);
+                            if matches!(
+                                fault,
+                                Fault::ParallelDeniedChild | Fault::ParallelProtocolChild
+                            ) && !parallel_done
+                                && path == "/vault/gone"
+                            {
+                                status = 3;
+                                deferred = 2;
+                            } else if path == "/vault/gone"
+                                && matches!(fault, Fault::MissingChild | Fault::DeniedChild)
+                            {
+                                status = if fault == Fault::MissingChild { 2 } else { 3 };
+                            } else {
+                                files.listed.insert(path.clone(), 0);
+                                response[0] = 102;
+                                fake_string(&mut response, path.as_bytes());
+                                if matches!(
+                                    fault,
+                                    Fault::ParallelDeniedChild | Fault::ParallelProtocolChild
+                                ) && !parallel_done
+                                    && path == "/vault/kept"
+                                {
+                                    deferred = 1;
+                                }
+                            }
                         }
                         12 => {
                             let path = fake_path(&request);
-                            if files.listed.insert(path.clone()) {
+                            let page = files.listed.entry(path.clone()).or_default();
+                            let current_page = *page;
+                            *page += 1;
+                            let names: &[&[u8]] = match (fault, current_page) {
+                                (Fault::UnrepresentableNames, 0) => &[b"latin-\xff.md"],
+                                (Fault::UnrepresentableNames, 1) => {
+                                    &[b"literal\\name.md", b".Icon\r", b"note.md"]
+                                }
+                                (Fault::EscapingName, 0) => &[b"../outside-\xff.md"],
+                                (Fault::AbsoluteName, 0) => &[b"/outside.md"],
+                                (Fault::EmptyName, 0) => &[b""],
+                                (Fault::NulName, 0) => &[b"nul\0.md"],
+                                (Fault::UnicodeDestination | Fault::UnicodeAliasDestination, 0) => {
+                                    &[b"note.md", "cafe\u{301}.md".as_bytes()]
+                                }
+                                (Fault::NonemptyDirectory, 0) => &[b"note.md", b"folder"],
+                                (Fault::ContainedAliases, 0) => {
+                                    &[b"note.md", b"alias.md", b"alias-dir"]
+                                }
+                                (Fault::EscapingAlias, 0) => &[b"note.md", b"alias.md"],
+                                (Fault::SparseAttrs, 0) if path == "/vault" => &[b"nested"],
+                                (
+                                    Fault::MissingChild
+                                    | Fault::MissingReadDir
+                                    | Fault::DeniedChild
+                                    | Fault::FailedReadDir
+                                    | Fault::ParallelDeniedChild
+                                    | Fault::ParallelProtocolChild,
+                                    0,
+                                ) if path == "/vault" => &[b"kept", b"gone"],
+                                (Fault::MissingReadDir | Fault::FailedReadDir, _)
+                                    if path == "/vault/gone" =>
+                                {
+                                    &[]
+                                }
+                                (_, 0) => &[b"note.md"],
+                                _ => &[],
+                            };
+                            if !names.is_empty() {
                                 response[0] = 104;
-                                response.extend_from_slice(&1u32.to_be_bytes());
-                                fake_string(
-                                    &mut response,
-                                    if path == "/vault" && fault == Fault::SparseAttrs {
-                                        b"nested"
-                                    } else {
-                                        b"note.md"
-                                    },
-                                );
-                                fake_string(&mut response, b"");
-                                response.extend_from_slice(&0u32.to_be_bytes());
+                                response.extend_from_slice(&(names.len() as u32).to_be_bytes());
+                                for name in names {
+                                    fake_string(&mut response, name);
+                                    fake_string(&mut response, b"");
+                                    response.extend_from_slice(&0u32.to_be_bytes());
+                                }
                             } else {
-                                status = 1;
+                                status = if path == "/vault/gone" && fault == Fault::MissingReadDir
+                                {
+                                    2
+                                } else if path == "/vault/gone" && fault == Fault::FailedReadDir {
+                                    4
+                                } else {
+                                    1
+                                };
                             }
                         }
                         3 => {
                             let path = fake_path(&request);
-                            if path.contains("upload-") {
+                            if path == "/vault/.obsidian-mcp/ignore"
+                                && matches!(fault, Fault::MissingPolicy | Fault::DeniedPolicy)
+                            {
+                                status = if fault == Fault::MissingPolicy { 2 } else { 3 };
+                            } else if path.contains("upload-") {
+                                files.temporary_path = Some(path.clone());
+                                let permissions = 17 + path.len();
+                                files.temporary_mode = Some(u32::from_be_bytes(
+                                    request[permissions..permissions + 4].try_into().unwrap(),
+                                ));
                                 if fault == Fault::Collision {
                                     files.temporary = Some(b"unowned".to_vec());
                                     status = 4;
@@ -2015,15 +2555,31 @@ mod tests {
                                     hold = fault == Fault::HoldOpen;
                                 }
                             } else {
+                                files.read_paths.push(path);
                                 response[0] = 102;
                                 fake_string(&mut response, &[0xff, 0]);
                             }
                         }
                         8 => {
+                            files.fstats += 1;
                             response[0] = 105;
-                            fake_attrs(&mut response, files.target.len(), false);
+                            if fault == Fault::UnknownReadSize {
+                                response.extend_from_slice(&4u32.to_be_bytes());
+                                response.extend_from_slice(&0o100600u32.to_be_bytes());
+                            } else {
+                                fake_attrs(
+                                    &mut response,
+                                    if fault == Fault::GrowingRead {
+                                        1
+                                    } else {
+                                        files.target.len()
+                                    },
+                                    fault == Fault::DirectoryPolicy,
+                                );
+                            }
                         }
                         5 => {
+                            files.reads += 1;
                             let offset =
                                 u64::from_be_bytes(request[11..19].try_into().unwrap()) as usize;
                             let len =
@@ -2047,24 +2603,48 @@ mod tests {
                                 .as_mut()
                                 .unwrap()
                                 .extend_from_slice(&request[23..23 + len]);
-                            if fault == Fault::Conflict {
+                            if matches!(fault, Fault::Conflict | Fault::ConflictCleanupFailure) {
                                 files.target = b"external edit".to_vec();
+                            }
+                            if fault == Fault::DisconnectWrite {
+                                files.temporary = Some(b"unowned replacement".to_vec());
+                                disconnect = true;
                             }
                             hold = fault == Fault::HoldWrite;
                         }
-                        10 if fault == Fault::DenyAttrs => status = 3,
+                        10 if matches!(fault, Fault::DenyAttrs | Fault::AttrsCleanupFailure) => {
+                            status = 3
+                        }
                         13 => {
                             files.removed += 1;
-                            files.temporary = None;
+                            if matches!(
+                                fault,
+                                Fault::RenameCleanupFailure
+                                    | Fault::AttrsCleanupFailure
+                                    | Fault::ConflictCleanupFailure
+                            ) {
+                                status = 3;
+                            } else {
+                                files.temporary = None;
+                            }
                         }
+                        15 if fault == Fault::NonemptyDirectory => status = 4,
                         18 | 200 => {
                             files.renames += 1;
-                            files.target = files.temporary.take().unwrap();
+                            if fault == Fault::RenameCleanupFailure {
+                                status = 4;
+                            } else {
+                                files.target = files.temporary.take().unwrap();
+                            }
                             hold = fault == Fault::HoldRename;
                         }
-                        4 | 10 => (),
+                        4 => files.closed_handles += 1,
+                        10 => (),
                         other => panic!("unexpected fake SFTP request {other}"),
                     }
+                }
+                if disconnect {
+                    break;
                 }
                 if hold {
                     std::future::pending::<()>().await;
@@ -2073,6 +2653,41 @@ mod tests {
                     response.extend_from_slice(&status.to_be_bytes());
                     fake_string(&mut response, b"injected server status");
                     fake_string(&mut response, b"");
+                }
+                if fault == Fault::HeldRead && request[0] == 5 && !read_released {
+                    let release = {
+                        let mut files = server_files.lock().unwrap();
+                        files.read_blocked = true;
+                        Arc::clone(&files.read_release)
+                    };
+                    release.notified().await;
+                    read_released = true;
+                }
+                if deferred != 0 {
+                    if deferred == 1 {
+                        held_directory = Some(response);
+                    } else {
+                        denied_directory = Some(response);
+                    }
+                    if held_directory.is_none() || denied_directory.is_none() {
+                        continue;
+                    }
+                    let denied = denied_directory.take().unwrap();
+                    server.write_u32(denied.len() as u32).await.unwrap();
+                    server.write_all(&denied).await.unwrap();
+                    let release = {
+                        let mut files = server_files.lock().unwrap();
+                        files.parallel_rejected = true;
+                        Arc::clone(&files.parallel_release)
+                    };
+                    release.notified().await;
+                    parallel_done = true;
+                    response = held_directory.take().unwrap();
+                    if fault == Fault::ParallelProtocolChild {
+                        response[0] = 104;
+                        response.truncate(5);
+                        response.extend_from_slice(&u32::MAX.to_be_bytes());
+                    }
                 }
                 if server.write_u32(response.len() as u32).await.is_err() {
                     break;
@@ -2135,6 +2750,750 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconnect_notification_wakes_without_withdrawing_source_authority() {
+        let (storage, _, server) = fake_storage(Fault::Normal).await;
+        let wakeup = Arc::new(tokio::sync::Notify::new());
+        storage
+            .set_reconciliation_owner(Arc::clone(&wakeup))
+            .unwrap();
+        storage.notify_reconnected();
+        tokio::time::timeout(Duration::from_millis(100), wakeup.notified())
+            .await
+            .unwrap();
+        assert!(storage.last_failure().is_none());
+        assert!(storage.session.lock().await.is_healthy());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reconnect_policy_check_treats_missing_read_as_absence() {
+        let (storage, _, server) = fake_storage(Fault::MissingPolicy).await;
+        let session = Arc::clone(&*storage.session.lock().await);
+        storage.pin_policy_revision(None);
+        storage.validate_policy_revision(&session).await.unwrap();
+        assert_eq!(
+            storage.read_file(Path::new("note.md")).await.unwrap(),
+            "old"
+        );
+        storage.pin_policy_revision(Some(crate::vault::source::source_revision(
+            "previous policy",
+        )));
+        assert!(matches!(
+            storage.validate_policy_revision(&session).await,
+            Err(VaultError::Storage {
+                kind: StorageErrorKind::IdentityChanged,
+                ..
+            })
+        ));
+        server.abort();
+
+        let (storage, _, server) = fake_storage(Fault::DeniedPolicy).await;
+        let session = Arc::clone(&*storage.session.lock().await);
+        storage.pin_policy_revision(None);
+        assert!(matches!(
+            storage.validate_policy_revision(&session).await,
+            Err(VaultError::Storage {
+                kind: StorageErrorKind::PermissionDenied,
+                ..
+            })
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn escaped_portable_policy_withdraws_source_authority_without_reading_it() {
+        let (storage, files, server) = fake_storage(Fault::EscapingPolicy).await;
+        let session = Arc::clone(&*storage.session.lock().await);
+        storage.pin_policy_revision(None);
+        let error = storage
+            .operation(
+                "reconnect",
+                Path::new(""),
+                storage.validate_policy_revision(&session),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                VaultError::Storage {
+                    kind: StorageErrorKind::IdentityChanged,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        let withdrawn = storage.last_failure().unwrap();
+        assert_eq!(withdrawn.0, StorageErrorKind::IdentityChanged);
+        storage.record_result(&Ok(()));
+        assert_eq!(storage.last_failure().as_ref(), Some(&withdrawn));
+        assert!(files.lock().unwrap().read_paths.is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn invalid_portable_policy_withdraws_source_authority_with_its_cause() {
+        for (fault, cause) in [
+            (Fault::InvalidUtf8Policy, "remote note is not UTF-8"),
+            (Fault::OversizedPolicy, "maximum 262144"),
+            (Fault::DirectoryPolicy, "unexpected remote file type"),
+        ] {
+            let (storage, _, server) = fake_storage(fault).await;
+            let session = Arc::clone(&*storage.session.lock().await);
+            storage.pin_policy_revision(None);
+            let error = storage
+                .operation(
+                    "reconnect",
+                    Path::new(""),
+                    storage.validate_policy_revision(&session),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    VaultError::Storage {
+                        kind: StorageErrorKind::IdentityChanged,
+                        ..
+                    }
+                ),
+                "{fault:?}: {error}"
+            );
+            assert!(error.to_string().contains(cause), "{fault:?}: {error}");
+            assert_eq!(
+                storage.last_failure().unwrap().0,
+                StorageErrorKind::IdentityChanged
+            );
+            server.abort();
+        }
+    }
+
+    #[test]
+    fn unknown_policy_read_failures_preserve_their_classification() {
+        for kind in [
+            StorageErrorKind::PermissionDenied,
+            StorageErrorKind::Unavailable,
+            StorageErrorKind::RemoteFailure,
+            StorageErrorKind::Protocol,
+            StorageErrorKind::Unsupported,
+            StorageErrorKind::ResourceLimit,
+        ] {
+            let error = policy_validation_error(storage_error(
+                "read",
+                ".obsidian-mcp/ignore",
+                kind,
+                "original failure",
+            ));
+            assert!(matches!(error, VaultError::Storage { kind: actual, .. } if actual == kind));
+            assert!(error.to_string().contains("original failure"));
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_directory_errors_settle_siblings_and_preserve_shared_failures() {
+        for fault in [Fault::ParallelDeniedChild, Fault::ParallelProtocolChild] {
+            for observe in [false, true] {
+                let (storage, files, server) = fake_storage(fault).await;
+                let storage = Arc::new(storage);
+                let session = Arc::clone(&*storage.session.lock().await);
+                let release = Arc::clone(&files.lock().unwrap().parallel_release);
+                let source = Arc::clone(&storage);
+                let mut request = tokio::spawn(async move {
+                    if observe {
+                        source
+                            .observe_batch(&[
+                                PathBuf::from("kept/note.md"),
+                                PathBuf::from("gone/note.md"),
+                            ])
+                            .await
+                            .map(|_| ())
+                    } else {
+                        source.entries(Path::new(""), true).await.map(|_| ())
+                    }
+                });
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        if files.lock().unwrap().parallel_rejected {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(30), &mut request)
+                        .await
+                        .is_err()
+                );
+                assert!(session.is_healthy());
+                release.notify_one();
+                let error = request.await.unwrap().unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        VaultError::Storage {
+                            kind: StorageErrorKind::PermissionDenied,
+                            ..
+                        }
+                    ),
+                    "{error}"
+                );
+                if fault == Fault::ParallelProtocolChild {
+                    assert!(!session.is_healthy());
+                    assert_eq!(
+                        storage.last_failure().unwrap().0,
+                        StorageErrorKind::Protocol
+                    );
+                } else {
+                    assert!(session.is_healthy());
+                    assert!(storage.last_failure().is_none());
+                    assert_eq!(
+                        storage.read_file(Path::new("kept/note.md")).await.unwrap(),
+                        "old"
+                    );
+                    assert!(Arc::ptr_eq(&session, &*storage.session.lock().await));
+                }
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_walk_child_is_absent_but_missing_start_and_mid_read_failures_propagate() {
+        let (storage, _, server) = fake_storage(Fault::MissingChild).await;
+        let entries = storage.entries(Path::new(""), true).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].relative, Path::new("kept/note.md"));
+        assert!(matches!(
+            storage.entries(Path::new("gone"), true).await,
+            Err(VaultError::DirectoryNotFound(_))
+        ));
+        server.abort();
+
+        let (storage, _, server) = fake_storage(Fault::MissingReadDir).await;
+        assert!(matches!(
+            storage.entries(Path::new(""), true).await,
+            Err(VaultError::NoteNotFound(_))
+        ));
+        assert!(storage.session.lock().await.is_healthy());
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[cfg(has_embeddings)]
+    async fn semantic_context_cancellation_and_deadline_leave_launched_reads_healthy() {
+        use crate::models::{EvidenceScope, SemanticEvidence, SourceRange, SourceStatus};
+        use crate::vault::embeddings::{ChunkEmbedding, NoteEmbeddingEntry, prepared_text_hash};
+        use crate::vault::semantic_results::{RankedNote, render_many_source};
+
+        for cancel_caller in [false, true] {
+            let (mut storage, files, server) = fake_storage(Fault::HeldRead).await;
+            storage.timeout = Duration::from_secs(2);
+            let session = Arc::clone(&*storage.session.lock().await);
+            let release = Arc::clone(&files.lock().unwrap().read_release);
+            let storage = crate::vault::storage::Storage::Sftp(Arc::new(storage));
+            let range = SourceRange {
+                start_byte: 0,
+                end_byte: 3,
+            };
+            let entry = Arc::new(NoteEmbeddingEntry {
+                source_revision: crate::vault::source::source_revision("old"),
+                source_bytes: 3,
+                body_range: range,
+                title: "note".into(),
+                tags: Vec::new(),
+                chunks: vec![ChunkEmbedding {
+                    input_hash: prepared_text_hash("old"),
+                    vector: vec![1.0],
+                    scope: EvidenceScope::Note,
+                    range,
+                    overlap_range: None,
+                    heading_path: Vec::new(),
+                    section_range: None,
+                    block_kind: None,
+                }],
+            });
+            let hit = RankedNote {
+                path: PathBuf::from("note.md"),
+                score: 1.0,
+                entry,
+                evidence: SemanticEvidence {
+                    scope: EvidenceScope::Note,
+                    cosine_similarity: 1.0,
+                    range,
+                    heading_path: Vec::new(),
+                    section_range: None,
+                },
+            };
+            if cancel_caller {
+                let owned_storage = storage.clone();
+                let request = tokio::spawn(async move {
+                    render_many_source(&owned_storage, vec![hit; 5], "old", true, None).await
+                });
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        if files.lock().unwrap().read_blocked {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                request.abort();
+                assert!(request.await.unwrap_err().is_cancelled());
+            } else {
+                let results = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    render_many_source(
+                        &storage,
+                        vec![hit; 5],
+                        "old",
+                        true,
+                        Some(Duration::from_millis(50)),
+                    ),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(results.len(), 5);
+                assert!(results.iter().all(|result| {
+                    result.source_status == SourceStatus::Unavailable
+                        && result
+                            .context_error
+                            .as_ref()
+                            .is_some_and(|error| error.message.contains("deadline"))
+                }));
+            }
+            assert!(session.is_healthy());
+            assert!(files.lock().unwrap().read_blocked);
+            release.notify_one();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let drained = {
+                        let files = files.lock().unwrap();
+                        assert!(files.read_paths.len() <= 4);
+                        files.read_paths.len() == 4 && files.closed_handles == 5
+                    };
+                    if drained {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(session.is_healthy());
+            assert!(files.lock().unwrap().read_paths.len() <= 4);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn known_oversized_read_closes_without_reserving_content_budget_or_reading() {
+        let (storage, files, server) = fake_storage(Fault::Normal).await;
+        let session = Arc::clone(&*storage.session.lock().await);
+        let _budget = storage
+            .read_budget
+            .acquire_many((MAX_READ_BYTES / 1024) as u32)
+            .await
+            .unwrap();
+        let error = storage
+            .operation(
+                "read",
+                Path::new("note.md"),
+                read_source_with_stat(
+                    &session,
+                    "/vault/note.md",
+                    2,
+                    &storage.read_budget,
+                    &storage.read_admission,
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                VaultError::SemanticResourceLimit {
+                    actual: 3,
+                    limit: 2,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        let files = files.lock().unwrap();
+        assert_eq!(files.reads, 0);
+        assert_eq!(files.closed_handles, 1);
+        assert!(session.is_healthy());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn read_limit_still_checks_content_after_growth_or_unknown_size() {
+        for fault in [Fault::GrowingRead, Fault::UnknownReadSize] {
+            let (storage, files, server) = fake_storage(fault).await;
+            let session = Arc::clone(&*storage.session.lock().await);
+            let error = read_source_with_stat(
+                &session,
+                "/vault/note.md",
+                2,
+                &storage.read_budget,
+                &storage.read_admission,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    VaultError::SemanticResourceLimit {
+                        actual: 3,
+                        limit: 2,
+                        ..
+                    }
+                ),
+                "{fault:?}: {error}"
+            );
+            let files = files.lock().unwrap();
+            assert_eq!(files.reads, 1, "{fault:?}");
+            assert_eq!(files.closed_handles, 1, "{fault:?}");
+            assert!(session.is_healthy(), "{fault:?}");
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_budget_wait_retires_the_session_with_an_open_handle() {
+        let (storage, files, server) = fake_storage(Fault::Normal).await;
+        let budget = storage
+            .read_budget
+            .acquire_many((MAX_READ_BYTES / 1024) as u32)
+            .await
+            .unwrap();
+        let session = Arc::clone(&*storage.session.lock().await);
+        let mut read = Box::pin(read_source_with_stat(
+            &session,
+            "/vault/note.md",
+            MAX_READ_BYTES,
+            &storage.read_budget,
+            &storage.read_admission,
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                assert!(futures_util::poll!(read.as_mut()).is_pending());
+                let stat_requested = files.lock().unwrap().fstats > 0;
+                if stat_requested {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // This later reply proves the earlier FSTAT reply has been decoded.
+        // The next explicit poll reaches the read-budget wait with no RPC pending.
+        session.stat("/vault/note.md").await.unwrap();
+        assert!(futures_util::poll!(read.as_mut()).is_pending());
+        assert!(session.is_healthy());
+        drop(read);
+        assert!(!session.is_healthy());
+        assert_eq!(
+            storage.last_failure().unwrap().0,
+            StorageErrorKind::Unavailable
+        );
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(budget);
+    }
+
+    #[tokio::test]
+    async fn admission_timeout_does_not_withdraw_a_healthy_source() {
+        let (storage, _, server) = fake_storage(Fault::Normal).await;
+        let admission = storage.read_admission.acquire_many(16).await.unwrap();
+        let error = storage.read_file(Path::new("note.md")).await.unwrap_err();
+        assert!(matches!(
+            error,
+            VaultError::Storage {
+                kind: StorageErrorKind::Unavailable,
+                ..
+            }
+        ));
+        assert!(storage.session.lock().await.is_healthy());
+        assert!(storage.last_failure().is_none());
+        drop(admission);
+
+        storage.record_result::<()>(&Err(storage_error(
+            "read",
+            "note.md",
+            StorageErrorKind::Protocol,
+            "invalid response",
+        )));
+        storage.record_result::<()>(&Err(storage_error(
+            "read",
+            "note.md",
+            StorageErrorKind::Unavailable,
+            "queued request expired",
+        )));
+        assert_eq!(
+            storage.last_failure().unwrap().0,
+            StorageErrorKind::Protocol
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn passive_source_health_distinguishes_a_busy_lock_from_a_dead_session() {
+        let (storage, _, server) = fake_storage(Fault::Normal).await;
+        let session = storage.session.lock().await;
+        storage.record_result::<()>(&Err(storage_error(
+            "read",
+            "note.md",
+            StorageErrorKind::Unavailable,
+            "queued request expired",
+        )));
+        assert!(storage.last_failure().is_some());
+        drop(session);
+        assert!(storage.last_failure().is_none());
+
+        server.abort();
+        let _ = server.await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !storage.session.lock().await.is_healthy() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        storage.record_result::<()>(&Err(storage_error(
+            "read",
+            "note.md",
+            StorageErrorKind::Unavailable,
+            "connection closed",
+        )));
+        assert_eq!(
+            storage.last_failure().unwrap().0,
+            StorageErrorKind::Unavailable
+        );
+        storage.record_result::<()>(&Err(storage_error(
+            "read",
+            "note.md",
+            StorageErrorKind::Protocol,
+            "invalid response",
+        )));
+        storage.record_result::<()>(&Err(storage_error(
+            "read",
+            "note.md",
+            StorageErrorKind::Unavailable,
+            "connection is still closed",
+        )));
+        assert_eq!(
+            storage.last_failure().unwrap().0,
+            StorageErrorKind::Protocol
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_observed_child_does_not_hide_unrelated_notes() {
+        let (storage, files, server) = fake_storage(Fault::MissingChild).await;
+        let kept = PathBuf::from("kept/note.md");
+        let gone = PathBuf::from("gone/note.md");
+        let batch = storage
+            .observe_batch(&[kept.clone(), gone.clone()])
+            .await
+            .unwrap();
+        assert!(matches!(
+            batch.read(&gone, 4096).await,
+            Err(VaultError::NoteNotFound(_))
+        ));
+        assert_eq!(batch.read(&kept, 4096).await.unwrap().0, "old");
+        assert_eq!(files.lock().unwrap().read_paths, ["/vault/kept/note.md"]);
+        assert!(storage.session.lock().await.is_healthy());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn observed_batch_propagates_read_directory_failures_after_open() {
+        for fault in [
+            Fault::MissingReadDir,
+            Fault::DeniedChild,
+            Fault::FailedReadDir,
+        ] {
+            let (storage, _, server) = fake_storage(fault).await;
+            let error = match storage
+                .observe_batch(&[PathBuf::from("kept/note.md"), PathBuf::from("gone/note.md")])
+                .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("directory failure was hidden: {fault:?}"),
+            };
+            match fault {
+                Fault::MissingReadDir => assert!(matches!(error, VaultError::NoteNotFound(_))),
+                Fault::DeniedChild => assert!(matches!(
+                    error,
+                    VaultError::Storage {
+                        kind: StorageErrorKind::PermissionDenied,
+                        ..
+                    }
+                )),
+                Fault::FailedReadDir => assert!(matches!(
+                    error,
+                    VaultError::Storage {
+                        kind: StorageErrorKind::RemoteFailure,
+                        ..
+                    }
+                )),
+                _ => unreachable!(),
+            }
+            assert!(storage.session.lock().await.is_healthy(), "{fault:?}");
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_remote_names_do_not_block_valid_notes_or_end_pagination() {
+        let (storage, files, server) = fake_storage(Fault::UnrepresentableNames).await;
+        let entries = storage.entries(Path::new(""), true).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].relative, Path::new("note.md"));
+        assert_eq!(
+            storage.read_file(Path::new("note.md")).await.unwrap(),
+            "old"
+        );
+        let files = files.lock().unwrap();
+        assert_eq!(files.read_paths, ["/vault/note.md"]);
+        assert!(
+            files
+                .paths
+                .iter()
+                .all(|path| matches!(path.as_str(), "/vault" | "/vault/note.md"))
+        );
+        assert!(storage.last_failure().is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn malicious_directory_basenames_reject_the_listing_without_source_reads() {
+        for fault in [
+            Fault::EscapingName,
+            Fault::AbsoluteName,
+            Fault::EmptyName,
+            Fault::NulName,
+        ] {
+            let (storage, files, server) = fake_storage(fault).await;
+            assert!(
+                matches!(
+                    storage.entries(Path::new(""), true).await,
+                    Err(VaultError::Storage {
+                        kind: StorageErrorKind::Protocol,
+                        ..
+                    })
+                ),
+                "{fault:?}"
+            );
+            let files = files.lock().unwrap();
+            assert!(files.read_paths.is_empty(), "{fault:?}");
+            assert!(files.paths.iter().all(|path| path == "/vault"), "{fault:?}");
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn move_preserves_unicode_equivalent_destination_entries_without_following_aliases() {
+        for fault in [Fault::UnicodeDestination, Fault::UnicodeAliasDestination] {
+            let (storage, files, server) = fake_storage(fault).await;
+            assert!(
+                matches!(
+                    storage
+                        .move_file(Path::new("note.md"), Path::new("caf\u{e9}.md"))
+                        .await,
+                    Err(VaultError::AlreadyExists(_))
+                ),
+                "{fault:?}"
+            );
+            let files = files.lock().unwrap();
+            assert_eq!(files.renames, 0, "{fault:?}");
+            assert_eq!(files.removed, 0, "{fault:?}");
+            assert_eq!(files.target, b"old", "{fault:?}");
+            assert!(files.read_paths.is_empty(), "{fault:?}");
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_remote_statuses_leave_the_source_and_session_available() {
+        for fault in [Fault::NonemptyDirectory, Fault::StatFailure] {
+            let (storage, _, server) = fake_storage(fault).await;
+            let error = if fault == Fault::NonemptyDirectory {
+                storage.delete_file(Path::new("folder")).await.unwrap_err()
+            } else {
+                storage
+                    .read_file(Path::new("failing.md"))
+                    .await
+                    .unwrap_err()
+            };
+            let expected_outcome = if fault == Fault::NonemptyDirectory {
+                MutationOutcome::NotCommitted
+            } else {
+                MutationOutcome::NotDispatched
+            };
+            assert!(
+                matches!(
+                    error,
+                    VaultError::Storage {
+                        kind: StorageErrorKind::RemoteFailure,
+                        outcome,
+                        ..
+                    } if outcome == expected_outcome
+                ),
+                "{fault:?}: {error}"
+            );
+            assert!(storage.last_failure().is_none(), "{fault:?}");
+            assert!(storage.session.lock().await.is_healthy(), "{fault:?}");
+            assert_eq!(
+                storage.read_file(Path::new("note.md")).await.unwrap(),
+                "old",
+                "{fault:?}"
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn regular_file_listing_keeps_confined_file_aliases_and_rejects_escapes() {
+        let (storage, _, server) = fake_storage(Fault::ContainedAliases).await;
+        let files = storage
+            .list_regular_files(Path::new(""), true, None)
+            .await
+            .unwrap();
+        assert_eq!(files, [PathBuf::from("alias.md"), PathBuf::from("note.md")]);
+        let entries = storage.entries(Path::new(""), true).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].relative, Path::new("note.md"));
+        server.abort();
+
+        let (storage, _, server) = fake_storage(Fault::EscapingAlias).await;
+        assert!(matches!(
+            storage.list_regular_files(Path::new(""), true, None).await,
+            Err(VaultError::OutsideVault(_))
+        ));
+        assert_eq!(
+            storage
+                .list_regular_files(Path::new(""), true, Some("note.md"))
+                .await
+                .unwrap(),
+            [PathBuf::from("note.md")]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn failed_publication_preserves_destination_and_cleanup_ownership() {
         for fault in [
             Fault::NoPosix,
@@ -2143,12 +3502,13 @@ mod tests {
             Fault::Conflict,
         ] {
             let (storage, files, task) = fake_storage(fault).await;
+            let error = storage
+                .write_file(Path::new("note.md"), "replacement")
+                .await
+                .unwrap_err();
             assert!(
-                storage
-                    .write_file(Path::new("note.md"), "replacement")
-                    .await
-                    .is_err(),
-                "{fault:?}"
+                !error.to_string().contains("temporary upload may remain"),
+                "{fault:?}: {error}"
             );
             let files = files.lock().unwrap();
             assert_eq!(files.renames, 0, "{fault:?}");
@@ -2174,6 +3534,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_failure_preserves_the_structured_publication_destination() {
+        for (fault, expected_kind) in [
+            (Fault::RenameCleanupFailure, StorageErrorKind::RemoteFailure),
+            (
+                Fault::AttrsCleanupFailure,
+                StorageErrorKind::PermissionDenied,
+            ),
+            (Fault::ConflictCleanupFailure, StorageErrorKind::Conflict),
+        ] {
+            let (storage, files, server) = fake_storage(fault).await;
+            let error = storage
+                .write_file(Path::new("note.md"), "replacement")
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, VaultError::Storage {
+                operation, path, kind, outcome: MutationOutcome::NotCommitted, ..
+            } if operation == "write" && path == "note.md" && *kind == expected_kind),
+                "{fault:?}: {error}"
+            );
+            let temporary = {
+                let files = files.lock().unwrap();
+                assert_eq!(
+                    files.target,
+                    if fault == Fault::ConflictCleanupFailure {
+                        b"external edit".as_slice()
+                    } else {
+                        b"old".as_slice()
+                    }
+                );
+                assert!(files.temporary.is_some());
+                files.temporary_path.clone().unwrap()
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains("temporary upload cleanup failed"),
+                "{fault:?}: {message}"
+            );
+            assert!(
+                message.contains("temporary upload may remain"),
+                "{fault:?}: {message}"
+            );
+            assert_eq!(
+                message.matches(&temporary).count(),
+                1,
+                "{fault:?}: {message}"
+            );
+            let data = rmcp::model::ErrorData::from(error).data.unwrap();
+            assert_eq!(data["operation"], "write");
+            assert_eq!(data["path"], "note.md");
+            assert_eq!(data["outcome"], "not_committed");
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn publication_deadlines_distinguish_upload_from_destination_dispatch() {
         for fault in [Fault::HoldOpen, Fault::HoldWrite, Fault::HoldRename] {
             let (storage, files, task) = fake_storage(fault).await;
@@ -2191,6 +3607,13 @@ mod tests {
                 "{fault:?}: {error}"
             );
             let files = files.lock().unwrap();
+            let temporary = files.temporary_path.as_ref().unwrap();
+            assert!(error.to_string().contains(temporary), "{fault:?}: {error}");
+            assert!(
+                error.to_string().contains("temporary upload may remain"),
+                "{fault:?}: {error}"
+            );
+            assert_eq!(files.temporary_mode, Some(0o600), "{fault:?}");
             assert_eq!(files.renames, usize::from(fault == Fault::HoldRename));
             assert_eq!(
                 files.target,
@@ -2202,6 +3625,44 @@ mod tests {
             );
             task.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn disconnected_upload_reports_candidate_without_reclaiming_a_replacement() {
+        let (storage, files, server) = fake_storage(Fault::DisconnectWrite).await;
+        let error = storage
+            .write_file(Path::new("note.md"), "replacement")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                VaultError::Storage {
+                    kind: StorageErrorKind::Unavailable,
+                    outcome: MutationOutcome::NotCommitted,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        {
+            let files = files.lock().unwrap();
+            let temporary = files.temporary_path.as_ref().unwrap();
+            assert!(error.to_string().contains(temporary), "{error}");
+            assert!(
+                error.to_string().contains("temporary upload may remain"),
+                "{error}"
+            );
+            assert_eq!(files.temporary_mode, Some(0o600));
+            assert_eq!(
+                files.temporary.as_deref(),
+                Some(b"unowned replacement".as_slice())
+            );
+            assert_eq!(files.removed, 0);
+            assert_eq!(files.renames, 0);
+            assert_eq!(files.target, b"old");
+        }
+        server.await.unwrap();
     }
 
     #[tokio::test]

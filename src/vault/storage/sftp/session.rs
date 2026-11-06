@@ -1,6 +1,7 @@
 //! Binary-safe SFTP requests over a retained, bounded SSH subsystem connection.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::num::NonZeroUsize;
@@ -29,15 +30,56 @@ const STDERR_LIMIT: usize = 16 * 1024;
 
 type Id = wire::Id<Vec<u8>>;
 type Writer = wire::WriteEnd<Vec<u8>, PacketQueue>;
+type SharedResponse = Arc<Mutex<ResponseMetadata>>;
+
+#[derive(Default)]
+struct ResponseMetadata {
+    directory: bool,
+    status: Option<u32>,
+    skipped_count: usize,
+    skipped_bytes: usize,
+}
+
+#[derive(Default)]
+struct Requests {
+    building: Option<SharedResponse>,
+    pending: HashMap<u32, SharedResponse>,
+}
+
+pub(super) struct DirectoryPage {
+    pub entries: Box<[NameEntry]>,
+    pub skipped_count: usize,
+    pub skipped_bytes: usize,
+}
 
 /// Admission limits the number and size of packets before this infallible
 /// protocol queue is reached. All file writes use bounded buffered chunks.
-#[derive(Clone, Debug)]
-struct PacketQueue(mpsc::UnboundedSender<Bytes>);
+#[derive(Clone)]
+struct PacketQueue {
+    sender: mpsc::UnboundedSender<Bytes>,
+    state: Arc<State>,
+}
+
+impl std::fmt::Debug for PacketQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PacketQueue").finish_non_exhaustive()
+    }
+}
 
 impl wire::Queue for PacketQueue {
     fn push(&self, bytes: Bytes) {
-        let _ = self.0.send(bytes);
+        if bytes.len() >= 9 && bytes[4] != 1 {
+            let id = u32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]);
+            let mut requests = self
+                .state
+                .requests
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(response) = requests.building.clone() {
+                requests.pending.insert(id, response);
+            }
+        }
+        let _ = self.sender.send(bytes);
     }
 
     fn extend(&self, header: Bytes, body: &[&[Bytes]]) {
@@ -52,7 +94,7 @@ impl wire::Queue for PacketQueue {
         for part in body.iter().flat_map(|parts| parts.iter()) {
             packet.extend_from_slice(part);
         }
-        let _ = self.0.send(packet.into());
+        self.push(packet.into());
     }
 }
 
@@ -60,6 +102,7 @@ struct State {
     failure: watch::Sender<Option<(StorageErrorKind, String)>>,
     stderr: Mutex<Vec<u8>>,
     pumps: Mutex<Vec<tokio::task::AbortHandle>>,
+    requests: Mutex<Requests>,
 }
 
 impl State {
@@ -78,6 +121,13 @@ impl State {
             }
         });
         if changed {
+            let mut requests = self
+                .requests
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            requests.building = None;
+            requests.pending.clear();
+            drop(requests);
             for pump in self
                 .pumps
                 .lock()
@@ -186,14 +236,51 @@ impl std::fmt::Debug for Session {
     }
 }
 
+/// Retire the connection if an acknowledged remote handle is abandoned.
+pub(super) struct HandleLifetime<'a> {
+    session: &'a Session,
+    handle: HandleOwned,
+    closed: bool,
+}
+
+impl HandleLifetime<'_> {
+    pub(super) fn handle(&self) -> &HandleOwned {
+        &self.handle
+    }
+
+    pub(super) async fn close(mut self) -> VaultResult<()> {
+        self.session.close(&self.handle).await?;
+        self.closed = true;
+        Ok(())
+    }
+}
+
+impl Drop for HandleLifetime<'_> {
+    fn drop(&mut self) {
+        if !self.closed {
+            self.session
+                .0
+                .state
+                .fail("SFTP handle was abandoned before confirmed close");
+        }
+    }
+}
+
 /// A dropped caller must not leave a request ID or partial frame reusable.
 struct RequestGuard<'a> {
     state: &'a State,
+    response: SharedResponse,
     completed: bool,
 }
 
 impl Drop for RequestGuard<'_> {
     fn drop(&mut self) {
+        self.state
+            .requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pending
+            .retain(|_, response| !Arc::ptr_eq(response, &self.response));
         if !self.completed {
             self.state
                 .fail("SFTP request was cancelled or exceeded its deadline");
@@ -262,10 +349,17 @@ impl Session {
             failure,
             stderr: Mutex::new(Vec::new()),
             pumps: Mutex::new(Vec::new()),
+            requests: Mutex::new(Requests::default()),
         });
         let (sender, mut receiver) = mpsc::unbounded_channel::<Bytes>();
-        let writer: Writer = wire::connect(PacketQueue(sender), ())
-            .map_err(|error| map_error("initialize", "", error, false))?;
+        let writer: Writer = wire::connect(
+            PacketQueue {
+                sender,
+                state: state.clone(),
+            },
+            (),
+        )
+        .map_err(|error| map_error("initialize", "", error, false))?;
         let mut tasks = Tasks::default();
         let task_state = state.clone();
         tasks.push_pump(
@@ -303,7 +397,8 @@ impl Session {
                     let packet = tokio::select! {
                         _ = failed.changed() => break,
                         packet = read_frame(&mut reader) => packet,
-                    };
+                    }
+                    .and_then(|packet| admit_response(packet, &task_state));
                     match packet {
                         Ok(packet) => {
                             if let Err(error) = admitted.write_all(&packet).await {
@@ -451,6 +546,25 @@ impl Session {
     pub(super) fn is_healthy(&self) -> bool {
         self.0.state.failure.borrow().is_none()
     }
+
+    pub(super) fn failure_snapshot(&self) -> Option<(StorageErrorKind, String)> {
+        let kind = self
+            .0
+            .state
+            .failure
+            .borrow()
+            .as_ref()
+            .map(|(kind, _)| *kind)?;
+        let message = self
+            .0
+            .state
+            .message()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(1024)
+            .collect();
+        Some((kind, message))
+    }
     pub(super) fn has_posix_rename(&self) -> bool {
         self.0.extensions.contains(wire::Extensions::POSIX_RENAME)
     }
@@ -465,6 +579,22 @@ impl Session {
         mutating: bool,
         build: F,
     ) -> VaultResult<T>
+    where
+        F: FnOnce(&mut Writer, Id) -> Result<Fut, wire::Error>,
+        Fut: Future<Output = Result<(Id, T), wire::Error>> + Send,
+    {
+        self.request_with_metadata(operation, path, mutating, build)
+            .await
+            .map(|(value, _)| value)
+    }
+
+    async fn request_with_metadata<T, F, Fut>(
+        &self,
+        operation: &str,
+        path: &str,
+        mutating: bool,
+        build: F,
+    ) -> VaultResult<(T, ResponseMetadata)>
     where
         F: FnOnce(&mut Writer, Id) -> Result<Fut, wire::Error>,
         Fut: Future<Output = Result<(Id, T), wire::Error>> + Send,
@@ -488,25 +618,65 @@ impl Session {
                 _ = failed.changed() => return Err(self.unavailable(operation, path, false)),
                 permit = self.0.admission.acquire() => permit.map_err(|_| self.unavailable(operation, path, false))?,
             };
+            let response = Arc::new(Mutex::new(ResponseMetadata {
+                directory: operation == "readdir",
+                ..ResponseMetadata::default()
+            }));
+            let mut guard = RequestGuard {
+                state: &self.0.state,
+                response: response.clone(),
+                completed: true,
+            };
             let future = {
                 let mut writer = self.0.writer.lock().await;
                 if !self.is_healthy() {
                     return Err(self.unavailable(operation, path, false));
                 }
+                self.0
+                    .state
+                    .requests
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .building = Some(response.clone());
                 let id = writer.create_response_id();
-                build(&mut writer, id).map_err(|error| map_error(operation, path, error, false))?
+                let result = build(&mut writer, id);
+                self.0
+                    .state
+                    .requests
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .building = None;
+                result.map_err(|error| map_error(operation, path, error, false))?
             };
             dispatched.store(true, Ordering::Release);
-            let mut guard = RequestGuard {
-                state: &self.0.state,
-                completed: false,
-            };
+            guard.completed = false;
+            let mut lost_connection = false;
             let result = tokio::select! {
                 biased;
-                result = future => result.map(|(_id, value)| value).map_err(|error| map_error(operation, path, error, mutating)),
+                result = future => {
+                    let mut metadata = response.lock().unwrap_or_else(|error| error.into_inner());
+                    let metadata = std::mem::take(&mut *metadata);
+                    let status = metadata.status;
+                    lost_connection = matches!(status, Some(6 | 7));
+                    match result {
+                        Ok((_id, value)) => Ok((value, metadata)),
+                        Err(error) => {
+                            let confirmed_status = matches!(&error, wire::Error::SftpError(_, _))
+                                || (status == Some(1) && matches!(&error, wire::Error::InvalidResponse(_)));
+                            if !confirmed_status && !self.is_healthy() {
+                                Err(self.unavailable(operation, path, mutating))
+                            } else {
+                                Err(map_response_error(operation, path, error, mutating, status))
+                            }
+                        }
+                    }
+                },
                 _ = failed.changed() => Err(self.unavailable(operation, path, mutating)),
             };
             guard.completed = true;
+            if lost_connection {
+                self.0.state.fail("SFTP server reported a lost connection");
+            }
             result
         };
         match timeout_at(deadline, work).await {
@@ -548,6 +718,14 @@ impl Session {
         } else {
             MutationOutcome::NotDispatched
         })
+    }
+
+    pub(super) fn track_handle(&self, handle: HandleOwned) -> HandleLifetime<'_> {
+        HandleLifetime {
+            session: self,
+            handle,
+            closed: false,
+        }
     }
 
     pub(super) async fn open_read(&self, path: &str) -> VaultResult<HandleOwned> {
@@ -733,13 +911,19 @@ impl Session {
         })
         .await
     }
-    pub(super) async fn readdir(&self, handle: &HandleOwned) -> VaultResult<Box<[NameEntry]>> {
-        self.request("readdir", "", false, |writer, id| {
-            writer
-                .send_readdir_request(id, Cow::Borrowed(handle))
-                .map(|request| request.wait())
+    pub(super) async fn readdir(&self, handle: &HandleOwned) -> VaultResult<DirectoryPage> {
+        let (entries, metadata) = self
+            .request_with_metadata("readdir", "", false, |writer, id| {
+                writer
+                    .send_readdir_request(id, Cow::Borrowed(handle))
+                    .map(|request| request.wait())
+            })
+            .await?;
+        Ok(DirectoryPage {
+            entries,
+            skipped_count: metadata.skipped_count,
+            skipped_bytes: metadata.skipped_bytes,
         })
-        .await
     }
     pub(super) async fn mkdir(&self, path: &str) -> VaultResult<()> {
         self.request("mkdir", path, true, |writer, id| {
@@ -833,7 +1017,7 @@ fn map_error(operation: &str, path: &str, error: wire::Error, mutating: bool) ->
         wire::Error::SftpError(SftpErrorKind::OpUnsupported, _)
         | wire::Error::UnsupportedSftpProtocol { .. }
         | wire::Error::UnsupportedExtension(_) => (StorageErrorKind::Unsupported, true),
-        wire::Error::SftpError(_, _) => (StorageErrorKind::Protocol, true),
+        wire::Error::SftpError(_, _) => (StorageErrorKind::RemoteFailure, true),
         wire::Error::IOError(_) | wire::Error::AwaitableError(_) => {
             (StorageErrorKind::Unavailable, false)
         }
@@ -848,6 +1032,35 @@ fn map_error(operation: &str, path: &str, error: wire::Error, mutating: bool) ->
     VaultError::storage(operation, path, kind, message).with_mutation_outcome(if !mutating {
         MutationOutcome::NotDispatched
     } else if confirmed {
+        MutationOutcome::NotCommitted
+    } else {
+        MutationOutcome::Unknown
+    })
+}
+
+fn map_response_error(
+    operation: &str,
+    path: &str,
+    error: wire::Error,
+    mutating: bool,
+    status: Option<u32>,
+) -> VaultError {
+    let Some(status @ (1 | 6 | 7)) = status else {
+        return map_error(operation, path, error, mutating);
+    };
+    let kind = if status == 1 {
+        StorageErrorKind::RemoteFailure
+    } else {
+        StorageErrorKind::Unavailable
+    };
+    let message: String = format!("server returned SFTP status {status}: {error}")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(1024)
+        .collect();
+    VaultError::storage(operation, path, kind, message).with_mutation_outcome(if !mutating {
+        MutationOutcome::NotDispatched
+    } else if status == 1 {
         MutationOutcome::NotCommitted
     } else {
         MutationOutcome::Unknown
@@ -869,74 +1082,128 @@ async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<Vec<u8>
     Ok(packet)
 }
 
+fn admit_response(mut packet: Vec<u8>, state: &State) -> io::Result<Vec<u8>> {
+    if packet[4] == 2 {
+        return Ok(packet);
+    }
+    let id = u32::from_be_bytes([packet[5], packet[6], packet[7], packet[8]]);
+    let response = state
+        .requests
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .pending
+        .remove(&id)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unknown or duplicate SFTP response ID",
+            )
+        })?;
+    let mut metadata = response.lock().unwrap_or_else(|error| error.into_inner());
+    if packet[4] == 101 {
+        let status = u32::from_be_bytes([packet[9], packet[10], packet[11], packet[12]]);
+        metadata.status = Some(status);
+        if matches!(status, 6 | 7) {
+            // The decoder rejects these connection-status pseudo-errors. Keep
+            // their authoritative meaning beside the decoder-facing failure.
+            packet[9..13].copy_from_slice(&4_u32.to_be_bytes());
+        }
+    } else if packet[4] == 104 && metadata.directory {
+        let body = &packet[4..];
+        let mut offset = 5;
+        let count = u32_at(body, &mut offset)?;
+        let mut filtered = packet[..13].to_vec();
+        let mut accepted = 0_u32;
+        for _ in 0..count {
+            let start = offset;
+            string(body, &mut offset)?;
+            let filename = &body[start + 4..offset];
+            if filename.is_empty() || filename.contains(&0) || filename.contains(&b'/') {
+                return Err(invalid());
+            }
+            string(body, &mut offset)?;
+            attrs(body, &mut offset)?;
+            if std::str::from_utf8(filename).is_ok() {
+                filtered.extend_from_slice(&body[start..offset]);
+                accepted += 1;
+            } else {
+                metadata.skipped_count += 1;
+                metadata.skipped_bytes += filename.len();
+            }
+        }
+        if metadata.skipped_count != 0 {
+            filtered[9..13].copy_from_slice(&accepted.to_be_bytes());
+            let length = filtered.len() as u32 - 4;
+            filtered[..4].copy_from_slice(&length.to_be_bytes());
+            packet = filtered;
+        }
+    }
+    Ok(packet)
+}
+
+fn invalid() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "invalid SFTP response container",
+    )
+}
+fn u32_at(bytes: &[u8], offset: &mut usize) -> io::Result<usize> {
+    let end = offset.checked_add(4).ok_or_else(invalid)?;
+    let data: [u8; 4] = bytes
+        .get(*offset..end)
+        .ok_or_else(invalid)?
+        .try_into()
+        .map_err(|_| invalid())?;
+    *offset = end;
+    Ok(u32::from_be_bytes(data) as usize)
+}
+fn string(bytes: &[u8], offset: &mut usize) -> io::Result<()> {
+    let length = u32_at(bytes, offset)?;
+    *offset = offset
+        .checked_add(length)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(invalid)?;
+    Ok(())
+}
+fn attrs(bytes: &[u8], offset: &mut usize) -> io::Result<()> {
+    let flags = u32_at(bytes, offset)?;
+    if flags & !0x8000000f != 0 {
+        return Err(invalid());
+    }
+    for (flag, size) in [(1, 8), (2, 8), (4, 4), (8, 8)] {
+        if flags & flag != 0 {
+            if flag == 4 {
+                let mut cursor = *offset;
+                let mode = u32_at(bytes, &mut cursor)? as u32 & 0o170000;
+                if !matches!(
+                    mode,
+                    0 | 0o010000 | 0o020000 | 0o040000 | 0o060000 | 0o100000 | 0o120000 | 0o140000
+                ) {
+                    return Err(invalid());
+                }
+            }
+            *offset = offset
+                .checked_add(size)
+                .filter(|end| *end <= bytes.len())
+                .ok_or_else(invalid)?;
+        }
+    }
+    if flags & 0x80000000 != 0 {
+        let count = u32_at(bytes, offset)?;
+        if count > (bytes.len() - *offset) / 8 {
+            return Err(invalid());
+        }
+        for _ in 0..count {
+            string(bytes, offset)?;
+            string(bytes, offset)?;
+        }
+    }
+    Ok(())
+}
+
 /// Validate the few variable-length response containers before Serde can use
 /// their counts as allocation hints. Encoding/decoding remains in the library.
 fn validate_packet(packet: &[u8]) -> io::Result<()> {
-    fn invalid() -> io::Error {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid SFTP response container",
-        )
-    }
-    fn u32_at(bytes: &[u8], offset: &mut usize) -> io::Result<usize> {
-        let end = offset.checked_add(4).ok_or_else(invalid)?;
-        let data: [u8; 4] = bytes
-            .get(*offset..end)
-            .ok_or_else(invalid)?
-            .try_into()
-            .map_err(|_| invalid())?;
-        *offset = end;
-        Ok(u32::from_be_bytes(data) as usize)
-    }
-    fn string(bytes: &[u8], offset: &mut usize) -> io::Result<()> {
-        let length = u32_at(bytes, offset)?;
-        *offset = offset
-            .checked_add(length)
-            .filter(|end| *end <= bytes.len())
-            .ok_or_else(invalid)?;
-        Ok(())
-    }
-    fn attrs(bytes: &[u8], offset: &mut usize) -> io::Result<()> {
-        let flags = u32_at(bytes, offset)?;
-        if flags & !0x8000000f != 0 {
-            return Err(invalid());
-        }
-        for (flag, size) in [(1, 8), (2, 8), (4, 4), (8, 8)] {
-            if flags & flag != 0 {
-                if flag == 4 {
-                    let mut cursor = *offset;
-                    let mode = u32_at(bytes, &mut cursor)? as u32 & 0o170000;
-                    if !matches!(
-                        mode,
-                        0 | 0o010000
-                            | 0o020000
-                            | 0o040000
-                            | 0o060000
-                            | 0o100000
-                            | 0o120000
-                            | 0o140000
-                    ) {
-                        return Err(invalid());
-                    }
-                }
-                *offset = offset
-                    .checked_add(size)
-                    .filter(|end| *end <= bytes.len())
-                    .ok_or_else(invalid)?;
-            }
-        }
-        if flags & 0x80000000 != 0 {
-            let count = u32_at(bytes, offset)?;
-            if count > (bytes.len() - *offset) / 8 {
-                return Err(invalid());
-            }
-            for _ in 0..count {
-                string(bytes, offset)?;
-                string(bytes, offset)?;
-            }
-        }
-        Ok(())
-    }
     let mut offset = 5;
     match packet[0] {
         2 => {
@@ -1080,6 +1347,233 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_a_confirmed_handle_close_keeps_the_session_reusable() {
+        for close_status in [Some(0), Some(4), None] {
+            let (client, mut server) = tokio::io::duplex(4096);
+            let (finish, finished) = tokio::sync::oneshot::channel();
+            let fake = tokio::spawn(async move {
+                server_hello(&mut server, false).await;
+                let request = read_frame_request(&mut server).await;
+                assert_eq!(request[0], 3);
+                let mut reply = vec![102];
+                reply.extend_from_slice(&request[1..5]);
+                reply.extend_from_slice(&[0, 0, 0, 1, 0xff]);
+                write_reply(&mut server, &reply).await;
+                if let Some(status) = close_status {
+                    let request = read_frame_request(&mut server).await;
+                    assert_eq!(request[0], 4);
+                    status_reply(&mut server, &request, status).await;
+                }
+                let _ = finished.await;
+            });
+            let (reader, writer) = tokio::io::split(client);
+            let session = Session::from_io(reader, writer, Duration::from_secs(2))
+                .await
+                .unwrap();
+            let handle = session.track_handle(session.open_read("/vault/note.md").await.unwrap());
+            assert_eq!(handle.handle().into_inner(), &[0xff]);
+            match close_status {
+                Some(0) => handle.close().await.unwrap(),
+                Some(_) => assert!(handle.close().await.is_err()),
+                None => drop(handle),
+            }
+            assert_eq!(session.is_healthy(), close_status == Some(0));
+            finish.send(()).unwrap();
+            fake.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_mutations_preserve_the_session_and_confirm_no_commit() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        let fake = tokio::spawn(async move {
+            server_hello(&mut server, false).await;
+            for code in [1, 4, 5, 9] {
+                let request = read_frame_request(&mut server).await;
+                assert_eq!(request[0], 13);
+                status_reply(&mut server, &request, code).await;
+            }
+            let request = read_frame_request(&mut server).await;
+            assert_eq!(request[0], 3);
+            let mut reply = vec![102];
+            reply.extend_from_slice(&request[1..5]);
+            reply.extend_from_slice(&[0, 0, 0, 1, 1]);
+            write_reply(&mut server, &reply).await;
+            let request = read_frame_request(&mut server).await;
+            assert_eq!(request[0], 5);
+            let mut reply = vec![103];
+            reply.extend_from_slice(&request[1..5]);
+            reply.extend_from_slice(&[0, 0, 0, 2, b'o', b'k']);
+            write_reply(&mut server, &reply).await;
+            let _ = finished.await;
+        });
+        let (reader, writer) = tokio::io::split(client);
+        let session = Session::from_io(reader, writer, Duration::from_secs(2))
+            .await
+            .unwrap();
+        for _ in [1, 4, 5, 9] {
+            assert!(matches!(
+                session.remove("/vault/note.md").await,
+                Err(VaultError::Storage {
+                    kind: StorageErrorKind::RemoteFailure,
+                    outcome: MutationOutcome::NotCommitted,
+                    ..
+                })
+            ));
+            assert!(session.is_healthy());
+        }
+        let handle = session.open_read("/vault/note.md").await.unwrap();
+        assert_eq!(session.read(&handle, 0, 10).await.unwrap().unwrap(), b"ok");
+        assert!(session.is_healthy());
+        assert!(session.0.state.requests.lock().unwrap().pending.is_empty());
+        finish.send(()).unwrap();
+        fake.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connection_loss_status_after_remove_has_unknown_outcome_and_retires_session() {
+        for code in [6, 7] {
+            let (client, mut server) = tokio::io::duplex(4096);
+            let (finish, finished) = tokio::sync::oneshot::channel();
+            let source_exists = Arc::new(AtomicBool::new(true));
+            let remote_exists = source_exists.clone();
+            let fake = tokio::spawn(async move {
+                server_hello(&mut server, false).await;
+                let request = read_frame_request(&mut server).await;
+                assert_eq!(request[0], 13);
+                assert_eq!(&request[9..], b"/vault/note.md");
+                remote_exists.store(false, Ordering::Release);
+                status_reply(&mut server, &request, code).await;
+                let _ = finished.await;
+            });
+            let (reader, writer) = tokio::io::split(client);
+            let session = Session::from_io(reader, writer, Duration::from_secs(2))
+                .await
+                .unwrap();
+            assert!(matches!(
+                session.remove("/vault/note.md").await,
+                Err(VaultError::Storage {
+                    kind: StorageErrorKind::Unavailable,
+                    outcome: MutationOutcome::Unknown,
+                    ..
+                })
+            ));
+            assert!(!source_exists.load(Ordering::Acquire));
+            assert!(!session.is_healthy());
+            assert!(session.0.state.requests.lock().unwrap().pending.is_empty());
+            finish.send(()).unwrap();
+            fake.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_response_id_retires_the_session_with_uncertain_mutation() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        let fake = tokio::spawn(async move {
+            server_hello(&mut server, false).await;
+            let mut request = read_frame_request(&mut server).await;
+            request[4] ^= 1;
+            status_ok(&mut server, &request).await;
+            let _ = finished.await;
+        });
+        let (reader, writer) = tokio::io::split(client);
+        let session = Session::from_io(reader, writer, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(matches!(
+            session.remove("/vault/note.md").await,
+            Err(VaultError::Storage {
+                kind: StorageErrorKind::Protocol,
+                outcome: MutationOutcome::Unknown,
+                ..
+            })
+        ));
+        assert!(!session.is_healthy());
+        finish.send(()).unwrap();
+        fake.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_response_id_retires_the_session() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let (duplicate, duplicate_now) = tokio::sync::oneshot::channel();
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        let fake = tokio::spawn(async move {
+            server_hello(&mut server, false).await;
+            let request = read_frame_request(&mut server).await;
+            status_ok(&mut server, &request).await;
+            duplicate_now.await.unwrap();
+            status_ok(&mut server, &request).await;
+            let _ = finished.await;
+        });
+        let (reader, writer) = tokio::io::split(client);
+        let session = Session::from_io(reader, writer, Duration::from_secs(2))
+            .await
+            .unwrap();
+        session.remove("/vault/note.md").await.unwrap();
+        let mut failed = session.0.state.failure.subscribe();
+        duplicate.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), failed.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            session.stat("/vault/note.md").await,
+            Err(VaultError::Storage {
+                kind: StorageErrorKind::Protocol,
+                outcome: MutationOutcome::NotDispatched,
+                ..
+            })
+        ));
+        assert!(!session.is_healthy());
+        finish.send(()).unwrap();
+        fake.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_utf8_resolved_paths_remain_protocol_failures() {
+        for readlink in [false, true] {
+            let (client, mut server) = tokio::io::duplex(4096);
+            let (finish, finished) = tokio::sync::oneshot::channel();
+            let fake = tokio::spawn(async move {
+                server_hello(&mut server, false).await;
+                let request = read_frame_request(&mut server).await;
+                assert_eq!(request[0], if readlink { 19 } else { 16 });
+                let mut reply = vec![104];
+                reply.extend_from_slice(&request[1..5]);
+                reply.extend_from_slice(&1_u32.to_be_bytes());
+                reply.extend_from_slice(&[0, 0, 0, 1, 0xff]);
+                reply.extend_from_slice(&[0; 8]);
+                write_reply(&mut server, &reply).await;
+                let _ = finished.await;
+            });
+            let (reader, writer) = tokio::io::split(client);
+            let session = Session::from_io(reader, writer, Duration::from_secs(2))
+                .await
+                .unwrap();
+            let result = if readlink {
+                session.readlink("/vault/link").await
+            } else {
+                session.realpath("/vault").await
+            };
+            assert!(matches!(
+                result,
+                Err(VaultError::Storage {
+                    kind: StorageErrorKind::Protocol,
+                    outcome: MutationOutcome::NotDispatched,
+                    ..
+                })
+            ));
+            assert!(!session.is_healthy());
+            assert!(session.0.state.requests.lock().unwrap().pending.is_empty());
+            finish.send(()).unwrap();
+            fake.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn replacement_without_extension_is_rejected_before_dispatch() {
         let (client, mut server) = tokio::io::duplex(4096);
         let fake = tokio::spawn(async move {
@@ -1159,6 +1653,7 @@ mod tests {
         request.abort();
         assert!(request.await.unwrap_err().is_cancelled());
         assert!(!session.is_healthy());
+        assert!(session.0.state.requests.lock().unwrap().pending.is_empty());
         finish.send(()).unwrap();
         fake.await.unwrap();
     }
@@ -1258,9 +1753,14 @@ mod tests {
     }
 
     async fn status_ok(server: &mut (impl AsyncWrite + Unpin), request: &[u8]) {
+        status_reply(server, request, 0).await;
+    }
+
+    async fn status_reply(server: &mut (impl AsyncWrite + Unpin), request: &[u8], code: u32) {
         let mut reply = vec![101];
         reply.extend_from_slice(&request[1..5]);
-        reply.extend_from_slice(&[0; 12]);
+        reply.extend_from_slice(&code.to_be_bytes());
+        reply.extend_from_slice(&[0; 8]);
         write_reply(server, &reply).await;
     }
 

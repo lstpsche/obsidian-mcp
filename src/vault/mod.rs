@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use storage::{SourceStatus, Storage};
 
 use chrono::{Local, NaiveDate};
-use futures_util::{StreamExt, stream};
+use futures_util::{FutureExt, StreamExt, stream};
 use notify_debouncer_mini::Debouncer;
 
 use crate::config::Config;
@@ -72,6 +72,98 @@ async fn source_work<T: Send + 'static>(
         .map_err(|error| VaultError::Other(format!("source processing task failed: {error}")))?
 }
 
+async fn read_search_matches(
+    batch: &storage::ObservedBatch<'_>,
+    path: &Path,
+    max_bytes: Option<usize>,
+    regex: regex::Regex,
+    context_len: usize,
+    reservation: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> VaultResult<Vec<SearchMatch>> {
+    let read = match max_bytes {
+        Some(max_bytes) => batch.read_exact_bounded(path, max_bytes).await,
+        None => batch.read_observed(path).await,
+    };
+    let content = match read {
+        Ok(content) => content,
+        Err(error) if error.is_not_found() || matches!(batch, storage::ObservedBatch::Local(_)) => {
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(error),
+    };
+    source_work(move || {
+        let _reservation = reservation;
+        Ok(regex
+            .find_iter(&content)
+            .map(|matched| {
+                let (context, match_start, match_end, line) = index::extract_match_context(
+                    &content,
+                    matched.start(),
+                    matched.end(),
+                    context_len,
+                );
+                SearchMatch {
+                    line,
+                    context,
+                    match_start,
+                    match_end,
+                }
+            })
+            .collect())
+    })
+    .await
+}
+
+fn listing_bound_exceeded<T>(read: &VaultResult<T>) -> bool {
+    matches!(
+        read,
+        Err(VaultError::SemanticResourceLimit { limit, .. })
+            if *limit < storage::sftp::MAX_READ_BYTES
+    )
+}
+
+fn invalid_catalog_document(error: &VaultError) -> bool {
+    match error {
+        VaultError::Storage {
+            kind: crate::error::StorageErrorKind::InvalidSource,
+            ..
+        }
+        | VaultError::SemanticResourceLimit { .. } => true,
+        VaultError::Storage {
+            kind: crate::error::StorageErrorKind::PermissionDenied,
+            operation,
+            ..
+        } => matches!(
+            operation.as_str(),
+            "open" | "read" | "stat" | "lstat" | "fstat"
+        ),
+        _ => false,
+    }
+}
+
+fn terminal_source_error(error: &VaultError, attached: bool) -> bool {
+    use crate::error::StorageErrorKind;
+    if matches!(
+        error,
+        VaultError::Storage {
+            kind: StorageErrorKind::IdentityChanged,
+            ..
+        }
+    ) {
+        return true;
+    }
+    !attached
+        && !matches!(
+            error,
+            VaultError::Storage {
+                kind: StorageErrorKind::Unavailable
+                    | StorageErrorKind::RemoteFailure
+                    | StorageErrorKind::ResourceLimit,
+                ..
+            }
+        )
+}
+
 async fn validate_source(content: String) -> VaultResult<String> {
     source_work(move || {
         frontmatter::parse_frontmatter(&content)?;
@@ -88,11 +180,14 @@ struct VaultInner {
     reported_root: PathBuf,
     remote_status: RwLock<Option<SourceStatus>>,
     source_ready: tokio::sync::Notify,
+    source_terminal: AtomicBool,
     reconcile_needed: Arc<AtomicBool>,
     reconcile_wakeup: Arc<tokio::sync::Notify>,
     catalog_ready: AtomicBool,
     generation: AtomicU64,
+    scan_active: AtomicBool,
     changed: Mutex<HashMap<OsString, u64>>,
+    source_buffers: Arc<tokio::sync::Semaphore>,
     invalid_sources: Mutex<HashMap<OsString, String>>,
     watch_enabled: bool,
     mcp_home: PathBuf,
@@ -128,6 +223,80 @@ struct Background {
     mutations: Mutex<Vec<tokio::task::AbortHandle>>,
     admission: Arc<tokio::sync::Semaphore>,
     owner: Mutex<std::sync::Weak<VaultInner>>,
+}
+
+enum CatalogOutcome {
+    Retry(PathBuf),
+    Observed {
+        path: PathBuf,
+        stat: Option<FileStat>,
+        missing: bool,
+        changed: bool,
+    },
+}
+
+struct CatalogTurn {
+    previous: Option<tokio::sync::oneshot::Receiver<()>>,
+    release: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl CatalogTurn {
+    fn next(previous: &mut Option<tokio::sync::oneshot::Receiver<()>>) -> Self {
+        let (release, next) = tokio::sync::oneshot::channel();
+        Self {
+            previous: previous.replace(next),
+            release: Some(release),
+        }
+    }
+
+    async fn wait(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            let _ = previous.await;
+        }
+    }
+
+    fn release(&mut self) {
+        self.release.take();
+    }
+}
+
+impl CatalogOutcome {
+    fn record(
+        self,
+        present: &mut HashSet<OsString>,
+        next: &mut HashMap<OsString, FileStat>,
+    ) -> (bool, Option<PathBuf>) {
+        match self {
+            Self::Retry(path) => (false, Some(path)),
+            Self::Observed {
+                path,
+                stat,
+                missing,
+                changed,
+            } => {
+                if missing {
+                    present.remove(path.as_os_str());
+                    next.remove(path.as_os_str());
+                } else if let Some(stat) = stat {
+                    next.insert(path.into_os_string(), stat);
+                }
+                (changed, None)
+            }
+        }
+    }
+}
+
+struct SourceScan {
+    inner: Arc<VaultInner>,
+    start: u64,
+}
+
+impl Drop for SourceScan {
+    fn drop(&mut self) {
+        let mut changed = self.inner.changed.lock().unwrap_or_else(|e| e.into_inner());
+        self.inner.scan_active.store(false, Ordering::Release);
+        changed.clear();
+    }
 }
 impl Default for Background {
     fn default() -> Self {
@@ -292,11 +461,14 @@ impl Vault {
                 remote: None,
                 remote_status: RwLock::new(None),
                 source_ready: tokio::sync::Notify::new(),
+                source_terminal: AtomicBool::new(false),
                 reconcile_needed: Arc::new(AtomicBool::new(false)),
                 reconcile_wakeup: Arc::new(tokio::sync::Notify::new()),
                 catalog_ready: AtomicBool::new(true),
                 generation: AtomicU64::new(0),
+                scan_active: AtomicBool::new(false),
                 changed: Mutex::new(HashMap::new()),
+                source_buffers: Arc::new(tokio::sync::Semaphore::new(64 * 1024)),
                 invalid_sources: Mutex::new(HashMap::new()),
                 watch_enabled: config.watch,
                 mcp_home,
@@ -398,10 +570,22 @@ impl Vault {
         if !self.is_remote() {
             return error;
         }
+        let kind = match &error {
+            VaultError::Storage { kind, .. } => *kind,
+            VaultError::FrontmatterParse { .. }
+            | VaultError::InvalidFrontmatter { .. }
+            | VaultError::SemanticResourceLimit { .. } => {
+                crate::error::StorageErrorKind::InvalidSource
+            }
+            VaultError::Io(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                crate::error::StorageErrorKind::InvalidSource
+            }
+            _ => crate::error::StorageErrorKind::ProjectionFailure,
+        };
         VaultError::Storage {
             operation: "index publication".into(),
             path: path.display().to_string(),
-            kind: crate::error::StorageErrorKind::Protocol,
+            kind,
             message: error.to_string(),
             outcome: crate::error::MutationOutcome::Committed,
         }
@@ -484,6 +668,12 @@ impl Vault {
         self.inner.mcp_data.get().map(PathBuf::as_path)
     }
     pub async fn storage(&self) -> VaultResult<Storage> {
+        if let Some(source) = self.inner.source.get() {
+            return Ok(source.clone());
+        }
+        let deadline =
+            storage::source_deadline(crate::config::source::SftpSettings::from_env()?.timeout);
+        let mut wake_requested = false;
         loop {
             let notified = self.inner.source_ready.notified();
             if let Some(source) = self.inner.source.get() {
@@ -492,20 +682,27 @@ impl Vault {
             if let Some(status) = self.source_status()
                 && status.availability == "unavailable"
             {
-                return Err(self.source_error(
-                    crate::error::StorageErrorKind::Unavailable,
-                    status
-                        .error
-                        .unwrap_or_else(|| "remote source unavailable".into()),
-                ));
+                if self.inner.source_terminal.load(Ordering::Acquire) {
+                    return Err(self.source_error(
+                        crate::error::StorageErrorKind::Unavailable,
+                        status
+                            .error
+                            .unwrap_or_else(|| "remote source unavailable".into()),
+                    ));
+                }
+                if !wake_requested {
+                    self.inner.reconcile_wakeup.notify_one();
+                    wake_requested = true;
+                }
             }
-            let timeout = crate::config::source::SftpSettings::from_env()?.timeout;
-            tokio::time::timeout_at(storage::source_deadline(timeout), notified)
+            tokio::time::timeout_at(deadline, notified)
                 .await
                 .map_err(|_| {
                     self.source_error(
                         crate::error::StorageErrorKind::Unavailable,
-                        "remote source initialization timed out",
+                        self.source_status()
+                            .and_then(|status| status.error)
+                            .unwrap_or_else(|| "remote source initialization timed out".into()),
                     )
                 })?;
         }
@@ -536,7 +733,7 @@ impl Vault {
     }
 
     #[cfg(has_embeddings)]
-    fn require_semantic_catalog(&self) -> VaultResult<()> {
+    pub(crate) fn require_semantic_catalog(&self) -> VaultResult<()> {
         // A completed catalog can rank retained evidence during a connection
         // outage; context reads still report their own source errors. An uncertain
         // mutation withdraws catalog readiness until a complete repair scan.
@@ -574,6 +771,26 @@ impl Vault {
         }
         self.inner.source_ready.notify_waiters();
     }
+
+    fn begin_reconciliation(&self, notified: bool) -> bool {
+        let mut uncertain = false;
+        self.update_source_status(|status| {
+            uncertain = self.inner.reconcile_needed.swap(false, Ordering::AcqRel);
+            if uncertain {
+                self.inner.catalog_ready.store(false, Ordering::Release);
+                status.availability = "unavailable".into();
+                status.catalog_phase = "degraded".into();
+                status
+                    .error
+                    .get_or_insert_with(|| "source catalog requires reconciliation".into());
+            } else if notified && self.catalog_ready() {
+                status.availability = "available".into();
+                status.catalog_phase = "reconciling".into();
+                status.error = None;
+            }
+        });
+        uncertain
+    }
     async fn open_remote(
         config: &Config,
         location: crate::config::source::SftpLocation,
@@ -595,11 +812,14 @@ impl Vault {
                 })),
                 remote: Some(location),
                 source_ready: tokio::sync::Notify::new(),
+                source_terminal: AtomicBool::new(false),
                 reconcile_needed: Arc::new(AtomicBool::new(false)),
                 reconcile_wakeup: Arc::new(tokio::sync::Notify::new()),
                 catalog_ready: AtomicBool::new(false),
                 generation: AtomicU64::new(0),
+                scan_active: AtomicBool::new(false),
                 changed: Mutex::new(HashMap::new()),
+                source_buffers: Arc::new(tokio::sync::Semaphore::new(64 * 1024)),
                 invalid_sources: Mutex::new(HashMap::new()),
                 watch_enabled: config.watch,
                 mcp_home: PathBuf::new(),
@@ -633,6 +853,7 @@ impl Vault {
         let worker = tokio::spawn(async move {
             let mut initialized = false;
             let mut recovering = false;
+            let mut notified = false;
             let mut verified = std::time::Instant::now();
             let mut observations = HashMap::new();
             loop {
@@ -641,17 +862,10 @@ impl Vault {
                     inner,
                     background: Arc::new(Background::default()),
                 };
-                if service.inner.reconcile_needed.load(Ordering::Acquire) {
-                    service.update_source_status(|status| {
-                        recovering |= service.inner.reconcile_needed.swap(false, Ordering::AcqRel);
-                        service.inner.catalog_ready.store(false, Ordering::Release);
-                        status.availability = "unavailable".into();
-                        status.catalog_phase = "degraded".into();
-                        status
-                            .error
-                            .get_or_insert_with(|| "source catalog requires reconciliation".into());
-                    });
+                if notified || service.inner.reconcile_needed.load(Ordering::Acquire) {
+                    recovering |= service.begin_reconciliation(notified);
                 }
+                recovering |= notified;
                 let full =
                     !initialized || recovering || verified.elapsed() >= settings.verify_interval;
                 let result = if !initialized {
@@ -663,6 +877,7 @@ impl Vault {
                     Ok(()) => service.reconcile_remote(full, &mut observations).await,
                     Err(e) => Err(e),
                 };
+                let mut failed_cycle = false;
                 match result {
                     Ok(()) => {
                         initialized = true;
@@ -704,51 +919,56 @@ impl Vault {
                         }
                     }
                     Err(error) => {
+                        failed_cycle = true;
                         let message = error.to_string();
                         if service.source_status().and_then(|s| s.error).as_deref()
                             != Some(message.as_str())
                         {
                             tracing::warn!(error=%message,"remote source reconciliation failed");
                         }
+                        let terminal =
+                            terminal_source_error(&error, service.inner.source.get().is_some());
+                        service
+                            .inner
+                            .source_terminal
+                            .store(terminal, Ordering::Release);
                         service.update_source_status(|s| {
                             s.availability = "unavailable".into();
                             s.catalog_phase = "degraded".into();
                             s.error = Some(message)
                         });
-                        let transient = matches!(
-                            error,
-                            VaultError::Storage {
-                                kind: crate::error::StorageErrorKind::Unavailable,
-                                ..
-                            }
-                        );
-                        let terminal = matches!(
-                            error,
-                            VaultError::Storage {
-                                kind: crate::error::StorageErrorKind::IdentityChanged
-                                    | crate::error::StorageErrorKind::Protocol
-                                    | crate::error::StorageErrorKind::Unsupported,
-                                ..
-                            }
-                        );
-                        if terminal || (!transient && service.inner.source.get().is_none()) {
+                        if terminal {
                             #[cfg(has_embeddings)]
                             if let Some(runtime) = service.inner.embedding_runtime.get() {
                                 runtime.retire();
                             }
                             break;
                         }
+                        recovering = true;
                     }
+                }
+                if failed_cycle && service.inner.source.get().is_some() {
+                    // This failed scan has settled its source jobs. Its own
+                    // reconnect notice must not bypass the recovery cadence.
+                    let _ = wakeup.notified().now_or_never();
                 }
                 drop(service);
-                if !config.watch && initialized && !recovering {
+                notified = if !config.watch && initialized && !recovering {
                     wakeup.notified().await;
+                    true
                 } else {
+                    let retry_interval = if !initialized || recovering {
+                        settings
+                            .poll_interval
+                            .min(std::time::Duration::from_secs(5))
+                    } else {
+                        settings.poll_interval
+                    };
                     tokio::select! {
-                        _ = tokio::time::sleep(settings.poll_interval) => {},
-                        _ = wakeup.notified() => {},
+                        _ = tokio::time::sleep(retry_interval) => false,
+                        _ = wakeup.notified() => true,
                     }
-                }
+                };
             }
         });
         *source
@@ -778,10 +998,7 @@ impl Vault {
             Err(e) => return Err(e),
         };
         remote.pin_policy_revision(portable.as_ref().map(|raw| source::source_revision(raw)));
-        remote.set_reconciliation_owner(
-            Arc::clone(&self.inner.reconcile_needed),
-            Arc::clone(&self.inner.reconcile_wakeup),
-        )?;
+        remote.set_reconciliation_owner(Arc::clone(&self.inner.reconcile_wakeup))?;
         let base = config
             .mcp_data_dir
             .clone()
@@ -849,6 +1066,17 @@ impl Vault {
         Ok(())
     }
 
+    async fn begin_source_scan(&self) -> SourceScan {
+        let _mutation = self.inner.mutations.lock().await;
+        let mut changed = self.inner.changed.lock().unwrap_or_else(|e| e.into_inner());
+        changed.clear();
+        self.inner.scan_active.store(true, Ordering::Release);
+        SourceScan {
+            inner: Arc::clone(&self.inner),
+            start: self.inner.generation.load(Ordering::Acquire),
+        }
+    }
+
     async fn reconcile_remote(
         &self,
         full: bool,
@@ -858,7 +1086,8 @@ impl Vault {
         let Storage::Sftp(remote) = &source else {
             return Ok(());
         };
-        let start = self.inner.generation.load(Ordering::Acquire);
+        let scan = self.begin_source_scan().await;
+        let start = scan.start;
         let entries = remote.entries(Path::new(""), true).await?;
         let mut present = HashSet::new();
         let mut next = HashMap::new();
@@ -892,112 +1121,126 @@ impl Vault {
             })
             .map(|(path, _)| path.clone())
             .collect::<Vec<_>>();
-        let batch = remote.observe_batch(&note_paths).await?;
+        let batch = source.observe_batch(&note_paths).await?;
         let mut changed_any = false;
-        let read_budget = Arc::new(tokio::sync::Semaphore::new(64 * 1024));
-        let reads = stream::iter(changed.into_iter().map(|(path, stat)| {
-            let batch = &batch;
-            let read_budget = Arc::clone(&read_budget);
-            async move {
-                let note = path::logical_extension(&path)
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-                    && !self.exclude().is_excluded(&path);
-                // Hold this reservation through projection. A file that grows beyond
-                // its listing observation is retried on a later scan with a new bound.
-                let max_bytes = stat.size.min(64 * 1024 * 1024) as usize;
-                let reservation = if note {
-                    Some(
-                        read_budget
-                            .acquire_many_owned(max_bytes.max(1).div_ceil(1024) as u32)
+        let read_budget = Arc::clone(&self.inner.source_buffers);
+        for chunk in changed.chunks(16) {
+            let failed = Arc::new(AtomicBool::new(false));
+            let mut admission_order = None;
+            let mut projection_order = None;
+            let reads = stream::iter(chunk.iter().cloned().map(|(path, stat)| {
+                let batch = &batch;
+                let read_budget = Arc::clone(&read_budget);
+                let failed = Arc::clone(&failed);
+                let mut admission_turn = CatalogTurn::next(&mut admission_order);
+                let mut projection_turn = CatalogTurn::next(&mut projection_order);
+                async move {
+                    let outcome = async {
+                        admission_turn.wait().await;
+                        if failed.load(Ordering::Acquire) {
+                            return Ok(None);
+                        }
+                        let note = path::logical_extension(&path)
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+                            && !self.exclude().is_excluded(&path);
+                        let max_bytes =
+                            stat.size.min(storage::sftp::MAX_READ_BYTES as u64) as usize;
+                        let reservation = if note {
+                            Some(
+                                read_budget
+                                    .acquire_many_owned(max_bytes.max(1).div_ceil(1024) as u32)
+                                    .await
+                                    .map_err(|_| {
+                                        self.source_error(
+                                            crate::error::StorageErrorKind::Unavailable,
+                                            "catalog content admission closed",
+                                        )
+                                    })?,
+                            )
+                        } else {
+                            None
+                        };
+                        admission_turn.release();
+                        if failed.load(Ordering::Acquire) {
+                            return Ok(None);
+                        }
+                        let read = if note {
+                            batch
+                                .read_with_stat_bounded(&path, max_bytes)
+                                .await
+                                .map(|(raw, stat)| Some((Some(raw), stat)))
+                        } else {
+                            Ok(Some((None, stat)))
+                        };
+                        if matches!(&read, Err(error)
+                            if !error.is_not_found() && !invalid_catalog_document(error))
+                        {
+                            failed.store(true, Ordering::Release);
+                        }
+                        projection_turn.wait().await;
+                        if failed.load(Ordering::Acquire) && read.is_ok() {
+                            return Ok(None);
+                        }
+                        self.project_catalog_read(path, read, start, reservation)
                             .await
-                            .map_err(|_| {
-                                self.source_error(
-                                    crate::error::StorageErrorKind::Unavailable,
-                                    "catalog content admission closed",
-                                )
-                            }),
-                    )
-                } else {
-                    None
-                };
-                let read = match &reservation {
-                    Some(Err(_)) => Err(self.source_error(
-                        crate::error::StorageErrorKind::Unavailable,
-                        "catalog content admission closed",
-                    )),
-                    _ if note => batch
-                        .read(&path, max_bytes)
-                        .await
-                        .map(|(raw, stat)| Some((Some(raw), stat))),
-                    _ => Ok(Some((None, stat))),
-                };
-                (path, read, reservation)
+                    }
+                    .await;
+                    if outcome.is_err() {
+                        failed.store(true, Ordering::Release);
+                    }
+                    outcome
+                }
+            }))
+            .buffered(16);
+            // Futures retain their content reservations through projection, then
+            // yield only small outcomes. Settle all launched readers before an
+            // error leaves the catalog owner; no next chunk starts after failure.
+            let outcomes = reads.collect::<Vec<_>>().await;
+            let mut first_error = None;
+            let mut grown = Vec::new();
+            for outcome in outcomes {
+                match outcome {
+                    Ok(Some(outcome)) => {
+                        let (changed, retry) = outcome.record(&mut present, &mut next);
+                        changed_any |= changed;
+                        grown.extend(retry);
+                    }
+                    Ok(None) => (),
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
             }
-        }))
-        .buffered(16);
-        tokio::pin!(reads);
-        while let Some((path, read, _reservation)) = reads.next().await {
-            let _mutation = self.inner.mutations.lock().await;
-            if self
-                .inner
-                .changed
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(path.as_os_str())
-                .is_some_and(|g| *g > start)
-            {
-                continue;
+            if let Some(error) = first_error {
+                return Err(error);
             }
-            let observation = match read {
-                Ok(observation) => observation,
-                Err(error) if error.is_not_found() => {
-                    present.remove(path.as_os_str());
-                    next.remove(path.as_os_str());
-                    None
+            for path in grown {
+                let reservation = Arc::clone(&self.inner.source_buffers)
+                    .acquire_many_owned((storage::sftp::MAX_READ_BYTES / 1024) as u32)
+                    .await
+                    .map_err(|_| {
+                        self.source_error(
+                            crate::error::StorageErrorKind::Unavailable,
+                            "source content admission closed",
+                        )
+                    })?;
+                let read = batch
+                    .read_with_stat_bounded(&path, storage::sftp::MAX_READ_BYTES)
+                    .await
+                    .map(|(raw, stat)| Some((Some(raw), stat)));
+                if let Some(outcome) = self
+                    .project_catalog_read(path, read, start, Some(reservation))
+                    .await?
+                {
+                    let (changed, retry) = outcome.record(&mut present, &mut next);
+                    changed_any |= changed;
+                    if retry.is_some() {
+                        return Err(self.source_error(
+                            crate::error::StorageErrorKind::ResourceLimit,
+                            "source content exceeded its admitted maximum",
+                        ));
+                    }
                 }
-                Err(
-                    error @ VaultError::Storage {
-                        kind:
-                            crate::error::StorageErrorKind::InvalidSource
-                            | crate::error::StorageErrorKind::PermissionDenied
-                            | crate::error::StorageErrorKind::ResourceLimit,
-                        ..
-                    },
-                )
-                | Err(error @ VaultError::SemanticResourceLimit { .. }) => {
-                    self.apply_source_observation(path.clone(), None, false)
-                        .await?;
-                    self.record_invalid_source(&path, &error);
-                    changed_any = true;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            if let Some((_, stat)) = &observation {
-                next.insert(path.as_os_str().to_owned(), stat.clone());
-            }
-            changed_any = true;
-            match self
-                .apply_source_observation(path.clone(), observation, false)
-                .await
-            {
-                Ok(()) => {
-                    self.inner
-                        .invalid_sources
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(path.as_os_str());
-                }
-                Err(error @ VaultError::FrontmatterParse { .. })
-                | Err(
-                    error @ VaultError::Storage {
-                        kind: crate::error::StorageErrorKind::InvalidSource,
-                        ..
-                    },
-                ) => {
-                    self.record_invalid_source(&path, &error);
-                }
-                Err(error) => return Err(error),
             }
         }
         let _mutation = self.inner.mutations.lock().await;
@@ -1016,7 +1259,7 @@ impl Vault {
                     .get(path.as_os_str())
                     .is_some_and(|g| *g > start)
             {
-                self.apply_source_observation(path.clone(), None, false)
+                self.apply_source_observation(path.clone(), None, false, None)
                     .await?;
                 changed_any = true;
             }
@@ -1026,7 +1269,7 @@ impl Vault {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|path, _| present.contains(path));
-        if changed_any || !self.catalog_ready() {
+        if changed_any || full || !self.catalog_ready() {
             let vault = self.clone();
             tokio::task::spawn_blocking(move || vault.publish_source())
                 .await
@@ -1035,12 +1278,91 @@ impl Vault {
                 })??;
         }
         *observations = next;
-        self.inner
+        Ok(())
+    }
+
+    async fn project_catalog_read(
+        &self,
+        path: PathBuf,
+        read: VaultResult<Option<(Option<String>, FileStat)>>,
+        start: u64,
+        reservation: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> VaultResult<Option<CatalogOutcome>> {
+        if listing_bound_exceeded(&read) {
+            return Ok(Some(CatalogOutcome::Retry(path)));
+        }
+        let missing =
+            matches!(&read, Ok(None)) || matches!(&read, Err(error) if error.is_not_found());
+        let stat = read
+            .as_ref()
+            .ok()
+            .and_then(|entry| entry.as_ref())
+            .map(|(_, stat)| stat.clone());
+        Ok(self
+            .apply_catalog_read(path.clone(), read, start, reservation)
+            .await?
+            .map(|changed| CatalogOutcome::Observed {
+                path,
+                stat,
+                missing,
+                changed,
+            }))
+    }
+
+    async fn apply_catalog_read(
+        &self,
+        path: PathBuf,
+        read: VaultResult<Option<(Option<String>, FileStat)>>,
+        start: u64,
+        reservation: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> VaultResult<Option<bool>> {
+        let _mutation = self.inner.mutations.lock().await;
+        if self
+            .inner
             .changed
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .retain(|_, generation| *generation > start);
-        Ok(())
+            .get(path.as_os_str())
+            .is_some_and(|g| *g > start)
+        {
+            return Ok(None);
+        }
+        let observation = match read {
+            Ok(observation) => observation,
+            Err(error) if error.is_not_found() => None,
+            Err(error) if invalid_catalog_document(&error) => {
+                self.apply_source_observation(path.clone(), None, false, None)
+                    .await?;
+                self.record_invalid_source(&path, &error);
+                return Ok(Some(true));
+            }
+            Err(error) => return Err(error),
+        };
+        let changed = match self
+            .apply_source_observation(path.clone(), observation, false, reservation)
+            .await
+        {
+            Ok(changed) => {
+                self.inner
+                    .invalid_sources
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(path.as_os_str());
+                changed
+            }
+            Err(error @ VaultError::FrontmatterParse { .. })
+            | Err(
+                error @ VaultError::Storage {
+                    kind: crate::error::StorageErrorKind::InvalidSource,
+                    ..
+                },
+            ) => {
+                self.record_invalid_source(&path, &error);
+                true
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(Some(changed))
     }
 
     fn record_invalid_source(&self, path: &Path, error: &VaultError) {
@@ -1134,7 +1456,7 @@ impl Vault {
             Err(e) => return Err(e),
         };
         let paths = match source
-            .list_files(
+            .list_regular_files(
                 Path::new(config.folder.as_deref().unwrap_or("")),
                 true,
                 None,
@@ -1147,23 +1469,21 @@ impl Vault {
         };
         let mut filtered = Vec::new();
         for path in paths {
-            if source.is_file(&path).await? {
-                let path_text = path.to_str().ok_or_else(|| {
-                    VaultError::InvalidPath("remote vault paths must be UTF-8".into())
-                })?;
-                let actual_text = actual.to_str().ok_or_else(|| {
-                    VaultError::InvalidPath("remote vault paths must be UTF-8".into())
-                })?;
-                let suffix = if actual_text.is_empty() {
-                    path_text
-                } else {
-                    path_text
-                        .strip_prefix(actual_text)
-                        .and_then(|suffix| suffix.strip_prefix('/'))
-                        .ok_or_else(|| VaultError::OutsideVault(path.clone()))?
-                };
-                filtered.push(path::logical_join(folder, Path::new(suffix))?);
-            }
+            let path_text = path.to_str().ok_or_else(|| {
+                VaultError::InvalidPath("remote vault paths must be UTF-8".into())
+            })?;
+            let actual_text = actual.to_str().ok_or_else(|| {
+                VaultError::InvalidPath("remote vault paths must be UTF-8".into())
+            })?;
+            let suffix = if actual_text.is_empty() {
+                path_text
+            } else {
+                path_text
+                    .strip_prefix(actual_text)
+                    .and_then(|suffix| suffix.strip_prefix('/'))
+                    .ok_or_else(|| VaultError::OutsideVault(path.clone()))?
+            };
+            filtered.push(path::logical_join(folder, Path::new(suffix))?);
         }
         periodic::filter_recent_paths(config, filtered, limit)
     }
@@ -1210,18 +1530,17 @@ impl Vault {
         self.inner.watch_enabled
     }
 
-    /// Always `{vault_root}/.obsidian-mcp`. Auto-created on startup.
-    pub fn mcp_home(&self) -> &Path {
-        &self.inner.mcp_home
+    /// Native vault-local configuration directory. Remote sources have no local vault home.
+    pub fn mcp_home(&self) -> Option<&Path> {
+        self.inner
+            .filesystem
+            .as_ref()
+            .map(|_| self.inner.mcp_home.as_path())
     }
 
-    /// Resolved data location. Equals `mcp_home` unless `OBSIDIAN_MCP_DATA` is set.
-    pub fn mcp_data(&self) -> &Path {
-        self.inner
-            .mcp_data
-            .get()
-            .map(PathBuf::as_path)
-            .unwrap_or_else(|| Path::new(""))
+    /// Resolved local machine-data directory, absent until remote initialization completes.
+    pub fn mcp_data(&self) -> Option<&Path> {
+        self.resolved_mcp_data()
     }
 
     /// Active path exclusion set.
@@ -1246,6 +1565,18 @@ impl Vault {
         glob: Option<&str>,
     ) -> VaultResult<Vec<PathBuf>> {
         self.storage().await?.list_files(dir, recursive, glob).await
+    }
+
+    pub(crate) async fn list_regular_files(
+        &self,
+        dir: &Path,
+        recursive: bool,
+        glob: Option<&str>,
+    ) -> VaultResult<Vec<PathBuf>> {
+        self.storage()
+            .await?
+            .list_regular_files(dir, recursive, glob)
+            .await
     }
 
     pub async fn read_note(&self, path: &Path) -> VaultResult<String> {
@@ -1332,8 +1663,11 @@ impl Vault {
             Ok((combined, expected))
         })
         .await?;
-        let actual_path = if !storage.is_remote() {
-            storage.append_file(path, content).await?
+        let actual_path = if let Some(root) = storage.local_root() {
+            let root = root.clone();
+            let path = path.to_owned();
+            let content = content.to_owned();
+            source_work(move || root.append_file(&path, &content)).await?
         } else if let Some(expected) = expected {
             storage
                 .write_file_if_revision(path, &combined, &expected)
@@ -1655,8 +1989,15 @@ impl Vault {
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        let pattern = format!("(?i){}", regex::escape(query));
-        self.scan_regex(&pattern, context_len, Some(max_results))
+        let regex = regex::RegexBuilder::new(&regex::escape(query))
+            .case_insensitive(true)
+            .size_limit(1 << 20)
+            .build()
+            .map_err(|source| VaultError::InvalidRegex {
+                pattern: query.into(),
+                source,
+            })?;
+        self.scan_compiled_regex(regex, context_len, Some(max_results))
             .await
     }
     pub(crate) async fn search_text_with_limit(
@@ -1708,6 +2049,15 @@ impl Vault {
                 pattern: pattern.into(),
                 source,
             })?;
+        self.scan_compiled_regex(regex, context_len, limit).await
+    }
+
+    async fn scan_compiled_regex(
+        &self,
+        regex: regex::Regex,
+        context_len: usize,
+        limit: Option<usize>,
+    ) -> VaultResult<Vec<SearchResult>> {
         if limit == Some(0) {
             return Ok(Vec::new());
         }
@@ -1719,43 +2069,17 @@ impl Vault {
             .collect::<Vec<_>>();
         paths.sort_by(|left, right| left.as_os_str().cmp(right.as_os_str()));
         let source = self.storage().await?;
-        let mut results = Vec::new();
-        for path in paths {
-            let content = match source.read_observed(&path).await {
-                Ok(raw) => raw,
-                Err(e) if e.is_not_found() || !self.is_remote() => continue,
-                Err(e) => return Err(e),
-            };
-            let regex = regex.clone();
-            let matches = source_work(move || {
-                let matches = regex
-                    .find_iter(&content)
-                    .map(|m| {
-                        let (context, match_start, match_end, line) =
-                            index::extract_match_context(&content, m.start(), m.end(), context_len);
-                        SearchMatch {
-                            line,
-                            context,
-                            match_start,
-                            match_end,
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                Ok(matches)
+        Ok(self
+            .search_source_matches(&source, paths, regex, context_len, limit)
+            .await?
+            .into_iter()
+            .filter(|(_, matches)| !matches.is_empty())
+            .map(|(path, matches)| SearchResult {
+                path,
+                matches,
+                score: None,
             })
-            .await?;
-            if !matches.is_empty() {
-                results.push(SearchResult {
-                    path,
-                    matches,
-                    score: None,
-                });
-                if limit.is_some_and(|max| results.len() >= max) {
-                    break;
-                }
-            }
-        }
-        Ok(results)
+            .collect())
     }
 
     /// Semantic search via embedding cosine similarity (Layer 2).
@@ -1795,10 +2119,13 @@ impl Vault {
         let entries = snapshot.capture_entries(&current_paths);
         if entries.is_empty() {
             snapshot.validate_query(query)?;
+            self.require_semantic_catalog()?;
             return Ok(Vec::new());
         }
         let query_vector = snapshot.embed_query(query)?;
-        semantic_results::rank_semantic(entries, &query_vector, top_k)
+        let ranked = semantic_results::rank_semantic(entries, &query_vector, top_k)?;
+        self.require_semantic_catalog()?;
+        Ok(ranked)
     }
 
     /// Returns `true` if embeddings are available for semantic search.
@@ -1890,23 +2217,27 @@ impl Vault {
         let current_paths = self.read_index().notes().keys().cloned().collect();
         let entries = snapshot.capture_entries(&current_paths);
         if entries.is_empty() {
+            self.require_semantic_catalog()?;
             return Ok(Vec::new());
         }
         let allowed = semantic_results::paths(&entries);
         let prefetch = prefetch_count.max(top_k);
         let bm25_hits = tv.search_for_paths(query, prefetch, Some(&allowed))?;
         if bm25_hits.is_empty() {
+            self.require_semantic_catalog()?;
             return Ok(Vec::new());
         }
 
         let query_vec = snapshot.embed_query(query)?;
-        semantic_results::rank_hybrid(
+        let ranked = semantic_results::rank_hybrid(
             &entries,
             &bm25_hits,
             &query_vec,
             alpha.clamp(0.0, 1.0),
             top_k,
-        )
+        )?;
+        self.require_semantic_catalog()?;
+        Ok(ranked)
     }
 
     pub fn search_by_tag(&self, tag: &str) -> VaultResult<Vec<NoteMetadata>> {
@@ -2133,52 +2464,123 @@ impl Vault {
         let word_re = (context_len > 0 && !hits.is_empty())
             .then(|| search_utils::compile_query_word_regex(query))
             .flatten();
-
-        let mut results = Vec::with_capacity(hits.len());
-        for (path, score) in hits {
-            let matches = if let Some(re) = &word_re {
-                let content = match self.storage().await?.read_observed(&path).await {
-                    Ok(raw) => Some(raw),
-                    Err(e) if e.is_not_found() || !self.is_remote() => None,
-                    Err(e) => return Err(e),
-                };
-                if let Some(content) = content {
-                    let re = re.clone();
-                    source_work(move || {
-                        Ok(re
-                            .find_iter(&content)
-                            .map(|m| {
-                                let (context, match_start, match_end, line) =
-                                    index::extract_match_context(
-                                        &content,
-                                        m.start(),
-                                        m.end(),
-                                        context_len,
-                                    );
-                                SearchMatch {
-                                    line,
-                                    context,
-                                    match_start,
-                                    match_end,
-                                }
-                            })
-                            .collect())
-                    })
-                    .await?
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            };
-
-            results.push(SearchResult {
+        let matches = if let Some(regex) = word_re {
+            let source = self.storage().await?;
+            let paths = hits.iter().map(|(path, _)| path.clone()).collect();
+            self.search_source_matches(&source, paths, regex, context_len, None)
+                .await?
+                .into_iter()
+                .map(|(_, matches)| matches)
+                .collect::<Vec<_>>()
+        } else {
+            vec![Vec::new(); hits.len()]
+        };
+        Ok(hits
+            .into_iter()
+            .zip(matches)
+            .map(|((path, score), matches)| SearchResult {
                 path,
                 matches,
                 score: Some(score as f64),
-            });
-        }
+            })
+            .collect())
+    }
 
+    async fn search_source_matches(
+        &self,
+        source: &Storage,
+        paths: Vec<PathBuf>,
+        regex: regex::Regex,
+        context_len: usize,
+        limit: Option<usize>,
+    ) -> VaultResult<Vec<(PathBuf, Vec<SearchMatch>)>> {
+        let batch = source.observe_batch(&paths).await?;
+        let remote = source.is_remote();
+        let candidates = {
+            let index = self.read_index();
+            paths
+                .into_iter()
+                .map(|path| {
+                    let bytes = index
+                        .get_note(&path)
+                        .map(|note| {
+                            note.stat.size.min(storage::sftp::MAX_READ_BYTES as u64) as usize
+                        })
+                        .unwrap_or(storage::sftp::MAX_READ_BYTES);
+                    (path, bytes)
+                })
+                .collect::<Vec<_>>()
+        };
+        let width = if remote { 16 } else { 1 };
+        let mut results = Vec::new();
+        let mut matched = 0usize;
+        for chunk in candidates.chunks(width) {
+            let reads = stream::iter(chunk.iter().cloned().map(|(path, bytes)| {
+                let budget = Arc::clone(&self.inner.source_buffers);
+                let regex = regex.clone();
+                let batch = &batch;
+                async move {
+                    let reservation = if remote {
+                        Some(
+                            budget
+                                .acquire_many_owned(bytes.max(1).div_ceil(1024) as u32)
+                                .await
+                                .map_err(|_| {
+                                    self.source_error(
+                                        crate::error::StorageErrorKind::Unavailable,
+                                        "source content admission closed",
+                                    )
+                                })?,
+                        )
+                    } else {
+                        None
+                    };
+                    read_search_matches(
+                        batch,
+                        &path,
+                        remote.then_some(bytes),
+                        regex,
+                        context_len,
+                        reservation,
+                    )
+                    .await
+                }
+            }))
+            .buffered(width);
+            // Finish every launched read before returning for an ordinary limit.
+            // Dropping dispatched protocol requests would invalidate the session.
+            let mut reads = reads.collect::<Vec<_>>().await;
+            for ((path, _), result) in chunk.iter().zip(&mut reads) {
+                if listing_bound_exceeded(result) {
+                    let reservation = Arc::clone(&self.inner.source_buffers)
+                        .acquire_many_owned((storage::sftp::MAX_READ_BYTES / 1024) as u32)
+                        .await
+                        .map_err(|_| {
+                            self.source_error(
+                                crate::error::StorageErrorKind::Unavailable,
+                                "source content admission closed",
+                            )
+                        })?;
+                    *result = read_search_matches(
+                        &batch,
+                        path,
+                        Some(storage::sftp::MAX_READ_BYTES),
+                        regex.clone(),
+                        context_len,
+                        Some(reservation),
+                    )
+                    .await;
+                }
+            }
+            for ((path, _), result) in chunk.iter().zip(reads) {
+                let matches = result?;
+                matched += usize::from(!matches.is_empty());
+                results.push((path.clone(), matches));
+                if limit.is_some_and(|limit| matched >= limit) {
+                    return Ok(results);
+                }
+            }
+        }
         Ok(results)
     }
 
@@ -2200,12 +2602,11 @@ impl Vault {
         }
 
         let generation = self.inner.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        if self.inner.watch_enabled || !self.catalog_ready() {
-            self.inner
-                .changed
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(path.as_os_str().to_owned(), generation);
+        {
+            let mut changed = self.inner.changed.lock().unwrap_or_else(|e| e.into_inner());
+            if self.inner.scan_active.load(Ordering::Acquire) {
+                changed.insert(path.as_os_str().to_owned(), generation);
+            }
         }
         let storage = self.storage().await?;
         let observation = if path::logical_extension(path)
@@ -2224,8 +2625,9 @@ impl Vault {
             Err(e) if e.is_not_found() => None,
             Err(e) => return Err(e),
         };
-        self.apply_source_observation(path.to_owned(), observation, true)
+        self.apply_source_observation(path.to_owned(), observation, true, None)
             .await
+            .map(|_| ())
     }
 
     fn reindex_local(&self, path: &Path) -> VaultResult<()> {
@@ -2299,11 +2701,15 @@ impl Vault {
         path: PathBuf,
         observation: Option<(Option<String>, FileStat)>,
         publish: bool,
-    ) -> VaultResult<()> {
+        reservation: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> VaultResult<bool> {
         let vault = self.clone();
-        tokio::task::spawn_blocking(move || vault.apply_observation(&path, observation, publish))
-            .await
-            .map_err(|e| VaultError::Other(format!("source projection task failed: {e}")))?
+        tokio::task::spawn_blocking(move || {
+            let _reservation = reservation;
+            vault.apply_observation(&path, observation, publish)
+        })
+        .await
+        .map_err(|e| VaultError::Other(format!("source projection task failed: {e}")))?
     }
 
     fn apply_observation(
@@ -2311,8 +2717,35 @@ impl Vault {
         path: &Path,
         observation: Option<(Option<String>, FileStat)>,
         publish: bool,
-    ) -> VaultResult<()> {
+    ) -> VaultResult<bool> {
+        let unchanged_revision = if !publish
+            && !self
+                .inner
+                .invalid_sources
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(path.as_os_str())
+        {
+            observation
+                .as_ref()
+                .and_then(|(raw, _)| raw.as_ref())
+                .map(|raw| source::source_revision(raw))
+        } else {
+            None
+        };
         let mut index = self.write_index();
+        if let (Some(revision), Some((_, stat))) = (&unchanged_revision, &observation)
+            && index.refresh_unchanged_note(path, revision, stat.clone())?
+        {
+            #[cfg(has_embeddings)]
+            if let Some(runtime) = self.inner.embedding_runtime.get()
+                && !runtime.has_current_or_pending(path, revision)
+                && let Some(change) = index.embedding_change(path, true)
+            {
+                runtime.submit(path, change);
+            }
+            return Ok(false);
+        }
         let was_note = index.get_note(path).is_some();
         let embeddings_enabled = {
             #[cfg(has_embeddings)]
@@ -2348,7 +2781,7 @@ impl Vault {
         }
         drop(index);
         if !publish {
-            return result.map(|_| ());
+            return result.map(|_| true);
         }
         let dirty = result.as_ref().copied().unwrap_or(was_note);
         let flush = self
@@ -2370,7 +2803,7 @@ impl Vault {
                 "{error}; search flush failed: {flush}"
             ))),
             (Err(error), _) | (_, Err(error)) => Err(error),
-            _ => Ok(()),
+            _ => Ok(true),
         }
     }
 
@@ -2385,6 +2818,257 @@ mod tests {
     use crate::models::{PatchOperation, PatchTargetType};
     use crate::test_helpers::{create_test_vault, tantivy_config, test_config};
     use unicode_normalization::UnicodeNormalization;
+
+    #[test]
+    fn attached_source_protocol_failures_allow_future_reconciliation() {
+        use crate::error::StorageErrorKind;
+
+        for kind in [StorageErrorKind::Protocol, StorageErrorKind::Unsupported] {
+            let error = VaultError::storage("scan", "note.md", kind, "injected failure");
+            assert!(terminal_source_error(&error, false));
+            assert!(!terminal_source_error(&error, true));
+        }
+        let identity = VaultError::storage(
+            "reconnect",
+            "",
+            StorageErrorKind::IdentityChanged,
+            "policy changed",
+        );
+        assert!(terminal_source_error(&identity, false));
+        assert!(terminal_source_error(&identity, true));
+        let pressure = VaultError::storage(
+            "read",
+            "note.md",
+            StorageErrorKind::ResourceLimit,
+            "source memory budget in use",
+        );
+        assert!(!terminal_source_error(&pressure, false));
+    }
+
+    #[tokio::test]
+    async fn catalog_projection_turns_preserve_order_after_later_reads_finish_first() {
+        let mut previous = None;
+        let mut first = CatalogTurn::next(&mut previous);
+        let mut second = CatalogTurn::next(&mut previous);
+        let intents = Arc::new(Mutex::new(Vec::new()));
+        let later_intents = Arc::clone(&intents);
+        let (read_complete, later_read) = tokio::sync::oneshot::channel();
+        let later = tokio::spawn(async move {
+            read_complete.send(()).unwrap();
+            second.wait().await;
+            later_intents.lock().unwrap().push(("b.md", 2));
+        });
+        later_read.await.unwrap();
+        assert!(intents.lock().unwrap().is_empty());
+        first.wait().await;
+        intents.lock().unwrap().push(("a.md", 1));
+        drop(first);
+        later.await.unwrap();
+        assert_eq!(*intents.lock().unwrap(), [("a.md", 1), ("b.md", 2)]);
+    }
+
+    #[tokio::test]
+    async fn reconnect_authentication_errors_preserve_existing_catalog_projections() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = Path::new("note.md");
+        std::fs::write(directory.path().join(path), "retainedneedle").unwrap();
+        let vault = Vault::open(&tantivy_config(directory.path()))
+            .await
+            .unwrap();
+        for operation in ["initialize", "connect", "reconnect", "realpath"] {
+            let error = VaultError::storage(
+                operation,
+                "note.md",
+                crate::error::StorageErrorKind::PermissionDenied,
+                "credentials unavailable",
+            );
+            assert!(!invalid_catalog_document(&error));
+            assert!(matches!(
+                vault
+                    .apply_catalog_read(path.to_owned(), Err(error), 0, None)
+                    .await,
+                Err(VaultError::Storage {
+                    kind: crate::error::StorageErrorKind::PermissionDenied,
+                    ..
+                })
+            ));
+            assert!(vault.read_index().get_note(path).is_some());
+            assert_eq!(
+                vault.search_text("retainedneedle", 0).await.unwrap().len(),
+                1
+            );
+            assert!(vault.inner.invalid_sources.lock().unwrap().is_empty());
+        }
+        for operation in ["open", "read", "stat", "lstat", "fstat"] {
+            assert!(invalid_catalog_document(&VaultError::storage(
+                operation,
+                "note.md",
+                crate::error::StorageErrorKind::PermissionDenied,
+                "note is unreadable",
+            )));
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_projection_errors_preserve_the_underlying_failure_kind() {
+        use crate::error::{MutationOutcome, StorageErrorKind};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path());
+        config.vault_path = PathBuf::from("sftp://fixture/vault");
+        let vault = Vault::open(&config).await.unwrap();
+        vault
+            .background
+            .worker
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .abort();
+        for kind in [
+            StorageErrorKind::Unavailable,
+            StorageErrorKind::PermissionDenied,
+            StorageErrorKind::IdentityChanged,
+        ] {
+            let error = vault.committed_error(
+                Path::new("note.md"),
+                VaultError::storage("read", "note.md", kind, "original cause"),
+            );
+            assert!(matches!(error, VaultError::Storage {
+                kind: actual,
+                outcome: MutationOutcome::Committed,
+                ref message,
+                ..
+            } if actual == kind && message.contains("original cause")));
+        }
+        for (error, expected) in [
+            (
+                VaultError::Other("index flush failed".into()),
+                StorageErrorKind::ProjectionFailure,
+            ),
+            (
+                VaultError::InvalidFrontmatter {
+                    path: "note.md".into(),
+                    actual: "array",
+                },
+                StorageErrorKind::InvalidSource,
+            ),
+        ] {
+            assert!(matches!(
+                vault.committed_error(Path::new("note.md"), error),
+                VaultError::Storage {
+                    kind,
+                    outcome: MutationOutcome::Committed,
+                    ..
+                } if kind == expected
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn temporary_source_pressure_preserves_complete_projections_without_watching() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = Path::new("note.md");
+        std::fs::write(directory.path().join(path), "#retainedtag\nretainedneedle").unwrap();
+        #[cfg(not(has_embeddings))]
+        let vault = Vault::open(&tantivy_config(directory.path()))
+            .await
+            .unwrap();
+        #[cfg(has_embeddings)]
+        let vault = {
+            let model = Arc::new(TestEmbedder::new());
+            let loader: EmbeddingLoaderFuture =
+                Box::pin(async move { Ok(model as Arc<dyn embeddings::Embedder>) });
+            let mut config = embedding_config(directory.path());
+            config.tantivy = true;
+            let vault = Vault::open_with_embedding_loader(&config, Some(loader))
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !vault
+                    .embedding_status()
+                    .is_some_and(|status| status.phase == embedding_runtime::EmbeddingPhase::Ready)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            vault
+        };
+        assert!(!vault.watch_enabled());
+        let before = vault.read_index().get_note(path).unwrap().clone();
+        let mut verified_stat = before.stat.clone();
+        verified_stat.modified = Some(chrono::Utc::now() + chrono::Duration::seconds(5));
+        let raw = vault.read_note(path).await.unwrap();
+        assert_eq!(
+            vault
+                .apply_catalog_read(
+                    path.to_owned(),
+                    Ok(Some((Some(raw), verified_stat.clone()))),
+                    0,
+                    None,
+                )
+                .await
+                .unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            vault.read_index().get_note(path).unwrap().stat.modified,
+            verified_stat.modified
+        );
+        #[cfg(has_embeddings)]
+        assert_eq!(
+            vault
+                .inner
+                .embedding_runtime
+                .get()
+                .unwrap()
+                .pending_kind(path),
+            None
+        );
+
+        #[cfg(has_embeddings)]
+        let capture = || {
+            vault
+                .inner
+                .embedding_runtime
+                .get()
+                .unwrap()
+                .query_snapshot()
+                .unwrap()
+                .capture_entries(&HashSet::from([path.as_os_str().to_owned()]))
+                .remove(path.as_os_str())
+                .unwrap()
+        };
+        #[cfg(has_embeddings)]
+        let embedding_before = capture();
+        let error = VaultError::storage(
+            "read",
+            "note.md",
+            crate::error::StorageErrorKind::ResourceLimit,
+            "source memory budget in use",
+        );
+        assert!(matches!(
+            vault
+                .apply_catalog_read(path.to_owned(), Err(error), 0, None)
+                .await,
+            Err(VaultError::Storage {
+                kind: crate::error::StorageErrorKind::ResourceLimit,
+                ..
+            })
+        ));
+        let after = vault.read_index().get_note(path).unwrap().clone();
+        assert_eq!(after.tags, before.tags);
+        assert_eq!(after.stat.size, before.stat.size);
+        assert_eq!(
+            vault.search_text("retainedneedle", 0).await.unwrap().len(),
+            1
+        );
+        assert!(vault.inner.invalid_sources.lock().unwrap().is_empty());
+        #[cfg(has_embeddings)]
+        assert!(Arc::ptr_eq(&embedding_before, &capture()));
+    }
 
     #[tokio::test]
     async fn mutation_deadline_bounds_admission_and_serialization_before_dispatch() {
@@ -2507,6 +3191,265 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legal_growth_after_listing_is_admitted_without_another_scan() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = Path::new("growing.md");
+        std::fs::write(directory.path().join(path), "#old").unwrap();
+        let vault = Vault::open(&test_config(directory.path())).await.unwrap();
+        let storage = vault.storage().await.unwrap();
+        let batch = storage.observe_batch(&[path.to_owned()]).await.unwrap();
+        let listed = storage.file_stat(path).await.unwrap();
+        let grown = "#grown\nA complete note that grew after the directory listing.\n";
+        std::fs::write(directory.path().join(path), grown).unwrap();
+        let initial = batch
+            .read_with_stat_bounded(path, listed.size as usize)
+            .await;
+        assert!(listing_bound_exceeded(&initial));
+        assert_eq!(
+            vault.read_index().get_note(path).unwrap().stat.size,
+            listed.size
+        );
+
+        let (raw, stat) = batch
+            .read_with_stat_bounded(path, storage::sftp::MAX_READ_BYTES)
+            .await
+            .unwrap();
+        let mut present = HashSet::from([path.as_os_str().to_owned()]);
+        let mut next = HashMap::from([(path.as_os_str().to_owned(), listed)]);
+        let outcome = vault
+            .project_catalog_read(path.to_owned(), Ok(Some((Some(raw), stat))), 0, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, retry) = outcome.record(&mut present, &mut next);
+        assert!(retry.is_none());
+        assert_eq!(next[path.as_os_str()].size, grown.len() as u64);
+        assert_eq!(vault.read_index().get_note(path).unwrap().tags, ["grown"]);
+        assert!(vault.inner.invalid_sources.lock().unwrap().is_empty());
+
+        let oversized = std::fs::OpenOptions::new()
+            .write(true)
+            .open(directory.path().join(path))
+            .unwrap();
+        oversized
+            .set_len(storage::sftp::MAX_READ_BYTES as u64 + 1)
+            .unwrap();
+        let rejected = batch
+            .read_with_stat_bounded(path, storage::sftp::MAX_READ_BYTES)
+            .await;
+        assert!(rejected.is_err());
+        assert!(!listing_bound_exceeded(&rejected));
+    }
+
+    #[tokio::test]
+    async fn maximum_search_context_retains_native_matches_and_complete_source() {
+        let source = "# Context\n\npréface needle tail\n";
+        for ranked in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("note.md"), source).unwrap();
+            let mut config = test_config(directory.path());
+            config.tantivy = ranked;
+            let vault = Vault::open(&config).await.unwrap();
+            for hits in [
+                vault.search_regex("needle", usize::MAX).await.unwrap(),
+                vault.search_text("needle", usize::MAX).await.unwrap(),
+            ] {
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].path, Path::new("note.md"));
+                assert_eq!(hits[0].matches.len(), 1);
+                let matched = &hits[0].matches[0];
+                assert_eq!(matched.context, source);
+                let start = source[..source.find("needle").unwrap()].chars().count();
+                assert_eq!(matched.match_start, start);
+                assert_eq!(matched.match_end, start + "needle".len());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn literal_text_search_does_not_inherit_the_regexp_pattern_length_cap() {
+        let directory = tempfile::tempdir().unwrap();
+        let literal = ".+[]?*".repeat(180);
+        std::fs::write(directory.path().join("literal.md"), &literal).unwrap();
+        let vault = Vault::open(&test_config(directory.path())).await.unwrap();
+        let hits = vault.search_text(&literal, 0).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, Path::new("literal.md"));
+        assert_eq!(hits[0].matches[0].context, literal);
+        assert!(matches!(
+            vault.search_regex(&literal, 0).await,
+            Err(VaultError::InvalidRegex { .. })
+        ));
+        assert!(matches!(
+            vault.search_regex(&"a".repeat(1001), 0).await,
+            Err(VaultError::InvalidRegex { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_data_locations_are_explicitly_unresolved_before_initialization() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path());
+        config.vault_path = PathBuf::from("sftp://fixture/vault");
+        let vault = Vault::open(&config).await.unwrap();
+        vault
+            .background
+            .worker
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .abort();
+        assert_eq!(vault.mcp_data(), None);
+        assert_eq!(vault.resolved_mcp_data(), None);
+        assert_eq!(vault.mcp_home(), None);
+    }
+
+    #[tokio::test]
+    async fn watch_disabled_scan_cannot_revert_later_mutations_and_releases_tracking() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path());
+        config.vault_path = PathBuf::from("sftp://fixture/vault");
+        config.watch = false;
+        config.tantivy = true;
+        let vault = Vault::open(&config).await.unwrap();
+        // Use the native source adapter to control observations without a network
+        // clock; the vault still executes the remote reconciliation path.
+        vault
+            .background
+            .worker
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .abort();
+        assert!(
+            vault
+                .inner
+                .source
+                .set(Storage::Local(
+                    fs::VaultRoot::open(directory.path()).unwrap()
+                ))
+                .is_ok()
+        );
+        vault.inner.catalog_ready.store(true, Ordering::Release);
+        vault.update_source_status(|status| {
+            status.availability = "available".into();
+            status.catalog_phase = "ready".into();
+        });
+        let existing = Path::new("existing.md");
+        let created = Path::new("created.md");
+        vault.write_note(existing, "old source").await.unwrap();
+        assert!(vault.inner.changed.lock().unwrap().is_empty());
+        let scan = vault.begin_source_scan().await;
+        let old = vault
+            .storage()
+            .await
+            .unwrap()
+            .read_observed_with_stat(existing)
+            .await
+            .unwrap();
+        vault.write_note(existing, "updated source").await.unwrap();
+        vault
+            .create_note(created, "created source", None)
+            .await
+            .unwrap();
+        assert!(
+            vault
+                .apply_catalog_read(
+                    existing.to_owned(),
+                    Ok(Some((Some(old.0), old.1))),
+                    scan.start,
+                    None,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            vault
+                .apply_catalog_read(created.to_owned(), Ok(None), scan.start, None,)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(vault.search_text("updated", 0).await.unwrap().len(), 1);
+        assert_eq!(vault.search_text("created", 0).await.unwrap().len(), 1);
+        drop(scan);
+        assert!(!vault.inner.scan_active.load(Ordering::Acquire));
+        assert!(vault.inner.changed.lock().unwrap().is_empty());
+        vault.write_note(existing, "idle source").await.unwrap();
+        assert!(vault.inner.changed.lock().unwrap().is_empty());
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let ready = entered.notified();
+        let owner = vault.clone();
+        let started = Arc::clone(&entered);
+        let scanner = tokio::spawn(async move {
+            let _scan = owner.begin_source_scan().await;
+            started.notify_one();
+            std::future::pending::<()>().await;
+        });
+        ready.await;
+        vault
+            .write_note(existing, "after cancellation")
+            .await
+            .unwrap();
+        assert!(!vault.inner.changed.lock().unwrap().is_empty());
+        scanner.abort();
+        assert!(scanner.await.unwrap_err().is_cancelled());
+        assert!(!vault.inner.scan_active.load(Ordering::Acquire));
+        assert!(vault.inner.changed.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn regular_listing_keeps_file_aliases_and_rejects_selected_escapes() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("note.md"), "inside").unwrap();
+        std::fs::create_dir(directory.path().join("folder")).unwrap();
+        std::fs::write(directory.path().join("folder/nested.md"), "nested").unwrap();
+        symlink("note.md", directory.path().join("alias.md")).unwrap();
+        symlink("folder", directory.path().join("directory-alias")).unwrap();
+        let vault = Vault::open(&test_config(directory.path())).await.unwrap();
+        let files = vault
+            .list_regular_files(Path::new(""), true, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            files,
+            ["alias.md", "folder/nested.md", "note.md"].map(PathBuf::from)
+        );
+        assert!(
+            vault
+                .list_files(Path::new(""), false, None)
+                .await
+                .unwrap()
+                .contains(&PathBuf::from("directory-alias"))
+        );
+        std::fs::write(outside.path().join("secret.md"), "outside").unwrap();
+        symlink(
+            outside.path().join("secret.md"),
+            directory.path().join("escape.md"),
+        )
+        .unwrap();
+        assert!(matches!(
+            vault.list_regular_files(Path::new(""), false, None).await,
+            Err(VaultError::OutsideVault(_))
+        ));
+        assert_eq!(
+            vault
+                .list_regular_files(Path::new(""), false, Some("alias.md"))
+                .await
+                .unwrap(),
+            [PathBuf::from("alias.md")]
+        );
+    }
+
+    #[tokio::test]
     async fn uncertain_mutation_withdraws_catalog_and_wakes_repair_without_watching() {
         let directory = tempfile::tempdir().unwrap();
         let mut config = test_config(directory.path());
@@ -2518,8 +3461,26 @@ mod tests {
             status.availability = "unavailable".into();
             status.catalog_phase = "degraded".into();
         });
+        vault
+            .write_index()
+            .apply_observation(
+                Path::new("cached.md"),
+                Some("#cached".into()),
+                FileStat {
+                    size: 7,
+                    created: None,
+                    modified: None,
+                },
+                None,
+                false,
+            )
+            .unwrap();
         #[cfg(has_embeddings)]
         assert!(vault.require_semantic_catalog().is_ok());
+        assert!(!vault.begin_reconciliation(true));
+        assert!(vault.catalog_ready());
+        assert_eq!(vault.source_status().unwrap().catalog_phase, "reconciling");
+        assert_eq!(vault.search_by_tag("cached").unwrap().len(), 1);
         let error = VaultError::storage(
             "replace",
             "note.md",
@@ -4489,10 +5450,13 @@ mod tests {
 
         let vault = Vault::open(&config).await.unwrap();
 
-        assert_eq!(vault.mcp_home(), vault.root().join(".obsidian-mcp"));
+        assert_eq!(
+            vault.mcp_home(),
+            Some(vault.root().join(".obsidian-mcp").as_path())
+        );
         assert_eq!(vault.mcp_data(), vault.mcp_home());
         assert!(
-            !vault.mcp_home().join("vaults").exists(),
+            !vault.mcp_home().unwrap().join("vaults").exists(),
             "default mcp home must not be namespaced under itself"
         );
     }

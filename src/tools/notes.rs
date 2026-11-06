@@ -256,6 +256,7 @@ pub async fn note_read_many(
         ));
     }
 
+    let explicit_paths = params.paths.is_some();
     let candidates: Vec<ReadCandidate> = match (params.paths, params.dir) {
         (Some(_), Some(_)) | (None, None) => {
             return Err(invalid_params(
@@ -272,10 +273,6 @@ pub async fn note_read_many(
                 )));
             }
 
-            for path in &paths {
-                vault.validate_path(Path::new(path)).await?;
-            }
-
             paths
                 .into_iter()
                 .map(|path| ReadCandidate {
@@ -287,7 +284,7 @@ pub async fn note_read_many(
         (None, Some(dir)) => {
             let mut candidates = Vec::new();
             for path in vault
-                .list_files(
+                .list_regular_files(
                     Path::new(&dir),
                     params.recursive.unwrap_or(false),
                     params.glob.as_deref(),
@@ -296,7 +293,6 @@ pub async fn note_read_many(
             {
                 if !crate::vault::path::logical_extension(&path)
                     .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
-                    || !vault.is_file(&path).await?
                 {
                     continue;
                 }
@@ -314,13 +310,16 @@ pub async fn note_read_many(
     let mut skipped_count = 0;
     let mut content_bytes = 0;
     let storage = vault.storage().await?;
+    let mut batch = storage.read_batch().await?;
+    if explicit_paths {
+        for candidate in &candidates {
+            batch.validate(&candidate.path).await?;
+        }
+    }
 
     for candidate in candidates.iter().take(inspected_count) {
-        let actual_path = match vault
-            .canonical_existing_relative_path(&candidate.path)
-            .await
-        {
-            Ok(path) => path,
+        let target = match batch.prepare(&candidate.path).await {
+            Ok(target) => target,
             Err(error) => {
                 record_file_error(
                     error,
@@ -331,13 +330,14 @@ pub async fn note_read_many(
                 continue;
             }
         };
-        let display_path = actual_path
+        let display_path = target
+            .relative
             .to_str()
             .map(str::to_owned)
             .unwrap_or_else(|| candidate.display_path.clone());
         let remaining_bytes = max_bytes - content_bytes;
 
-        let stat = match vault.file_stat(&actual_path).await {
+        let stat = match batch.stat(&target).await {
             Ok(stat) => stat,
             Err(error) => {
                 record_file_error(error, &display_path, &mut skipped, &mut skipped_count)?;
@@ -354,10 +354,7 @@ pub async fn note_read_many(
             continue;
         }
 
-        let content = match storage
-            .read_file_bounded(&actual_path, remaining_bytes)
-            .await
-        {
+        let content = match batch.read(&target, remaining_bytes).await {
             Ok(content) => content,
             Err(VaultError::SemanticResourceLimit { .. }) => {
                 record_skipped(

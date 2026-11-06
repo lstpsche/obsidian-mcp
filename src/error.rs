@@ -11,6 +11,8 @@ pub enum StorageErrorKind {
     PermissionDenied,
     Unsupported,
     Protocol,
+    RemoteFailure,
+    ProjectionFailure,
     InvalidSource,
     Conflict,
     IdentityChanged,

@@ -1276,7 +1276,7 @@ mod vault_exclusion {
             expected.is_dir(),
             "external data directory should contain a vault-specific namespace"
         );
-        assert_eq!(vault.mcp_data(), expected);
+        assert_eq!(vault.mcp_data().unwrap(), expected);
     }
 
     #[tokio::test]

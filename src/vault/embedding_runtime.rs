@@ -153,7 +153,7 @@ impl RuntimeShared {
 struct RuntimeState {
     next_generation: u64,
     pending: HashMap<OsString, PendingWork>,
-    inflight: HashMap<OsString, u64>,
+    inflight: HashMap<OsString, (u64, PendingKind)>,
     batch_started_at: Option<Instant>,
     initial_remaining: HashSet<OsString>,
     initial_started: bool,
@@ -470,6 +470,63 @@ impl EmbeddingRuntime {
 
     pub(crate) fn submit_upsert(&self, path: &Path) {
         self.submit(path, PendingKind::Upsert);
+    }
+
+    /// Report existing evidence or retained note work without creating a generation.
+    /// Called while the source index is locked; use only the state-to-store lock order.
+    pub(crate) fn has_current_or_pending(&self, path: &Path, source_revision: &str) -> bool {
+        if !self.control.shared.source_is_live() {
+            return false;
+        }
+        let Ok(path) = normalize_intent_path(path, self.control.shared.source.is_remote()) else {
+            return false;
+        };
+        let state = self
+            .control
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let current = state_generation(&state, &path);
+        let removing = state
+            .pending
+            .get(path.as_os_str())
+            .is_some_and(|work| work.kind == PendingKind::Remove)
+            || state
+                .inflight
+                .get(path.as_os_str())
+                .is_some_and(|(generation, kind)| {
+                    current == Some(*generation) && *kind == PendingKind::Remove
+                });
+        if removing {
+            return false;
+        }
+        let note_work = |generation, kind| {
+            current == Some(generation)
+                && matches!(kind, PendingKind::Upsert | PendingKind::AwaitingLexical)
+        };
+        if state
+            .pending
+            .get(path.as_os_str())
+            .is_some_and(|work| note_work(work.generation, work.kind))
+            || state
+                .inflight
+                .get(path.as_os_str())
+                .is_some_and(|(generation, kind)| note_work(*generation, *kind))
+            || state
+                .staged
+                .get(path.as_os_str())
+                .is_some_and(|draft| note_work(draft.work.generation, draft.work.kind))
+        {
+            return true;
+        }
+        state.store.as_ref().is_some_and(|store| {
+            store
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .note(&path)
+                .is_some_and(|entry| entry.source_revision == source_revision)
+        })
     }
 
     #[cfg(test)]
@@ -954,7 +1011,7 @@ fn take_due_batch(shared: &RuntimeShared) -> (Vec<PendingWork>, Option<Instant>,
     let mut batch = Vec::with_capacity(due.len());
     for (path, _, _) in due {
         if let Some(work) = state.pending.remove(path.as_os_str()) {
-            state.inflight.insert(path, work.generation);
+            state.inflight.insert(path, (work.generation, work.kind));
             batch.push(work);
         }
     }
@@ -1480,7 +1537,12 @@ fn defer_pending(shared: &RuntimeShared, work: &PendingWork) {
             .pending
             .insert(work.path.as_os_str().to_owned(), deferred);
     }
-    if state.inflight.get(work.path.as_os_str()) == Some(&work.generation) {
+    if state
+        .inflight
+        .get(work.path.as_os_str())
+        .map(|(generation, _)| generation)
+        == Some(&work.generation)
+    {
         state.inflight.remove(work.path.as_os_str());
     }
     update_pending_status(&mut state);
@@ -1534,7 +1596,12 @@ fn discard_inflight(shared: &RuntimeShared, work: &PendingWork) {
         .state
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    if state.inflight.get(work.path.as_os_str()) == Some(&work.generation) {
+    if state
+        .inflight
+        .get(work.path.as_os_str())
+        .map(|(generation, _)| generation)
+        == Some(&work.generation)
+    {
         state.inflight.remove(work.path.as_os_str());
     }
     update_pending_status(&mut state);
@@ -1558,7 +1625,12 @@ fn defer_work(shared: &RuntimeShared, mut draft: StagedNote, retain: bool) {
                 .insert(draft.work.path.as_os_str().to_owned(), draft);
         }
     }
-    if state.inflight.get(path.as_os_str()) == Some(&generation) {
+    if state
+        .inflight
+        .get(path.as_os_str())
+        .map(|(generation, _)| generation)
+        == Some(&generation)
+    {
         state.inflight.remove(path.as_os_str());
     }
     update_pending_status(&mut state);
@@ -1681,7 +1753,9 @@ fn retry_hint(error: &VaultError) -> Option<Duration> {
         } => Some(retry_after.unwrap_or(Duration::ZERO)),
         VaultError::Io(error) if transient_source_io(error) => Some(Duration::ZERO),
         VaultError::Storage {
-            kind: crate::error::StorageErrorKind::Unavailable,
+            kind:
+                crate::error::StorageErrorKind::Unavailable
+                | crate::error::StorageErrorKind::RemoteFailure,
             ..
         } => Some(Duration::ZERO),
         _ => None,
@@ -1732,7 +1806,12 @@ fn record_failure_message(
         .lock()
         .unwrap_or_else(|lock_error| lock_error.into_inner());
     let is_current = state_generation(&state, &work.path) == Some(work.generation);
-    if state.inflight.get(work.path.as_os_str()) == Some(&work.generation) {
+    if state
+        .inflight
+        .get(work.path.as_os_str())
+        .map(|(generation, _)| generation)
+        == Some(&work.generation)
+    {
         state.inflight.remove(work.path.as_os_str());
     }
     if is_current {
@@ -2034,7 +2113,12 @@ fn state_generation(state: &RuntimeState, path: &Path) -> Option<u64> {
         .pending
         .get(path.as_os_str())
         .map(|work| work.generation)
-        .or_else(|| state.inflight.get(path.as_os_str()).copied())
+        .or_else(|| {
+            state
+                .inflight
+                .get(path.as_os_str())
+                .map(|(generation, _)| *generation)
+        })
 }
 
 fn retry_delay(attempt: u8) -> Duration {
@@ -3310,7 +3394,7 @@ mod tests {
                 .state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            let generation = *state
+            let (generation, _) = *state
                 .inflight
                 .get(OsStr::new("one.md"))
                 .expect("changed note should be in flight");
@@ -3575,6 +3659,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retained_note_work_needs_no_replacement_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = Path::new("one.md");
+        std::fs::write(directory.path().join(path), "# One\nbody").unwrap();
+        let index = test_index(directory.path()).await;
+        let runtime = EmbeddingRuntime::spawn_for_test(
+            directory.path().to_path_buf(),
+            index,
+            directory.path().join("cache.bin"),
+            TEST_BATCH_SIZE,
+            false,
+            async { Ok(Arc::new(FakeEmbedder::new()) as Arc<dyn Embedder>) },
+        );
+        let shared = &runtime.control.shared;
+        let generation = shared.state.lock().unwrap().next_generation;
+        assert!(runtime.has_current_or_pending(path, "unpublished"));
+        assert_eq!(shared.state.lock().unwrap().next_generation, generation);
+        let (batch, _, _) = take_due_batch(shared);
+        assert_eq!(batch.len(), 1);
+        assert!(runtime.has_current_or_pending(path, "unpublished"));
+        assert_eq!(shared.state.lock().unwrap().next_generation, generation);
+
+        runtime.submit_remove(path);
+        assert!(
+            !runtime.has_current_or_pending(path, "unpublished"),
+            "a superseded in-flight upsert must not hide the current removal"
+        );
+        let (batch, _, _) = take_due_batch(shared);
+        assert_eq!(batch[0].kind, PendingKind::Remove);
+        assert!(!runtime.has_current_or_pending(path, "unpublished"));
+
+        runtime.submit(path, PendingKind::AwaitingLexical);
+        let generation = shared.state.lock().unwrap().next_generation;
+        assert!(runtime.has_current_or_pending(path, "unpublished"));
+        assert_eq!(shared.state.lock().unwrap().next_generation, generation);
+        runtime.retire();
+        assert!(!runtime.has_current_or_pending(path, "unpublished"));
+    }
+
+    #[tokio::test]
     async fn terminal_request_failure_waits_for_a_new_generation() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("one.md"), "# One\nold body").unwrap();
@@ -3588,6 +3712,10 @@ mod tests {
             async move { Ok(loaded as Arc<dyn Embedder>) },
         );
         wait_for_status(&runtime, |status| status.phase == EmbeddingPhase::Ready).await;
+        let original_revision = super::super::source::source_revision("# One\nold body");
+        let changed_revision = super::super::source::source_revision("# One\nnew body");
+        assert!(runtime.has_current_or_pending(Path::new("one.md"), &original_revision));
+        assert!(!runtime.has_current_or_pending(Path::new("one.md"), &changed_revision));
         model.transient.store(false, AtomicOrdering::SeqCst);
         model.fail_on_call.store(
             model.calls.load(AtomicOrdering::SeqCst),
@@ -3599,12 +3727,33 @@ mod tests {
             status.phase == EmbeddingPhase::Degraded && status.pending_notes == 0
         })
         .await;
+        assert!(
+            !runtime.has_current_or_pending(Path::new("one.md"), &changed_revision),
+            "a terminal failure without retained work needs a repair generation"
+        );
         let failed_calls = model.calls.load(AtomicOrdering::SeqCst);
         tokio::time::sleep(Duration::from_millis(1200)).await;
         assert_eq!(model.calls.load(AtomicOrdering::SeqCst), failed_calls);
-        runtime.submit_upsert(Path::new("one.md"));
+        if !runtime.has_current_or_pending(Path::new("one.md"), &changed_revision) {
+            runtime.submit_upsert(Path::new("one.md"));
+        }
         wait_for_status(&runtime, |status| status.phase == EmbeddingPhase::Ready).await;
         assert_eq!(model.calls.load(AtomicOrdering::SeqCst), failed_calls + 1);
+        assert!(runtime.has_current_or_pending(Path::new("one.md"), &changed_revision));
+        let generation = runtime.control.shared.state.lock().unwrap().next_generation;
+        if !runtime.has_current_or_pending(Path::new("one.md"), &changed_revision) {
+            runtime.submit_upsert(Path::new("one.md"));
+        }
+        assert_eq!(
+            runtime.control.shared.state.lock().unwrap().next_generation,
+            generation
+        );
+        runtime.submit_remove(Path::new("one.md"));
+        assert!(
+            !runtime.has_current_or_pending(Path::new("one.md"), &changed_revision),
+            "evidence scheduled for removal still needs a note repair intent"
+        );
+        runtime.submit_upsert(Path::new("one.md"));
     }
 
     #[tokio::test]
@@ -3632,9 +3781,10 @@ mod tests {
         let work = {
             let mut state = runtime.control.shared.state.lock().unwrap();
             let generation = next_generation(&mut state);
-            state
-                .inflight
-                .insert(path.as_os_str().to_owned(), generation);
+            state.inflight.insert(
+                path.as_os_str().to_owned(),
+                (generation, PendingKind::Upsert),
+            );
             PendingWork {
                 path: path.to_path_buf(),
                 generation,
@@ -3749,6 +3899,7 @@ mod tests {
 
         for (kind, expected) in [
             (StorageErrorKind::Unavailable, Some(Duration::ZERO)),
+            (StorageErrorKind::RemoteFailure, Some(Duration::ZERO)),
             (StorageErrorKind::PermissionDenied, None),
             (StorageErrorKind::Unsupported, None),
             (StorageErrorKind::Protocol, None),
