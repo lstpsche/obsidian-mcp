@@ -80,6 +80,7 @@ pub struct VaultIndex {
     attachments: HashMap<PathBuf, u64>,
     attachment_bytes: u64,
     filesystem: Option<fs::VaultRoot>,
+    read_contents: Option<HashMap<PathBuf, String>>,
     exclude: Arc<ExcludeSet>,
     excluded_note_paths: HashSet<PathBuf>,
     watch_paths: OnceLock<WatchPaths>,
@@ -106,12 +107,45 @@ impl VaultIndex {
             attachments: HashMap::new(),
             attachment_bytes: 0,
             filesystem: None,
+            read_contents: None,
             exclude: Arc::default(),
             excluded_note_paths: HashSet::new(),
             watch_paths: OnceLock::new(),
             #[cfg(has_embeddings)]
             waiting_for_lexical: HashMap::new(),
         }
+    }
+
+    /// Build an isolated metadata and graph projection without changing shared state.
+    pub(crate) fn read_view(&self, contents: HashMap<PathBuf, String>) -> Self {
+        let mut view = Self::empty();
+        view.filesystem = self.filesystem.clone();
+        view.exclude = Arc::clone(&self.exclude);
+        for (path, metadata) in &self.notes {
+            let Some(content) = contents.get(path) else {
+                continue;
+            };
+            let Ok(mut metadata) = parse_note_metadata(path, content, metadata.stat.clone()) else {
+                continue;
+            };
+            metadata.links.retain(|link| {
+                self.link_resolver
+                    .resolve(&link.target)
+                    .is_none_or(|target| contents.contains_key(&target))
+            });
+            for tag in &metadata.tags {
+                view.tags
+                    .entry(tag.to_lowercase())
+                    .or_default()
+                    .insert(path.clone());
+            }
+            view.notes.insert(path.clone(), metadata);
+        }
+        view.link_resolver = build_link_resolver(&view.notes.keys().cloned().collect::<Vec<_>>());
+        view.rebuild_backlinks();
+        view.recompute_stats();
+        view.read_contents = Some(contents);
+        view
     }
 
     /// Build the index by walking the entire vault directory.
@@ -167,6 +201,10 @@ impl VaultIndex {
                 }
                 FileClass::Note => match read_indexed_note(&filesystem, path) {
                     Ok((metadata, content)) => {
+                        if !exclude.allows_source(path, &content) {
+                            index.excluded_note_paths.insert(path.to_owned());
+                            return Ok(());
+                        }
                         check()?;
                         index_content(&metadata, &content)?;
                         for tag in &metadata.tags {
@@ -364,6 +402,10 @@ impl VaultIndex {
         match classify(path, exclude) {
             FileClass::Note => {
                 let (note, content) = read_indexed_note(filesystem, path)?;
+                if !exclude.allows_source(path, &content) {
+                    self.add_excluded_file(path);
+                    return Ok(None);
+                }
                 self.replace_note(path, note);
                 Ok(Some(content))
             }
@@ -497,6 +539,11 @@ impl VaultIndex {
 
     pub fn notes(&self) -> &HashMap<PathBuf, NoteMetadata> {
         &self.notes
+    }
+
+    #[cfg(has_embeddings)]
+    pub(crate) fn allows_source(&self, path: &Path, content: &str) -> bool {
+        self.exclude.allows_source(path, content)
     }
 
     pub fn get_note(&self, path: &Path) -> Option<&NoteMetadata> {
@@ -810,7 +857,14 @@ impl VaultIndex {
                 break;
             }
 
-            let content = match filesystem.read_observed(path) {
+            let observed = match &self.read_contents {
+                Some(contents) => contents
+                    .get(path)
+                    .cloned()
+                    .ok_or_else(|| VaultError::NoteNotFound(path.clone())),
+                None => filesystem.read_observed(path),
+            };
+            let content = match observed {
                 Ok(c) => c,
                 Err(_) => continue,
             };

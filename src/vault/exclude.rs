@@ -24,6 +24,7 @@ pub(crate) fn is_visible_path(path: &Path) -> bool {
 pub struct ExcludeSet {
     set: GlobSet,
     patterns: Vec<String>,
+    private_memory: bool,
 }
 
 impl ExcludeSet {
@@ -69,6 +70,7 @@ impl ExcludeSet {
                 .build()
                 .map_err(|err| VaultError::Other(format!("compile exclusion policy: {err}")))?,
             patterns: accepted.into_iter().collect(),
+            private_memory: std::env::var_os("OBSIDIAN_MEMORY_AUTHORIZER_URL").is_some(),
         })
     }
 
@@ -80,6 +82,9 @@ impl ExcludeSet {
         let mut hash = Sha256::new();
         hash.update(b"obsidian-mcp/index-scope/v1\0");
         hash.update(crate::config::vault_storage_key(canonical_root));
+        if self.private_memory {
+            hash.update(b"private-memory-corpus/v1\0");
+        }
         for rule in &self.patterns {
             hash.update((rule.len() as u64).to_be_bytes());
             hash.update(rule.as_bytes());
@@ -93,6 +98,10 @@ impl ExcludeSet {
             return false;
         }
         self.set.is_match(relative_path)
+    }
+
+    pub(crate) fn allows_source(&self, path: &Path, content: &str) -> bool {
+        !self.private_memory || crate::access::private_source_eligible(path, content)
     }
 
     /// True when no patterns are configured.

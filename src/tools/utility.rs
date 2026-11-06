@@ -189,6 +189,13 @@ pub async fn vault_info(
     } else {
         None
     };
+    let mut embeddings = embedding_info(vault, runtime).await;
+    if vault.is_scoped() {
+        embeddings.status = None;
+        if embeddings.error.is_some() {
+            embeddings.error = Some("semantic service is unavailable".into());
+        }
+    }
     let info = VaultInfo {
         stats,
         vault_name: vault
@@ -197,9 +204,13 @@ pub async fn vault_info(
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default(),
         vault_path: vault.root().display().to_string(),
-        exclude_patterns: vault.exclude().patterns().to_vec(),
+        exclude_patterns: if vault.is_scoped() {
+            Vec::new()
+        } else {
+            vault.exclude().patterns().to_vec()
+        },
         mcp_data_dir,
-        embeddings: embedding_info(vault, runtime).await,
+        embeddings,
     };
     super::output::json(&info)
 }

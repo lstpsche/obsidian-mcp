@@ -1168,6 +1168,13 @@ async fn prepare_work(
                     return Ok(PreparationOutcome::Missing);
                 }
                 let raw = vault_root.read_exact_bounded(&path, read_limit)?;
+                if !index
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .allows_source(&path, &raw)
+                {
+                    return Ok(PreparationOutcome::Missing);
+                }
                 if previous.as_ref().is_some_and(|previous| {
                     super::source::source_revision_matches(&raw, &previous.source_revision)
                 }) {

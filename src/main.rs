@@ -1,4 +1,5 @@
 mod http_process;
+mod memory_http;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -38,7 +39,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = parse_cli_args(std::env::args_os().skip(1))?;
     let config = Config::load(&cli)?;
+    if matches!(config.transport, Transport::Stdio)
+        && (std::env::var_os("OBSIDIAN_MEMORY_AUTHORIZER_URL").is_some()
+            || std::env::var_os("OBSIDIAN_MEMORY_KEY_FILE").is_some())
+    {
+        return Err("private memory authorization requires HTTP transport".into());
+    }
     let semantic_runtime_config = SemanticRuntimeConfig::load_from_env();
+    if (std::env::var_os("OBSIDIAN_MEMORY_AUTHORIZER_URL").is_some()
+        || std::env::var_os("OBSIDIAN_MEMORY_KEY_FILE").is_some())
+        && semantic_runtime_config.mode != SemanticMode::Local
+    {
+        return Err("private memory authorization requires OBSIDIAN_SEMANTIC_MODE=local".into());
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(&config.log_level))
@@ -105,6 +118,11 @@ async fn serve_http(
     mcp_config.legacy_session_mode = true;
     mcp_config.json_response = true;
 
+    let memory_authorizer = memory_http::Authorizer::from_env()?;
+    let memory_required = memory_authorizer.is_some();
+    if memory_required && !config.http_host.is_loopback() {
+        return Err("private memory HTTP reader must bind to loopback".into());
+    }
     let health_vault = vault.clone();
     let mcp_service: StreamableHttpService<ObsidianMcp, LocalSessionManager> =
         StreamableHttpService::new(
@@ -119,8 +137,26 @@ async fn serve_http(
                             "HTTP tool filter context unavailable: {error}"
                         ))
                     })?;
+                let vault = match memory_http::REQUEST_READ_SCOPE.try_with(Clone::clone) {
+                    Ok(scope) => {
+                        disabled.extend(
+                            ToolFilter::parse("read")
+                                .map_err(std::io::Error::other)?
+                                .disabled_tools(),
+                        );
+                        vault
+                            .with_read_scope(scope)
+                            .map_err(std::io::Error::other)?
+                    }
+                    Err(_) if memory_required => {
+                        return Err(std::io::Error::other(
+                            "private memory authorization context unavailable",
+                        ));
+                    }
+                    Err(_) => vault.clone(),
+                };
                 Ok(ObsidianMcp::new(
-                    vault.clone(),
+                    vault,
                     hybrid_alpha,
                     semantic_runtime.clone(),
                     disabled,
@@ -133,9 +169,20 @@ async fn serve_http(
     let mcp_router = Router::new()
         .nest_service("/mcp", mcp_service)
         .layer(middleware::from_fn(tool_filter_middleware));
+    let mcp_router = if let Some(authorizer) = memory_authorizer {
+        mcp_router.layer(middleware::from_fn_with_state(
+            authorizer,
+            memory_http::middleware,
+        ))
+    } else {
+        mcp_router
+    };
 
     let app = Router::new()
-        .route("/health", get(move || health_handler(health_vault.clone())))
+        .route(
+            "/health",
+            get(move || health_handler(health_vault.clone(), memory_required)),
+        )
         .merge(mcp_router);
 
     let addr = std::net::SocketAddr::new(config.http_host, config.http_port);
@@ -178,7 +225,7 @@ async fn tool_filter_middleware(
         .await
 }
 
-async fn health_handler(vault: Vault) -> axum::Json<serde_json::Value> {
+async fn health_handler(vault: Vault, memory_required: bool) -> axum::Json<serde_json::Value> {
     let stats = vault.vault_stats().ok();
     let note_count = stats.as_ref().map(|s| s.total_notes);
 
@@ -188,6 +235,8 @@ async fn health_handler(vault: Vault) -> axum::Json<serde_json::Value> {
         "server": env!("CARGO_PKG_NAME"),
         "version": env!("CARGO_PKG_VERSION"),
         "notes": note_count,
+        "memory_scope_v1": true,
+        "memory_authorization_required": memory_required,
     });
 
     #[cfg(has_embeddings)]

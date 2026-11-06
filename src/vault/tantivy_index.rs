@@ -337,12 +337,23 @@ impl TantivyIndex {
         fuzzy: bool,
         fields: Option<&[SearchField]>,
     ) -> VaultResult<Vec<(PathBuf, f32)>> {
+        self.search_with_options_for_paths(query, top_k, fuzzy, fields, None)
+    }
+
+    pub(crate) fn search_with_options_for_paths(
+        &self,
+        query: &str,
+        top_k: usize,
+        fuzzy: bool,
+        fields: Option<&[SearchField]>,
+        allowed_paths: Option<&std::collections::HashSet<PathBuf>>,
+    ) -> VaultResult<Vec<(PathBuf, f32)>> {
         if query.is_empty() || top_k == 0 {
             return Ok(Vec::new());
         }
 
         if !fuzzy && fields.is_none() {
-            return self.search(query, top_k);
+            return self.search_for_paths(query, top_k, allowed_paths);
         }
 
         let searcher = self.reader.searcher();
@@ -415,6 +426,17 @@ impl TantivyIndex {
             _ => Box::new(BooleanQuery::new(subqueries)),
         };
 
+        let final_query: Box<dyn tantivy::query::Query> = if let Some(paths) = allowed_paths {
+            let terms = paths
+                .iter()
+                .map(|path| Term::from_field_text(self.ts.f_path, &path.to_string_lossy()));
+            Box::new(BooleanQuery::intersection(vec![
+                final_query,
+                Box::new(tantivy::query::TermSetQuery::new(terms)),
+            ]))
+        } else {
+            final_query
+        };
         let top_docs =
             searcher.search(&*final_query, &TopDocs::with_limit(top_k).order_by_score())?;
 

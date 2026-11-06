@@ -687,6 +687,44 @@ For legacy HTTP sessions, send the header with `initialize`; that filter lasts f
 
 The `read` profile exposes frontmatter as part of the raw Markdown returned by `note_read`. For structured frontmatter `get`, `set`, and `remove` actions, use `full`, `core`, or an explicit allow-list containing `frontmatter` (for example, `OBSIDIAN_TOOLS=note_read,frontmatter`). Allowing `frontmatter` enables all three actions.
 
+Private audience isolation is optional and disabled by default. A managed memory
+reader can set both `OBSIDIAN_MEMORY_AUTHORIZER_URL` and
+`OBSIDIAN_MEMORY_KEY_FILE`, with `OBSIDIAN_SEMANTIC_MODE=local`. The reader
+must use HTTP bound to loopback; the authorizer must be `http://127.0.0.1:<port>/vault/memory/authorize` (or IPv6
+loopback). The key must be an absolute regular file, readable only by its owner
+and optionally its group. This mode always restricts MCP to read tools.
+
+Every MCP request must supply `Authorization: Bearer <opaque-grant>`, including
+legacy session requests. The reader revalidates the grant with the local
+authorizer using `X-Vault-Key` and JSON `{"version":1,"token":"<opaque-grant>"}`.
+Unavailable authorization fails closed; a session ID never replaces a grant.
+The authorizer must return version 1 with `tenant_id`, `star_label`,
+`workspace_id`, `audience_kind` (`channel` or `dm`), `audience_id`, `purpose`
+(`conversation`, `reflection` or `operator`), a path-safe `scope_id`,
+`allowed_prefixes`, and numeric Unix-seconds `expires_at`.
+
+Allowed paths are relative CODE directories ending in `/`, or exact `.md`
+files, and must contain the scope ID as a path component. Conversation grants
+cannot include Capture. Notes must carry matching tenant, bot, workspace and
+audience frontmatter; unclassified notes are inaccessible. Listing, metadata,
+graph, statistics and lexical/semantic candidate selection use the same
+immutable audience view. Scoped semantic results require a matching current
+source revision. The local `/health` endpoint remains available to operators
+and reports `memory_scope_v1` and `memory_authorization_required`, along with
+source-wide indexing readiness; it is not an audience-scoped MCP endpoint.
+
+Private indexing admits only schema `slack-code/1` notes marked
+`sensitivity: normal`, with valid origin metadata and its matching audience
+directory under active Organize sections, Express Skills, or exact Distill
+brief/index files. Raw Capture, review material, inferred bullets and
+unclassified notes never reach the embedding provider. Direct scoped reads
+also require this schema and normal sensitivity; a selected reflection grant
+can read its own raw Capture without adding it to the provider corpus.
+
+Private readers reject auto/daemon semantic ownership at startup so an
+unscoped pre-existing daemon cannot ingest their source. Ordinary unscoped
+clients retain all supported ownership modes.
+
 ## Configuration
 
 | Variable | Required | Default | Description |
