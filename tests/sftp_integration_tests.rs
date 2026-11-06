@@ -202,6 +202,65 @@ fn key(ssh_keygen: &Path, path: &Path) {
     );
 }
 
+#[cfg(windows)]
+fn protect_windows_ssh_keys(root: &Path) {
+    // sshd runs as SYSTEM; host keys must belong to SYSTEM or Administrators,
+    // while the client keys belong to the account running the test.
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$system = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+$administrators = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+$user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+function Set-OpenSshFileAcl {
+    param(
+        [string]$Path,
+        [System.Security.Principal.SecurityIdentifier]$Owner,
+        [System.Security.Principal.SecurityIdentifier[]]$Principals
+    )
+    $allowed = @($Principals | ForEach-Object { $_.Value } | Select-Object -Unique)
+    $acl = [System.Security.AccessControl.FileSecurity]::new()
+    $acl.SetOwner($Owner)
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($sid in $allowed) {
+        $identity = [System.Security.Principal.SecurityIdentifier]::new($sid)
+        $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+            $identity,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            [System.Security.AccessControl.AccessControlType]::Allow
+        )
+        $acl.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $Path -AclObject $acl
+    $actual = Get-Acl -LiteralPath $Path
+    if (!$actual.AreAccessRulesProtected -or $actual.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $Owner.Value) {
+        throw "Unexpected OpenSSH file owner or inheritance: $Path"
+    }
+    $rules = @($actual.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+    if ($rules.Count -ne $allowed.Count) {
+        throw "Unexpected OpenSSH file access rules: $Path"
+    }
+    foreach ($rule in $rules) {
+        if ($rule.IsInherited -or $rule.IdentityReference.Value -notin $allowed -or
+            $rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
+            $rule.FileSystemRights -ne [System.Security.AccessControl.FileSystemRights]::FullControl) {
+            throw "Unexpected OpenSSH file access rule: $Path"
+        }
+    }
+}
+foreach ($name in 'host_key', 'other_host_key', 'authorized_keys') {
+    Set-OpenSshFileAcl -Path (Join-Path $env:OBSIDIAN_TEST_SSH_ROOT $name) -Owner $administrators -Principals @($system, $administrators)
+}
+foreach ($name in 'client_key', 'rejected_key') {
+    Set-OpenSshFileAcl -Path (Join-Path $env:OBSIDIAN_TEST_SSH_ROOT $name) -Owner $user -Principals @($user)
+}
+"#;
+    checked(
+        Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .env("OBSIDIAN_TEST_SSH_ROOT", root),
+    );
+}
+
 impl SshFixture {
     fn start() -> Self {
         assert_eq!(
@@ -232,6 +291,8 @@ impl SshFixture {
         }
         let authorized = root.join("authorized_keys");
         std::fs::copy(client_key.with_extension("pub"), &authorized).unwrap();
+        #[cfg(windows)]
+        protect_windows_ssh_keys(root);
         #[cfg(unix)]
         let user = {
             let output = Command::new("id").arg("-un").output().unwrap();

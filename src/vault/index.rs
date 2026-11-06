@@ -13,7 +13,7 @@ use crate::vault::wikilink::{LinkResolver, build_link_resolver};
 use crate::vault::{frontmatter, fs, parser};
 
 use super::exclude::ExcludeSet;
-use super::path::{logical_file_name, logical_file_stem};
+use super::path::{logical_file_name, logical_file_stem, logical_separators};
 
 /// Native spellings for each case-folded path prefix in the tracked inventory.
 /// A directory stays present until its last tracked descendant is removed.
@@ -550,6 +550,8 @@ impl VaultIndex {
 
     /// Remove all contributions for a deleted file.
     pub fn remove_file(&mut self, path: &Path) {
+        let path = logical_separators(path);
+        let path = path.as_ref();
         self.source_revisions.remove(path.as_os_str());
         if self.tracks(path)
             && let Some(paths) = self.watch_paths.get_mut()
@@ -765,6 +767,8 @@ impl VaultIndex {
     }
 
     pub(crate) fn tracks(&self, path: &Path) -> bool {
+        let path = logical_separators(path);
+        let path = path.as_ref();
         self.notes.contains_key(path.as_os_str())
             || self.excluded_note_paths.contains(path.as_os_str())
             || self.attachments.contains_key(path.as_os_str())
@@ -782,6 +786,8 @@ impl VaultIndex {
     }
 
     pub fn get_note(&self, path: &Path) -> Option<&NoteMetadata> {
+        let path = logical_separators(path);
+        let path = path.as_ref();
         self.notes.get(path.as_os_str())
     }
 
@@ -813,6 +819,8 @@ impl VaultIndex {
     }
 
     pub fn backlinks_to(&self, path: &Path) -> Vec<&NoteMetadata> {
+        let path = logical_separators(path);
+        let path = path.as_ref();
         self.backlinks
             .get(path.as_os_str())
             .map(|sources| sources.iter().filter_map(|p| self.notes.get(p)).collect())
@@ -820,6 +828,8 @@ impl VaultIndex {
     }
 
     pub fn outgoing_links(&self, path: &Path) -> Vec<&WikiLink> {
+        let path = logical_separators(path);
+        let path = path.as_ref();
         self.notes
             .get(path.as_os_str())
             .map(|note| note.links.iter().collect())
@@ -867,6 +877,8 @@ impl VaultIndex {
 
     /// Track a markdown file that exists on disk but is excluded from the index.
     pub fn add_excluded_file(&mut self, path: &Path) {
+        let path = logical_separators(path);
+        let path = path.as_ref();
         if self.excluded_note_paths.contains(path.as_os_str()) {
             return;
         }
@@ -1688,6 +1700,117 @@ mod tests {
         assert!(filtered.get_note(Path::new("a:b.md")).is_none());
         assert!(filtered.get_note(Path::new("A:b.md")).is_some());
         assert_eq!(filtered.stats().total_notes, 1);
+    }
+
+    #[test]
+    fn index_path_boundaries_accept_native_and_logical_separator_spellings() {
+        let mut index = VaultIndex::for_source(empty_exclude());
+        let source = "[[target]] #source";
+        let source_path = Path::new("notes/source.md");
+        let target_path = Path::new("notes/target.md");
+        for (path, content) in [(source_path, source), (target_path, "# Target")] {
+            index
+                .apply_observation(
+                    path,
+                    Some(content.into()),
+                    observed_stat(content.len()),
+                    None,
+                    false,
+                )
+                .unwrap();
+        }
+        for source_path in [
+            Path::new("notes").join("source.md"),
+            PathBuf::from("notes\\source.md"),
+        ] {
+            assert_eq!(
+                index.get_note(&source_path).unwrap().path.as_os_str(),
+                std::ffi::OsStr::new("notes/source.md")
+            );
+            assert_eq!(index.outgoing_links(&source_path).len(), 1);
+            assert!(index.tracks(&source_path));
+        }
+        for target_path in [
+            Path::new("notes").join("target.md"),
+            PathBuf::from("notes\\target.md"),
+        ] {
+            assert_eq!(index.backlinks_to(&target_path).len(), 1);
+        }
+        assert!(
+            index
+                .refresh_unchanged_note(
+                    source_path,
+                    &super::super::source::source_revision(source),
+                    observed_stat(source.len() + 1)
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            index.get_note(source_path).unwrap().stat.size,
+            source.len() as u64 + 1
+        );
+        index.remove_file(Path::new("notes\\source.md"));
+        assert!(index.get_note(source_path).is_none());
+        assert!(index.backlinks_to(target_path).is_empty());
+        assert_eq!(index.stats().total_notes, 1);
+
+        index
+            .apply_observation(
+                source_path,
+                Some(source.into()),
+                observed_stat(source.len()),
+                None,
+                false,
+            )
+            .unwrap();
+        assert!(
+            index
+                .notes()
+                .contains_key(std::ffi::OsStr::new("notes/source.md"))
+        );
+        assert!(
+            !index
+                .notes()
+                .contains_key(std::ffi::OsStr::new("notes\\source.md"))
+        );
+        assert_eq!(index.backlinks_to(target_path).len(), 1);
+        for (path, content) in [("a:b.md", "#lower"), ("A:b.md", "#upper")] {
+            index
+                .apply_observation(
+                    Path::new(path),
+                    Some(content.into()),
+                    observed_stat(content.len()),
+                    None,
+                    false,
+                )
+                .unwrap();
+        }
+        assert_eq!(index.get_note(Path::new("a:b.md")).unwrap().tags, ["lower"]);
+        assert_eq!(index.get_note(Path::new("A:b.md")).unwrap().tags, ["upper"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_inventory_does_not_reinterpret_literal_filename_separators() {
+        let directory = TempDir::new().unwrap();
+        stdfs::create_dir(directory.path().join("notes")).unwrap();
+        stdfs::write(directory.path().join("notes/source.md"), "#kept").unwrap();
+        stdfs::write(directory.path().join("notes\\source.md"), "#canary").unwrap();
+        let index = VaultIndex::build(directory.path(), empty_exclude())
+            .await
+            .unwrap();
+        assert_eq!(index.notes().len(), 1);
+        assert_eq!(
+            index.get_note(Path::new("notes/source.md")).unwrap().tags,
+            ["kept"]
+        );
+        assert_eq!(
+            index.get_note(Path::new("notes\\source.md")).unwrap().tags,
+            ["kept"]
+        );
+        assert!(index.notes_with_tag("canary").is_empty());
+        assert_eq!(index.stats().total_files, 1);
+        assert_eq!(index.stats().vault_size_bytes, "#kept".len() as u64);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Vault-relative path normalization and Unicode-aware filesystem resolution.
 
+use std::borrow::Cow;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
@@ -59,6 +60,16 @@ impl VaultPath {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// Use the accepted logical separator spelling without changing name identity.
+/// Native Windows joins introduce backslashes, while source indexes store `/`.
+/// Avoid native component parsing so drive-like remote names remain exact keys.
+pub(crate) fn logical_separators(path: &Path) -> Cow<'_, Path> {
+    match path.to_str() {
+        Some(raw) if raw.contains('\\') => Cow::Owned(PathBuf::from(raw.replace('\\', "/"))),
+        _ => Cow::Borrowed(path),
     }
 }
 
@@ -252,6 +263,31 @@ mod tests {
         assert_ne!(
             VaultPath::entry("café.md").unwrap(),
             VaultPath::entry("cafe\u{301}.md").unwrap()
+        );
+    }
+
+    #[test]
+    fn logical_separator_spelling_preserves_exact_names() {
+        let native = Path::new("notes").join("re\u{301}sume\u{301}.md");
+        assert_eq!(
+            logical_separators(&native).as_os_str(),
+            std::ffi::OsStr::new("notes/re\u{301}sume\u{301}.md")
+        );
+        assert_eq!(
+            logical_separators(Path::new("notes\\nested\\entry.md")).as_os_str(),
+            std::ffi::OsStr::new("notes/nested/entry.md")
+        );
+        assert_ne!(
+            logical_separators(Path::new("a:b.md")).as_os_str(),
+            logical_separators(Path::new("A:b.md")).as_os_str()
+        );
+        assert_ne!(
+            logical_separators(Path::new("notes/café.md")).as_os_str(),
+            logical_separators(Path::new("notes/cafe\u{301}.md")).as_os_str()
+        );
+        assert_eq!(
+            logical_separators(Path::new("a:b\\CON.md")).as_os_str(),
+            std::ffi::OsStr::new("a:b/CON.md")
         );
     }
 
