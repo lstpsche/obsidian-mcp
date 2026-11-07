@@ -156,7 +156,9 @@ Private audience-scoped HTTP readers require a local vault source. Combining SFT
 
 ## Rust consumers
 
-Source I/O through `Vault` is asynchronous. Await source reads, mutations, listing, source-dependent inspection and search calls; pure cached operations retain their synchronous APIs. Data-path getters return `Option<&Path>`: `mcp_data()` is absent until remote initialization resolves local derived state, and remote sources have no vault-local `mcp_home()`. Native low-level filesystem operations still use `VaultRoot` and local daemon IPC remains local-only. MCP tool parameters and normal local result meanings are preserved, while remote status can represent initialization and unknown aggregates. The public Rust source API change requires a major-version migration before publication.
+Source I/O through `Vault` is asynchronous. Await source reads, mutations, listing, source-dependent inspection and search calls; pure cached operations retain their synchronous APIs. Data-path getters return `Option<&Path>`: `mcp_data()` is absent until remote initialization resolves local derived state, and remote sources have no vault-local `mcp_home()`. Native low-level filesystem operations still use `VaultRoot` and local daemon IPC remains local-only. MCP tool parameters and normal local result meanings are preserved, while remote status can represent initialization and unknown aggregates. These source API changes require migration when upgrading from 4.x to 5.0.
+
+`VaultIndex::notes()` now returns a map keyed by exact `OsString` values instead of `PathBuf`. Use `Path::new(key)` for path operations; native path equality must not collapse distinct remote names.
 
 ## Native SSH integration checks
 
