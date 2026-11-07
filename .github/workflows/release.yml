@@ -7,7 +7,11 @@ on:
     paths:
       - ".github/workflows/release.yml"
       - "tests/semantic_daemon_api_tests.rs"
+      - "tests/sftp_mcp_tests.rs"
+      - "tests/sftp_integration_tests.rs"
       - "tests/common/**"
+      - "src/config/source.rs"
+      - "src/vault/storage/**"
 
 permissions:
   contents: read
@@ -46,6 +50,28 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Prepare native SSH fixture
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes openssh-server openssh-sftp-server
+          sudo install -d -m 755 /run/sshd
+
+      - name: Prepare Windows native SSH fixture
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $capability = Get-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+          if ($capability.State -ne 'Installed') {
+            Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
+          }
+          foreach ($tool in 'ssh', 'ssh-keygen', 'sshd') {
+            if (!(Test-Path "$env:WINDIR/System32/OpenSSH/$tool.exe")) {
+              throw "Native SSH fixture requires $tool.exe"
+            }
+          }
 
       - name: Build
         run: cargo build --locked --release --features "${{ matrix.features }}" --target ${{ matrix.target }}
@@ -88,7 +114,18 @@ jobs:
             tar -xzf obsidian-semanticd-"${ARCHIVE_REF#v}"-${{ matrix.target }}.tar.gz -C daemon-smoke
             tar -xzf obsidian-mcp-"${ARCHIVE_REF#v}"-${{ matrix.target }}.tar.gz -C daemon-smoke
           fi
-          OBSIDIAN_TEST_DAEMON_BINARY="$PWD/daemon-smoke/obsidian-semanticd$daemon_suffix" OBSIDIAN_TEST_MCP_BINARY="$PWD/daemon-smoke/obsidian-mcp$daemon_suffix" cargo test --locked --release --features "${{ matrix.features }}" --target ${{ matrix.target }} --test semantic_daemon_api_tests
+          OBSIDIAN_TEST_DAEMON_BINARY="$PWD/daemon-smoke/obsidian-semanticd$daemon_suffix" OBSIDIAN_TEST_MCP_BINARY="$PWD/daemon-smoke/obsidian-mcp$daemon_suffix" cargo test --locked --release --features "${{ matrix.features }}" --target ${{ matrix.target }} --test semantic_daemon_api_tests --test sftp_mcp_tests
+
+      - name: Verify native SSH authentication against archive
+        shell: bash
+        env:
+          OBSIDIAN_TEST_SSH_INTEGRATION: '1'
+        run: |
+          mcp_suffix=""
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            mcp_suffix=".exe"
+          fi
+          OBSIDIAN_TEST_MCP_BINARY="$PWD/daemon-smoke/obsidian-mcp$mcp_suffix" cargo test --locked --release --features "${{ matrix.features }}" --target ${{ matrix.target }} --test sftp_integration_tests -- --ignored
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

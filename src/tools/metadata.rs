@@ -110,10 +110,10 @@ pub async fn note_inspect(
                 "max_bytes must be between 1 and 262144",
             ));
         }
-        let vault = vault.clone();
+        let snapshot = vault.read_source_snapshot(Path::new(&params.path)).await?;
         let page = tokio::task::spawn_blocking(move || {
             let path = Path::new(&params.path);
-            vault.read_source_snapshot(path)?.headings_page(
+            snapshot.headings_page(
                 path,
                 params.expected_revision.as_deref(),
                 params.heading_offset.unwrap_or(0),
@@ -163,8 +163,8 @@ async fn note_inspect_metadata(
     note_path: &str,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     let path = Path::new(note_path);
-    let meta = vault.get_note_metadata(path)?;
-    let backlinks = vault.backlinks(path)?;
+    let meta = vault.get_note_metadata(path).await?;
+    let backlinks = vault.backlinks(path).await?;
 
     let output = NoteMetadataOutput {
         path: meta.path,
@@ -188,7 +188,7 @@ async fn note_inspect_targets(
     note_path: &str,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     let path = Path::new(note_path);
-    let map = vault.get_document_map(path)?;
+    let map = vault.get_document_map(path).await?;
 
     let value = serde_json::to_value(NoteInspectOutput::Targets(map))
         .map_err(|e| VaultError::Other(format!("serialization error: {e}")))?;
@@ -224,7 +224,7 @@ pub async fn frontmatter(
     let path = Path::new(&params.path);
 
     if params.action.eq_ignore_ascii_case("get") {
-        let fm = vault.get_frontmatter(path)?;
+        let fm = vault.get_frontmatter(path).await?;
         let text = serde_json::to_string(&fm)
             .map_err(|error| VaultError::Other(format!("JSON serialization failed: {error}")))?;
         super::output::with_text(&FrontmatterOutput::Get { frontmatter: fm }, text)
@@ -243,7 +243,7 @@ pub async fn frontmatter(
                 None::<serde_json::Value>,
             )
         })?;
-        vault.set_frontmatter_field(path, key, value)?;
+        vault.set_frontmatter_field(path, key, value).await?;
         let message = format!("Set frontmatter field '{key}' on '{}'", params.path);
         super::output::with_text(
             &FrontmatterOutput::Set {
@@ -259,7 +259,7 @@ pub async fn frontmatter(
                 None::<serde_json::Value>,
             )
         })?;
-        vault.remove_frontmatter_field(path, key)?;
+        vault.remove_frontmatter_field(path, key).await?;
         let message = format!("Removed frontmatter field '{key}' from '{}'", params.path);
         super::output::with_text(
             &FrontmatterOutput::Remove {
@@ -296,6 +296,7 @@ mod tests {
                 Path::new("outline.md"),
                 "# Parent\n## Child\nbody\n## Other\n",
             )
+            .await
             .unwrap();
         let result = note_inspect(
             &vault,
@@ -317,6 +318,7 @@ mod tests {
         let revision = value["source_revision"].as_str().unwrap().to_owned();
         vault
             .write_note(Path::new("outline.md"), "# Changed\n")
+            .await
             .unwrap();
         let error = note_inspect(
             &vault,
@@ -379,10 +381,11 @@ mod tests {
             .write_note(
                 Path::new("test.md"),
                 "---\ntags: [rust]\nstatus: draft\n---\n# Heading\n## Sub\n[[other]] #inline\n^block1\n",
-            )
+            ).await
             .unwrap();
         vault
             .write_note(Path::new("other.md"), "# Other\n[[test]]\n")
+            .await
             .unwrap();
 
         let result = note_inspect(
@@ -446,6 +449,7 @@ mod tests {
                 Path::new("mapped.md"),
                 "---\ntags: [rust]\ndate: 2026-01-01\n---\n# Heading\n## Sub\nText ^block1\n",
             )
+            .await
             .unwrap();
 
         let result = note_inspect(
@@ -498,6 +502,7 @@ mod tests {
                 Path::new("scratch.md"),
                 "# Scratch\n\n## Log\n\n| Date | Update |\n| ---- | ------ |\n",
             )
+            .await
             .unwrap();
 
         let result = note_inspect(
@@ -534,7 +539,7 @@ mod tests {
         .await
         .unwrap();
 
-        let content = vault.read_note(Path::new("scratch.md")).unwrap();
+        let content = vault.read_note(Path::new("scratch.md")).await.unwrap();
         let log_idx = content.find("## Log").unwrap();
         let appended_idx = content.find("| 2026-02-02 | x |").unwrap();
         assert!(appended_idx > log_idx);
@@ -546,7 +551,10 @@ mod tests {
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        vault.write_note(Path::new("test.md"), "# Note\n").unwrap();
+        vault
+            .write_note(Path::new("test.md"), "# Note\n")
+            .await
+            .unwrap();
 
         let result = note_inspect(
             &vault,
@@ -568,6 +576,7 @@ mod tests {
 
         vault
             .write_note(Path::new("fm.md"), "# Note\nBody\n")
+            .await
             .unwrap();
 
         let result = frontmatter(
@@ -739,7 +748,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
-        vault.write_note(Path::new("fm.md"), "# Note\n").unwrap();
+        vault
+            .write_note(Path::new("fm.md"), "# Note\n")
+            .await
+            .unwrap();
 
         let result = frontmatter(
             &vault,
@@ -758,7 +770,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
-        vault.write_note(Path::new("fm.md"), "# Note\n").unwrap();
+        vault
+            .write_note(Path::new("fm.md"), "# Note\n")
+            .await
+            .unwrap();
 
         let result = frontmatter(
             &vault,
@@ -778,7 +793,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
-        vault.write_note(Path::new("fm.md"), "# Note\n").unwrap();
+        vault
+            .write_note(Path::new("fm.md"), "# Note\n")
+            .await
+            .unwrap();
 
         let result = frontmatter(
             &vault,
@@ -798,7 +816,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
-        vault.write_note(Path::new("fm.md"), "# Note\n").unwrap();
+        vault
+            .write_note(Path::new("fm.md"), "# Note\n")
+            .await
+            .unwrap();
 
         let result = frontmatter(
             &vault,

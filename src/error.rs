@@ -4,8 +4,42 @@ use std::path::PathBuf;
 
 use rmcp::model::ErrorCode;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageErrorKind {
+    Unavailable,
+    PermissionDenied,
+    Unsupported,
+    Protocol,
+    RemoteFailure,
+    ProjectionFailure,
+    InvalidSource,
+    Conflict,
+    IdentityChanged,
+    Warming,
+    ResourceLimit,
+}
+
+/// The destination outcome, independently of local index publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationOutcome {
+    NotDispatched,
+    NotCommitted,
+    Committed,
+    Unknown,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum VaultError {
+    #[error("Storage {operation} failed for {path}: {message} (outcome: {outcome:?})")]
+    Storage {
+        operation: String,
+        path: String,
+        kind: StorageErrorKind,
+        message: String,
+        outcome: MutationOutcome,
+    },
     #[error("Note not found: {0}")]
     NoteNotFound(PathBuf),
 
@@ -123,6 +157,40 @@ pub enum VaultError {
 pub type VaultResult<T> = Result<T, VaultError>;
 
 impl VaultError {
+    pub fn storage(
+        operation: impl Into<String>,
+        path: impl Into<String>,
+        kind: StorageErrorKind,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::Storage {
+            operation: operation.into(),
+            path: path.into(),
+            kind,
+            message: message.into(),
+            outcome: MutationOutcome::NotDispatched,
+        }
+    }
+
+    pub fn with_mutation_outcome(self, outcome: MutationOutcome) -> Self {
+        match self {
+            Self::Storage {
+                operation,
+                path,
+                kind,
+                message,
+                ..
+            } => Self::Storage {
+                operation,
+                path,
+                kind,
+                message,
+                outcome,
+            },
+            other => other,
+        }
+    }
+
     pub(crate) fn is_not_found(&self) -> bool {
         matches!(self, Self::NoteNotFound(_) | Self::DirectoryNotFound(_))
             || matches!(self, Self::Io(err) if err.kind() == std::io::ErrorKind::NotFound)
@@ -132,6 +200,13 @@ impl VaultError {
 impl From<VaultError> for rmcp::ErrorData {
     fn from(err: VaultError) -> Self {
         let code = match &err {
+            VaultError::Storage { kind, .. } => match kind {
+                StorageErrorKind::Warming
+                | StorageErrorKind::Conflict
+                | StorageErrorKind::IdentityChanged
+                | StorageErrorKind::Unsupported => ErrorCode::INVALID_REQUEST,
+                _ => ErrorCode::INTERNAL_ERROR,
+            },
             VaultError::NoteNotFound(_) | VaultError::DirectoryNotFound(_) => {
                 ErrorCode::RESOURCE_NOT_FOUND
             }
@@ -171,6 +246,16 @@ impl From<VaultError> for rmcp::ErrorData {
             },
         };
         let data = match &err {
+            VaultError::Storage {
+                operation,
+                path,
+                kind,
+                outcome,
+                ..
+            } => Some(serde_json::json!({
+                "code": "storage_error", "operation": operation, "path": path,
+                "kind": kind, "outcome": outcome,
+            })),
             VaultError::DaemonRpc { data, .. } => data.clone(),
             VaultError::SourceChanged {
                 path,
@@ -188,5 +273,27 @@ impl From<VaultError> for rmcp::ErrorData {
             _ => None,
         };
         rmcp::ErrorData::new(code, err.to_string(), data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_failure_preserves_mutation_uncertainty_at_mcp_boundary() {
+        let error: rmcp::ErrorData = VaultError::storage(
+            "replace",
+            "note.md",
+            StorageErrorKind::Unavailable,
+            "connection closed before acknowledgment",
+        )
+        .with_mutation_outcome(MutationOutcome::Unknown)
+        .into();
+        let data = error.data.unwrap();
+        assert_eq!(data["outcome"], "unknown");
+        assert_eq!(data["operation"], "replace");
+        assert_eq!(data["kind"], "unavailable");
+        assert!(error.message.contains("before acknowledgment"));
     }
 }

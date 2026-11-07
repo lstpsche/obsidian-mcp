@@ -1,6 +1,7 @@
 //! Managed background lifecycle for optional semantic embeddings.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,6 +26,7 @@ use super::embeddings::{
     validate_embedding_batch,
 };
 use super::index::VaultIndex;
+use super::storage::Storage;
 
 #[cfg(not(test))]
 const MAX_DIRTY_INTERVAL: Duration = Duration::from_secs(2);
@@ -111,7 +113,7 @@ impl Drop for RuntimeControl {
 }
 
 struct RuntimeShared {
-    vault_root: super::fs::VaultRoot,
+    source: Storage,
     index: Arc<RwLock<VaultIndex>>,
     cache: CacheFile,
     batch_size: usize,
@@ -123,23 +125,71 @@ struct RuntimeShared {
     first_load_error: OnceLock<String>,
 }
 
+impl RuntimeShared {
+    /// Withdraw semantic publication after a source identity has been rejected.
+    fn source_is_live(&self) -> bool {
+        let Storage::Sftp(source) = &self.source else {
+            return self.live.load(Ordering::Acquire);
+        };
+        let Some((crate::error::StorageErrorKind::IdentityChanged, message)) =
+            source.last_failure()
+        else {
+            return self.live.load(Ordering::Acquire);
+        };
+        self.live.store(false, Ordering::Release);
+        let total_notes = self
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .status
+            .total_notes;
+        record_terminal_failure_message(self, message, total_notes);
+        self.notify.notify_waiters();
+        false
+    }
+}
+
 #[derive(Default)]
 struct RuntimeState {
     next_generation: u64,
-    pending: HashMap<PathBuf, PendingWork>,
-    inflight: HashMap<PathBuf, u64>,
+    pending: HashMap<OsString, PendingWork>,
+    inflight: HashMap<OsString, (u64, PendingKind)>,
     batch_started_at: Option<Instant>,
-    initial_remaining: HashSet<PathBuf>,
+    initial_remaining: HashSet<OsString>,
     initial_started: bool,
     reconciliation_complete: bool,
-    failures: HashMap<PathBuf, String>,
+    failures: HashMap<OsString, String>,
     persistence_error: Option<String>,
     cache_error: Option<String>,
-    staged: HashMap<PathBuf, StagedNote>,
+    staged: HashMap<OsString, StagedNote>,
     model: Option<Arc<dyn Embedder>>,
     store: Option<Arc<RwLock<EmbeddingStore>>>,
     store_queryable: bool,
     status: EmbeddingRuntimeStatus,
+}
+
+/// Directory authority for the finite set of work due at one observation.
+/// Provider batches and preparation admission remain independently bounded.
+struct ObservationPass<'a> {
+    generations: HashMap<OsString, u64>,
+    observed: VaultResult<super::storage::ObservedBatch<'a>>,
+}
+
+impl ObservationPass<'_> {
+    fn contains(&self, batch: &[PendingWork]) -> bool {
+        batch.iter().all(|work| {
+            work.kind == PendingKind::Remove
+                || self.generations.get(work.path.as_os_str()) == Some(&work.generation)
+        })
+    }
+
+    fn consume(&mut self, batch: &[PendingWork]) {
+        for work in batch {
+            if self.generations.get(work.path.as_os_str()) == Some(&work.generation) {
+                self.generations.remove(work.path.as_os_str());
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,8 +271,8 @@ pub(crate) struct EmbeddingQuerySnapshot {
 impl EmbeddingQuerySnapshot {
     pub(crate) fn capture_entries(
         &self,
-        allowed_paths: &HashSet<PathBuf>,
-    ) -> HashMap<PathBuf, Arc<NoteEmbeddingEntry>> {
+        allowed_paths: &HashSet<OsString>,
+    ) -> HashMap<OsString, Arc<NoteEmbeddingEntry>> {
         self.store
             .read()
             .unwrap_or_else(|error| error.into_inner())
@@ -308,6 +358,27 @@ impl EmbeddingRuntime {
     where
         F: Future<Output = VaultResult<Arc<dyn Embedder>>> + Send + 'static,
     {
+        Self::spawn_with_source(
+            Storage::Local(vault_root),
+            index,
+            cache,
+            batch_size,
+            initially_active,
+            loader,
+        )
+    }
+
+    pub(crate) fn spawn_with_source<F>(
+        source: Storage,
+        index: Arc<RwLock<VaultIndex>>,
+        cache: CacheFile,
+        batch_size: usize,
+        initially_active: bool,
+        loader: F,
+    ) -> Self
+    where
+        F: Future<Output = VaultResult<Arc<dyn Embedder>>> + Send + 'static,
+    {
         #[cfg(test)]
         tests::initialize_test_logging();
         debug_assert!(batch_size > 0);
@@ -323,7 +394,7 @@ impl EmbeddingRuntime {
         for (path, kind) in initial_paths {
             let generation = next_generation(&mut state);
             state.pending.insert(
-                path.clone(),
+                path.as_os_str().to_owned(),
                 PendingWork {
                     path,
                     generation,
@@ -335,7 +406,7 @@ impl EmbeddingRuntime {
         }
         update_pending_status(&mut state);
         let shared = Arc::new(RuntimeShared {
-            vault_root,
+            source,
             index,
             cache,
             batch_size,
@@ -347,8 +418,11 @@ impl EmbeddingRuntime {
             first_load_error: OnceLock::new(),
         });
         let worker_shared = Arc::clone(&shared);
-        let span =
-            tracing::info_span!("embedding_runtime", vault = %shared.vault_root.path().display());
+        let span = tracing::info_span!(
+            "embedding_runtime",
+            source = if shared.source.is_remote() { "sftp" } else { "local" },
+            vault = %shared.source.path().display(),
+        );
         let worker = tokio::spawn(
             async move {
                 let coordinator = run_coordinator(Arc::clone(&worker_shared), loader);
@@ -380,7 +454,7 @@ impl EmbeddingRuntime {
 
     /// Activate the existing coordinator once, preserving queued mutation intents.
     pub(crate) fn activate(&self) -> bool {
-        if !self.control.shared.live.load(Ordering::Acquire) {
+        if !self.control.shared.source_is_live() {
             return false;
         }
         let activated = !self.control.shared.active.swap(true, Ordering::AcqRel);
@@ -398,6 +472,63 @@ impl EmbeddingRuntime {
         self.submit(path, PendingKind::Upsert);
     }
 
+    /// Report existing evidence or retained note work without creating a generation.
+    /// Called while the source index is locked; use only the state-to-store lock order.
+    pub(crate) fn has_current_or_pending(&self, path: &Path, source_revision: &str) -> bool {
+        if !self.control.shared.source_is_live() {
+            return false;
+        }
+        let Ok(path) = normalize_intent_path(path, self.control.shared.source.is_remote()) else {
+            return false;
+        };
+        let state = self
+            .control
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let current = state_generation(&state, &path);
+        let removing = state
+            .pending
+            .get(path.as_os_str())
+            .is_some_and(|work| work.kind == PendingKind::Remove)
+            || state
+                .inflight
+                .get(path.as_os_str())
+                .is_some_and(|(generation, kind)| {
+                    current == Some(*generation) && *kind == PendingKind::Remove
+                });
+        if removing {
+            return false;
+        }
+        let note_work = |generation, kind| {
+            current == Some(generation)
+                && matches!(kind, PendingKind::Upsert | PendingKind::AwaitingLexical)
+        };
+        if state
+            .pending
+            .get(path.as_os_str())
+            .is_some_and(|work| note_work(work.generation, work.kind))
+            || state
+                .inflight
+                .get(path.as_os_str())
+                .is_some_and(|(generation, kind)| note_work(*generation, *kind))
+            || state
+                .staged
+                .get(path.as_os_str())
+                .is_some_and(|draft| note_work(draft.work.generation, draft.work.kind))
+        {
+            return true;
+        }
+        state.store.as_ref().is_some_and(|store| {
+            store
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .note(&path)
+                .is_some_and(|entry| entry.source_revision == source_revision)
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn submit_remove(&self, path: &Path) {
         self.submit(path, PendingKind::Remove);
@@ -410,10 +541,10 @@ impl EmbeddingRuntime {
     }
 
     pub(super) fn submit(&self, path: &Path, kind: PendingKind) {
-        if !self.control.shared.live.load(Ordering::Acquire) {
+        if !self.control.shared.source_is_live() {
             return;
         }
-        let normalized = match super::path::normalize_relative(path) {
+        let normalized = match normalize_intent_path(path, self.control.shared.source.is_remote()) {
             Ok(path) if !path.as_os_str().is_empty() => path,
             Ok(_) => return,
             Err(error) => {
@@ -428,10 +559,10 @@ impl EmbeddingRuntime {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let generation = next_generation(&mut state);
-        state.staged.remove(&normalized);
-        state.failures.remove(&normalized);
+        state.staged.remove(normalized.as_os_str());
+        state.failures.remove(normalized.as_os_str());
         state.pending.insert(
-            normalized.clone(),
+            normalized.as_os_str().to_owned(),
             PendingWork {
                 path: normalized,
                 generation,
@@ -448,6 +579,7 @@ impl EmbeddingRuntime {
     }
 
     pub(crate) fn status(&self) -> EmbeddingRuntimeStatus {
+        let live = self.control.shared.source_is_live();
         let paths = current_paths(&self.control.shared.index);
         let state = self
             .control
@@ -455,10 +587,29 @@ impl EmbeddingRuntime {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        status_for_current_paths(&state, &paths)
+        let mut status = status_for_current_paths(&state, &paths);
+        if !live {
+            status.queryable = false;
+        }
+        status
     }
 
     pub(crate) fn query_snapshot(&self) -> VaultResult<EmbeddingQuerySnapshot> {
+        if !self.control.shared.source_is_live() {
+            let state = self
+                .control
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            return Err(VaultError::Embedding(
+                state
+                    .status
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "embedding runtime has stopped".into()),
+            ));
+        }
         {
             let state = self
                 .control
@@ -505,14 +656,15 @@ impl EmbeddingRuntime {
 
     #[cfg(test)]
     pub(crate) fn pending_kind(&self, path: &Path) -> Option<PendingKind> {
-        let normalized = super::path::normalize_relative(path).ok()?;
+        let normalized =
+            normalize_intent_path(path, self.control.shared.source.is_remote()).ok()?;
         self.control
             .shared
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .pending
-            .get(&normalized)
+            .get(normalized.as_os_str())
             .map(|work| work.kind)
     }
 }
@@ -541,7 +693,7 @@ where
 {
     while !shared.active.load(Ordering::Acquire) {
         let notified = shared.notify.notified();
-        if !shared.live.load(Ordering::Acquire) {
+        if !shared.source_is_live() {
             return;
         }
         if shared.active.load(Ordering::Acquire) {
@@ -549,7 +701,7 @@ where
         }
         notified.await;
     }
-    if !shared.live.load(Ordering::Acquire) {
+    if !shared.source_is_live() {
         return;
     }
 
@@ -560,7 +712,7 @@ where
             return;
         }
     };
-    if !shared.live.load(Ordering::Acquire) {
+    if !shared.source_is_live() {
         return;
     }
 
@@ -591,7 +743,7 @@ where
             (None, Some(message))
         }
     };
-    if !shared.live.load(Ordering::Acquire) {
+    if !shared.source_is_live() {
         return;
     }
 
@@ -620,12 +772,15 @@ where
         state.store_queryable =
             previously_publishable && (current_paths.is_empty() || has_cached_vectors);
         state.initial_started = true;
-        state.initial_remaining = initial_paths.iter().map(|(path, _)| path.clone()).collect();
+        state.initial_remaining = initial_paths
+            .iter()
+            .map(|(path, _)| path.as_os_str().to_owned())
+            .collect();
         for (path, kind) in initial_paths {
-            if !state.pending.contains_key(&path) {
+            if !state.pending.contains_key(path.as_os_str()) {
                 let generation = next_generation(&mut state);
                 state.pending.insert(
-                    path.clone(),
+                    path.as_os_str().to_owned(),
                     PendingWork {
                         path,
                         generation,
@@ -640,20 +795,56 @@ where
     }
 
     dirty |= finalize_reconciliation_if_complete(&shared, &store);
+    if !shared.source_is_live() {
+        return;
+    }
     refresh_status(&shared, &store);
 
     let mut last_persist = Instant::now();
     let mut persist_retry_at = Instant::now();
     let mut persist_attempt = 0u8;
+    let mut observation: Option<ObservationPass<'_>> = None;
 
     loop {
-        if !shared.live.load(Ordering::Acquire) {
+        if !shared.source_is_live() {
             return;
         }
         let notified = shared.notify.notified();
         let (batch, next_pending, pending_empty) = take_due_batch(&shared);
         if !batch.is_empty() {
-            dirty |= process_batch(&shared, &store, &model, batch).await;
+            if batch.iter().all(|work| work.kind == PendingKind::Remove) {
+                for work in &batch {
+                    dirty |= commit_remove(&shared, &store, work);
+                }
+                if let Some(pass) = observation.as_mut() {
+                    pass.consume(&batch);
+                }
+            } else {
+                if observation
+                    .as_ref()
+                    .is_none_or(|pass| !pass.contains(&batch))
+                {
+                    let generations = due_observation_paths(&shared, &batch);
+                    let paths = generations.keys().map(PathBuf::from).collect::<Vec<_>>();
+                    observation = Some(ObservationPass {
+                        generations,
+                        observed: shared.source.observe_batch(&paths).await,
+                    });
+                }
+                if let Some(pass) = observation.as_mut() {
+                    let (changed, source_failed) =
+                        process_batch(&shared, &store, &model, &batch, pass.observed.as_ref())
+                            .await;
+                    dirty |= changed;
+                    pass.consume(&batch);
+                    if source_failed || pass.generations.is_empty() {
+                        observation = None;
+                    }
+                }
+            }
+            if !shared.source_is_live() {
+                return;
+            }
             shared
                 .state
                 .lock()
@@ -679,6 +870,7 @@ where
             }
             continue;
         }
+        observation = None;
 
         let now = Instant::now();
         let persistence_due = dirty
@@ -724,9 +916,12 @@ where
 }
 
 fn record_terminal_failure(shared: &RuntimeShared, error: VaultError) {
-    let message = error.to_string();
-    let _ = shared.first_load_error.set(message.clone());
     let total_notes = current_paths(&shared.index).len();
+    record_terminal_failure_message(shared, error.to_string(), total_notes);
+}
+
+fn record_terminal_failure_message(shared: &RuntimeShared, message: String, total_notes: usize) {
+    let _ = shared.first_load_error.set(message.clone());
     let mut state = shared
         .state
         .lock()
@@ -815,8 +1010,8 @@ fn take_due_batch(shared: &RuntimeShared) -> (Vec<PendingWork>, Option<Instant>,
 
     let mut batch = Vec::with_capacity(due.len());
     for (path, _, _) in due {
-        if let Some(work) = state.pending.remove(&path) {
-            state.inflight.insert(path, work.generation);
+        if let Some(work) = state.pending.remove(path.as_os_str()) {
+            state.inflight.insert(path, (work.generation, work.kind));
             batch.push(work);
         }
     }
@@ -832,139 +1027,186 @@ fn take_due_batch(shared: &RuntimeShared) -> (Vec<PendingWork>, Option<Instant>,
     (batch, next_pending, pending_empty)
 }
 
+fn due_observation_paths(shared: &RuntimeShared, batch: &[PendingWork]) -> HashMap<OsString, u64> {
+    let now = Instant::now();
+    let state = shared
+        .state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    state
+        .pending
+        .values()
+        .chain(batch)
+        .filter(|work| work.kind == PendingKind::Upsert && work.not_before <= now)
+        .map(|work| (work.path.as_os_str().to_owned(), work.generation))
+        .collect()
+}
+
 async fn process_batch(
     shared: &Arc<RuntimeShared>,
     store: &Arc<RwLock<EmbeddingStore>>,
     model: &Arc<dyn Embedder>,
-    batch: Vec<PendingWork>,
-) -> bool {
+    batch: &[PendingWork],
+    observed: Result<&super::storage::ObservedBatch<'_>, &VaultError>,
+) -> (bool, bool) {
     let mut dirty = false;
+    let mut source_failed = observed.is_err();
     let mut active: Vec<Option<StagedNote>> = Vec::new();
     let mut active_bytes = 0usize;
-    for work in batch {
-        if work.kind == PendingKind::Remove {
-            dirty |= commit_remove(shared, store, &work);
-            continue;
+    // Source bodies enter preparation individually under its staging budget.
+    for group in batch.chunks(32) {
+        for work in group.iter().filter(|work| work.kind == PendingKind::Remove) {
+            dirty |= commit_remove(shared, store, work);
         }
-        if !work_is_current(shared, &work) {
-            discard_inflight(shared, &work);
-            continue;
-        }
-        let existing_draft = shared
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .staged
-            .remove(&work.path)
-            .filter(|draft| draft.work.generation == work.generation);
-        let mut draft = if let Some(mut draft) = existing_draft {
-            draft.work = work.clone();
-            draft
-        } else {
-            let previous = store
-                .read()
+        for work in group
+            .iter()
+            .filter(|work| work.kind != PendingKind::Remove)
+            .cloned()
+        {
+            if !work_is_current(shared, &work) {
+                discard_inflight(shared, &work);
+                continue;
+            }
+            let existing_draft = shared
+                .state
+                .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .note(&work.path);
-            let reuse_index_bytes = previous.as_ref().map_or(0, |note| {
-                std::mem::size_of::<Vec<&ChunkEmbedding>>().saturating_add(
-                    note.chunks
-                        .len()
-                        .saturating_mul(std::mem::size_of::<&ChunkEmbedding>()),
+                .staged
+                .remove(work.path.as_os_str())
+                .filter(|draft| draft.work.generation == work.generation);
+            let mut draft = if let Some(mut draft) = existing_draft {
+                draft.work = work.clone();
+                draft
+            } else {
+                let observed = match observed {
+                    Ok(observed) => observed,
+                    Err(error) => {
+                        record_failure_message(
+                            shared,
+                            work,
+                            error.to_string(),
+                            retry_hint(error),
+                            None,
+                        );
+                        continue;
+                    }
+                };
+                let previous = store
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .note(&work.path);
+                let reuse_index_bytes = previous.as_ref().map_or(0, |note| {
+                    std::mem::size_of::<Vec<&ChunkEmbedding>>().saturating_add(
+                        note.chunks
+                            .len()
+                            .saturating_mul(std::mem::size_of::<&ChunkEmbedding>()),
+                    )
+                });
+                let prepared = match prepare_work_observed(
+                    shared,
+                    model,
+                    &work,
+                    active_bytes,
+                    reuse_index_bytes,
+                    previous.clone(),
+                    observed,
                 )
-            });
-            let prepared = match prepare_work(
-                shared,
-                model,
-                &work,
-                active_bytes,
-                reuse_index_bytes,
-                previous.clone(),
-            )
-            .await
-            {
-                Ok(PreparationOutcome::Prepared(prepared)) => prepared,
-                Ok(PreparationOutcome::Missing) => {
-                    dirty |= commit_remove(shared, store, &work);
-                    continue;
-                }
-                Ok(PreparationOutcome::Unchanged) => {
-                    mark_success(shared, &work);
-                    continue;
-                }
-                Ok(PreparationOutcome::Deferred) => {
+                .await
+                {
+                    Ok(PreparationOutcome::Prepared(prepared)) => prepared,
+                    Ok(PreparationOutcome::Missing) => {
+                        dirty |= commit_remove(shared, store, &work);
+                        continue;
+                    }
+                    Ok(PreparationOutcome::Unchanged) => {
+                        mark_success(shared, &work);
+                        continue;
+                    }
+                    Ok(PreparationOutcome::Deferred) => {
+                        defer_pending(shared, &work);
+                        continue;
+                    }
+                    Err(error) => {
+                        source_failed |= matches!(
+                            error,
+                            VaultError::Storage {
+                                kind: crate::error::StorageErrorKind::Unavailable
+                                    | crate::error::StorageErrorKind::Protocol
+                                    | crate::error::StorageErrorKind::IdentityChanged,
+                                ..
+                            }
+                        );
+                        record_failure(shared, work, error, None);
+                        continue;
+                    }
+                };
+                let memory_bytes = match staging_size(&prepared, model.dimension(), &work) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        record_failure(shared, work, error, None);
+                        continue;
+                    }
+                };
+                // The preparation reservation includes every eventual vector, so
+                // reusable vectors are copied only after their complete note is admitted.
+                if !admit_staging(
+                    shared,
+                    active_bytes,
+                    memory_bytes.saturating_add(reuse_index_bytes),
+                ) {
                     defer_pending(shared, &work);
                     continue;
                 }
-                Err(error) => {
-                    record_failure(shared, work, error, None);
-                    continue;
+                let vectors = {
+                    let mut reusable = previous.as_ref().map(|note| {
+                        let mut index = Vec::with_capacity(note.chunks.len());
+                        index.extend(note.chunks.iter());
+                        index.sort_unstable_by_key(|chunk| chunk.input_hash);
+                        index
+                    });
+                    let mut vectors = Vec::with_capacity(prepared.chunks.len());
+                    for chunk in &prepared.chunks {
+                        let cached = reusable.as_mut().and_then(|index| {
+                            index
+                                .binary_search_by_key(&chunk.input_hash, |cached| cached.input_hash)
+                                .ok()
+                                .map(|offset| index[offset])
+                        });
+                        vectors.push(cached.map(|cached| cached.vector.clone()));
+                    }
+                    vectors
+                };
+                let mut hash_order = (0..prepared.chunks.len()).collect::<Vec<_>>();
+                hash_order
+                    .sort_unstable_by_key(|&index| (prepared.chunks[index].input_hash, index));
+                StagedNote {
+                    work: work.clone(),
+                    prepared: Arc::new(prepared),
+                    vectors,
+                    hash_order,
+                    memory_bytes,
+                    last_used: Instant::now(),
                 }
             };
-            let memory_bytes = match staging_size(&prepared, model.dimension(), &work) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    record_failure(shared, work, error, None);
-                    continue;
-                }
-            };
-            // The preparation reservation includes every eventual vector, so
-            // reusable vectors are copied only after their complete note is admitted.
-            if !admit_staging(
-                shared,
-                active_bytes,
-                memory_bytes.saturating_add(reuse_index_bytes),
-            ) {
-                defer_pending(shared, &work);
+            if !work_is_current(shared, &work) {
+                discard_inflight(shared, &work);
                 continue;
             }
-            let vectors = {
-                let mut reusable = previous.as_ref().map(|note| {
-                    let mut index = Vec::with_capacity(note.chunks.len());
-                    index.extend(note.chunks.iter());
-                    index.sort_unstable_by_key(|chunk| chunk.input_hash);
-                    index
-                });
-                let mut vectors = Vec::with_capacity(prepared.chunks.len());
-                for chunk in &prepared.chunks {
-                    let cached = reusable.as_mut().and_then(|index| {
-                        index
-                            .binary_search_by_key(&chunk.input_hash, |cached| cached.input_hash)
-                            .ok()
-                            .map(|offset| index[offset])
-                    });
-                    vectors.push(cached.map(|cached| cached.vector.clone()));
+            if !admit_staging(shared, active_bytes, draft.memory_bytes) {
+                draft.last_used = Instant::now();
+                defer_work(shared, draft, false);
+                continue;
+            }
+            if draft.complete() {
+                let work = draft.work.clone();
+                match draft.into_entry() {
+                    Ok(entry) => dirty |= commit_note(shared, store, &work, entry),
+                    Err(error) => record_failure(shared, work, error, None),
                 }
-                vectors
-            };
-            let mut hash_order = (0..prepared.chunks.len()).collect::<Vec<_>>();
-            hash_order.sort_unstable_by_key(|&index| (prepared.chunks[index].input_hash, index));
-            StagedNote {
-                work: work.clone(),
-                prepared: Arc::new(prepared),
-                vectors,
-                hash_order,
-                memory_bytes,
-                last_used: Instant::now(),
+            } else {
+                active_bytes += draft.memory_bytes;
+                active.push(Some(draft));
             }
-        };
-        if !work_is_current(shared, &work) {
-            discard_inflight(shared, &work);
-            continue;
-        }
-        if !admit_staging(shared, active_bytes, draft.memory_bytes) {
-            draft.last_used = Instant::now();
-            defer_work(shared, draft, false);
-            continue;
-        }
-        if draft.complete() {
-            let work = draft.work.clone();
-            match draft.into_entry() {
-                Ok(entry) => dirty |= commit_note(shared, store, &work, entry),
-                Err(error) => record_failure(shared, work, error, None),
-            }
-        } else {
-            active_bytes += draft.memory_bytes;
-            active.push(Some(draft));
         }
     }
 
@@ -1006,6 +1248,7 @@ async fn process_batch(
             break;
         }
         let embedder = Arc::clone(model);
+        let source_owner = Arc::clone(shared);
         let owner_live = Arc::clone(&shared.live);
         let started = Instant::now();
         let dispatcher = tracing::dispatcher::get_default(Clone::clone);
@@ -1013,6 +1256,14 @@ async fn process_batch(
         let inference = tokio::task::spawn_blocking(move || {
             tracing::dispatcher::with_default(&dispatcher, || {
                 span.in_scope(|| {
+                    if !source_owner.source_is_live() {
+                        return (
+                            0,
+                            Err(VaultError::Embedding(
+                                "embedding source authority was withdrawn".into(),
+                            )),
+                        );
+                    }
                     let texts = inputs
                         .iter()
                         .map(|(prepared, chunk)| prepared.chunks[*chunk].text.as_str())
@@ -1104,7 +1355,7 @@ async fn process_batch(
             }
         }
     }
-    dirty
+    (dirty, source_failed)
 }
 
 enum PreparationOutcome {
@@ -1133,6 +1384,7 @@ fn available_staging(shared: &RuntimeShared, active_bytes: usize) -> usize {
     MAX_STAGING_BYTES.saturating_sub(active_bytes.saturating_add(paused))
 }
 
+#[cfg(test)]
 async fn prepare_work(
     shared: &Arc<RuntimeShared>,
     model: &Arc<dyn Embedder>,
@@ -1140,6 +1392,31 @@ async fn prepare_work(
     active_bytes: usize,
     reuse_index_bytes: usize,
     previous: Option<Arc<NoteEmbeddingEntry>>,
+) -> VaultResult<PreparationOutcome> {
+    let observed = shared
+        .source
+        .observe_batch(std::slice::from_ref(&work.path))
+        .await?;
+    prepare_work_observed(
+        shared,
+        model,
+        work,
+        active_bytes,
+        reuse_index_bytes,
+        previous,
+        &observed,
+    )
+    .await
+}
+
+async fn prepare_work_observed(
+    shared: &Arc<RuntimeShared>,
+    model: &Arc<dyn Embedder>,
+    work: &PendingWork,
+    active_bytes: usize,
+    reuse_index_bytes: usize,
+    previous: Option<Arc<NoteEmbeddingEntry>>,
+    observed: &super::storage::ObservedBatch<'_>,
 ) -> VaultResult<PreparationOutcome> {
     loop {
         let available = available_staging(shared, active_bytes);
@@ -1153,56 +1430,59 @@ async fn prepare_work(
                 limit: available,
             })
         } else {
-            let vault_root = shared.vault_root.clone();
-            let index = Arc::clone(&shared.index);
             let path = work.path.clone();
+            if shared
+                .index
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .get_note(&path)
+                .is_none()
+            {
+                return Ok(PreparationOutcome::Missing);
+            }
             let embedder = Arc::clone(model);
             let previous = previous.clone();
-            tokio::task::spawn_blocking(move || {
-                if index
-                    .read()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .get_note(&path)
-                    .is_none()
-                {
-                    return Ok(PreparationOutcome::Missing);
-                }
-                let raw = vault_root.read_exact_bounded(&path, read_limit)?;
-                if !index
-                    .read()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .allows_source(&path, &raw)
-                {
-                    return Ok(PreparationOutcome::Missing);
-                }
-                if previous.as_ref().is_some_and(|previous| {
-                    super::source::source_revision_matches(&raw, &previous.source_revision)
-                }) {
-                    return Ok(PreparationOutcome::Unchanged);
-                }
-                let reserved = overhead.saturating_add(raw.capacity());
-                let budget = available.saturating_sub(reserved);
-                prepare_note_with_budget(&path, &raw, embedder.as_ref(), budget)
-                    .map(PreparationOutcome::Prepared)
-                    .map_err(|error| match error {
-                        VaultError::SemanticResourceLimit {
-                            resource, actual, ..
-                        } if resource == "embedding preparation budget" => {
+            let raw = observed.read_exact_bounded(&path, read_limit).await;
+            let index = Arc::clone(&shared.index);
+            match raw {
+                Err(error) => Err(error),
+                Ok(raw) => tokio::task::spawn_blocking(move || {
+                    if !index
+                        .read()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .allows_source(&path, &raw)
+                    {
+                        return Ok(PreparationOutcome::Missing);
+                    }
+                    if previous.as_ref().is_some_and(|previous| {
+                        super::source::source_revision_matches(&raw, &previous.source_revision)
+                    }) {
+                        return Ok(PreparationOutcome::Unchanged);
+                    }
+                    let reserved = overhead.saturating_add(raw.capacity());
+                    let budget = available.saturating_sub(reserved);
+                    prepare_note_with_budget(&path, &raw, embedder.as_ref(), budget)
+                        .map(PreparationOutcome::Prepared)
+                        .map_err(|error| match error {
                             VaultError::SemanticResourceLimit {
-                                resource,
-                                actual: reserved.saturating_add(actual),
-                                limit: available,
+                                resource, actual, ..
+                            } if resource == "embedding preparation budget" => {
+                                VaultError::SemanticResourceLimit {
+                                    resource,
+                                    actual: reserved.saturating_add(actual),
+                                    limit: available,
+                                }
                             }
-                        }
-                        other => other,
-                    })
-            })
-            .await
-            .map_err(|error| VaultError::EmbeddingRequest {
-                message: format!("embedding preparation task failed: {error}"),
-                retryable: true,
-                retry_after: None,
-            })?
+                            other => other,
+                        })
+                })
+                .await
+                .map_err(|error| VaultError::EmbeddingRequest {
+                    message: format!("embedding preparation task failed: {error}"),
+                    retryable: true,
+                    retry_after: None,
+                })?,
+            }
         };
         match prepared {
             Err(VaultError::SemanticResourceLimit {
@@ -1261,10 +1541,17 @@ fn defer_pending(shared: &RuntimeShared, work: &PendingWork) {
     if state_generation(&state, &work.path) == Some(work.generation) {
         let mut deferred = work.clone();
         deferred.not_before = Instant::now();
-        state.pending.insert(work.path.clone(), deferred);
+        state
+            .pending
+            .insert(work.path.as_os_str().to_owned(), deferred);
     }
-    if state.inflight.get(&work.path) == Some(&work.generation) {
-        state.inflight.remove(&work.path);
+    if state
+        .inflight
+        .get(work.path.as_os_str())
+        .map(|(generation, _)| generation)
+        == Some(&work.generation)
+    {
+        state.inflight.remove(work.path.as_os_str());
     }
     update_pending_status(&mut state);
 }
@@ -1294,7 +1581,7 @@ fn admit_staging(shared: &RuntimeShared, active_bytes: usize, required: usize) -
             .map(|(path, _)| path.clone());
         match oldest {
             Some(path) => {
-                state.staged.remove(&path);
+                state.staged.remove(path.as_os_str());
             }
             None => return false,
         }
@@ -1302,7 +1589,7 @@ fn admit_staging(shared: &RuntimeShared, active_bytes: usize, required: usize) -
 }
 
 fn work_is_current(shared: &RuntimeShared, work: &PendingWork) -> bool {
-    shared.live.load(Ordering::Acquire)
+    shared.source_is_live()
         && state_generation(
             &shared
                 .state
@@ -1317,8 +1604,13 @@ fn discard_inflight(shared: &RuntimeShared, work: &PendingWork) {
         .state
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    if state.inflight.get(&work.path) == Some(&work.generation) {
-        state.inflight.remove(&work.path);
+    if state
+        .inflight
+        .get(work.path.as_os_str())
+        .map(|(generation, _)| generation)
+        == Some(&work.generation)
+    {
+        state.inflight.remove(work.path.as_os_str());
     }
     update_pending_status(&mut state);
 }
@@ -1334,13 +1626,20 @@ fn defer_work(shared: &RuntimeShared, mut draft: StagedNote, retain: bool) {
         draft.work.not_before = Instant::now();
         state
             .pending
-            .insert(draft.work.path.clone(), draft.work.clone());
+            .insert(draft.work.path.as_os_str().to_owned(), draft.work.clone());
         if retain {
-            state.staged.insert(draft.work.path.clone(), draft);
+            state
+                .staged
+                .insert(draft.work.path.as_os_str().to_owned(), draft);
         }
     }
-    if state.inflight.get(&path) == Some(&generation) {
-        state.inflight.remove(&path);
+    if state
+        .inflight
+        .get(path.as_os_str())
+        .map(|(generation, _)| generation)
+        == Some(&generation)
+    {
+        state.inflight.remove(path.as_os_str());
     }
     update_pending_status(&mut state);
 }
@@ -1354,7 +1653,7 @@ fn commit_remove(
         .lifecycle_gate
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    if !shared.live.load(Ordering::Acquire) {
+    if !shared.source_is_live() {
         return false;
     }
     let mut state = shared
@@ -1362,7 +1661,7 @@ fn commit_remove(
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     if state_generation(&state, &work.path) != Some(work.generation) {
-        state.inflight.remove(&work.path);
+        state.inflight.remove(work.path.as_os_str());
         update_pending_status(&mut state);
         return false;
     }
@@ -1393,7 +1692,7 @@ fn commit_note(
         .lifecycle_gate
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    if !shared.live.load(Ordering::Acquire) {
+    if !shared.source_is_live() {
         return false;
     }
     let mut state = shared
@@ -1401,7 +1700,7 @@ fn commit_note(
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     if state_generation(&state, &work.path) != Some(work.generation) {
-        state.inflight.remove(&work.path);
+        state.inflight.remove(work.path.as_os_str());
         update_pending_status(&mut state);
         return false;
     }
@@ -1430,7 +1729,7 @@ fn mark_success(shared: &RuntimeShared, work: &PendingWork) {
         .lifecycle_gate
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    if !shared.live.load(Ordering::Acquire) {
+    if !shared.source_is_live() {
         return;
     }
     let mut state = shared
@@ -1440,15 +1739,15 @@ fn mark_success(shared: &RuntimeShared, work: &PendingWork) {
     if state_generation(&state, &work.path) == Some(work.generation) {
         finish_success(&mut state, work);
     } else {
-        state.inflight.remove(&work.path);
+        state.inflight.remove(work.path.as_os_str());
         update_pending_status(&mut state);
     }
 }
 
 fn finish_success(state: &mut RuntimeState, work: &PendingWork) {
-    state.inflight.remove(&work.path);
-    state.initial_remaining.remove(&work.path);
-    state.failures.remove(&work.path);
+    state.inflight.remove(work.path.as_os_str());
+    state.initial_remaining.remove(work.path.as_os_str());
+    state.failures.remove(work.path.as_os_str());
     update_pending_status(state);
 }
 
@@ -1461,6 +1760,12 @@ fn retry_hint(error: &VaultError) -> Option<Duration> {
             ..
         } => Some(retry_after.unwrap_or(Duration::ZERO)),
         VaultError::Io(error) if transient_source_io(error) => Some(Duration::ZERO),
+        VaultError::Storage {
+            kind:
+                crate::error::StorageErrorKind::Unavailable
+                | crate::error::StorageErrorKind::RemoteFailure,
+            ..
+        } => Some(Duration::ZERO),
         _ => None,
     }
 }
@@ -1509,8 +1814,13 @@ fn record_failure_message(
         .lock()
         .unwrap_or_else(|lock_error| lock_error.into_inner());
     let is_current = state_generation(&state, &work.path) == Some(work.generation);
-    if state.inflight.get(&work.path) == Some(&work.generation) {
-        state.inflight.remove(&work.path);
+    if state
+        .inflight
+        .get(work.path.as_os_str())
+        .map(|(generation, _)| generation)
+        == Some(&work.generation)
+    {
+        state.inflight.remove(work.path.as_os_str());
     }
     if is_current {
         let retry_at = retry_after.and_then(|minimum| {
@@ -1522,9 +1832,9 @@ fn record_failure_message(
             }
             deadline
         });
-        state.initial_remaining.remove(&work.path);
+        state.initial_remaining.remove(work.path.as_os_str());
         state.failures.insert(
-            work.path.clone(),
+            work.path.as_os_str().to_owned(),
             format!(
                 "embedding update for {} failed: {error}",
                 work.path.display()
@@ -1532,14 +1842,18 @@ fn record_failure_message(
         );
         if let Some(deadline) = retry_at {
             work.not_before = deadline;
-            state.pending.insert(work.path.clone(), work.clone());
+            state
+                .pending
+                .insert(work.path.as_os_str().to_owned(), work.clone());
             if let Some(mut draft) = staged {
                 draft.work = work;
                 draft.last_used = Instant::now();
-                state.staged.insert(draft.work.path.clone(), draft);
+                state
+                    .staged
+                    .insert(draft.work.path.as_os_str().to_owned(), draft);
             }
         } else {
-            state.staged.remove(&work.path);
+            state.staged.remove(work.path.as_os_str());
         }
     }
     update_pending_status(&mut state);
@@ -1563,7 +1877,7 @@ fn finalize_reconciliation_if_complete(
         .lifecycle_gate
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    if !shared.live.load(Ordering::Acquire) {
+    if !shared.source_is_live() {
         return false;
     }
     let mut state = shared
@@ -1597,11 +1911,15 @@ async fn persist_store(
     let cache = shared.cache.clone();
     let live = Arc::clone(&shared.live);
     let lifecycle_gate = Arc::clone(&shared.lifecycle_gate);
+    let source_owner = Arc::clone(shared);
     tokio::task::spawn_blocking(move || {
         let bytes = {
             let store = store.read().unwrap_or_else(|error| error.into_inner());
             store.encode_cache()?
         };
+        if !source_owner.source_is_live() {
+            return Ok(false);
+        }
         cache.publish(&bytes, Some((&live, &lifecycle_gate)))
     })
     .await
@@ -1614,7 +1932,7 @@ fn refresh_status(shared: &RuntimeShared, store: &Arc<RwLock<EmbeddingStore>>) {
         let store = store.read().unwrap_or_else(|error| error.into_inner());
         paths
             .iter()
-            .filter(|path| store.get(path).is_some())
+            .filter(|path| store.get(Path::new(path)).is_some())
             .count()
     };
     let mut state = shared
@@ -1655,7 +1973,7 @@ fn status_for_loaded_state(
 
 fn status_for_current_paths(
     state: &RuntimeState,
-    paths: &HashSet<PathBuf>,
+    paths: &HashSet<OsString>,
 ) -> EmbeddingRuntimeStatus {
     if state.model.is_none() {
         let mut status = state.status.clone();
@@ -1668,14 +1986,14 @@ fn status_for_current_paths(
         let store = store.read().unwrap_or_else(|error| error.into_inner());
         paths
             .iter()
-            .filter(|path| store.get(path).is_some())
+            .filter(|path| store.get(Path::new(path)).is_some())
             .count()
     });
     status_for_loaded_state(state, paths.len(), indexed_notes)
 }
 
 fn report_progress(shared: &RuntimeShared) {
-    if !shared.active.load(Ordering::Acquire) || !shared.live.load(Ordering::Acquire) {
+    if !shared.active.load(Ordering::Acquire) || !shared.source_is_live() {
         return;
     }
     let paths = current_paths(&shared.index);
@@ -1739,6 +2057,16 @@ fn replace_status(state: &mut RuntimeState, next: EmbeddingRuntimeStatus) {
     state.status = next;
 }
 
+fn normalize_intent_path(path: &Path, remote: bool) -> VaultResult<PathBuf> {
+    if !remote {
+        return super::path::normalize_relative(path);
+    }
+    let text = path
+        .to_str()
+        .ok_or_else(|| VaultError::InvalidPath("vault-relative paths must be UTF-8".into()))?;
+    super::path::VaultPath::parse(text).map(|path| PathBuf::from(path.as_str()))
+}
+
 fn initial_embedding_work(index: &RwLock<VaultIndex>) -> Vec<(PathBuf, PendingKind)> {
     let index = index.read().unwrap_or_else(|error| error.into_inner());
     let mut paths: Vec<_> = index
@@ -1746,15 +2074,15 @@ fn initial_embedding_work(index: &RwLock<VaultIndex>) -> Vec<(PathBuf, PendingKi
         .keys()
         .filter_map(|path| {
             index
-                .embedding_change(path, false)
-                .map(|kind| (path.clone(), kind))
+                .embedding_change(Path::new(path), false)
+                .map(|kind| (PathBuf::from(path), kind))
         })
         .collect();
-    paths.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    paths.sort_unstable_by(|(left, _), (right, _)| left.as_os_str().cmp(right.as_os_str()));
     paths
 }
 
-fn current_paths(index: &Arc<RwLock<VaultIndex>>) -> HashSet<PathBuf> {
+fn current_paths(index: &Arc<RwLock<VaultIndex>>) -> HashSet<OsString> {
     index
         .read()
         .unwrap_or_else(|error| error.into_inner())
@@ -1791,9 +2119,14 @@ fn next_generation(state: &mut RuntimeState) -> u64 {
 fn state_generation(state: &RuntimeState, path: &Path) -> Option<u64> {
     state
         .pending
-        .get(path)
+        .get(path.as_os_str())
         .map(|work| work.generation)
-        .or_else(|| state.inflight.get(path).copied())
+        .or_else(|| {
+            state
+                .inflight
+                .get(path.as_os_str())
+                .map(|(generation, _)| *generation)
+        })
 }
 
 fn retry_delay(attempt: u8) -> Duration {
@@ -1814,6 +2147,7 @@ fn not_ready_message(status: &EmbeddingRuntimeStatus) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     use super::*;
@@ -2483,6 +2817,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_reader_and_checkpoint_root_are_independent() {
+        let source = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("one.md"), "# One\nsource body").unwrap();
+        let index = test_index(source.path()).await;
+        let runtime = EmbeddingRuntime::spawn_with_source(
+            Storage::Local(super::super::fs::VaultRoot::open(source.path()).unwrap()),
+            index,
+            CacheFile::new(
+                super::super::fs::VaultRoot::open(data.path()).unwrap(),
+                PathBuf::from("embeddings.bin"),
+            ),
+            TEST_BATCH_SIZE,
+            true,
+            async { Ok(Arc::new(FakeEmbedder::new()) as Arc<dyn Embedder>) },
+        );
+        wait_for_status(&runtime, |status| {
+            status.phase == EmbeddingPhase::Ready && status.indexed_notes == 1
+        })
+        .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !data.path().join("embeddings.bin").is_file() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!source.path().join("embeddings.bin").exists());
+        assert_eq!(
+            std::fs::read_to_string(source.path().join("one.md")).unwrap(),
+            "# One\nsource body"
+        );
+    }
+
+    #[tokio::test]
     async fn weak_submit_handle_does_not_extend_runtime_lifetime() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(directory.path().join(".obsidian")).unwrap();
@@ -2846,7 +3213,7 @@ mod tests {
         let outstanding = runtime.clone();
         wait_for_status(&runtime, |status| status.phase == EmbeddingPhase::Degraded).await;
         let retry =
-            runtime.control.shared.state.lock().unwrap().pending[Path::new("one.md")].not_before;
+            runtime.control.shared.state.lock().unwrap().pending[OsStr::new("one.md")].not_before;
         runtime.retire();
         drop(runtime);
         model.fail.store(false, AtomicOrdering::SeqCst);
@@ -2858,6 +3225,24 @@ mod tests {
         )
         .await;
         assert_eq!(model.calls.load(AtomicOrdering::SeqCst), calls);
+    }
+
+    #[tokio::test]
+    async fn retiring_a_ready_runtime_withdraws_retained_queries_and_status() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("one.md"), "# One\nprivate").unwrap();
+        let model = Arc::new(FakeEmbedder::new());
+        let runtime = EmbeddingRuntime::spawn(
+            directory.path().to_path_buf(),
+            test_index(directory.path()).await,
+            directory.path().join("cache.bin"),
+            async move { Ok(model as Arc<dyn Embedder>) },
+        );
+        wait_for_status(&runtime, |status| status.queryable).await;
+        assert!(runtime.query_snapshot().is_ok());
+        runtime.retire();
+        assert!(!runtime.status().queryable);
+        assert!(runtime.query_snapshot().is_err());
     }
 
     #[tokio::test]
@@ -3017,9 +3402,9 @@ mod tests {
                 .state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            let generation = *state
+            let (generation, _) = *state
                 .inflight
-                .get(Path::new("one.md"))
+                .get(OsStr::new("one.md"))
                 .expect("changed note should be in flight");
             (
                 Arc::clone(state.store.as_ref().expect("cache should be loaded")),
@@ -3233,7 +3618,8 @@ mod tests {
         let before = runtime
             .query_snapshot()
             .unwrap()
-            .capture_entries(&HashSet::from([PathBuf::from("policy.md")]))[Path::new("policy.md")]
+            .capture_entries(&HashSet::from([OsString::from("policy.md")]))
+            [OsStr::new("policy.md")]
         .clone();
         let changed = long_section_note();
         let prepared = prepare_note(Path::new("policy.md"), &changed, model.as_ref()).unwrap();
@@ -3249,7 +3635,8 @@ mod tests {
         let during = runtime
             .query_snapshot()
             .unwrap()
-            .capture_entries(&HashSet::from([PathBuf::from("policy.md")]))[Path::new("policy.md")]
+            .capture_entries(&HashSet::from([OsString::from("policy.md")]))
+            [OsStr::new("policy.md")]
         .clone();
         assert_eq!(during.source_revision, before.source_revision);
         assert_eq!(during.chunks.len(), 1);
@@ -3258,7 +3645,8 @@ mod tests {
         let after = runtime
             .query_snapshot()
             .unwrap()
-            .capture_entries(&HashSet::from([PathBuf::from("policy.md")]))[Path::new("policy.md")]
+            .capture_entries(&HashSet::from([OsString::from("policy.md")]))
+            [OsStr::new("policy.md")]
         .clone();
         assert_eq!(
             after.source_revision,
@@ -3279,6 +3667,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retained_note_work_needs_no_replacement_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = Path::new("one.md");
+        std::fs::write(directory.path().join(path), "# One\nbody").unwrap();
+        let index = test_index(directory.path()).await;
+        let runtime = EmbeddingRuntime::spawn_for_test(
+            directory.path().to_path_buf(),
+            index,
+            directory.path().join("cache.bin"),
+            TEST_BATCH_SIZE,
+            false,
+            async { Ok(Arc::new(FakeEmbedder::new()) as Arc<dyn Embedder>) },
+        );
+        let shared = &runtime.control.shared;
+        let generation = shared.state.lock().unwrap().next_generation;
+        assert!(runtime.has_current_or_pending(path, "unpublished"));
+        assert_eq!(shared.state.lock().unwrap().next_generation, generation);
+        let (batch, _, _) = take_due_batch(shared);
+        assert_eq!(batch.len(), 1);
+        assert!(runtime.has_current_or_pending(path, "unpublished"));
+        assert_eq!(shared.state.lock().unwrap().next_generation, generation);
+
+        runtime.submit_remove(path);
+        assert!(
+            !runtime.has_current_or_pending(path, "unpublished"),
+            "a superseded in-flight upsert must not hide the current removal"
+        );
+        let (batch, _, _) = take_due_batch(shared);
+        assert_eq!(batch[0].kind, PendingKind::Remove);
+        assert!(!runtime.has_current_or_pending(path, "unpublished"));
+
+        runtime.submit(path, PendingKind::AwaitingLexical);
+        let generation = shared.state.lock().unwrap().next_generation;
+        assert!(runtime.has_current_or_pending(path, "unpublished"));
+        assert_eq!(shared.state.lock().unwrap().next_generation, generation);
+        runtime.retire();
+        assert!(!runtime.has_current_or_pending(path, "unpublished"));
+    }
+
+    #[tokio::test]
     async fn terminal_request_failure_waits_for_a_new_generation() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("one.md"), "# One\nold body").unwrap();
@@ -3292,6 +3720,10 @@ mod tests {
             async move { Ok(loaded as Arc<dyn Embedder>) },
         );
         wait_for_status(&runtime, |status| status.phase == EmbeddingPhase::Ready).await;
+        let original_revision = super::super::source::source_revision("# One\nold body");
+        let changed_revision = super::super::source::source_revision("# One\nnew body");
+        assert!(runtime.has_current_or_pending(Path::new("one.md"), &original_revision));
+        assert!(!runtime.has_current_or_pending(Path::new("one.md"), &changed_revision));
         model.transient.store(false, AtomicOrdering::SeqCst);
         model.fail_on_call.store(
             model.calls.load(AtomicOrdering::SeqCst),
@@ -3303,12 +3735,33 @@ mod tests {
             status.phase == EmbeddingPhase::Degraded && status.pending_notes == 0
         })
         .await;
+        assert!(
+            !runtime.has_current_or_pending(Path::new("one.md"), &changed_revision),
+            "a terminal failure without retained work needs a repair generation"
+        );
         let failed_calls = model.calls.load(AtomicOrdering::SeqCst);
         tokio::time::sleep(Duration::from_millis(1200)).await;
         assert_eq!(model.calls.load(AtomicOrdering::SeqCst), failed_calls);
-        runtime.submit_upsert(Path::new("one.md"));
+        if !runtime.has_current_or_pending(Path::new("one.md"), &changed_revision) {
+            runtime.submit_upsert(Path::new("one.md"));
+        }
         wait_for_status(&runtime, |status| status.phase == EmbeddingPhase::Ready).await;
         assert_eq!(model.calls.load(AtomicOrdering::SeqCst), failed_calls + 1);
+        assert!(runtime.has_current_or_pending(Path::new("one.md"), &changed_revision));
+        let generation = runtime.control.shared.state.lock().unwrap().next_generation;
+        if !runtime.has_current_or_pending(Path::new("one.md"), &changed_revision) {
+            runtime.submit_upsert(Path::new("one.md"));
+        }
+        assert_eq!(
+            runtime.control.shared.state.lock().unwrap().next_generation,
+            generation
+        );
+        runtime.submit_remove(Path::new("one.md"));
+        assert!(
+            !runtime.has_current_or_pending(Path::new("one.md"), &changed_revision),
+            "evidence scheduled for removal still needs a note repair intent"
+        );
+        runtime.submit_upsert(Path::new("one.md"));
     }
 
     #[tokio::test]
@@ -3329,14 +3782,17 @@ mod tests {
         let before = runtime
             .query_snapshot()
             .unwrap()
-            .capture_entries(&HashSet::from([path.to_path_buf()]))[path]
-            .clone();
+            .capture_entries(&HashSet::from([path.as_os_str().to_owned()]))[path.as_os_str()]
+        .clone();
         let changed = "# One\nrecovered without another event";
         std::fs::write(directory.path().join(path), changed).unwrap();
         let work = {
             let mut state = runtime.control.shared.state.lock().unwrap();
             let generation = next_generation(&mut state);
-            state.inflight.insert(path.to_path_buf(), generation);
+            state.inflight.insert(
+                path.as_os_str().to_owned(),
+                (generation, PendingKind::Upsert),
+            );
             PendingWork {
                 path: path.to_path_buf(),
                 generation,
@@ -3353,23 +3809,23 @@ mod tests {
         );
         {
             let state = runtime.control.shared.state.lock().unwrap();
-            assert_eq!(state.pending[path].generation, work.generation);
+            assert_eq!(state.pending[path.as_os_str()].generation, work.generation);
             assert_eq!(state.next_generation, work.generation);
         }
         assert_eq!(runtime.status().phase, EmbeddingPhase::Degraded);
         let during = runtime
             .query_snapshot()
             .unwrap()
-            .capture_entries(&HashSet::from([path.to_path_buf()]))[path]
-            .clone();
+            .capture_entries(&HashSet::from([path.as_os_str().to_owned()]))[path.as_os_str()]
+        .clone();
         assert_eq!(during.source_revision, before.source_revision);
 
         wait_for_status(&runtime, |status| status.phase == EmbeddingPhase::Ready).await;
         let after = runtime
             .query_snapshot()
             .unwrap()
-            .capture_entries(&HashSet::from([path.to_path_buf()]))[path]
-            .clone();
+            .capture_entries(&HashSet::from([path.as_os_str().to_owned()]))[path.as_os_str()]
+        .clone();
         assert_eq!(
             after.source_revision,
             super::super::source::source_revision(changed)
@@ -3382,7 +3838,95 @@ mod tests {
     }
 
     #[test]
+    fn remote_intents_preserve_server_names() {
+        for path in ["a:b.md", "CON.md", "folder/a:b.md"] {
+            assert_eq!(
+                normalize_intent_path(Path::new(path), true).unwrap(),
+                PathBuf::from(path)
+            );
+        }
+        assert!(normalize_intent_path(Path::new("../outside.md"), true).is_err());
+        assert!(normalize_intent_path(Path::new("/absolute.md"), true).is_err());
+        #[cfg(windows)]
+        for path in ["a:b.md", "CON.md"] {
+            assert!(normalize_intent_path(Path::new(path), false).is_err());
+        }
+    }
+
+    #[test]
+    fn intent_generations_distinguish_exact_server_spellings() {
+        let mut state = RuntimeState::default();
+        for (generation, name) in [(1, "a:b.md"), (2, "A:b.md")] {
+            let path = normalize_intent_path(Path::new(name), true).unwrap();
+            state.pending.insert(
+                path.as_os_str().to_owned(),
+                PendingWork {
+                    path,
+                    generation,
+                    kind: PendingKind::Upsert,
+                    attempt: 0,
+                    not_before: Instant::now(),
+                },
+            );
+        }
+        assert_eq!(distinct_pending_count(&state), 2);
+        assert_eq!(state_generation(&state, Path::new("a:b.md")), Some(1));
+        assert_eq!(state_generation(&state, Path::new("A:b.md")), Some(2));
+    }
+
+    #[test]
+    fn source_observation_pass_reuses_only_its_captured_generations() {
+        let work = |path: &str, generation| PendingWork {
+            path: PathBuf::from(path),
+            generation,
+            kind: PendingKind::Upsert,
+            attempt: 0,
+            not_before: Instant::now(),
+        };
+        let first = work("a:b.md", 1);
+        let second = work("A:b.md", 2);
+        let mut pass = ObservationPass {
+            generations: HashMap::from([
+                (first.path.as_os_str().to_owned(), first.generation),
+                (second.path.as_os_str().to_owned(), second.generation),
+            ]),
+            observed: Err(VaultError::Other("observation fixture".into())),
+        };
+        assert!(pass.contains(std::slice::from_ref(&first)));
+        pass.consume(std::slice::from_ref(&first));
+        assert!(pass.contains(std::slice::from_ref(&second)));
+        assert!(!pass.contains(std::slice::from_ref(&work("A:b.md", 3))));
+        assert!(!pass.contains(std::slice::from_ref(&work("new.md", 4))));
+        pass.consume(std::slice::from_ref(&second));
+        assert!(pass.generations.is_empty());
+    }
+
+    #[test]
     fn source_retry_classification_preserves_terminal_input_failures() {
+        use crate::error::StorageErrorKind;
+
+        for (kind, expected) in [
+            (StorageErrorKind::Unavailable, Some(Duration::ZERO)),
+            (StorageErrorKind::RemoteFailure, Some(Duration::ZERO)),
+            (StorageErrorKind::PermissionDenied, None),
+            (StorageErrorKind::Unsupported, None),
+            (StorageErrorKind::Protocol, None),
+            (StorageErrorKind::Conflict, None),
+            (StorageErrorKind::IdentityChanged, None),
+            (StorageErrorKind::Warming, None),
+            (StorageErrorKind::ResourceLimit, None),
+        ] {
+            assert_eq!(
+                retry_hint(&VaultError::storage(
+                    "read",
+                    "note.md",
+                    kind,
+                    "source failure"
+                )),
+                expected,
+                "{kind:?}"
+            );
+        }
         for kind in [
             std::io::ErrorKind::WouldBlock,
             std::io::ErrorKind::TimedOut,
@@ -3491,10 +4035,10 @@ mod tests {
             );
             let state = runtime.control.shared.state.lock().unwrap();
             if let Some(expected) = expected {
-                assert!(state.pending[Path::new("one.md")].not_before >= before + expected);
+                assert!(state.pending[OsStr::new("one.md")].not_before >= before + expected);
             } else {
                 assert!(state.pending.is_empty());
-                assert!(state.failures[Path::new("one.md")].contains("runtime clock"));
+                assert!(state.failures[OsStr::new("one.md")].contains("runtime clock"));
             }
         }
     }
@@ -3516,8 +4060,8 @@ mod tests {
         let entries = runtime
             .query_snapshot()
             .unwrap()
-            .capture_entries(&HashSet::from([PathBuf::from("one.md")]));
-        let note = &entries[Path::new("one.md")];
+            .capture_entries(&HashSet::from([OsString::from("one.md")]));
+        let note = &entries[OsStr::new("one.md")];
         assert_eq!(
             note.source_revision,
             super::super::source::source_revision(changed)
@@ -3548,9 +4092,9 @@ mod tests {
         let prepared = prepare_note(Path::new("a.md"), "# A\nbody", &FakeEmbedder::new()).unwrap();
         {
             let mut state = shared.state.lock().unwrap();
-            let work = state.pending[Path::new("a.md")].clone();
+            let work = state.pending[OsStr::new("a.md")].clone();
             state.staged.insert(
-                work.path.clone(),
+                work.path.as_os_str().to_owned(),
                 StagedNote {
                     work,
                     vectors: vec![None; prepared.chunks.len()],
@@ -3591,14 +4135,14 @@ mod tests {
         {
             let mut state = shared.state.lock().unwrap();
             for (ordinal, name) in ["a.md", "b.md", "c.md"].into_iter().enumerate() {
-                let work = state.pending[Path::new(name)].clone();
+                let work = state.pending[OsStr::new(name)].clone();
                 let prepared = prepare_note(Path::new(name), &raw, &FakeEmbedder::new()).unwrap();
                 assert!(prepared.chunks.len() > 1);
                 assert!(prepared.staging_bytes(3) <= 4096);
                 let mut vectors = vec![None; prepared.chunks.len()];
                 vectors[0] = Some(vec![1.0, 0.0, 0.0]);
                 state.staged.insert(
-                    work.path.clone(),
+                    work.path.as_os_str().to_owned(),
                     StagedNote {
                         work,
                         vectors,
@@ -3616,7 +4160,7 @@ mod tests {
         assert!(admit_staging(shared, active, 11_200));
         let state = shared.state.lock().unwrap();
         assert_eq!(state.staged.len(), 1);
-        assert!(state.staged[Path::new("c.md")].vectors[0].is_some());
+        assert!(state.staged[OsStr::new("c.md")].vectors[0].is_some());
     }
 
     #[tokio::test]
@@ -3646,9 +4190,9 @@ mod tests {
             let mut vectors = vec![None; prepared.chunks.len()];
             vectors[0] = Some(vec![1.0, 0.0, 0.0]);
             let mut state = shared.state.lock().unwrap();
-            let work = state.pending[Path::new("paused.md")].clone();
+            let work = state.pending[OsStr::new("paused.md")].clone();
             state.staged.insert(
-                work.path.clone(),
+                work.path.as_os_str().to_owned(),
                 StagedNote {
                     work,
                     vectors,
@@ -3675,7 +4219,7 @@ mod tests {
             .unwrap(),
             PreparationOutcome::Deferred
         ));
-        assert!(shared.state.lock().unwrap().staged[Path::new("paused.md")].vectors[0].is_some());
+        assert!(shared.state.lock().unwrap().staged[OsStr::new("paused.md")].vectors[0].is_some());
     }
 
     #[tokio::test]
@@ -3824,8 +4368,8 @@ mod tests {
         let entries = runtime
             .query_snapshot()
             .unwrap()
-            .capture_entries(&HashSet::from([path.to_path_buf()]));
-        let current = &entries[path];
+            .capture_entries(&HashSet::from([path.as_os_str().to_owned()]));
+        let current = &entries[path.as_os_str()];
         assert_eq!(
             current.source_revision,
             super::super::source::source_revision(&updated)

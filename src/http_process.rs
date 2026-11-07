@@ -717,17 +717,29 @@ mod tests {
     #[test]
     fn wildcard_inspection_sees_specific_ipv4_and_ipv6_listeners() {
         for address in ["127.0.0.1:0", "[::1]:0"] {
-            let listener = TcpListener::bind(address).unwrap();
-            let bound = listener.local_addr().unwrap();
-            let wildcard = if bound.is_ipv4() {
-                IpAddr::V4(Ipv4Addr::UNSPECIFIED)
-            } else {
-                IpAddr::V6(Ipv6Addr::UNSPECIFIED)
-            };
-            let endpoint = SocketAddr::new(wildcard, bound.port());
-            assert!(platform::wildcard_port_in_use(endpoint).unwrap());
-            drop(listener);
-            assert!(!platform::wildcard_port_in_use(endpoint).unwrap());
+            let mut observed_release = false;
+            for _ in 0..8 {
+                let listener = TcpListener::bind(address).unwrap();
+                let bound = listener.local_addr().unwrap();
+                let wildcard = if bound.is_ipv4() {
+                    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                } else {
+                    IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+                };
+                let endpoint = SocketAddr::new(wildcard, bound.port());
+                assert!(platform::wildcard_port_in_use(endpoint).unwrap());
+                drop(listener);
+                if !platform::wildcard_port_in_use(endpoint).unwrap() {
+                    observed_release = true;
+                    break;
+                }
+                // Another test may reuse a released ephemeral port. Retry with
+                // another owned endpoint, still requiring a real nonzero release.
+            }
+            assert!(
+                observed_release,
+                "no released endpoint observed for {address}"
+            );
         }
     }
 

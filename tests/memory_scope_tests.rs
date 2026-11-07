@@ -50,6 +50,28 @@ async fn private_reader_rejects_shared_semantic_ownership_before_opening_source(
     }
 }
 
+#[tokio::test]
+async fn private_reader_rejects_remote_source_before_connection_or_local_state() {
+    let data = tempfile::tempdir().unwrap();
+    let mut command = http_listening::isolated_command(env!("CARGO_BIN_EXE_obsidian-mcp"));
+    let output = command
+        .arg("sftp://unreachable-private-reader.invalid/vault")
+        .arg("--http")
+        .env(
+            "OBSIDIAN_MEMORY_AUTHORIZER_URL",
+            "http://127.0.0.1:1/vault/memory/authorize",
+        )
+        .env("OBSIDIAN_MEMORY_KEY_FILE", data.path().join("missing-key"))
+        .env("OBSIDIAN_MCP_DATA", data.path())
+        .env("OBSIDIAN_SEMANTIC_MODE", "local")
+        .output()
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires a local vault source"));
+    assert_eq!(std::fs::read_dir(data.path()).unwrap().count(), 0);
+}
+
 fn policy(token: &str) -> Value {
     let (scope, kind, audience) = match token {
         "alice" | "reflection" => (ALICE, "channel", "CA"),
@@ -352,6 +374,23 @@ async fn every_private_read_surface_is_scoped_and_revocation_is_immediate() {
         )
         .await;
     assert!(own.to_string().contains("violet-origin"), "{own}");
+    let bulk = server
+        .call(
+            "alice",
+            "note_read_many",
+            json!({"paths":[
+                format!("Organize/Work/{BOB}/decision.md"),
+                format!("Organize/Work/{ALICE}/sensitive.md"),
+                format!("Organize/Work/{ALICE}/decision.md")
+            ]}),
+        )
+        .await;
+    assert!(bulk.get("error").is_none(), "{bulk}");
+    let bulk_text = bulk.to_string();
+    assert!(bulk_text.contains("violet-origin"), "{bulk}");
+    for forbidden in ["saffron-private", "sensitive-provider-secret"] {
+        assert!(!bulk_text.contains(forbidden), "{bulk}");
+    }
     let capture_path = format!("Capture/chats/{ALICE}/raw.md");
     let denied_capture = server
         .call("alice", "note_read", json!({"path":capture_path}))

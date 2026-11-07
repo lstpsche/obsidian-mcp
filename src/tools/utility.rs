@@ -31,6 +31,26 @@ pub struct VaultInfo {
     pub mcp_data_dir: Option<String>,
     /// Passive status of the selected semantic backend; inspection never activates indexing.
     pub embeddings: EmbeddingInfo,
+    /// Passive remote source status. Local output retains its existing shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<crate::vault::storage::SourceStatus>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(super) struct PendingVaultInfo {
+    vault_name: String,
+    vault_path: String,
+    mcp_data_dir: Option<String>,
+    embeddings: EmbeddingInfo,
+    source: crate::vault::storage::SourceStatus,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(untagged)]
+#[schemars(extend("type" = "object"))]
+pub(super) enum VaultInfoOutput {
+    Ready(VaultInfo),
+    Pending(PendingVaultInfo),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -86,7 +106,7 @@ pub struct EmbeddingInfo {
 }
 
 async fn embedding_info(vault: &Vault, runtime: &SemanticRuntime) -> EmbeddingInfo {
-    if runtime.uses_local_backend() {
+    if vault.is_remote() || runtime.uses_local_backend() {
         #[cfg(has_embeddings)]
         {
             let status = vault.embedding_status().map(|status| EmbeddingSnapshot {
@@ -109,11 +129,14 @@ async fn embedding_info(vault: &Vault, runtime: &SemanticRuntime) -> EmbeddingIn
                 source: EmbeddingSource::Local,
                 availability: if status.is_some() {
                     EmbeddingAvailability::Available
+                } else if vault.embeddings_requested() {
+                    EmbeddingAvailability::Unavailable
                 } else {
                     EmbeddingAvailability::Disabled
                 },
+                error: (status.is_none() && vault.embeddings_requested())
+                    .then(|| "semantic source initialization is incomplete".to_owned()),
                 status,
-                error: None,
             };
         }
         #[cfg(not(has_embeddings))]
@@ -183,12 +206,15 @@ pub async fn vault_info(
     runtime: &SemanticRuntime,
     _params: VaultInfoParams,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    let stats = vault.vault_stats()?;
-    let mcp_data_dir = if vault.mcp_data() != vault.mcp_home() {
-        Some(vault.mcp_data().display().to_string())
-    } else {
-        None
-    };
+    let stats = vault.vault_stats();
+    let source = vault.source_status();
+    let vault_name = crate::vault::path::logical_file_name(vault.root())
+        .unwrap_or_default()
+        .to_owned();
+    let vault_path = vault.source_location();
+    let mcp_data_dir = vault
+        .resolved_mcp_data()
+        .and_then(|path| (Some(path) != vault.mcp_home()).then(|| path.display().to_string()));
     let mut embeddings = embedding_info(vault, runtime).await;
     if vault.is_scoped() {
         embeddings.status = None;
@@ -196,14 +222,29 @@ pub async fn vault_info(
             embeddings.error = Some("semantic service is unavailable".into());
         }
     }
+    let catalog_unavailable = matches!(
+        &stats,
+        Err(VaultError::Storage {
+            kind: crate::error::StorageErrorKind::Warming
+                | crate::error::StorageErrorKind::Unavailable,
+            ..
+        })
+    );
+    if let Some(source) = source.as_ref()
+        && (!vault.catalog_ready() || source.availability == "unavailable" || catalog_unavailable)
+    {
+        return super::output::json(&VaultInfoOutput::Pending(PendingVaultInfo {
+            vault_name,
+            vault_path,
+            mcp_data_dir,
+            embeddings,
+            source: source.clone(),
+        }));
+    }
     let info = VaultInfo {
-        stats,
-        vault_name: vault
-            .root()
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        vault_path: vault.root().display().to_string(),
+        stats: stats?,
+        vault_name,
+        vault_path,
         exclude_patterns: if vault.is_scoped() {
             Vec::new()
         } else {
@@ -211,8 +252,9 @@ pub async fn vault_info(
         },
         mcp_data_dir,
         embeddings,
+        source,
     };
-    super::output::json(&info)
+    super::output::json(&VaultInfoOutput::Ready(info))
 }
 
 // ── open_in_obsidian ────────────────────────────────────────────────────
@@ -231,11 +273,18 @@ pub async fn open_in_obsidian(
     vault: &Vault,
     params: OpenInObsidianParams,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
+    if vault.is_remote() {
+        return Err(rmcp::ErrorData::new(
+            rmcp::model::ErrorCode::INVALID_REQUEST,
+            "A remote-only vault cannot be opened in the local Obsidian application",
+            None::<serde_json::Value>,
+        ));
+    }
     let requested_path = Path::new(&params.path);
-    let uri_path = match vault.canonical_existing_relative_path(requested_path) {
+    let uri_path = match vault.canonical_existing_relative_path(requested_path).await {
         Ok(path) => path.to_string_lossy().into_owned(),
         Err(VaultError::NoteNotFound(_)) => {
-            vault.validate_path(requested_path)?;
+            vault.validate_path(requested_path).await?;
             params.path.clone()
         }
         Err(err) => return Err(err.into()),
@@ -342,13 +391,55 @@ mod tests {
         structured.clone()
     }
 
+    #[test]
+    fn initializing_source_info_has_no_fabricated_aggregate_counts() {
+        let pending = VaultInfoOutput::Pending(PendingVaultInfo {
+            vault_name: "notes".into(),
+            vault_path: "sftp://vault-server/notes".into(),
+            mcp_data_dir: None,
+            embeddings: EmbeddingInfo {
+                source: EmbeddingSource::Local,
+                availability: EmbeddingAvailability::Unavailable,
+                status: None,
+                error: Some("source initialization is incomplete".into()),
+            },
+            source: crate::vault::storage::SourceStatus {
+                kind: "sftp".into(),
+                location: "sftp://vault-server/notes".into(),
+                availability: "initializing".into(),
+                catalog_phase: "warming".into(),
+                last_scan: None,
+                last_verification: None,
+                error: None,
+            },
+        });
+        let value = serde_json::to_value(&pending).unwrap();
+        for field in [
+            "total_notes",
+            "total_files",
+            "total_tags",
+            "total_links",
+            "vault_size_bytes",
+        ] {
+            assert!(value.get(field).is_none());
+        }
+        let schema = serde_json::to_value(schemars::schema_for!(VaultInfoOutput)).unwrap();
+        jsonschema::validator_for(&schema)
+            .unwrap()
+            .validate(&value)
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn vault_info_returns_stats() {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        vault.write_note(Path::new("note.md"), "# Hello").unwrap();
+        vault
+            .write_note(Path::new("note.md"), "# Hello")
+            .await
+            .unwrap();
 
         let result = vault_info(
             &vault,

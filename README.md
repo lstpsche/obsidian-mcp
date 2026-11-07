@@ -6,13 +6,13 @@
 
 A high-performance [MCP](https://modelcontextprotocol.io) server that gives AI agents full read/write access to [Obsidian](https://obsidian.md) vaults. Written in Rust. Ships as a single binary.
 
-**No Obsidian plugins. No REST API. No Obsidian running. Just your vault on disk.**
+**No Obsidian plugins. No REST API. No Obsidian running. Use a local folder or an SFTP vault.**
 
 ## Why?
 
 Existing solutions for AI + Obsidian require the Obsidian app to be running with a community plugin ([obsidian-local-rest-api](https://github.com/coddingtonbear/obsidian-local-rest-api)) and an MCP wrapper ([mcp-obsidian](https://github.com/MarkusPfundstein/mcp-obsidian)) on top. That's fragile, slow, and limited to what the REST API exposes.
 
-obsidian-mcp talks directly to the filesystem. It understands the Obsidian format natively — wikilinks, frontmatter, tags, block references, periodic notes, the full graph. It builds fast in-memory indices on startup and keeps them synced via a filesystem watcher. The result is a single dependency-free binary that works whether Obsidian is open or not.
+obsidian-mcp reads and writes vault files directly. It understands the Obsidian format natively — wikilinks, frontmatter, tags, block references, periodic notes, the full graph. Local folders use filesystem notifications; remote folders use SFTP reconciliation. Search indexes and embedding caches stay on the computer running the MCP server. Local vaults need only the binary; SFTP vaults also need a local OpenSSH client.
 
 ## Quick Start
 
@@ -25,9 +25,12 @@ obsidian-mcp /path/to/your/vault
 
 # Run (HTTP — shared server for multiple agents)
 obsidian-mcp --http /path/to/your/vault
+
+# Remote folder (OpenSSH keys/agent and known host configured locally)
+obsidian-mcp sftp://vault-server/home/alice/notes
 ```
 
-Add to your MCP client config (Cursor, Claude Desktop, etc.) and you're done — 19 tools are available immediately.
+Add to your MCP client config (Cursor, Claude Desktop, etc.). Local vaults expose 19 tools before filtering. Remote vaults expose the same operations except `open_in_obsidian`, which requires a local Obsidian vault. See [remote vault setup and behavior](docs/remote-vaults.md).
 
 ## What It Can Do
 
@@ -41,7 +44,7 @@ Add to your MCP client config (Cursor, Claude Desktop, etc.) and you're done —
 | **Frontmatter** | Get/set/remove fields, query notes by metadata |
 | **Periodic notes** | Daily, weekly, monthly, quarterly, yearly — with Obsidian-compatible date formats and template expansion |
 
-Metadata and BM25 indices update immediately through the filesystem watcher. Embeddings reconcile asynchronously through a managed background runtime, so model loading, inference, and cache writes never delay MCP startup or core tools.
+Local metadata and BM25 indices update through the filesystem watcher. Remote indexes reconcile through periodic scans, and direct note reads fetch remote content. Embeddings reconcile asynchronously through a managed background runtime. Remote initial indexing reports warming until its catalog is available; unknown counts are not reported as an empty vault.
 
 ## Installation
 
@@ -311,7 +314,7 @@ Config file location:
 
 ### Any MCP client
 
-obsidian-mcp supports both **stdio** and **Streamable HTTP** MCP transports. Any MCP-compatible client can connect via either method. Pass the vault path as the first argument or via `OBSIDIAN_VAULT_PATH`.
+obsidian-mcp supports both **stdio** and **Streamable HTTP** MCP transports for local and SFTP sources. Any MCP-compatible client can connect via either method. Pass the local vault path or SFTP URI as the first argument or via `OBSIDIAN_VAULT_PATH`.
 
 ## Running as a Service
 
@@ -668,6 +671,8 @@ For `note_patch` heading targets, bare heading text such as `"Log"` is canonical
 |------|-----------|-------------|
 | `open_in_obsidian` | `path`, `new_leaf?` | Open note in Obsidian via `obsidian://` URI |
 
+`open_in_obsidian` is unavailable for SFTP sources. A remote folder does not identify a local Obsidian vault, and the server does not guess a matching vault name.
+
 </details>
 
 ## Tool Filtering
@@ -678,7 +683,7 @@ For legacy HTTP sessions, send the header with `initialize`; that filter lasts f
 
 | Value | Effect |
 |-------|--------|
-| `full` (or unset) | All 19 tools |
+| `full` (or unset) | All supported tools (19 for local vaults; `open_in_obsidian` is unavailable for SFTP) |
 | `core` | 15 tools — drops `search_semantic`, `wikilinks`, `periodic`, `open_in_obsidian` |
 | `read` | 10 tools — read-only (excludes all mutation tools, including `frontmatter`) |
 | `minimal` | 6 tools — `vault_list`, `vault_info`, `note_read`, `note_create`, `note_write`, `search_text` |
@@ -690,7 +695,7 @@ The `read` profile exposes frontmatter as part of the raw Markdown returned by `
 Private audience isolation is optional and disabled by default. A managed memory
 reader can set both `OBSIDIAN_MEMORY_AUTHORIZER_URL` and
 `OBSIDIAN_MEMORY_KEY_FILE`, with `OBSIDIAN_SEMANTIC_MODE=local`. The reader
-must use HTTP bound to loopback; the authorizer must be `http://127.0.0.1:<port>/vault/memory/authorize` (or IPv6
+must use a local vault and HTTP bound to loopback; the authorizer must be `http://127.0.0.1:<port>/vault/memory/authorize` (or IPv6
 loopback). The key must be an absolute regular file, readable only by its owner
 and optionally its group. This mode always restricts MCP to read tools.
 
@@ -729,15 +734,18 @@ clients retain all supported ownership modes.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `OBSIDIAN_VAULT_PATH` | Yes* | — | Absolute path to your Obsidian vault |
+| `OBSIDIAN_VAULT_PATH` | Yes* | — | Local vault path or `sftp://[user@]host[:port]/absolute/remote/root` |
 | `OBSIDIAN_TRANSPORT` | No | `stdio` | Transport mode: `stdio` or `http` |
 | `OBSIDIAN_HTTP_PORT` | No | `37842` | HTTP listen port |
 | `OBSIDIAN_HTTP_HOST` | No | `127.0.0.1` | HTTP bind address |
-| `OBSIDIAN_WATCH` | No | `true` | Filesystem watcher for live index updates |
+| `OBSIDIAN_WATCH` | No | `true` | Native filesystem watching or SFTP polling for external index updates |
 | `OBSIDIAN_LOG_LEVEL` | No | `info` | `trace`, `debug`, `info`, `warn`, `error` |
 | `OBSIDIAN_TANTIVY` | No | `true` | BM25 full-text index |
 | `OBSIDIAN_TOOLS` | No | `full` | Tool filtering: profile name, comma-separated allow-list, or `!`-prefixed deny-list |
-| `OBSIDIAN_MCP_DATA` | No | `{vault}/.obsidian-mcp` | External obsidian-mcp data directory. When set, cache/config data is stored under `{value}/vaults-v2/<vault_key>/` and merged with vault-local config |
+| `OBSIDIAN_MCP_DATA` | No | Source-dependent | Local machine-data root. Local vaults default to `{vault}/.obsidian-mcp`; external local-vault data uses `vaults-v2/<vault_key>/`. SFTP data uses a separate `sources-v1/<source-id>/` namespace and never writes caches into the remote folder |
+| `OBSIDIAN_SFTP_TIMEOUT_SECS` | No | `30` | SFTP source-operation deadline, including queueing and eligible recovery; integer from 1 to 86400 |
+| `OBSIDIAN_SFTP_POLL_INTERVAL_SECS` | No | `300` | Metadata/tree polling interval while watching is enabled; integer from 1 to 86400 |
+| `OBSIDIAN_SFTP_VERIFY_INTERVAL_SECS` | No | `3600` | Full content verification interval; integer from 1 to 86400 and at least the polling interval |
 | `OBSIDIAN_EXCLUDE_PATHS` | No | *(empty)* | Comma-separated glob patterns excluded from indexing, search, graph, and stats. Merged with `.obsidian-mcp/ignore`; restart after changing ignore files |
 | `OBSIDIAN_EMBEDDINGS` | No | `false` | Semantic embedding search (requires `embeddings` or `embeddings-api` feature) |
 | `OBSIDIAN_EMBEDDINGS_MODEL` | No | `BAAI/bge-small-en-v1.5` | HuggingFace model for embeddings |
@@ -751,7 +759,7 @@ clients retain all supported ownership modes.
 | `OBSIDIAN_EMBEDDING_BATCH_SIZE` | No | `32` | Maximum notes processed per background reconciliation batch; positive integer, for either embedding backend |
 | `OBSIDIAN_EMBEDDING_CA_CERT` | No | — | Path to PEM CA certificate for API TLS |
 | `OBSIDIAN_EMBEDDING_TLS_VERIFY` | No | `true` | Set to `false` to skip TLS verification |
-| `OBSIDIAN_SEMANTIC_MODE` | No | `auto` | Semantic backend mode: `auto`, `daemon`, `local` |
+| `OBSIDIAN_SEMANTIC_MODE` | No | `auto` | Semantic backend mode: `auto`, `daemon`, `local`. SFTP sources use the MCP-local runtime for `auto`/`local`; explicit `daemon` is unsupported when embeddings are enabled |
 | `OBSIDIAN_SEMANTIC_HOME` | No | OS data-dir default | Shared semantic runtime home for daemon bin/model/cache state |
 | `OBSIDIAN_SEMANTIC_DAEMON_PATH` | No | unset | Override daemon binary path used by bootstrap |
 | `OBSIDIAN_SEMANTIC_DAEMON_DOWNLOAD_URL` | No | `https://github.com/lstpsche/obsidian-mcp/releases/download/v<version>/obsidian-semanticd-<version>-<target>.<ext>` | Override daemon download URL when binary is missing |
@@ -765,7 +773,7 @@ clients retain all supported ownership modes.
 | `OBSIDIAN_HYBRID_ALPHA` | No | alias | Backward-compatible alias for `OBSIDIAN_SEMANTIC_ALPHA` |
 | `FASTEMBED_CACHE_DIR` | No | `<semantic-home>/model/fastembed-cache` | Daemon-internal shared fastembed cache root |
 
-\* Also accepted as the first CLI argument: `obsidian-mcp /path/to/vault`
+\* Also accepted as the first CLI argument: `obsidian-mcp /path/to/vault` or `obsidian-mcp sftp://vault-server/path/to/vault`.
 
 The machine-data key hashes the canonical native vault path. On upgrade, a legacy
 directory containing operator configuration can require a decision because different

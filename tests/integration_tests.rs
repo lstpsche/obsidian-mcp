@@ -89,76 +89,105 @@ mod vault_read {
 
     #[test]
     fn list_files_root() {
-        let files = VAULT.list_files(Path::new(""), true, None).unwrap();
-        assert!(
-            files.len() >= 7,
-            "expected at least 7 files, got {}",
-            files.len()
-        );
+        let _ = &*VAULT;
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let files = VAULT.list_files(Path::new(""), true, None).await.unwrap();
+            assert!(
+                files.len() >= 7,
+                "expected at least 7 files, got {}",
+                files.len()
+            );
+        });
     }
 
     #[test]
     fn list_files_subdirectory() {
-        let files = VAULT
-            .list_files(Path::new("Projects"), false, None)
-            .unwrap();
-        assert!(files.iter().any(|f| f.ends_with("rust-mcp.md")));
-        assert!(files.iter().any(|f| f.ends_with("python-tools.md")));
+        let _ = &*VAULT;
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let files = VAULT
+                .list_files(Path::new("Projects"), false, None)
+                .await
+                .unwrap();
+            assert!(files.iter().any(|f| f.ends_with("rust-mcp.md")));
+            assert!(files.iter().any(|f| f.ends_with("python-tools.md")));
+        });
     }
 
     #[test]
     fn list_files_glob() {
-        let files = VAULT
-            .list_files(Path::new(""), true, Some("**/*.md"))
-            .unwrap();
-        assert!(
-            files
-                .iter()
-                .all(|f| f.extension().is_some_and(|e| e == "md"))
-        );
-        assert!(!files.is_empty());
+        let _ = &*VAULT;
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let files = VAULT
+                .list_files(Path::new(""), true, Some("**/*.md"))
+                .await
+                .unwrap();
+            assert!(
+                files
+                    .iter()
+                    .all(|f| f.extension().is_some_and(|e| e == "md"))
+            );
+            assert!(!files.is_empty());
+        });
     }
 
     #[test]
     fn read_note_content() {
-        let content = VAULT.read_note(Path::new("Projects/rust-mcp.md")).unwrap();
-        assert!(content.contains("# Rust MCP Server"));
-        assert!(content.contains("tags: [rust, mcp, project]"));
+        let _ = &*VAULT;
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let content = VAULT
+                .read_note(Path::new("Projects/rust-mcp.md"))
+                .await
+                .unwrap();
+            assert!(content.contains("# Rust MCP Server"));
+            assert!(content.contains("tags: [rust, mcp, project]"));
+        });
     }
 
     #[test]
     fn read_nested_note() {
-        let content = VAULT
-            .read_note(Path::new("Notes/deep/nested-note.md"))
-            .unwrap();
-        assert!(content.contains("# Nested Note"));
+        let _ = &*VAULT;
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let content = VAULT
+                .read_note(Path::new("Notes/deep/nested-note.md"))
+                .await
+                .unwrap();
+            assert!(content.contains("# Nested Note"));
+        });
     }
 
     #[test]
     fn note_metadata() {
-        let meta = VAULT
-            .get_note_metadata(Path::new("Projects/rust-mcp.md"))
-            .unwrap();
-        assert_eq!(meta.title, "rust-mcp");
-        assert!(meta.tags.contains(&"rust".to_string()));
-        assert!(meta.tags.contains(&"mcp".to_string()));
-        assert!(meta.tags.contains(&"backend".to_string()));
-        assert!(!meta.headings.is_empty());
-        assert!(!meta.links.is_empty());
-        assert!(!meta.block_refs.is_empty());
+        let _ = &*VAULT;
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let meta = VAULT
+                .get_note_metadata(Path::new("Projects/rust-mcp.md"))
+                .await
+                .unwrap();
+            assert_eq!(meta.title, "rust-mcp");
+            assert!(meta.tags.contains(&"rust".to_string()));
+            assert!(meta.tags.contains(&"mcp".to_string()));
+            assert!(meta.tags.contains(&"backend".to_string()));
+            assert!(!meta.headings.is_empty());
+            assert!(!meta.links.is_empty());
+            assert!(!meta.block_refs.is_empty());
+        });
     }
 
     #[test]
     fn document_map() {
-        let map = VAULT
-            .get_document_map(Path::new("Projects/rust-mcp.md"))
-            .unwrap();
-        assert!(map.headings.iter().any(|h| h.contains("Rust MCP Server")));
-        assert!(map.headings.iter().any(|h| h.contains("Architecture")));
-        assert!(map.block_refs.contains(&"intro".to_string()));
-        assert!(map.block_refs.contains(&"impl".to_string()));
-        assert!(map.frontmatter_fields.contains(&"tags".to_string()));
-        assert!(map.frontmatter_fields.contains(&"status".to_string()));
+        let _ = &*VAULT;
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let map = VAULT
+                .get_document_map(Path::new("Projects/rust-mcp.md"))
+                .await
+                .unwrap();
+            assert!(map.headings.iter().any(|h| h.contains("Rust MCP Server")));
+            assert!(map.headings.iter().any(|h| h.contains("Architecture")));
+            assert!(map.block_refs.contains(&"intro".to_string()));
+            assert!(map.block_refs.contains(&"impl".to_string()));
+            assert!(map.frontmatter_fields.contains(&"tags".to_string()));
+            assert!(map.frontmatter_fields.contains(&"status".to_string()));
+        });
     }
 
     #[test]
@@ -237,6 +266,7 @@ mod bulk_read_workflow {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
         let default_paths: Vec<String> = serde_json::from_str(
             default_list.content[0]
@@ -256,6 +286,7 @@ mod bulk_read_workflow {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
         let metadata: Vec<serde_json::Value> = serde_json::from_str(
             metadata_list.content[0]
@@ -292,33 +323,46 @@ mod vault_search {
 
     #[test]
     fn search_text_finds_match() {
-        let results = VAULT.search_text("quantum entanglement", 40).unwrap();
-        assert!(!results.is_empty());
-        assert!(results.iter().any(|r| r.path == Path::new("orphan.md")));
+        let _ = &*VAULT;
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let results = VAULT.search_text("quantum entanglement", 40).await.unwrap();
+            assert!(!results.is_empty());
+            assert!(results.iter().any(|r| r.path == Path::new("orphan.md")));
+        });
     }
 
     #[test]
     fn search_text_case_insensitive() {
-        let results = VAULT.search_text("RUST MCP SERVER", 40).unwrap();
-        assert!(
-            results
-                .iter()
-                .any(|r| r.path == Path::new("Projects/rust-mcp.md"))
-        );
+        let _ = &*VAULT;
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let results = VAULT.search_text("RUST MCP SERVER", 40).await.unwrap();
+            assert!(
+                results
+                    .iter()
+                    .any(|r| r.path == Path::new("Projects/rust-mcp.md"))
+            );
+        });
     }
 
     #[test]
     fn search_text_no_match() {
-        let results = VAULT
-            .search_text("xyzzy_nonexistent_term_12345", 40)
-            .unwrap();
-        assert!(results.is_empty());
+        let _ = &*VAULT;
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let results = VAULT
+                .search_text("xyzzy_nonexistent_term_12345", 40)
+                .await
+                .unwrap();
+            assert!(results.is_empty());
+        });
     }
 
     #[test]
     fn search_regex() {
-        let results = VAULT.search_regex(r"#\w+", 40).unwrap();
-        assert!(!results.is_empty());
+        let _ = &*VAULT;
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let results = VAULT.search_regex(r"#\w+", 40).await.unwrap();
+            assert!(!results.is_empty());
+        });
     }
 
     #[test]
@@ -388,21 +432,31 @@ mod vault_graph {
 
     #[test]
     fn backlinks() {
-        let backlinks = VAULT.backlinks(Path::new("Projects/rust-mcp.md")).unwrap();
-        let paths: Vec<_> = backlinks.iter().map(|n| &n.path).collect();
-        assert!(paths.contains(&&PathBuf::from("Projects/python-tools.md")));
-        assert!(paths.contains(&&PathBuf::from("Notes/getting-started.md")));
-        assert!(paths.contains(&&PathBuf::from("Daily/2026-03-19.md")));
+        let _ = &*VAULT;
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let backlinks = VAULT
+                .backlinks(Path::new("Projects/rust-mcp.md"))
+                .await
+                .unwrap();
+            let paths: Vec<_> = backlinks.iter().map(|n| &n.path).collect();
+            assert!(paths.contains(&&PathBuf::from("Projects/python-tools.md")));
+            assert!(paths.contains(&&PathBuf::from("Notes/getting-started.md")));
+            assert!(paths.contains(&&PathBuf::from("Daily/2026-03-19.md")));
+        });
     }
 
     #[test]
     fn outgoing_links() {
-        let links = VAULT
-            .outgoing_links(Path::new("Projects/rust-mcp.md"))
-            .unwrap();
-        let targets: Vec<_> = links.iter().map(|l| l.target.as_str()).collect();
-        assert!(targets.contains(&"getting-started"));
-        assert!(targets.contains(&"python-tools"));
+        let _ = &*VAULT;
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let links = VAULT
+                .outgoing_links(Path::new("Projects/rust-mcp.md"))
+                .await
+                .unwrap();
+            let targets: Vec<_> = links.iter().map(|l| l.target.as_str()).collect();
+            assert!(targets.contains(&"getting-started"));
+            assert!(targets.contains(&"python-tools"));
+        });
     }
 
     #[test]
@@ -467,7 +521,7 @@ mod vault_tantivy_search {
     #[tokio::test]
     async fn search_text_returns_ranked_results() {
         let (_tmp, vault) = copy_fixture_with_tantivy().await;
-        let results = vault.search_text("quantum entanglement", 40).unwrap();
+        let results = vault.search_text("quantum entanglement", 40).await.unwrap();
         assert!(!results.is_empty());
         assert!(
             results[0].score.is_some(),
@@ -485,7 +539,7 @@ mod vault_tantivy_search {
     async fn search_text_stemming_finds_related_terms() {
         let (_tmp, vault) = copy_fixture_with_tantivy().await;
         // "server" appears in rust-mcp.md; "servers" stems to the same root
-        let results = vault.search_text("servers", 40).unwrap();
+        let results = vault.search_text("servers", 40).await.unwrap();
         assert!(
             !results.is_empty(),
             "stemming should match 'servers' → 'server'"
@@ -502,11 +556,13 @@ mod vault_tantivy_search {
                 Path::new("fuzzy_target.md"),
                 "# Architecture\nMicroservices architecture patterns.\n",
             )
+            .await
             .unwrap();
 
         // "architeture" has a typo (missing 'c')
         let results = vault
             .search_text_with_options("architeture", 40, 10, true, None)
+            .await
             .unwrap();
         assert!(
             results
@@ -525,11 +581,13 @@ mod vault_tantivy_search {
                 Path::new("elasticsearch.md"),
                 "# Elasticsearch\nDatabase internals and indexing.\n",
             )
+            .await
             .unwrap();
 
         // Title field = filename stem = "elasticsearch"
         let title_results = vault
             .search_text_with_options("elasticsearch", 40, 10, false, Some(&[SearchField::Title]))
+            .await
             .unwrap();
         assert!(
             title_results
@@ -540,6 +598,7 @@ mod vault_tantivy_search {
         // "indexing" appears only in the body, not title
         let body_results = vault
             .search_text_with_options("indexing", 40, 10, false, Some(&[SearchField::Body]))
+            .await
             .unwrap();
         assert!(
             body_results
@@ -551,7 +610,7 @@ mod vault_tantivy_search {
     #[tokio::test]
     async fn search_text_context_snippets_from_tantivy() {
         let (_tmp, vault) = copy_fixture_with_tantivy().await;
-        let results = vault.search_text("quantum entanglement", 80).unwrap();
+        let results = vault.search_text("quantum entanglement", 80).await.unwrap();
 
         assert!(!results.is_empty());
         let first = &results[0];
@@ -575,8 +634,9 @@ mod vault_write {
         let (_tmp, vault) = copy_fixture_to_temp().await;
         vault
             .create_note(Path::new("new-note.md"), "# New Note\nBody\n", None)
+            .await
             .unwrap();
-        let content = vault.read_note(Path::new("new-note.md")).unwrap();
+        let content = vault.read_note(Path::new("new-note.md")).await.unwrap();
         assert!(content.contains("# New Note"));
     }
 
@@ -586,8 +646,9 @@ mod vault_write {
         let fm = serde_json::json!({"tags": ["test"], "draft": true});
         vault
             .create_note(Path::new("fm-note.md"), "Body\n", Some(&fm))
+            .await
             .unwrap();
-        let content = vault.read_note(Path::new("fm-note.md")).unwrap();
+        let content = vault.read_note(Path::new("fm-note.md")).await.unwrap();
         assert!(content.starts_with("---\n"));
         assert!(content.contains("Body\n"));
     }
@@ -597,6 +658,7 @@ mod vault_write {
         let (_tmp, vault) = copy_fixture_to_temp().await;
         let err = vault
             .create_note(Path::new("Projects/rust-mcp.md"), "dup", None)
+            .await
             .unwrap_err();
         assert!(
             matches!(err, obsidian_mcp::error::VaultError::AlreadyExists(_)),
@@ -609,8 +671,9 @@ mod vault_write {
         let (_tmp, vault) = copy_fixture_to_temp().await;
         vault
             .write_note(Path::new("orphan.md"), "# Replaced\n")
+            .await
             .unwrap();
-        let content = vault.read_note(Path::new("orphan.md")).unwrap();
+        let content = vault.read_note(Path::new("orphan.md")).await.unwrap();
         assert_eq!(content, "# Replaced\n");
     }
 
@@ -619,8 +682,9 @@ mod vault_write {
         let (_tmp, vault) = copy_fixture_to_temp().await;
         vault
             .append_note(Path::new("orphan.md"), "\nAppended line\n")
+            .await
             .unwrap();
-        let content = vault.read_note(Path::new("orphan.md")).unwrap();
+        let content = vault.read_note(Path::new("orphan.md")).await.unwrap();
         assert!(content.ends_with("Appended line\n"));
     }
 
@@ -629,8 +693,12 @@ mod vault_write {
         let (_tmp, vault) = copy_fixture_to_temp().await;
         vault
             .prepend_note(Path::new("Projects/rust-mcp.md"), "Prepended\n")
+            .await
             .unwrap();
-        let content = vault.read_note(Path::new("Projects/rust-mcp.md")).unwrap();
+        let content = vault
+            .read_note(Path::new("Projects/rust-mcp.md"))
+            .await
+            .unwrap();
         let prepended_pos = content.find("Prepended\n").unwrap();
         let heading_pos = content.find("# Rust MCP Server").unwrap();
         assert!(prepended_pos < heading_pos);
@@ -640,8 +708,8 @@ mod vault_write {
     #[tokio::test]
     async fn delete_note() {
         let (_tmp, vault) = copy_fixture_to_temp().await;
-        vault.delete_note(Path::new("orphan.md")).unwrap();
-        let err = vault.read_note(Path::new("orphan.md")).unwrap_err();
+        vault.delete_note(Path::new("orphan.md")).await.unwrap();
+        let err = vault.read_note(Path::new("orphan.md")).await.unwrap_err();
         assert!(matches!(
             err,
             obsidian_mcp::error::VaultError::NoteNotFound(_)
@@ -653,11 +721,15 @@ mod vault_write {
         let (_tmp, vault) = copy_fixture_to_temp().await;
         let new_path = vault
             .move_note(Path::new("orphan.md"), Path::new("Archive/orphan.md"))
+            .await
             .unwrap();
         assert_eq!(new_path, PathBuf::from("Archive/orphan.md"));
-        let content = vault.read_note(Path::new("Archive/orphan.md")).unwrap();
+        let content = vault
+            .read_note(Path::new("Archive/orphan.md"))
+            .await
+            .unwrap();
         assert!(content.contains("Orphan Note"));
-        assert!(vault.read_note(Path::new("orphan.md")).is_err());
+        assert!(vault.read_note(Path::new("orphan.md")).await.is_err());
     }
 
     #[tokio::test]
@@ -673,8 +745,12 @@ mod vault_write {
                     content: "- New feature added\n".into(),
                 },
             )
+            .await
             .unwrap();
-        let content = vault.read_note(Path::new("Projects/rust-mcp.md")).unwrap();
+        let content = vault
+            .read_note(Path::new("Projects/rust-mcp.md"))
+            .await
+            .unwrap();
         assert!(content.contains("- New feature added\n"));
     }
 
@@ -687,14 +763,16 @@ mod vault_write {
                 "category",
                 serde_json::json!("archive"),
             )
+            .await
             .unwrap();
-        let fm = vault.get_frontmatter(Path::new("orphan.md")).unwrap();
+        let fm = vault.get_frontmatter(Path::new("orphan.md")).await.unwrap();
         assert_eq!(fm.unwrap()["category"], "archive");
 
         vault
             .remove_frontmatter_field(Path::new("orphan.md"), "category")
+            .await
             .unwrap();
-        let fm = vault.get_frontmatter(Path::new("orphan.md")).unwrap();
+        let fm = vault.get_frontmatter(Path::new("orphan.md")).await.unwrap();
         match fm {
             None => {} // removing last field strips frontmatter entirely
             Some(obj) => assert!(obj.get("category").is_none()),
@@ -706,6 +784,7 @@ mod vault_write {
         let (_tmp, vault) = copy_fixture_to_temp().await;
         let fm = vault
             .get_frontmatter(Path::new("Projects/rust-mcp.md"))
+            .await
             .unwrap();
         let obj = fm.expect("rust-mcp.md should have frontmatter");
         assert_eq!(obj["status"], "active");
@@ -719,8 +798,12 @@ mod vault_write {
                 Path::new("searchme.md"),
                 "# Unique\nfindable_xyzzy_content\n",
             )
+            .await
             .unwrap();
-        let results = vault.search_text("findable_xyzzy_content", 40).unwrap();
+        let results = vault
+            .search_text("findable_xyzzy_content", 40)
+            .await
+            .unwrap();
         assert!(results.iter().any(|r| r.path == Path::new("searchme.md")));
     }
 }
@@ -773,51 +856,61 @@ mod unicode_paths {
 
         let vault = Vault::open(&unicode_config(dir.path())).await.unwrap();
 
-        let content = vault.read_note(Path::new(composed)).unwrap();
+        let content = vault.read_note(Path::new(composed)).await.unwrap();
         assert!(content.contains("initial-unicode-token"));
 
-        let metadata = vault.get_note_metadata(Path::new(composed)).unwrap();
+        let metadata = vault.get_note_metadata(Path::new(composed)).await.unwrap();
         assert_eq!(metadata.path, disk_path);
 
-        let backlinks = vault.backlinks(Path::new(composed)).unwrap();
+        let backlinks = vault.backlinks(Path::new(composed)).await.unwrap();
         assert!(
             backlinks
                 .iter()
                 .any(|note| note.path == Path::new("source.md"))
         );
 
-        let outgoing = vault.outgoing_links(Path::new(composed)).unwrap();
+        let outgoing = vault.outgoing_links(Path::new(composed)).await.unwrap();
         assert!(outgoing.iter().any(|link| link.target == "source"));
 
-        let initial_results = vault.search_text("initial-unicode-token", 40).unwrap();
+        let initial_results = vault
+            .search_text("initial-unicode-token", 40)
+            .await
+            .unwrap();
         assert_eq!(initial_results.len(), 1);
         assert_eq!(initial_results[0].path, disk_path);
 
         vault
             .append_note(Path::new(composed), "\nappended-unicode-token\n")
+            .await
             .unwrap();
         assert!(
             vault
                 .read_note(Path::new(composed))
+                .await
                 .unwrap()
                 .contains("appended-unicode-token")
         );
-        let appended_results = vault.search_text("appended-unicode-token", 40).unwrap();
+        let appended_results = vault
+            .search_text("appended-unicode-token", 40)
+            .await
+            .unwrap();
         assert_eq!(appended_results.len(), 1);
         assert_eq!(appended_results[0].path, disk_path);
 
         let moved = vault
             .move_note(Path::new(composed), Path::new("Moved/lic1c.md"))
+            .await
             .unwrap();
         assert_eq!(moved, PathBuf::from("Moved/lic1c.md"));
-        assert!(vault.get_note_metadata(Path::new(composed)).is_err());
-        assert!(vault.get_note_metadata(&moved).is_ok());
+        assert!(vault.get_note_metadata(Path::new(composed)).await.is_err());
+        assert!(vault.get_note_metadata(&moved).await.is_ok());
 
-        vault.delete_note(&moved).unwrap();
-        assert!(vault.get_note_metadata(&moved).is_err());
+        vault.delete_note(&moved).await.unwrap();
+        assert!(vault.get_note_metadata(&moved).await.is_err());
         assert!(
             vault
                 .search_text("appended-unicode-token", 40)
+                .await
                 .unwrap()
                 .is_empty()
         );
@@ -831,14 +924,18 @@ mod vault_periodic {
 
     #[test]
     fn list_recent_daily_notes() {
-        let notes = VAULT
-            .list_recent_periodic_notes(&NotePeriod::Daily, 10)
-            .unwrap();
-        assert!(
-            notes.iter().any(|p| p.ends_with("2026-03-19.md")),
-            "expected to find the daily note, got: {:?}",
-            notes
-        );
+        let _ = &*VAULT;
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let notes = VAULT
+                .list_recent_periodic_notes(&NotePeriod::Daily, 10)
+                .await
+                .unwrap();
+            assert!(
+                notes.iter().any(|p| p.ends_with("2026-03-19.md")),
+                "expected to find the daily note, got: {:?}",
+                notes
+            );
+        });
     }
 
     #[tokio::test]
@@ -847,9 +944,10 @@ mod vault_periodic {
         let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
         let path = vault
             .create_periodic_note(&NotePeriod::Daily, Some(date), None)
+            .await
             .unwrap();
         assert!(path.to_string_lossy().contains("2026-01-15"));
-        let content = vault.read_note(&path).unwrap();
+        let content = vault.read_note(&path).await.unwrap();
         assert!(content.is_empty() || content.contains("2026"));
     }
 }
@@ -1074,12 +1172,16 @@ mod vault_exclusion {
         let vault = Vault::open(&config).await.unwrap();
 
         assert!(
-            vault.get_note_metadata(Path::new("Active/note.md")).is_ok(),
+            vault
+                .get_note_metadata(Path::new("Active/note.md"))
+                .await
+                .is_ok(),
             "non-excluded note should be in index"
         );
         assert!(
             vault
                 .get_note_metadata(Path::new("Archive/old.md"))
+                .await
                 .is_err(),
             "excluded note should not be in index"
         );
@@ -1087,7 +1189,7 @@ mod vault_exclusion {
         let stats = vault.vault_stats().unwrap();
         assert_eq!(stats.total_notes, 1, "only non-excluded notes counted");
 
-        let content = vault.read_note(Path::new("Archive/old.md")).unwrap();
+        let content = vault.read_note(Path::new("Archive/old.md")).await.unwrap();
         assert!(
             content.contains("Old Note"),
             "direct read of excluded note should still work"
@@ -1109,12 +1211,16 @@ mod vault_exclusion {
         let vault = Vault::open(&config).await.unwrap();
 
         assert!(
-            vault.get_note_metadata(Path::new("Active/note.md")).is_ok(),
+            vault
+                .get_note_metadata(Path::new("Active/note.md"))
+                .await
+                .is_ok(),
             "non-excluded note should be in index"
         );
         assert!(
             vault
                 .get_note_metadata(Path::new("Archive/old.md"))
+                .await
                 .is_err(),
             "note excluded via ignore file should not be in index"
         );
@@ -1170,7 +1276,7 @@ mod vault_exclusion {
             expected.is_dir(),
             "external data directory should contain a vault-specific namespace"
         );
-        assert_eq!(vault.mcp_data(), expected);
+        assert_eq!(vault.mcp_data().unwrap(), expected);
     }
 
     #[tokio::test]
@@ -1189,12 +1295,16 @@ mod vault_exclusion {
         let vault = Vault::open(&config).await.unwrap();
 
         assert!(
-            vault.get_note_metadata(Path::new("visible.md")).is_ok(),
+            vault
+                .get_note_metadata(Path::new("visible.md"))
+                .await
+                .is_ok(),
             "regular note should be indexed"
         );
         assert!(
             vault
                 .get_note_metadata(Path::new(".obsidian-mcp/test.md"))
+                .await
                 .is_err(),
             ".obsidian-mcp/ contents should never be indexed"
         );
@@ -1223,7 +1333,10 @@ mod vault_exclusion {
         let config = tantivy_config_with_exclusions(dir.path(), vec!["Archive/".into()]);
         let vault = Vault::open(&config).await.unwrap();
 
-        let results = vault.search_text("xylophone-unique-test-word", 40).unwrap();
+        let results = vault
+            .search_text("xylophone-unique-test-word", 40)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1, "only the non-excluded note should appear");
         assert_eq!(results[0].path, PathBuf::from("Active/visible.md"));
     }
@@ -1271,27 +1384,32 @@ mod vault_exclusion {
         let vault = Vault::open(&config).await.unwrap();
 
         assert!(
-            vault.get_note_metadata(Path::new("note.md")).is_ok(),
+            vault.get_note_metadata(Path::new("note.md")).await.is_ok(),
             "note should be in index before move"
         );
 
         let new_path = vault
             .move_note(Path::new("note.md"), Path::new("Archive/moved.md"))
+            .await
             .unwrap();
         assert_eq!(new_path, PathBuf::from("Archive/moved.md"));
 
         assert!(
             vault
                 .get_note_metadata(Path::new("Archive/moved.md"))
+                .await
                 .is_err(),
             "note should NOT be in index after moving to excluded dir"
         );
         assert!(
-            vault.get_note_metadata(Path::new("note.md")).is_err(),
+            vault.get_note_metadata(Path::new("note.md")).await.is_err(),
             "old path should be gone from index"
         );
 
-        let content = vault.read_note(Path::new("Archive/moved.md")).unwrap();
+        let content = vault
+            .read_note(Path::new("Archive/moved.md"))
+            .await
+            .unwrap();
         assert!(
             content.contains("Movable Note"),
             "file should still be readable on disk via direct access"
@@ -1311,22 +1429,28 @@ mod vault_exclusion {
         assert!(
             vault
                 .get_note_metadata(Path::new("Archive/hidden.md"))
+                .await
                 .is_err(),
             "excluded note should NOT be in index"
         );
 
         let new_path = vault
             .move_note(Path::new("Archive/hidden.md"), Path::new("visible.md"))
+            .await
             .unwrap();
         assert_eq!(new_path, PathBuf::from("visible.md"));
 
         assert!(
-            vault.get_note_metadata(Path::new("visible.md")).is_ok(),
+            vault
+                .get_note_metadata(Path::new("visible.md"))
+                .await
+                .is_ok(),
             "note should be in index after moving out of excluded dir"
         );
         assert!(
             vault
                 .get_note_metadata(Path::new("Archive/hidden.md"))
+                .await
                 .is_err(),
             "old excluded path should not be in index"
         );
@@ -1354,6 +1478,7 @@ mod vault_exclusion {
 
         let results = vault
             .search_text("zebra-platypus-unique-search-term", 40)
+            .await
             .unwrap();
         assert_eq!(
             results.len(),
@@ -1375,7 +1500,7 @@ mod vault_exclusion {
         let config = config_with_exclusions(dir.path(), vec!["Archive/".into()]);
         let vault = Vault::open(&config).await.unwrap();
 
-        let files = vault.list_files(Path::new(""), true, None).unwrap();
+        let files = vault.list_files(Path::new(""), true, None).await.unwrap();
         assert!(
             files.iter().any(|f| f == Path::new("Active/note.md")),
             "non-excluded file should appear in listing, got: {files:?}"
@@ -1516,6 +1641,7 @@ mod vault_semantic_search {
                 Path::new("rust.md"),
                 "# Rust\nRust is a systems programming language known for memory safety.\n",
             )
+            .await
             .unwrap();
 
         let results =
@@ -1537,8 +1663,9 @@ mod vault_semantic_search {
                 Path::new("gone.md"),
                 "# Ephemeral\nThis note will be deleted soon.\n",
             )
+            .await
             .unwrap();
-        vault.delete_note(Path::new("gone.md")).unwrap();
+        vault.delete_note(Path::new("gone.md")).await.unwrap();
 
         let results = vault.search_semantic("ephemeral deleted", 5).unwrap();
         assert!(
@@ -1577,12 +1704,14 @@ mod vault_semantic_search {
                 Path::new("rust.md"),
                 "# Rust\nRust is a systems programming language known for memory safety.\n",
             )
+            .await
             .unwrap();
         vault
             .write_note(
                 Path::new("python.md"),
                 "# Python\nPython is a dynamic language for scripting and data science.\n",
             )
+            .await
             .unwrap();
 
         wait_for_embeddings_ready(&vault).await;
@@ -1611,6 +1740,7 @@ mod vault_semantic_search {
 
         vault
             .write_note(Path::new("note.md"), "# Note\nSome content.\n")
+            .await
             .unwrap();
 
         let results = vault.search_hybrid("", 5, 50, 0.4).unwrap();
@@ -1641,6 +1771,7 @@ mod vault_semantic_search {
                 Path::new("quantum.md"),
                 "# Quantum Computing\nQuantum computers use qubits for exponential parallelism.\n",
             )
+            .await
             .unwrap();
 
         wait_for_embeddings_ready(&vault).await;
@@ -1818,6 +1949,7 @@ mod semantic_tool_runtime_modes {
                 Path::new("local.md"),
                 "# Local\nOwnership and borrow checker for memory safety.",
             )
+            .await
             .expect("write local note");
 
         let runtime = SemanticRuntime {
@@ -2640,6 +2772,7 @@ mod background_embedding_runtime {
             loop {
                 if vault
                     .search_text("WATCH_FINAL", 20)
+                    .await
                     .unwrap()
                     .iter()
                     .any(|result| result.path == Path::new("watched.md"))
@@ -2654,14 +2787,17 @@ mod background_embedding_runtime {
 
         vault
             .write_note(Path::new("direct.md"), "# Direct\nDIRECT_OLD\n")
+            .await
             .unwrap();
         vault
             .write_note(Path::new("direct.md"), "# Direct\nDIRECT_FINAL\n")
+            .await
             .unwrap();
         vault
             .write_note(Path::new("deleted.md"), "# Deleted\nDELETE_ME\n")
+            .await
             .unwrap();
-        vault.delete_note(Path::new("deleted.md")).unwrap();
+        vault.delete_note(Path::new("deleted.md")).await.unwrap();
 
         api.release_blocked();
         wait_for_status(&vault, "latest-wins reconciliation", |status| {
@@ -2810,6 +2946,7 @@ mod background_embedding_runtime {
                 Path::new("note.md"),
                 "# Note\nREAD_RECOVERED valid content\n",
             )
+            .await
             .unwrap();
         wait_for_status(&vault, "note read retry", |status| {
             status.phase == EmbeddingPhase::Ready

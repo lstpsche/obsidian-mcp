@@ -24,6 +24,12 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Install SFTP fixture
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes openssh-sftp-server
+
       - name: Cache cargo
         uses: actions/cache@v5
         with:
@@ -85,6 +91,28 @@ jobs:
         with:
           components: clippy
 
+      - name: Prepare native SSH fixture
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes openssh-server openssh-sftp-server
+          sudo install -d -m 755 /run/sshd
+
+      - name: Prepare Windows native SSH fixture
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $capability = Get-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+          if ($capability.State -ne 'Installed') {
+            Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
+          }
+          foreach ($tool in 'ssh', 'ssh-keygen', 'sshd') {
+            if (!(Test-Path "$env:WINDIR/System32/OpenSSH/$tool.exe")) {
+              throw "Native SSH fixture requires $tool.exe"
+            }
+          }
+
       - name: Cache cargo
         uses: actions/cache@v5
         with:
@@ -107,8 +135,13 @@ jobs:
             exit 1
           fi
 
-      - name: API library, chunking, daemon and MCP contracts
-        run: cargo test --locked --no-default-features --features embeddings-api --lib --test automatic_chunking_tests --test semantic_daemon_api_tests --test integration_tests --test mcp_transport_tests
+      - name: API library, chunking, daemon, SFTP and MCP contracts
+        run: cargo test --locked --no-default-features --features embeddings-api --lib --test automatic_chunking_tests --test semantic_daemon_api_tests --test integration_tests --test mcp_transport_tests --test sftp_mcp_tests
+
+      - name: Native SSH authentication and host-key checks
+        env:
+          OBSIDIAN_TEST_SSH_INTEGRATION: '1'
+        run: cargo test --locked --no-default-features --features embeddings-api --test sftp_integration_tests -- --ignored
 
   upgrade-contract:
     name: upgrade contract (${{ matrix.features }})

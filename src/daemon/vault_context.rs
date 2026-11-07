@@ -182,7 +182,7 @@ impl VaultContext {
         let allowed = allowed_paths.map(|paths| {
             paths
                 .iter()
-                .map(PathBuf::from)
+                .map(std::ffi::OsString::from)
                 .collect::<std::collections::HashSet<_>>()
         });
         let current_paths = self

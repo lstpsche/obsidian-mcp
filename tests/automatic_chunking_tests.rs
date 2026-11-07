@@ -103,6 +103,7 @@ mod context {
 
         vault
             .write_note(Path::new("policy.md"), "# Replacement\nChanged source.")
+            .await
             .unwrap();
         let params: NoteReadParams = serde_json::from_value(json!({
             "path":"policy.md", "expected_revision":revision, "range":exception["section_range"]

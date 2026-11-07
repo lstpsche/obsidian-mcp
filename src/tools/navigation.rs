@@ -74,14 +74,14 @@ impl VaultListEntry {
 ///
 /// In `"list"` mode (default): returns a JSON array of relative paths.
 /// In `"tree"` mode: returns a tree-formatted string like the `tree` command.
-pub fn vault_list(
+pub async fn vault_list(
     vault: &Vault,
     params: VaultListParams,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     let format = params.format.as_deref().unwrap_or("list");
 
     if format.eq_ignore_ascii_case("list") {
-        vault_list_flat(vault, &params)
+        vault_list_flat(vault, &params).await
     } else if format.eq_ignore_ascii_case("tree") {
         if params.include_metadata.unwrap_or(false) {
             return Err(rmcp::ErrorData::new(
@@ -90,7 +90,7 @@ pub fn vault_list(
                 None::<serde_json::Value>,
             ));
         }
-        vault_list_tree(vault, &params)
+        vault_list_tree(vault, &params).await
     } else {
         Err(rmcp::ErrorData::new(
             ErrorCode::INVALID_PARAMS,
@@ -100,25 +100,29 @@ pub fn vault_list(
     }
 }
 
-fn vault_list_flat(
+async fn vault_list_flat(
     vault: &Vault,
     params: &VaultListParams,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     let dir = params.path.as_deref().unwrap_or("");
     let recursive = params.recursive.unwrap_or(false);
-    let files = vault.list_files(Path::new(dir), recursive, params.glob.as_deref())?;
+    let files = vault
+        .list_files(Path::new(dir), recursive, params.glob.as_deref())
+        .await?;
 
     let paths: Vec<&str> = files
         .iter()
-        .filter(|p| {
+        .filter_map(|path| path.to_str())
+        .filter(|path| {
             params
                 .max_depth
-                .is_none_or(|max| p.components().count() <= max)
+                .is_none_or(|max| logical_depth(path) <= max)
         })
-        .filter_map(|p| p.to_str())
         .collect();
 
     let entries = if params.include_metadata.unwrap_or(false) {
+        // Indexed metadata must not look absent while the first catalog is unknown.
+        vault.vault_stats()?;
         let metadata =
             vault.get_indexed_note_metadata_batch(paths.iter().map(|path| Path::new(*path)));
         let entries = paths
@@ -126,9 +130,7 @@ fn vault_list_flat(
             .zip(metadata)
             .map(|(path, metadata)| {
                 let note_path = Path::new(path);
-                let is_markdown = note_path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
+                let is_markdown = crate::vault::path::logical_extension(note_path)
                     .is_some_and(|extension| extension.eq_ignore_ascii_case("md"));
                 if !is_markdown {
                     return VaultListEntry::path_only(path);
@@ -160,24 +162,30 @@ fn vault_list_flat(
     )
 }
 
-fn vault_list_tree(
+async fn vault_list_tree(
     vault: &Vault,
     params: &VaultListParams,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     let dir = params.path.as_deref().unwrap_or("");
     let dir_path = Path::new(dir);
-    let files = vault.list_files(dir_path, true, None)?;
+    let files = vault.list_files(dir_path, true, None).await?;
     let canonical_dir = if dir.is_empty() {
         PathBuf::new()
     } else {
-        vault.canonical_existing_relative_path(dir_path)?
+        vault.canonical_existing_relative_path(dir_path).await?
     };
 
+    let prefix = if canonical_dir.as_os_str().is_empty() {
+        String::new()
+    } else {
+        format!("{}/", canonical_dir.to_string_lossy())
+    };
     let mut root = TreeNode::new();
     for path in &files {
-        let relative = path.strip_prefix(&canonical_dir).unwrap_or(path);
+        let path = path.to_string_lossy();
+        let relative = path.strip_prefix(&prefix).unwrap_or(&path);
         if let Some(max) = params.max_depth
-            && relative.components().count() > max
+            && logical_depth(relative) > max
         {
             continue;
         }
@@ -205,6 +213,10 @@ fn vault_list_tree(
     )
 }
 
+fn logical_depth(path: &str) -> usize {
+    path.split('/').filter(|name| !name.is_empty()).count()
+}
+
 struct TreeNode {
     children: BTreeMap<String, TreeNode>,
 }
@@ -216,11 +228,13 @@ impl TreeNode {
         }
     }
 
-    fn insert(&mut self, path: &Path) {
+    fn insert(&mut self, path: &str) {
         let mut node = self;
-        for component in path.components() {
-            let name = component.as_os_str().to_string_lossy().into_owned();
-            node = node.children.entry(name).or_insert_with(TreeNode::new);
+        for name in path.split('/').filter(|name| !name.is_empty()) {
+            node = node
+                .children
+                .entry(name.to_owned())
+                .or_insert_with(TreeNode::new);
         }
     }
 }
@@ -255,6 +269,19 @@ mod tests {
     use crate::test_helpers::{extract_text, test_config};
     use unicode_normalization::UnicodeNormalization;
 
+    #[test]
+    fn logical_tree_names_preserve_drive_like_remote_spelling() {
+        assert_eq!(logical_depth("a:b.md"), 1);
+        assert_eq!(logical_depth("a:/nested.md"), 2);
+        let mut root = TreeNode::new();
+        root.insert("a:b.md");
+        root.insert("A:b.md");
+        root.insert("CON.md");
+        let mut rendered = String::new();
+        render_tree(&root, &mut rendered, "");
+        assert_eq!(rendered, "├── A:b.md\n├── CON.md\n└── a:b.md\n");
+    }
+
     fn create_test_vault(dir: &Path) {
         crate::test_helpers::create_test_vault(dir);
         fs::write(dir.join("readme.md"), "# Readme").unwrap();
@@ -274,7 +301,9 @@ mod tests {
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let result = vault_list(&vault, VaultListParams::default()).unwrap();
+        let result = vault_list(&vault, VaultListParams::default())
+            .await
+            .unwrap();
         let text = extract_text(&result);
         let paths: Vec<String> = serde_json::from_str(text).unwrap();
 
@@ -299,6 +328,7 @@ mod tests {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
         let text = extract_text(&result);
         let paths: Vec<String> = serde_json::from_str(text).unwrap();
@@ -321,6 +351,7 @@ mod tests {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
         let text = extract_text(&result);
         let paths: Vec<String> = serde_json::from_str(text).unwrap();
@@ -344,6 +375,7 @@ mod tests {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
         let text = extract_text(&result);
         let paths: Vec<String> = serde_json::from_str(text).unwrap();
@@ -364,7 +396,8 @@ mod tests {
                 path: Some("nonexistent".to_string()),
                 ..Default::default()
             },
-        );
+        )
+        .await;
         assert!(result.is_err());
     }
 
@@ -385,6 +418,7 @@ mod tests {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
         let entries: Vec<serde_json::Value> = serde_json::from_str(extract_text(&result)).unwrap();
 
@@ -433,6 +467,7 @@ mod tests {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
         let entries: Vec<serde_json::Value> = serde_json::from_str(extract_text(&result)).unwrap();
 
@@ -458,6 +493,7 @@ mod tests {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
         let entries: Vec<serde_json::Value> = serde_json::from_str(extract_text(&result)).unwrap();
 
@@ -470,7 +506,9 @@ mod tests {
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let default = vault_list(&vault, VaultListParams::default()).unwrap();
+        let default = vault_list(&vault, VaultListParams::default())
+            .await
+            .unwrap();
         let explicitly_disabled = vault_list(
             &vault,
             VaultListParams {
@@ -478,6 +516,7 @@ mod tests {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
 
         assert_eq!(extract_text(&default), extract_text(&explicitly_disabled));
@@ -497,7 +536,7 @@ mod tests {
             ..Default::default()
         };
 
-        let default = vault_list(&vault, params()).unwrap();
+        let default = vault_list(&vault, params()).await.unwrap();
         let expected: Vec<String> = serde_json::from_str(extract_text(&default)).unwrap();
         let metadata = vault_list(
             &vault,
@@ -506,6 +545,7 @@ mod tests {
                 ..params()
             },
         )
+        .await
         .unwrap();
         let entries: Vec<serde_json::Value> =
             serde_json::from_str(extract_text(&metadata)).unwrap();
@@ -534,6 +574,7 @@ mod tests {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
         let text = extract_text(&result);
 
@@ -558,6 +599,7 @@ mod tests {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
         let text = extract_text(&result);
 
@@ -581,6 +623,7 @@ mod tests {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
         let text = extract_text(&result);
 
@@ -608,6 +651,7 @@ mod tests {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
         let text = extract_text(&result);
 
@@ -629,7 +673,8 @@ mod tests {
                 path: Some("nonexistent".to_string()),
                 ..Default::default()
             },
-        );
+        )
+        .await;
         assert!(result.is_err());
     }
 
@@ -647,6 +692,7 @@ mod tests {
                 ..Default::default()
             },
         )
+        .await
         .expect_err("tree mode metadata must be rejected");
 
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
@@ -664,7 +710,8 @@ mod tests {
                 format: Some("invalid".into()),
                 ..Default::default()
             },
-        );
+        )
+        .await;
         assert!(result.is_err());
     }
 }

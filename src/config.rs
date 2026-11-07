@@ -1,6 +1,8 @@
 //! Configuration: env/CLI config for vault path, watch toggle, log level,
 //! transport selection, and optional search features (Tantivy BM25, embeddings).
 
+pub mod source;
+
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -375,6 +377,11 @@ where
 }
 
 impl Config {
+    /// Recognize a remote source without interpreting local native path bytes.
+    pub fn sftp_location(&self) -> crate::error::VaultResult<Option<source::SftpLocation>> {
+        source::SftpLocation::from_path(&self.vault_path)
+    }
+
     /// Load configuration from CLI args and environment variables.
     ///
     /// Priority for vault path: CLI positional arg > `OBSIDIAN_VAULT_PATH` env var.
@@ -396,6 +403,8 @@ impl Config {
                 _ => Transport::Stdio,
             }
         };
+
+        source::SftpLocation::from_path(&vault_path).map_err(|error| error.to_string())?;
 
         let endpoint = resolve_http_endpoint(cli)?;
         let http_host = endpoint.ip();

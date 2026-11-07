@@ -1,10 +1,14 @@
 //! Source-bound semantic ranking and result construction shared by both transports.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::{StreamExt, stream::FuturesUnordered};
 
 use crate::error::{VaultError, VaultResult};
 use crate::models::{
@@ -16,9 +20,10 @@ use super::embeddings::{CosineQuery, NoteEmbeddingEntry};
 use super::search_utils::{compile_query_word_regex, normalize_bm25_scores};
 use super::source;
 
-pub(crate) type CapturedEntries = HashMap<PathBuf, Arc<NoteEmbeddingEntry>>;
+pub(crate) type CapturedEntries = HashMap<OsString, Arc<NoteEmbeddingEntry>>;
 
 /// An immutable semantic observation retained until its source is rendered.
+#[derive(Clone)]
 pub(crate) struct RankedNote {
     pub path: PathBuf,
     pub score: f32,
@@ -26,7 +31,7 @@ pub(crate) struct RankedNote {
     pub entry: Arc<NoteEmbeddingEntry>,
 }
 
-pub(crate) fn paths(entries: &CapturedEntries) -> HashSet<PathBuf> {
+pub(crate) fn paths(entries: &CapturedEntries) -> HashSet<OsString> {
     entries.keys().cloned().collect()
 }
 
@@ -80,7 +85,7 @@ fn finish_ranking(mut hits: Vec<RankedNote>, top_k: usize) -> Vec<RankedNote> {
         right
             .score
             .total_cmp(&left.score)
-            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.path.as_os_str().cmp(right.path.as_os_str()))
     };
     if hits.len() > top_k {
         hits.select_nth_unstable_by(top_k, compare);
@@ -98,7 +103,7 @@ pub(crate) fn rank_semantic(
     let query = CosineQuery::new(query);
     let hits = entries
         .into_iter()
-        .map(|(path, entry)| best_note(path, entry, &query))
+        .map(|(path, entry)| best_note(PathBuf::from(path), entry, &query))
         .collect::<VaultResult<Vec<_>>>()?;
     Ok(finish_ranking(hits, top_k))
 }
@@ -113,7 +118,7 @@ pub(crate) fn rank_hybrid(
     let query = CosineQuery::new(query);
     let mut hits = Vec::with_capacity(lexical.len());
     for (path, lexical_score) in normalize_bm25_scores(lexical) {
-        let entry = entries.get(&path).ok_or_else(|| {
+        let entry = entries.get(path.as_os_str()).ok_or_else(|| {
             VaultError::Embedding(format!(
                 "lexical candidate {} is outside the captured semantic scope",
                 path.display()
@@ -133,6 +138,251 @@ pub(crate) fn render_rooted(
     query: &str,
     include_content: bool,
 ) -> SemanticNoteResult {
+    let snapshot = root
+        .read_exact_bounded(&hit.path, source::MAX_SOURCE_BYTES)
+        .map(source::SourceSnapshot::new);
+    render_snapshot(snapshot, hit, query, include_content)
+}
+
+/// Acquire current bytes asynchronously, preserving the scored revision on failure.
+async fn render_source(
+    observed: &super::storage::ObservedBatch<'_>,
+    hit: RankedNote,
+    query: &str,
+    include_content: bool,
+) -> VaultResult<SemanticNoteResult> {
+    let raw = observed
+        .read_exact_bounded(&hit.path, source::MAX_SOURCE_BYTES)
+        .await;
+    let query = query.to_owned();
+    tokio::task::spawn_blocking(move || {
+        render_snapshot(
+            raw.map(source::SourceSnapshot::new),
+            hit,
+            &query,
+            include_content,
+        )
+    })
+    .await
+    .map_err(|error| VaultError::Other(format!("semantic source rendering task failed: {error}")))
+}
+
+const CONCURRENT_SOURCE_READS: usize = 4;
+const CONTEXT_DEADLINE_ERROR: &str = "semantic source context deadline exceeded";
+
+type ContextSender = tokio::sync::mpsc::Sender<(usize, SemanticNoteResult)>;
+
+/// Retain dispatched I/O until its own operation deadline or confirmed completion.
+async fn acquire_source_context(
+    storage: &super::storage::Storage,
+    hits: Vec<RankedNote>,
+    query: &str,
+    include_content: bool,
+    deadline: Option<tokio::time::Instant>,
+    sender: &ContextSender,
+    failure_sender: tokio::sync::oneshot::Sender<VaultError>,
+) {
+    let finished = || {
+        sender.is_closed()
+            || deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+    };
+    if finished() {
+        return;
+    }
+    let paths = hits.iter().map(|hit| hit.path.clone()).collect::<Vec<_>>();
+    let observed = match storage.observe_batch(&paths).await {
+        Ok(observed) => observed,
+        Err(error) => {
+            let message = error.to_string();
+            for (index, hit) in hits.into_iter().enumerate() {
+                if finished() {
+                    break;
+                }
+                let result =
+                    render_snapshot(Err(VaultError::Other(message.clone())), hit, "", false);
+                if sender.send((index, result)).await.is_err() {
+                    break;
+                }
+            }
+            return;
+        }
+    };
+    let render = |(index, hit)| {
+        let observed = &observed;
+        let finished = &finished;
+        async move {
+            let result = if finished() {
+                None
+            } else {
+                Some(render_source(observed, hit, query, include_content).await)
+            };
+            (index, result)
+        }
+    };
+    let mut candidates = hits.into_iter().enumerate();
+    let mut pending = FuturesUnordered::new();
+    for _ in 0..CONCURRENT_SOURCE_READS {
+        if finished() {
+            break;
+        }
+        if let Some(candidate) = candidates.next() {
+            pending.push(render(candidate));
+        }
+    }
+    let mut failure_sender = Some(failure_sender);
+    let mut failed = false;
+    while let Some((index, result)) = pending.next().await {
+        match result {
+            Some(Ok(result)) => {
+                if !finished() {
+                    // A closed receiver stops admission, but never cancels peers
+                    // which already own a remote request or file handle.
+                    let _ = sender.send((index, result)).await;
+                }
+            }
+            Some(Err(error)) => {
+                failed = true;
+                if let Some(failure_sender) = failure_sender.take()
+                    && let Err(error) = failure_sender.send(error)
+                {
+                    tracing::warn!(%error, "semantic context acquisition failed after its caller stopped waiting");
+                }
+            }
+            None => (),
+        }
+        if !failed
+            && !finished()
+            && let Some(candidate) = candidates.next()
+        {
+            pending.push(render(candidate));
+        }
+    }
+}
+
+async fn finish_context_owner(owner: tokio::task::JoinHandle<()>) -> VaultResult<()> {
+    owner.await.map_err(|error| {
+        VaultError::Other(format!("semantic context acquisition task failed: {error}"))
+    })
+}
+
+/// Bound result presentation without cancelling already-dispatched source reads.
+pub(crate) async fn render_many_source(
+    storage: &super::storage::Storage,
+    hits: Vec<RankedNote>,
+    query: &str,
+    include_content: bool,
+    timeout: Option<Duration>,
+) -> VaultResult<Vec<SemanticNoteResult>> {
+    if hits.is_empty() {
+        return Ok(Vec::new());
+    }
+    let deadline = timeout
+        .map(|timeout| {
+            tokio::time::Instant::now()
+                .checked_add(timeout)
+                .ok_or_else(|| VaultError::Other("semantic context deadline is too large".into()))
+        })
+        .transpose()?;
+    let storage = storage.clone();
+    let observations = hits.clone();
+    let query = query.to_owned();
+    let source_deadline = super::storage::current_source_deadline();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(CONCURRENT_SOURCE_READS);
+    let (failure_sender, mut failure_receiver) = tokio::sync::oneshot::channel();
+    // Dropping the join handle detaches this bounded read owner. Receiver closure
+    // stops new work while requests and handles already in flight are drained.
+    let mut owner = Some(tokio::spawn(async move {
+        super::storage::with_source_deadline(
+            source_deadline,
+            acquire_source_context(
+                &storage,
+                observations,
+                &query,
+                include_content,
+                deadline,
+                &sender,
+                failure_sender,
+            ),
+        )
+        .await;
+    }));
+    let mut results: Vec<Option<SemanticNoteResult>> =
+        std::iter::repeat_with(|| None).take(hits.len()).collect();
+    let mut failure_open = true;
+    loop {
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            break;
+        }
+        tokio::select! {
+            biased;
+            failure = &mut failure_receiver, if failure_open => {
+                match failure {
+                    Ok(error) => return Err(error),
+                    Err(_) => failure_open = false,
+                }
+            }
+            received = receiver.recv() => {
+                match received {
+                    Some((index, result)) => results[index] = Some(result),
+                    None => {
+                        if let Some(owner) = owner.take() {
+                            finish_context_owner(owner).await?;
+                        }
+                        break;
+                    }
+                }
+            }
+            _ = async {
+                match deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => break,
+        }
+    }
+    // Closing before inspection makes late failures report at their retained
+    // owner instead of racing this caller's final deadline observation.
+    receiver.close();
+    failure_receiver.close();
+    while let Ok((index, result)) = receiver.try_recv() {
+        results[index] = Some(result);
+    }
+    if let Ok(error) = failure_receiver.try_recv() {
+        return Err(error);
+    }
+    if owner.as_ref().is_some_and(|owner| owner.is_finished())
+        && let Some(owner) = owner.take()
+    {
+        finish_context_owner(owner).await?;
+    }
+    if deadline.is_none() && results.iter().any(Option::is_none) {
+        return Err(VaultError::Other(
+            "semantic context acquisition finished without all observations".into(),
+        ));
+    }
+    Ok(hits
+        .into_iter()
+        .zip(results)
+        .map(|(hit, result)| {
+            result.unwrap_or_else(|| {
+                render_snapshot(
+                    Err(VaultError::Other(CONTEXT_DEADLINE_ERROR.into())),
+                    hit,
+                    "",
+                    false,
+                )
+            })
+        })
+        .collect())
+}
+
+/// Build context from exactly one observation, never from mixed source revisions.
+pub(crate) fn render_snapshot(
+    snapshot: VaultResult<source::SourceSnapshot>,
+    hit: RankedNote,
+    query: &str,
+    include_content: bool,
+) -> SemanticNoteResult {
     let mut result = SemanticNoteResult {
         path: hit.path.clone(),
         title: hit.entry.title.clone(),
@@ -147,10 +397,7 @@ pub(crate) fn render_rooted(
         preview: None,
         context_error: None,
     };
-    match root
-        .read_exact_bounded(&hit.path, source::MAX_SOURCE_BYTES)
-        .map(source::SourceSnapshot::new)
-    {
+    match snapshot {
         Ok(snapshot) if snapshot.source_revision != result.source_revision => {
             result.source_status = SourceStatus::Changed;
             result.context_error = Some(SemanticContextError {
@@ -305,7 +552,7 @@ mod tests {
         let mut allowed = HashSet::new();
         for (name, entry) in notes {
             let path = PathBuf::from(name);
-            allowed.insert(path.clone());
+            allowed.insert(path.as_os_str().to_owned());
             store.insert_note(path, entry).unwrap();
         }
         store.capture_entries(&allowed)
@@ -347,6 +594,19 @@ mod tests {
             assert_eq!(hits[1].path, Path::new("m.md"));
             assert!(hits.iter().all(|hit| hit.evidence.range.start_byte == 0));
         }
+    }
+
+    #[test]
+    fn ranking_retains_exact_server_path_spellings() {
+        let captured = capture(vec![
+            ("a:b.md", note_entry("lower", &[5], &[[1.0, 0.0]])),
+            ("A:b.md", note_entry("upper", &[5], &[[1.0, 0.0]])),
+        ]);
+        assert_eq!(captured.len(), 2);
+        let hits = rank_semantic(captured, &[1.0, 0.0], 2).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].path.as_os_str(), "A:b.md");
+        assert_eq!(hits[1].path.as_os_str(), "a:b.md");
     }
 
     #[test]
@@ -481,6 +741,127 @@ mod tests {
             deleted.snippet.is_none() && deleted.content.is_none() && deleted.preview.is_none()
         );
         assert_eq!(deleted.context_error.unwrap().code, "source_unavailable");
+    }
+
+    #[tokio::test]
+    async fn async_source_rendering_rechecks_the_ranked_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("note.md");
+        let original = "# Original\nsource observation";
+        std::fs::write(&path, original).unwrap();
+        let storage = super::super::storage::Storage::Local(
+            super::super::fs::VaultRoot::open(directory.path()).unwrap(),
+        );
+        let captured = capture(vec![(
+            "note.md",
+            note_entry(original, &[original.len()], &[[1.0, 0.0]]),
+        )]);
+        let hit = rank_semantic(captured.clone(), &[1.0, 0.0], 1)
+            .unwrap()
+            .remove(0);
+        let current = render_many_source(&storage, vec![hit], "observation", true, None)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(current.content.as_deref(), Some(original));
+        assert_eq!(current.source_status, SourceStatus::Current);
+
+        std::fs::write(&path, "# A later revision").unwrap();
+        let hit = rank_semantic(captured.clone(), &[1.0, 0.0], 1)
+            .unwrap()
+            .remove(0);
+        let changed = render_many_source(&storage, vec![hit], "observation", true, None)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(changed.source_status, SourceStatus::Changed);
+        assert_eq!(changed.source_revision, source::source_revision(original));
+        assert!(changed.content.is_none());
+        assert_eq!(changed.context_error.unwrap().code, "source_changed");
+
+        std::fs::remove_file(&path).unwrap();
+        let hit = rank_semantic(captured, &[1.0, 0.0], 1).unwrap().remove(0);
+        let missing = render_many_source(&storage, vec![hit], "observation", false, None)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(missing.source_status, SourceStatus::Unavailable);
+        assert!(missing.content.is_none() && missing.snippet.is_none());
+        assert_eq!(missing.context_error.unwrap().code, "source_unavailable");
+    }
+
+    #[test]
+    fn source_failure_never_uses_historical_content() {
+        let raw = "the exact indexed revision";
+        let hit = rank_semantic(
+            capture(vec![(
+                "note.md",
+                note_entry(raw, &[raw.len()], &[[1.0, 0.0]]),
+            )]),
+            &[1.0, 0.0],
+            1,
+        )
+        .unwrap()
+        .remove(0);
+        let failed = render_snapshot(
+            Err(VaultError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "source request exceeded its deadline",
+            ))),
+            hit,
+            "revision",
+            true,
+        );
+        assert_eq!(failed.score, 1.0);
+        assert_eq!(failed.source_status, SourceStatus::Unavailable);
+        assert_eq!(failed.source_revision, source::source_revision(raw));
+        assert!(failed.content.is_none() && failed.snippet.is_none() && failed.preview.is_none());
+        assert!(failed.context_error.unwrap().message.contains("deadline"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_context_reads_keep_order_and_deadlines_retain_all_hits() {
+        let directory = tempfile::tempdir().unwrap();
+        let raw = "# Evidence\ncomplete note";
+        let names: Vec<String> = (0..8).map(|index| format!("{index}.md")).collect();
+        for name in &names {
+            std::fs::write(directory.path().join(name), raw).unwrap();
+        }
+        let entries = capture(
+            names
+                .iter()
+                .map(|name| (name.as_str(), note_entry(raw, &[raw.len()], &[[1.0, 0.0]])))
+                .collect(),
+        );
+        let hits = rank_semantic(entries, &[1.0, 0.0], names.len()).unwrap();
+        let storage = super::super::storage::Storage::Local(
+            super::super::fs::VaultRoot::open(directory.path()).unwrap(),
+        );
+        let rendered = render_many_source(&storage, hits.clone(), "evidence", true, None)
+            .await
+            .unwrap();
+        assert_eq!(rendered.len(), names.len());
+        for (result, name) in rendered.iter().zip(&names) {
+            assert_eq!(result.path, Path::new(name));
+            assert_eq!(result.content.as_deref(), Some(raw));
+        }
+
+        let expired = render_many_source(&storage, hits, "evidence", true, Some(Duration::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(expired.len(), names.len());
+        for (result, name) in expired.iter().zip(&names) {
+            assert_eq!(result.path, Path::new(name));
+            assert_eq!(result.score, 1.0);
+            assert_eq!(result.source_status, SourceStatus::Unavailable);
+            assert!(
+                result.content.is_none() && result.snippet.is_none() && result.preview.is_none()
+            );
+            assert_eq!(
+                result.context_error.as_ref().unwrap().code,
+                "source_unavailable"
+            );
+        }
     }
 
     #[test]

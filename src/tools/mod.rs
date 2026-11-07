@@ -146,6 +146,11 @@ impl RuntimeAttachments {
         local_selected: &AtomicBool,
         expired: Option<&str>,
     ) -> VaultResult<Arc<VaultAttachment>> {
+        if vault.is_remote() {
+            return Err(VaultError::InvalidPath(
+                "SFTP vaults cannot attach to the local semantic daemon".into(),
+            ));
+        }
         let local_scope_id = vault.exclude().scope_id(vault.root());
         let key = (
             vault.root().to_owned(),
@@ -349,8 +354,11 @@ impl ObsidianMcp {
         vault: Vault,
         hybrid_alpha: f32,
         semantic_runtime: SemanticRuntime,
-        disabled_tools: HashSet<String>,
+        mut disabled_tools: HashSet<String>,
     ) -> Self {
+        if vault.is_remote() {
+            disabled_tools.insert("open_in_obsidian".to_owned());
+        }
         let mut tool_router = Self::tool_router();
         if !disabled_tools.is_empty() {
             tracing::info!(
@@ -381,7 +389,7 @@ impl ObsidianMcp {
         &self,
         Parameters(params): Parameters<navigation::VaultListParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        navigation::vault_list(&self.vault, params)
+        navigation::vault_list(&self.vault, params).await
     }
 
     // ── Note CRUD ───────────────────────────────────────────────────
@@ -622,7 +630,7 @@ impl ObsidianMcp {
     #[tool(
         name = "vault_info",
         annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
-        output_schema = schema_for_output::<utility::VaultInfo>(),
+        output_schema = schema_for_output::<utility::VaultInfoOutput>(),
         description = "Return aggregate vault statistics and passive semantic backend status. Inspecting status does not start indexing or attach a daemon vault."
     )]
     async fn vault_info(
