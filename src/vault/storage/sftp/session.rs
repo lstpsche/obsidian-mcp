@@ -612,12 +612,34 @@ impl Session {
         if failed.borrow().is_some() {
             return Err(self.unavailable(operation, path, false));
         }
+        let timeout_error = |dispatched| {
+            VaultError::storage(
+                operation,
+                path,
+                StorageErrorKind::Unavailable,
+                "SFTP operation deadline exceeded",
+            )
+            .with_mutation_outcome(if mutating && dispatched {
+                MutationOutcome::Unknown
+            } else {
+                MutationOutcome::NotDispatched
+            })
+        };
+        let check_deadline = || {
+            if tokio::time::Instant::now() >= deadline {
+                Err(timeout_error(false))
+            } else {
+                Ok(())
+            }
+        };
         let dispatched = AtomicBool::new(false);
         let work = async {
+            check_deadline()?;
             let _permit = tokio::select! {
                 _ = failed.changed() => return Err(self.unavailable(operation, path, false)),
                 permit = self.0.admission.acquire() => permit.map_err(|_| self.unavailable(operation, path, false))?,
             };
+            check_deadline()?;
             let response = Arc::new(Mutex::new(ResponseMetadata {
                 directory: operation == "readdir",
                 ..ResponseMetadata::default()
@@ -632,12 +654,15 @@ impl Session {
                 if !self.is_healthy() {
                     return Err(self.unavailable(operation, path, false));
                 }
-                self.0
+                let mut requests = self
+                    .0
                     .state
                     .requests
                     .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .building = Some(response.clone());
+                    .unwrap_or_else(|error| error.into_inner());
+                check_deadline()?;
+                requests.building = Some(response.clone());
+                drop(requests);
                 let id = writer.create_response_id();
                 let result = build(&mut writer, id);
                 self.0
@@ -686,17 +711,7 @@ impl Session {
                 if dispatched {
                     self.0.state.fail("SFTP operation deadline exceeded");
                 }
-                Err(VaultError::storage(
-                    operation,
-                    path,
-                    StorageErrorKind::Unavailable,
-                    "SFTP operation deadline exceeded",
-                )
-                .with_mutation_outcome(if mutating && dispatched {
-                    MutationOutcome::Unknown
-                } else {
-                    MutationOutcome::NotDispatched
-                }))
+                Err(timeout_error(dispatched))
             }
         }
     }
@@ -1598,6 +1613,113 @@ mod tests {
             })
         ));
         fake.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_owner_deadlines_do_not_construct_requests() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let fake = tokio::spawn(async move {
+            server_hello(&mut server, false).await;
+            std::future::pending::<()>().await;
+        });
+        let (reader, writer) = tokio::io::split(client);
+        let session = Session::from_io(reader, writer, Duration::from_secs(2))
+            .await
+            .unwrap();
+        let built = AtomicBool::new(false);
+        let error = super::super::super::with_source_deadline(
+            Some(tokio::time::Instant::now()),
+            session.request("remove", "/vault/note.md", true, |writer, id| {
+                built.store(true, Ordering::Release);
+                writer
+                    .send_remove_request(id, Cow::Borrowed(Path::new("/vault/note.md")))
+                    .map(|request| request.wait())
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            VaultError::Storage {
+                kind: StorageErrorKind::Unavailable,
+                outcome: MutationOutcome::NotDispatched,
+                ..
+            }
+        ));
+        assert!(!built.load(Ordering::Acquire));
+        assert!(session.is_healthy());
+        let requests = session.0.state.requests.lock().unwrap();
+        assert!(requests.building.is_none());
+        assert!(requests.pending.is_empty());
+        fake.abort();
+    }
+
+    #[tokio::test]
+    async fn expired_queued_requests_do_not_construct_packets_or_retire_the_session() {
+        for block_writer in [false, true] {
+            let (client, mut server) = tokio::io::duplex(4096);
+            let fake = tokio::spawn(async move {
+                server_hello(&mut server, false).await;
+                std::future::pending::<()>().await;
+            });
+            let (reader, writer) = tokio::io::split(client);
+            let session = Session::from_io(reader, writer, Duration::from_secs(2))
+                .await
+                .unwrap();
+            let admission = if block_writer {
+                None
+            } else {
+                Some(
+                    session
+                        .0
+                        .admission
+                        .acquire_many(MAX_REQUESTS as u32)
+                        .await
+                        .unwrap(),
+                )
+            };
+            let writer = if block_writer {
+                Some(session.0.writer.lock().await)
+            } else {
+                None
+            };
+            let built = AtomicBool::new(false);
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+            let request = super::super::super::with_source_deadline(
+                Some(deadline),
+                session.request("remove", "/vault/note.md", true, |writer, id| {
+                    built.store(true, Ordering::Release);
+                    writer
+                        .send_remove_request(id, Cow::Borrowed(Path::new("/vault/note.md")))
+                        .map(|request| request.wait())
+                }),
+            );
+            tokio::pin!(request);
+            assert!(futures_util::poll!(&mut request).is_pending());
+            // Retain the request without polling it while both its deadline and
+            // blocked admission become ready, then resume it in that state.
+            std::thread::sleep(
+                deadline.saturating_duration_since(tokio::time::Instant::now())
+                    + Duration::from_millis(1),
+            );
+            drop(admission);
+            drop(writer);
+            let error = request.await.unwrap_err();
+            assert!(matches!(
+                error,
+                VaultError::Storage {
+                    kind: StorageErrorKind::Unavailable,
+                    outcome: MutationOutcome::NotDispatched,
+                    ..
+                }
+            ));
+            assert!(!built.load(Ordering::Acquire));
+            assert!(session.is_healthy());
+            let requests = session.0.state.requests.lock().unwrap();
+            assert!(requests.building.is_none());
+            assert!(requests.pending.is_empty());
+            fake.abort();
+        }
     }
 
     #[tokio::test]

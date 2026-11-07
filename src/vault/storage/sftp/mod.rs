@@ -269,10 +269,9 @@ impl SftpStorage {
                 &message,
             ));
         }
-        let result = match tokio::time::timeout_at(super::source_deadline(self.timeout), work).await
-        {
-            Ok(result) => result,
-            Err(_) => Err(storage_error(
+        let deadline = super::source_deadline(self.timeout);
+        let timeout_error = || {
+            storage_error(
                 operation,
                 &path.display().to_string(),
                 StorageErrorKind::Unavailable,
@@ -282,7 +281,15 @@ impl SftpStorage {
                 Some(dispatched) if dispatched.load(Ordering::Acquire) => MutationOutcome::Unknown,
                 Some(_) => MutationOutcome::NotCommitted,
                 None => MutationOutcome::NotDispatched,
-            })),
+            })
+        };
+        let result = if tokio::time::Instant::now() >= deadline {
+            Err(timeout_error())
+        } else {
+            match tokio::time::timeout_at(deadline, work).await {
+                Ok(result) => result,
+                Err(_) => Err(timeout_error()),
+            }
         };
         self.record_result(&result);
         result
@@ -3666,19 +3673,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_source_deadlines_do_not_poll_work_or_change_destination_evidence() {
+        let (storage, _, task) = fake_storage(Fault::Normal).await;
+        for (destination, expected) in [
+            (None, MutationOutcome::NotDispatched),
+            (Some(false), MutationOutcome::NotCommitted),
+            (Some(true), MutationOutcome::Unknown),
+        ] {
+            let polled = AtomicBool::new(false);
+            let dispatched = AtomicBool::new(destination.unwrap_or(false));
+            let error = super::super::with_source_deadline(
+                Some(tokio::time::Instant::now()),
+                storage.timed_operation(
+                    "read",
+                    Path::new("note.md"),
+                    destination.map(|_| &dispatched),
+                    async {
+                        polled.store(true, Ordering::Release);
+                        Ok::<_, VaultError>(())
+                    },
+                ),
+            )
+            .await
+            .unwrap_err();
+            assert!(!polled.load(Ordering::Acquire));
+            assert!(matches!(
+                error,
+                VaultError::Storage {
+                    kind: StorageErrorKind::Unavailable,
+                    outcome,
+                    ..
+                } if outcome == expected
+            ));
+            assert!(storage.last_failure().is_none());
+            assert!(storage.session.lock().await.is_healthy());
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn successive_source_operations_share_the_retained_owner_deadline() {
         let (storage, _, task) = fake_storage(Fault::Normal).await;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(40);
-        let error = super::super::with_source_deadline(Some(deadline), async {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            storage
-                .operation("read", Path::new("note.md"), async {
-                    tokio::time::sleep(Duration::from_millis(60)).await;
-                    Ok::<_, VaultError>(())
-                })
-                .await
-        })
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            super::super::with_source_deadline(Some(deadline), async {
+                assert_eq!(super::super::source_deadline(storage.timeout), deadline);
+                storage
+                    .operation("stat", Path::new("note.md"), async { Ok(()) })
+                    .await?;
+                storage
+                    .operation("read", Path::new("note.md"), async {
+                        std::future::pending::<VaultResult<()>>().await
+                    })
+                    .await
+            }),
+        )
         .await
+        .expect("a later source operation reset the retained deadline")
         .unwrap_err();
         assert!(matches!(
             error,
