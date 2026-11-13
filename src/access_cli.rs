@@ -268,15 +268,21 @@ fn initialize(args: &Arguments) -> Result<Output, String> {
             )],
         ));
     }
+    let endpoint = setup_endpoint(args)?;
     let store =
         AccessStore::initialize(&profile, &vault, &data).map_err(|error| error.to_string())?;
     let snapshot = store.snapshot().map_err(|error| error.to_string())?;
+    let launch = launch_command(
+        &profile,
+        &snapshot.policy.source.canonical_path,
+        endpoint.backend_url.as_str(),
+    )?;
     Ok(Output::new(
         json!({"access_file":profile,"data_dir":data,"revision":snapshot.policy.revision}),
         [
             format!("Created access profile {}.", profile.display()),
             "Add a client with 'access client add NAME --directory PATH --role reader|editor' and the --access-file path above.".into(),
-            launch_command(&profile, &snapshot.policy.source.canonical_path, DEFAULT_URL)?,
+            launch,
         ],
     ))
 }

@@ -134,22 +134,34 @@ impl Vault {
         let config = self.inner.authenticated_config.as_ref().ok_or_else(|| {
             VaultError::Authorization("authenticated source configuration is missing".into())
         })?;
-        let missing = std::cell::RefCell::new(None);
+        let reconcile_path = std::cell::RefCell::new(None);
         let projected = self.inner.authorized_indices.project(
             &self.inner.index,
             client.policy(),
             config.tantivy,
             |path| {
                 let content = self.read_access_native(path, None);
-                if content.as_ref().is_err_and(VaultError::is_not_found) {
-                    *missing.borrow_mut() = Some(path.to_owned());
+                // The snapshot already admits this exact key under the current
+                // immutable read policy. A hidden denial here means its source
+                // eligibility changed, such as a new hardlink or denied alias.
+                // Fresh raw-key authority is checked again before reconciliation.
+                if content.as_ref().is_err_and(|error| {
+                    error.is_not_found()
+                        || matches!(error, VaultError::AccessDenied { visible: false, .. })
+                }) {
+                    *reconcile_path.borrow_mut() = Some(path.to_owned());
                 }
                 content
             },
         );
         let repair = match &projected {
             Err(VaultError::SourceChanged { path, .. }) => Some(path.clone()),
-            Err(error) if error.is_not_found() => missing.into_inner(),
+            Err(error)
+                if error.is_not_found()
+                    || matches!(error, VaultError::AccessDenied { visible: false, .. }) =>
+            {
+                reconcile_path.into_inner()
+            }
             _ => None,
         };
         let Some(path) = repair else {
@@ -987,24 +999,7 @@ mod tests {
     }
 
     async fn source_view_reconciles_intervening_change(deleted: bool) {
-        let f = fixture(vec![directory("Shared", Role::Editor)], vec![]).await;
-        assert!(!f.vault.watch_enabled());
-        f.vault
-            .create_note(Path::new("Shared/other.md"), "unrelated source", None)
-            .await
-            .unwrap();
-        std::fs::write(f.root.join("Shared/note.md"), "indexed precursor").unwrap();
-        f.vault
-            .write_index()
-            .refresh_file(
-                f.vault.inner.filesystem.as_ref().unwrap(),
-                Path::new("Shared/note.md"),
-                f.vault.exclude(),
-                None,
-                #[cfg(has_embeddings)]
-                false,
-            )
-            .unwrap();
+        let f = source_with_pending_readable_revision().await;
         if deleted {
             std::fs::remove_file(f.root.join("Shared/note.md")).unwrap();
         } else {
@@ -1060,6 +1055,130 @@ mod tests {
     #[tokio::test]
     async fn source_view_reconciles_a_note_deleted_after_its_index_observation() {
         source_view_reconciles_intervening_change(true).await;
+    }
+
+    async fn source_with_pending_readable_revision() -> Fixture {
+        let f = fixture(
+            vec![directory("Shared", Role::Editor)],
+            vec![deny_private()],
+        )
+        .await;
+        assert!(!f.vault.watch_enabled());
+        f.vault
+            .create_note(Path::new("Shared/other.md"), "unrelated source", None)
+            .await
+            .unwrap();
+        std::fs::write(
+            f.root.join("Shared/note.md"),
+            "---\ntags: [indexed]\n---\nupdated source",
+        )
+        .unwrap();
+        let generation = f.vault.inner.index.read().unwrap().generation();
+        f.vault
+            .write_index()
+            .refresh_file(
+                f.vault.inner.filesystem.as_ref().unwrap(),
+                Path::new("Shared/note.md"),
+                f.vault.exclude(),
+                None,
+                #[cfg(has_embeddings)]
+                false,
+            )
+            .unwrap();
+        assert!(f.vault.inner.index.read().unwrap().generation() > generation);
+        assert!(
+            f.vault
+                .projection
+                .as_ref()
+                .unwrap()
+                .index
+                .read()
+                .unwrap()
+                .get_note(Path::new("Shared/note.md"))
+                .unwrap()
+                .tags
+                .is_empty()
+        );
+        f
+    }
+
+    async fn assert_unsafe_source_reconciles(f: &Fixture) {
+        let selected = f
+            .vault
+            .with_access(f.vault.access_client().unwrap().clone())
+            .expect("an ineligible changed source must not disable unrelated readable notes");
+        assert_eq!(
+            selected
+                .read_note(Path::new("Shared/other.md"))
+                .await
+                .unwrap(),
+            "unrelated source"
+        );
+        assert_eq!(selected.vault_stats().unwrap().total_notes, 1);
+        assert!(selected.search_by_tag("indexed").unwrap().is_empty());
+        assert!(
+            f.vault
+                .inner
+                .index
+                .read()
+                .unwrap()
+                .get_note(Path::new("Shared/note.md"))
+                .is_none()
+        );
+        assert!(matches!(
+            selected.read_note(Path::new("Shared/note.md")).await,
+            Err(VaultError::AccessDenied { visible: false, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn source_view_reconciles_unsafe_multilink_after_its_index_observation() {
+        let f = source_with_pending_readable_revision().await;
+        std::fs::hard_link(
+            f.root.join("Shared/note.md"),
+            f.root.join("Private/linked.md"),
+        )
+        .unwrap();
+        assert_unsafe_source_reconciles(&f).await;
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("Private/linked.md")).unwrap(),
+            "---\ntags: [indexed]\n---\nupdated source"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_reconciliation_preserves_nonconcealed_read_failures() {
+        let f = source_with_pending_readable_revision().await;
+        std::fs::write(f.root.join("Shared/note.md"), [0xff]).unwrap();
+        assert!(matches!(
+            f.vault.with_access(f.vault.access_client().unwrap().clone()),
+            Err(VaultError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData
+        ));
+        assert_eq!(
+            f.vault
+                .inner
+                .index
+                .read()
+                .unwrap()
+                .get_note(Path::new("Shared/note.md"))
+                .unwrap()
+                .tags,
+            ["indexed"]
+        );
+        assert!(!f.vault.projection.as_ref().unwrap().is_ready());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_view_reconciles_unsafe_alias_after_its_index_observation() {
+        let f = source_with_pending_readable_revision().await;
+        std::fs::remove_file(f.root.join("Shared/note.md")).unwrap();
+        std::os::unix::fs::symlink("../Private/note.md", f.root.join("Shared/note.md")).unwrap();
+        assert_unsafe_source_reconciles(&f).await;
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("Private/note.md")).unwrap(),
+            "private source"
+        );
     }
 
     #[tokio::test]

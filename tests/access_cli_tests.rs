@@ -1000,7 +1000,7 @@ fn preview_preserves_a_real_read_permission_failure() {
 }
 
 struct OccupiedDefaultBackend {
-    listener: Option<std::net::TcpListener>,
+    _listener: Option<std::net::TcpListener>,
     // Close the listener before another fixture acquires the shared port.
     _serial: std::sync::MutexGuard<'static, ()>,
 }
@@ -1032,14 +1032,72 @@ fn occupy_default_backend() -> OccupiedDefaultBackend {
         Err(error) => panic!("could not qualify the default loopback port: {error}"),
     };
     OccupiedDefaultBackend {
-        listener,
+        _listener: listener,
         _serial: serial,
     }
 }
 
 #[test]
+fn initialization_prints_a_free_endpoint_without_starting_a_server() {
+    let _listener = occupy_default_backend();
+    let fixture = Fixture::new();
+    let output = command()
+        .arg("init")
+        .arg(&fixture.vault)
+        .arg("--access-file")
+        .arg(&fixture.profile)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    let launch = text
+        .lines()
+        .find(|line| line.contains(" --http --host "))
+        .unwrap();
+    let port: u16 = launch
+        .split_once("--port ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((37843..=37942).contains(&port));
+    assert!(launch.contains(&format!("--host 127.0.0.1 --port {port}")));
+    let endpoint = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let _selected = std::net::TcpListener::bind(endpoint).unwrap();
+    let snapshot = AccessStore::open(&fixture.profile)
+        .unwrap()
+        .snapshot()
+        .unwrap();
+    assert!(snapshot.policy.clients.is_empty());
+    assert!(!fixture.vault.join(".obsidian-mcp").exists());
+}
+
+#[test]
+fn initialization_keeps_endpoint_options_in_guided_setup() {
+    let fixture = Fixture::new();
+    let output = command()
+        .arg("init")
+        .arg(&fixture.vault)
+        .arg("--access-file")
+        .arg(&fixture.profile)
+        .args(["--url", "http://127.0.0.1:37843/mcp"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not valid"));
+    assert!(!fixture.profile.parent().unwrap().exists());
+}
+
+#[test]
 fn https_setup_preserves_public_route_and_selects_a_separate_free_backend() {
-    let listener = occupy_default_backend();
+    let _listener = occupy_default_backend();
     let fixture = Fixture::new();
     let out = fixture.profile.parent().unwrap().join("https-client.json");
     let public = "https://notes.example.test/assistant/mcp";
@@ -1094,14 +1152,6 @@ fn https_setup_preserves_public_route_and_selects_a_separate_free_backend() {
     );
     let configuration: Value = serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
     assert_eq!(configuration["mcpServers"]["assistant"]["url"], public);
-    if let Some(held) = listener.listener.as_ref() {
-        let endpoint = "127.0.0.1:37842".parse().unwrap();
-        let _probe =
-            std::net::TcpStream::connect_timeout(&endpoint, std::time::Duration::from_secs(2))
-                .unwrap();
-        let (accepted, _) = held.accept().unwrap();
-        assert_eq!(accepted.local_addr().unwrap(), endpoint);
-    }
 }
 
 #[test]

@@ -167,8 +167,23 @@ pub(crate) fn stop(endpoint: SocketAddr, _expected: &Path) -> io::Result<bool> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[derive(Debug, thiserror::Error)]
+#[error("listener inspection {operation}: {source}")]
+struct ListenerInspectionError {
+    operation: &'static str,
+    source: io::Error,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn inspect_listener(endpoint: SocketAddr, operation: &'static str) -> io::Result<Option<u32>> {
+    listener_pid(endpoint).map_err(|source| {
+        io::Error::new(source.kind(), ListenerInspectionError { operation, source })
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub(crate) fn stop(endpoint: SocketAddr, expected_executable: &Path) -> io::Result<bool> {
-    let Some(pid) = listener_pid(endpoint)? else {
+    let Some(pid) = inspect_listener(endpoint, "before stopping")? else {
         // Darwin may hide other users' kernel socket records. An exclusive bind
         // can confirm this empty wildcard before any child has been spawned.
         // Never take this port while waiting for the actual child to bind.
@@ -203,7 +218,7 @@ fn stop_instance(
     expected_executable: &Path,
 ) -> io::Result<()> {
     process.verify_executable(expected_executable)?;
-    if listener_pid(endpoint)? != Some(pid) {
+    if inspect_listener(endpoint, "before termination")? != Some(pid) {
         return Err(io::Error::other(format!(
             "listener on {endpoint} changed during inspection"
         )));
@@ -212,7 +227,9 @@ fn stop_instance(
     if !process.wait(Duration::from_secs(5))? {
         // The same instance may still be draining requests after closing its listener.
         // If a supervisor replaced it, leave the replacement to its owner.
-        if listener_pid(endpoint)?.is_some_and(|current| current != pid) {
+        if inspect_listener(endpoint, "before forced termination")?
+            .is_some_and(|current| current != pid)
+        {
             return Err(io::Error::other(format!(
                 "another process now owns {endpoint}"
             )));
@@ -225,7 +242,7 @@ fn stop_instance(
             )));
         }
     }
-    if let Some(owner) = listener_pid(endpoint)? {
+    if let Some(owner) = inspect_listener(endpoint, "after process exit")? {
         return Err(io::Error::other(format!(
             "HTTP server process {pid} exited but process {owner} now owns {endpoint}"
         )));
