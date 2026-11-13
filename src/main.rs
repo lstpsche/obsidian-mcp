@@ -270,15 +270,36 @@ async fn tool_filter_middleware(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
+    let authenticated = request
+        .extensions()
+        .get::<obsidian_mcp::access::store::AuthorizedClient>()
+        .is_some();
     let disabled = match request.headers().get("X-Obsidian-Tools") {
         Some(header) => {
             let filter = header
                 .to_str()
                 .map_err(|error| format!("Invalid X-Obsidian-Tools encoding: {error}"))
-                .and_then(ToolFilter::parse);
+                .and_then(|raw| {
+                    if authenticated {
+                        ToolFilter::parse_authenticated(raw)
+                    } else {
+                        ToolFilter::parse(raw)
+                    }
+                });
             match filter {
                 Ok(filter) => filter.disabled_tools(),
                 Err(error) => {
+                    if authenticated {
+                        tracing::warn!(
+                            category = "invalid_tools_filter",
+                            "rejected client tool filter"
+                        );
+                        return (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            "Invalid X-Obsidian-Tools filter",
+                        )
+                            .into_response();
+                    }
                     tracing::warn!(%error, "rejected invalid X-Obsidian-Tools header");
                     return (axum::http::StatusCode::BAD_REQUEST, error).into_response();
                 }

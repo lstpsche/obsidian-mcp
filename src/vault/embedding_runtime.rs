@@ -1323,7 +1323,7 @@ async fn process_batch(
             .sum();
         let mut jobs = Vec::with_capacity(capacity);
         let mut inputs = Vec::with_capacity(capacity);
-        let mut source_paths = HashSet::new();
+        let mut source_paths = Vec::with_capacity(capacity);
         for (note_index, slot) in active.iter_mut().enumerate() {
             let Some(draft) = slot.as_ref() else {
                 continue;
@@ -1347,7 +1347,7 @@ async fn process_batch(
                     continue;
                 }
                 jobs.push((note_index, chunk_index));
-                source_paths.insert(draft.work.path.clone());
+                source_paths.push(draft.work.path.clone());
                 inputs.push((Arc::clone(&draft.prepared), chunk_index));
             }
         }
@@ -1357,10 +1357,7 @@ async fn process_batch(
         let embedder = Arc::clone(model);
         let source_owner = Arc::clone(shared);
         let owner_live = Arc::clone(&shared.live);
-        let authorization = shared
-            .authorization
-            .as_ref()
-            .map(|authorization| authorization.for_paths(source_paths.into_iter().collect()));
+        let authorization = shared.authorization.clone();
         let started = Instant::now();
         let dispatcher = tracing::dispatcher::get_default(Clone::clone);
         let span = tracing::Span::current();
@@ -1380,8 +1377,12 @@ async fn process_batch(
                         .map(|(prepared, chunk)| prepared.chunks[*chunk].text.as_str())
                         .collect::<Vec<_>>();
                     tracing::debug!(pending_inputs = texts.len(), "embedding batch started");
-                    let (count, result) =
-                        embedder.embed_next_batch(&texts, &owner_live, authorization.as_ref());
+                    let (count, result) = embedder.embed_next_batch(
+                        &texts,
+                        &owner_live,
+                        authorization.as_ref(),
+                        &source_paths,
+                    );
                     let result = result.and_then(|vectors| {
                         validate_embedding_batch(vectors, count, embedder.dimension())
                     });
@@ -2522,6 +2523,66 @@ mod tests {
         assert_eq!(runtime.status().indexed_notes, 0);
         assert!(!runtime.status().queryable);
         assert!(!cache_path.exists());
+    }
+
+    #[tokio::test]
+    async fn late_unavailable_note_does_not_reject_an_earlier_dispatch_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("a.md"), "# A\nfirst body").unwrap();
+        std::fs::write(directory.path().join("b.md"), "# B\nlater body").unwrap();
+        let root = super::super::fs::VaultRoot::open(directory.path()).unwrap();
+        let cache = CacheFile::new(root.clone(), PathBuf::from(".cache/embeddings.bin"));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let model = Arc::new(RequestControlledEmbedder::new());
+        *model.planning_gate.lock().unwrap() = Some((started_tx, release_rx));
+        let loader_model = Arc::clone(&model);
+        let later_available = Arc::new(AtomicBool::new(true));
+        let check = Arc::clone(&later_available);
+        let runtime = EmbeddingRuntime::spawn_with_authorized_source(
+            Storage::Local(root),
+            test_index(directory.path()).await,
+            cache,
+            TEST_BATCH_SIZE,
+            true,
+            EmbeddingAuthorization::new(move |path| {
+                if path == Some(Path::new("b.md")) && !check.load(AtomicOrdering::Acquire) {
+                    return Err(VaultError::AccessDenied {
+                        path: "b.md".into(),
+                        visible: false,
+                    });
+                }
+                Ok(Box::new(()))
+            }),
+            async move { Ok(loader_model as Arc<dyn Embedder>) },
+        );
+        // Both notes have been prepared, but the provider's one-input prefix
+        // has not yet been selected. Only the later note loses source access.
+        tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .unwrap();
+        later_available.store(false, AtomicOrdering::Release);
+        release_tx.send(()).unwrap();
+        wait_for_status(&runtime, |status| {
+            status.phase == EmbeddingPhase::Degraded && status.pending_notes == 0
+        })
+        .await;
+        assert_eq!(runtime.status().indexed_notes, 1);
+        assert_eq!(model.calls.load(AtomicOrdering::SeqCst), 1);
+        let inputs = model.inputs.lock().unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert!(inputs[0].contains("first body"));
+        assert!(!inputs[0].contains("later body"));
+        let entries = runtime
+            .query_snapshot()
+            .unwrap()
+            .capture_entries(&HashSet::from([
+                OsString::from("a.md"),
+                OsString::from("b.md"),
+            ]));
+        assert!(entries.contains_key(OsStr::new("a.md")));
+        assert!(!entries.contains_key(OsStr::new("b.md")));
     }
 
     #[tokio::test]
@@ -3828,7 +3889,10 @@ mod tests {
         panic_on_call: AtomicUsize,
         transient: AtomicBool,
         inputs: Mutex<Vec<String>>,
+        planning_gate: Mutex<Option<PlanningGate>>,
     }
+
+    type PlanningGate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 
     impl RequestControlledEmbedder {
         fn new() -> Self {
@@ -3839,6 +3903,7 @@ mod tests {
                 panic_on_call: AtomicUsize::new(usize::MAX),
                 transient: AtomicBool::new(true),
                 inputs: Mutex::new(Vec::new()),
+                planning_gate: Mutex::new(None),
             }
         }
     }
@@ -3862,6 +3927,19 @@ mod tests {
                 max_total_tokens: 512,
                 max_request_bytes: 16 * 1024 * 1024,
             }
+        }
+        fn plan_batch(&self, texts: &[&str]) -> VaultResult<usize> {
+            if let Some((started, release)) = self.planning_gate.lock().unwrap().take() {
+                started.send(()).unwrap();
+                release.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            super::super::embedding_input::plan_batch(
+                texts,
+                self.input_policy(),
+                self.request_limits(),
+                2,
+                |text| self.count_tokens(text),
+            )
         }
         fn embed_batch(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>> {
             assert_eq!(texts.len(), 1);

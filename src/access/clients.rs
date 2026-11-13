@@ -239,17 +239,6 @@ impl AccessPolicy {
     pub fn client(&self, id: &str) -> Option<&ClientPolicy> {
         self.clients.get(id)
     }
-
-    /// Source-bound identity of the readable policy, independent of credentials.
-    pub fn read_policy_hash(&self, client_id: &str) -> Option<String> {
-        let client = self.clients.get(client_id)?;
-        let mut hash = Sha256::new();
-        hash_field(&mut hash, b"obsidian-mcp/access-source-read/v1");
-        hash_field(&mut hash, self.source.storage_key.as_bytes());
-        hash_field(&mut hash, self.source.object_id.as_bytes());
-        hash_field(&mut hash, client.read_policy_hash().as_bytes());
-        Some(hex_digest(hash))
-    }
 }
 
 impl ClientPolicy {

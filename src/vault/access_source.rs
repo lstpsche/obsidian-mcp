@@ -86,6 +86,13 @@ impl Vault {
         Ok(())
     }
 
+    pub(crate) async fn check_access_current_async(&self) -> VaultResult<()> {
+        if self.is_authenticated() {
+            self.require_access()?.current_async().await?;
+        }
+        Ok(())
+    }
+
     fn require_access(&self) -> VaultResult<&AuthorizedClient> {
         self.access.as_ref().ok_or_else(|| {
             VaultError::Authorization("authenticated invocation context is missing".into())
@@ -156,7 +163,7 @@ impl Vault {
         allow_missing: bool,
     ) -> VaultResult<(PathBuf, PathBuf)> {
         let client = self.require_access()?;
-        client.current()?;
+        self.check_access_current()?;
         let requested = path::normalize_relative(requested)?;
         let decision = client.policy().decision(Action::Read, &requested);
         if decision.reason == DecisionReason::InvalidPath {
@@ -438,9 +445,9 @@ impl Vault {
                     if visible
                         && matcher
                             .as_ref()
-                            .is_none_or(|matcher| matcher.is_match(&logical))
+                            .is_none_or(|matcher| matcher.is_match(&path))
                     {
-                        paths.push(logical);
+                        paths.push(path);
                     }
                 }
             }
@@ -696,6 +703,218 @@ mod tests {
             id: "private".into(),
             directory: Some("Private".into()),
             file: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_path_validation_does_not_observe_hidden_source_shapes() {
+        use crate::tools::notes::{NoteReadManyParams, NoteReadManySkipReason, note_read_many};
+
+        let f = fixture(vec![directory("Shared", Role::Reader)], vec![]).await;
+        for hidden in ["Private/note.md/child", "Private/missing.md/child"] {
+            f.vault.validate_path(Path::new(hidden)).await.unwrap();
+            let output = note_read_many(
+                &f.vault,
+                NoteReadManyParams {
+                    paths: Some(vec![hidden.into(), "Shared/note.md".into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(output.notes.len(), 1);
+            assert_eq!(output.notes[0].content, "original");
+            assert_eq!(output.skipped.len(), 1);
+            assert_eq!(output.skipped[0].reason, NoteReadManySkipReason::NotFound);
+        }
+        for invalid in ["../outside.md", "/outside.md", "Shared/control\n.md"] {
+            let error = note_read_many(
+                &f.vault,
+                NoteReadManyParams {
+                    paths: Some(vec!["Shared/note.md".into(), invalid.into()]),
+                    max_files: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .err()
+            .expect("all explicit paths must pass syntax validation");
+            assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn directory_aliases_return_canonical_listing_keys_and_metadata() {
+        use crate::tools::navigation::{VaultListParams, vault_list};
+
+        let f = fixture(vec![directory("", Role::Reader)], vec![]).await;
+        std::os::unix::fs::symlink("Shared", f.root.join("Alias")).unwrap();
+        assert_eq!(
+            f.vault
+                .list_files(Path::new("Alias"), true, None)
+                .await
+                .unwrap(),
+            vec![PathBuf::from("Shared/note.md")]
+        );
+        let listing = vault_list(
+            &f.vault,
+            VaultListParams {
+                path: Some("Alias".into()),
+                include_metadata: Some(true),
+                glob: Some("Shared/*.md".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let entries: Vec<serde_json::Value> =
+            serde_json::from_str(crate::test_helpers::extract_text(&listing)).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["path"], "Shared/note.md");
+        assert_eq!(entries[0]["title"], "note");
+
+        let tree = vault_list(
+            &f.vault,
+            VaultListParams {
+                path: Some("Alias".into()),
+                format: Some("tree".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::test_helpers::extract_text(&tree),
+            "Shared\n└── note.md"
+        );
+
+        std::fs::write(f.root.join("Shared/2026-11-13.md"), "daily").unwrap();
+        let config = crate::models::PeriodicNoteConfig {
+            folder: Some("Alias".into()),
+            format: "YYYY-MM-DD".into(),
+            template: None,
+        };
+        assert_eq!(
+            f.vault.list_periodic(&config, 10).await.unwrap(),
+            vec![PathBuf::from("Alias/2026-11-13.md")]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_held_projection_refresh_does_not_block_async_catalog_consumers() {
+        let f = fixture(vec![directory("Shared", Role::Reader)], vec![]).await;
+        std::fs::write(f.root.join("Shared/note.md"), "updated source").unwrap();
+        f.vault
+            .write_index()
+            .refresh_file(
+                f.vault.inner.filesystem.as_ref().unwrap(),
+                Path::new("Shared/note.md"),
+                f.vault.exclude(),
+                None,
+                #[cfg(has_embeddings)]
+                false,
+            )
+            .unwrap();
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let held_release = Arc::clone(&release);
+        let owner = f.vault.clone();
+        let refresh = tokio::task::spawn_blocking(move || {
+            owner.inner.authorized_indices.project(
+                &owner.inner.index,
+                owner.access_client().unwrap().policy(),
+                false,
+                |path| {
+                    if let Some(sender) = entered_tx.lock().unwrap().take() {
+                        sender.send(()).unwrap();
+                    }
+                    let (released, ready) = &*held_release;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = ready.wait(released).unwrap();
+                    }
+                    owner.read_access_native(path, None)
+                },
+            )
+        });
+        entered_rx.await.unwrap();
+        // A native watchdog bounds the regression even if an async worker is blocked.
+        let watchdog_release = Arc::clone(&release);
+        let watchdog = std::thread::spawn(move || {
+            let (released, ready) = &*watchdog_release;
+            let (mut released, _) = ready
+                .wait_timeout_while(
+                    released.lock().unwrap(),
+                    std::time::Duration::from_secs(2),
+                    |released| !*released,
+                )
+                .unwrap();
+            *released = true;
+            ready.notify_all();
+        });
+        let reader = f.vault.clone();
+        let (polling_tx, polling_rx) = tokio::sync::oneshot::channel();
+        let started = std::time::Instant::now();
+        let operation = tokio::spawn(async move {
+            polling_tx.send(()).unwrap();
+            reader.get_note_metadata(Path::new("Shared/note.md")).await
+        });
+        polling_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        let elapsed = started.elapsed();
+        let (released, ready) = &*release;
+        *released.lock().unwrap() = true;
+        ready.notify_all();
+        watchdog.join().unwrap();
+        refresh.await.unwrap().unwrap();
+        operation.await.unwrap().unwrap();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "catalog refresh occupied the async worker for {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_policy_writer_does_not_block_async_source_or_mutation_admission() {
+        let f = fixture(vec![directory("Shared", Role::Editor)], vec![]).await;
+        for mutation in [false, true] {
+            let store = f.store.clone();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let writer = std::thread::spawn(move || {
+                store.update(None, |_| {
+                    entered_tx.send(()).unwrap();
+                    // Bound a synchronous-admission regression without a hung test.
+                    let _ = released.recv_timeout(std::time::Duration::from_secs(2));
+                    Ok(())
+                })
+            });
+            entered_rx.await.unwrap();
+            let operation = async {
+                if mutation {
+                    f.vault
+                        .write_note(Path::new("Shared/note.md"), "updated")
+                        .await
+                } else {
+                    f.vault.storage().await.map(drop)
+                }
+            };
+            tokio::pin!(operation);
+            let started = std::time::Instant::now();
+            tokio::select! {
+                result = &mut operation => panic!("source admission bypassed the held policy writer: {result:?}"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => release.send(()).unwrap(),
+            }
+            assert!(started.elapsed() < std::time::Duration::from_secs(1));
+            tokio::time::timeout(std::time::Duration::from_secs(2), operation)
+                .await
+                .unwrap()
+                .unwrap();
+            writer.join().unwrap().unwrap();
         }
     }
 

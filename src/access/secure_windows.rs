@@ -23,9 +23,9 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
-    GetFileInformationByHandle, READ_CONTROL, ReOpenFile, WRITE_DAC, WRITE_OWNER,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, GetFileInformationByHandle, READ_CONTROL, ReOpenFile,
+    WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -92,10 +92,31 @@ fn trusted(sid: PSID, owner: PSID) -> bool {
     }
 }
 
-pub(super) fn protect(file: &File, directory: bool) -> AccessResult<()> {
-    let user = user_token()?;
+fn owner_category(sid: PSID, user: PSID) -> &'static str {
+    if sid.is_null() {
+        "missing"
+    } else if unsafe { EqualSid(sid, user) } != 0 {
+        "service_user"
+    } else if unsafe { IsWellKnownSid(sid, WinLocalSystemSid) } != 0 {
+        "system"
+    } else if unsafe { IsWellKnownSid(sid, WinBuiltinAdministratorsSid) } != 0 {
+        "administrators"
+    } else {
+        "unrecognized"
+    }
+}
+
+fn native_error(stage: &'static str, error: io::Error) -> AccessError {
+    io::Error::new(
+        error.kind(),
+        format!("Windows access state {stage}: {error}"),
+    )
+    .into()
+}
+
+fn sid_string(sid: PSID) -> AccessResult<String> {
     let mut sid_text = ptr::null_mut();
-    if unsafe { ConvertSidToStringSidW(user_sid(&user), &mut sid_text) } == 0 {
+    if unsafe { ConvertSidToStringSidW(sid, &mut sid_text) } == 0 {
         return Err(io::Error::last_os_error().into());
     }
     let mut length = 0;
@@ -107,10 +128,15 @@ pub(super) fn protect(file: &File, directory: bool) -> AccessResult<()> {
     let sid = String::from_utf16(unsafe { std::slice::from_raw_parts(sid_text, length) })
         .map_err(|_| AccessError::Configuration("invalid owner SID".into()));
     unsafe { LocalFree(sid_text.cast()) };
+    sid
+}
+
+pub(super) fn protect(file: &File, directory: bool) -> AccessResult<()> {
+    let user = user_token()?;
+    let sid = sid_string(user_sid(&user))?;
     let inheritance = if directory { "OICI" } else { "" };
     let descriptor = format!(
-        "D:P(A;{inheritance};FA;;;SY)(A;{inheritance};FA;;;BA)(A;{inheritance};FA;;;{})",
-        sid?
+        "D:P(A;{inheritance};FA;;;SY)(A;{inheritance};FA;;;BA)(A;{inheritance};FA;;;{sid})"
     );
     let descriptor: Vec<u16> = descriptor.encode_utf16().chain(Some(0)).collect();
     let mut security = ptr::null_mut();
@@ -135,33 +161,48 @@ pub(super) fn protect(file: &File, directory: bool) -> AccessResult<()> {
     {
         return Err(io::Error::last_os_error().into());
     }
-    // ReOpenFile preserves object identity and obtains WRITE_DAC without an
-    // ambient pathname reopen. The object owner may set its protected DACL.
-    let handle = unsafe {
-        ReOpenFile(
-            file.as_raw_handle().cast(),
-            READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-        )
+    // Called only for newly created empty access-state objects. Set the owner
+    // explicitly: a token's default owner need not be its TokenUser SID.
+    let access = READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES;
+    let handle = if directory {
+        crate::vault::fs::reopen_directory(file, access)
+            .map_err(|error| native_error("reopen_directory_for_protection", error))?
+    } else {
+        // ReOpenFile supports regular files, but rejects directory handles.
+        let handle = unsafe {
+            ReOpenFile(
+                file.as_raw_handle().cast(),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(native_error(
+                "reopen_file_for_protection",
+                io::Error::last_os_error(),
+            ));
+        }
+        unsafe { File::from_raw_handle(handle.cast()) }
     };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error().into());
-    }
-    let handle = unsafe { File::from_raw_handle(handle.cast()) };
     let result = unsafe {
         SetSecurityInfo(
             handle.as_raw_handle().cast(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            ptr::null_mut(),
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            user_sid(&user),
             ptr::null_mut(),
             acl,
             ptr::null(),
         )
     };
     if result != 0 {
-        return Err(io::Error::from_raw_os_error(result as i32).into());
+        return Err(native_error(
+            "set_owner_and_dacl",
+            io::Error::from_raw_os_error(result as i32),
+        ));
     }
     Ok(())
 }
@@ -201,7 +242,10 @@ fn validate_acl(file: &File, private: bool, directory: bool, creating: bool) -> 
         )
     };
     if result != 0 {
-        return Err(io::Error::from_raw_os_error(result as i32).into());
+        return Err(native_error(
+            "read_owner_and_dacl",
+            io::Error::from_raw_os_error(result as i32),
+        ));
     }
     let descriptor = LocalAllocation(descriptor);
     if owner.is_null()
@@ -209,9 +253,25 @@ fn validate_acl(file: &File, private: bool, directory: bool, creating: bool) -> 
         || !trusted(owner, user_sid)
         || (private && unsafe { EqualSid(owner, user_sid) } == 0)
     {
-        return Err(AccessError::Configuration(
-            "access state must be owned by the service owner with a private DACL".into(),
-        ));
+        let scope = if private { "private" } else { "ancestor" };
+        let category = owner_category(owner, user_sid);
+        let dacl = if acl.is_null() { "missing" } else { "present" };
+        let message = format!(
+            "Windows access state ownership rejected (scope={scope}, owner={category}, dacl={dacl})"
+        );
+        // Native test fixtures expose exact account identity only in their
+        // captured failure, so an unfamiliar system owner can be investigated.
+        #[cfg(test)]
+        let message = if owner.is_null() {
+            message
+        } else {
+            format!(
+                "{message}; test owner_sid={:?}, token_user_sid={:?}",
+                sid_string(owner),
+                sid_string(user_sid)
+            )
+        };
+        return Err(AccessError::Configuration(message));
     }
     let mut control = 0;
     let mut revision = 0;
@@ -328,6 +388,27 @@ mod tests {
             "icacls failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn windows_protection_sets_user_ownership_without_changing_object_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = directory_handle(temporary.path());
+        let identity = object_identity(&directory).unwrap();
+        protect(&directory, true).unwrap();
+        validate(&directory, true, true).unwrap();
+        assert_eq!(object_identity(&directory).unwrap(), identity);
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(temporary.path().join("credential"))
+            .unwrap();
+        let identity = object_identity(&file).unwrap();
+        protect(&file, false).unwrap();
+        validate(&file, true, false).unwrap();
+        assert_eq!(object_identity(&file).unwrap(), identity);
     }
 
     #[test]

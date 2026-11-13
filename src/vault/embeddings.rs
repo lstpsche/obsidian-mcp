@@ -100,6 +100,11 @@ impl EmbeddingAuthorization {
 
     pub(crate) fn for_paths(&self, paths: Vec<PathBuf>) -> Self {
         let authority = self.clone();
+        let mut seen = HashSet::new();
+        let paths = paths
+            .into_iter()
+            .filter(|path| seen.insert(path.clone()))
+            .collect::<Vec<_>>();
         Self::new(move |_| {
             // Independent store locks must never nest: a waiting policy writer
             // can otherwise sit between two shared acquisitions. Each path check
@@ -154,7 +159,11 @@ pub(crate) trait Embedder: Send + Sync {
         texts: &[&str],
         owner_live: &Arc<AtomicBool>,
         authorization: Option<&EmbeddingAuthorization>,
+        source_paths: &[PathBuf],
     ) -> (usize, VaultResult<Vec<Vec<f32>>>) {
+        // Check corpus eligibility before planning, then bind path admission to
+        // the exact request prefix. A later unavailable note must not reject or
+        // inherit the failure of an earlier, independently dispatched request.
         if let Err(error) = document_admission(Some(owner_live), authorization) {
             return (1, Err(error));
         }
@@ -170,9 +179,23 @@ pub(crate) trait Embedder: Send + Sync {
             }
             Err(error) => return (1, Err(error)),
         };
+        let authorization = match authorization {
+            Some(authority) if source_paths.len() == texts.len() => {
+                Some(authority.for_paths(source_paths[..count].to_vec()))
+            }
+            Some(_) => {
+                return (
+                    count,
+                    Err(VaultError::Embedding(
+                        "embedding request source paths do not match its inputs".into(),
+                    )),
+                );
+            }
+            None => None,
+        };
         (
             count,
-            self.dispatch_documents(&texts[..count], owner_live, authorization),
+            self.dispatch_documents(&texts[..count], owner_live, authorization.as_ref()),
         )
     }
 
@@ -3802,6 +3825,7 @@ mod tests {
                 &["document body"],
                 &Arc::new(AtomicBool::new(true)),
                 None,
+                &[],
             );
             assert_eq!(count, 1);
             let error = result.unwrap_err();
@@ -3838,6 +3862,7 @@ mod tests {
                     &["document body"],
                     &Arc::new(AtomicBool::new(true)),
                     None,
+                    &[],
                 );
                 assert_eq!(count, 1);
                 let error = result.unwrap_err();
@@ -3863,6 +3888,7 @@ mod tests {
                 &["document body"],
                 &Arc::new(AtomicBool::new(true)),
                 None,
+                &[],
             );
             assert_eq!(count, 1);
             let error = result.unwrap_err();
@@ -3887,6 +3913,7 @@ mod tests {
                 &["body"; 33],
                 &Arc::new(AtomicBool::new(true)),
                 None,
+                &[],
             );
             assert_eq!(count, 32);
             assert_eq!(result.unwrap(), vec![vec![1.0, 0.0]; 32]);
@@ -3901,6 +3928,7 @@ mod tests {
                 &[oversized.as_str()],
                 &Arc::new(AtomicBool::new(true)),
                 None,
+                &[],
             );
             assert_eq!(count, 1);
             assert!(matches!(

@@ -18,7 +18,7 @@ use obsidian_mcp::access::store::{AccessStore, read_token_file};
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
 
@@ -318,6 +318,117 @@ fn assert_rejected(response: &Value) {
 fn assert_not_found(response: &Value) {
     assert_eq!(response["error"]["code"], -32002, "{response}");
     assert_rejected(response);
+}
+
+#[tokio::test]
+async fn bulk_reads_hide_existing_and_missing_denied_parent_shapes() {
+    let fixture = AccessFixture::new();
+    std::fs::write(fixture.vault.join("Private/exists.md"), PRIVATE).unwrap();
+    let server = Server::start_fixture(fixture, true).await;
+    for path in ["Private/exists.md/child.md", "Private/missing.md/child.md"] {
+        let result = server
+            .call("reader", "note_read_many", json!({"paths":[path]}))
+            .await;
+        let result = data(&result);
+        assert_eq!(result["notes"], json!([]));
+        assert_eq!(result["skipped_count"], 1);
+        assert_eq!(result["skipped"][0]["path"], path);
+        assert_eq!(result["skipped"][0]["reason"], "not_found");
+    }
+    server.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn directory_aliases_preserve_listing_metadata_and_tree_namespace() {
+    let fixture = AccessFixture::new();
+    std::os::unix::fs::symlink("Shared", fixture.vault.join("Alias")).unwrap();
+    let server = Server::start_fixture(fixture, true).await;
+    for options in [json!({"include_metadata":true}), json!({"format":"tree"})] {
+        let mut canonical = options.clone();
+        canonical["path"] = json!("Shared");
+        let mut alias = options;
+        alias["path"] = json!("Alias");
+        let expected = server.call("editor", "vault_list", canonical).await;
+        let actual = server.call("editor", "vault_list", alias).await;
+        assert_eq!(data(&actual), data(&expected));
+    }
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn publication_wait_does_not_block_single_worker_http_health() {
+    let server = Server::start().await;
+    let address = server.url.strip_prefix("http://").unwrap();
+    let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let mut stream = BufReader::new(stream);
+    let prepared = server
+        .request("reader", "tools/list", json!({}), http_rpc::MODERN)
+        .build()
+        .unwrap();
+    let body = prepared.body().unwrap().as_bytes().unwrap();
+    let headers = prepared
+        .headers()
+        .iter()
+        .map(|(name, value)| format!("{name}: {}\r\n", value.to_str().unwrap()))
+        .collect::<String>();
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n{headers}Content-Length: {}\r\nExpect: 100-continue\r\n\r\n",
+        body.len(),
+    );
+    stream
+        .get_mut()
+        .write_all(request.as_bytes())
+        .await
+        .unwrap();
+    let mut interim = String::new();
+    loop {
+        let mut line = String::new();
+        timeout(Duration::from_secs(2), stream.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!line.is_empty(), "server closed before requesting the body");
+        interim.push_str(&line);
+        if line == "\r\n" {
+            break;
+        }
+    }
+    // Hyper requests the body only after the authentication middleware admits
+    // the headers. Hold publication now to exercise the later catalog permit.
+    assert!(interim.starts_with("HTTP/1.1 100 Continue"), "{interim}");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(
+            server
+                .fixture
+                .access_file
+                .with_file_name("access.json.lock"),
+        )
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&lock).unwrap();
+    stream.get_mut().write_all(body).await.unwrap();
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let health = timeout(
+            Duration::from_secs(1),
+            server.client.get(format!("{}/health", server.url)).send(),
+        )
+        .await
+        .expect("policy publication blocked the HTTP executor")
+        .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+    }
+    drop(lock);
+    let mut response = String::new();
+    timeout(Duration::from_secs(2), stream.read_to_string(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(response.contains("note_read"));
+    server.stop().await;
 }
 
 #[tokio::test]
@@ -1888,6 +1999,20 @@ async fn authenticated_trace_logging_omits_tokens_note_bodies_and_denied_parse_d
         .unwrap();
     let response = http_rpc::rpc_response(response).await;
     assert!(response.get("error").is_none());
+    for (filter, status) in [
+        ("private-single-filter-canary", StatusCode::BAD_REQUEST),
+        ("note_read,private-list-filter-canary", StatusCode::OK),
+        ("!private-deny-filter-canary", StatusCode::OK),
+    ] {
+        let response = captured
+            .server
+            .request("reader", "tools/list", json!({}), http_rpc::MODERN)
+            .header("X-Obsidian-Tools", filter)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+    }
     let stderr = captured.finish().await;
     assert!(stderr.contains("authenticated invocation finished"));
     assert!(stderr.contains("protected index build"));
@@ -1899,6 +2024,9 @@ async fn authenticated_trace_logging_omits_tokens_note_bodies_and_denied_parse_d
         "unterminated-yaml-marker",
         "denied-parse-source-marker",
         "notification-source-marker",
+        "private-single-filter-canary",
+        "private-list-filter-canary",
+        "private-deny-filter-canary",
     ] {
         assert!(
             !stderr.contains(forbidden),

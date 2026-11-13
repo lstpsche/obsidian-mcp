@@ -14,6 +14,7 @@ use obsidian_mcp::access::store::{
     AccessError, AccessStore, default_data_dir, default_profile_path, read_token_file,
     validate_initialization, write_protected_file,
 };
+use obsidian_mcp::error::VaultError;
 use obsidian_mcp::vault::fs::VaultRoot;
 use serde_json::{Value, json};
 
@@ -677,13 +678,21 @@ fn preview(args: &Arguments) -> Result<Output, String> {
         if !client.allows(AccessAction::Read, &path) {
             continue;
         }
-        let actual = root
-            .resolve_existing(&path)
-            .map_err(|error| error.to_string())?;
-        if client.allows(AccessAction::Read, &actual.relative) {
-            root.validate_access_file(&actual.relative)
-                .map_err(|error| error.to_string())?;
-            paths.push(path);
+        let eligible = || {
+            let actual = root.resolve_existing(&path)?;
+            if !client.allows(AccessAction::Read, &actual.relative)
+                || !root.entry_metadata_exact(&actual.relative)?.is_file()
+            {
+                return Ok(false);
+            }
+            root.validate_access_file(&actual.relative)?;
+            Ok(true)
+        };
+        match eligible() {
+            Ok(true) => paths.push(path),
+            Ok(false) => (),
+            Err(error) if unavailable_preview_entry(&error) => (),
+            Err(error) => return Err(error.to_string()),
         }
     }
     let total = paths.len();
@@ -699,6 +708,17 @@ fn preview(args: &Arguments) -> Result<Output, String> {
         json!({"client_id":name,"paths":paths,"total":total,"truncated":total>limit,"revision":snapshot.policy.revision}),
         lines,
     ))
+}
+
+fn unavailable_preview_entry(error: &VaultError) -> bool {
+    matches!(
+        error,
+        VaultError::NoteNotFound(_)
+            | VaultError::DirectoryNotFound(_)
+            | VaultError::OutsideVault(_)
+            | VaultError::InvalidPath(_)
+            | VaultError::AccessDenied { .. }
+    ) || matches!(error, VaultError::Io(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory))
 }
 
 fn rebind(args: &Arguments) -> Result<Output, String> {
@@ -1128,10 +1148,10 @@ fn setup(args: &Arguments) -> Result<Output, String> {
                 .into(),
         );
     }
-    let url = if transport == "http" {
-        setup_url(args)?
+    let endpoint = if transport == "http" {
+        Some(setup_endpoint(args)?)
     } else {
-        validated_url(DEFAULT_URL)?
+        None
     };
     let binary = args
         .path("binary")
@@ -1189,8 +1209,14 @@ fn setup(args: &Arguments) -> Result<Output, String> {
             return Err("Setup cancelled; no files were created.".into());
         }
     }
-    let configuration = if transport == "http" {
-        configuration_bytes(&name, &adapter, url.as_str(), &binary, &client_token)?
+    let configuration = if let Some(endpoint) = &endpoint {
+        configuration_bytes(
+            &name,
+            &adapter,
+            endpoint.public_url.as_str(),
+            &binary,
+            &client_token,
+        )?
     } else {
         stdio_configuration_bytes(
             &name,
@@ -1201,30 +1227,69 @@ fn setup(args: &Arguments) -> Result<Output, String> {
             &source.canonical_path,
         )?
     };
-    let launch = if transport == "http" {
-        Some(launch_command(
-            &profile,
-            &source.canonical_path,
-            url.as_str(),
-        )?)
-    } else {
-        None
-    };
+    let launch = endpoint
+        .as_ref()
+        .map(|endpoint| {
+            launch_command(
+                &profile,
+                &source.canonical_path,
+                endpoint.backend_url.as_str(),
+            )
+        })
+        .transpose()?;
+    let backend_doctor = endpoint
+        .as_ref()
+        .map(|endpoint| doctor_command(&profile, &token_path, &endpoint.backend_url))
+        .transpose()?;
+    let public_doctor = endpoint
+        .as_ref()
+        .filter(|endpoint| endpoint.public_url.scheme() == "https")
+        .map(|endpoint| doctor_command(&profile, &token_path, &endpoint.public_url))
+        .transpose()?;
+    let proxy_endpoint = endpoint
+        .as_ref()
+        .filter(|endpoint| endpoint.public_url.scheme() == "https");
+    let proxy_host_header = proxy_endpoint
+        .map(SetupEndpoint::backend_host_header)
+        .transpose()?;
+    let proxy_route = proxy_endpoint
+        .zip(proxy_host_header.as_ref())
+        .map(|(endpoint, host)| {
+            format!(
+                "Route your HTTPS proxy's {} endpoint to {} and forward Host as {host}.",
+                endpoint.public_url, endpoint.backend_url
+            )
+        });
+    let mut result = json!({"client_id":name,"access_file":profile,"token_file":token_path,
+        "client_token_file":client_token,"configuration_file":config_path,"transport":transport,
+        "url":endpoint.as_ref().map(|endpoint|endpoint.public_url.as_str()),
+        "backend_url":endpoint.as_ref().map(|endpoint|endpoint.backend_url.as_str()),
+        "server_command":launch,"doctor_command":backend_doctor,"public_doctor_command":public_doctor,
+        "proxy_upstream":proxy_endpoint.map(|endpoint|endpoint.backend_url.as_str()),
+        "proxy_host_header":proxy_host_header});
     if args.flag("dry-run") {
-        let instructions = match &launch {
-            Some(launch) => launch.clone(),
-            None => format!(
+        let mut lines = vec!["Setup preview complete; no files were created.".into()];
+        if let Some(launch) = &launch {
+            lines.push(launch.clone());
+            if let Some(route) = &proxy_route {
+                lines.push(route.clone());
+            }
+            if let Some(doctor) = &backend_doctor {
+                lines.push(format!("Check the backend: {doctor}"));
+            }
+            if let Some(doctor) = &public_doctor {
+                lines.push(format!(
+                    "After configuring the proxy, check its public endpoint: {doctor}"
+                ));
+            }
+        } else {
+            lines.push(format!(
                 "Would create {} for {adapter}. The client starts the restricted server process.",
                 config_path.display()
-            ),
-        };
-        return Ok(Output::new(
-            json!({"dry_run":true,"client_id":name,"access_file":profile,"token_file":token_path,"client_token_file":client_token,"configuration_file":config_path,"transport":transport,"url":(transport == "http").then_some(url.as_str())}),
-            [
-                "Setup preview complete; no files were created.".into(),
-                instructions,
-            ],
-        ));
+            ));
+        }
+        result["dry_run"] = json!(true);
+        return Ok(Output::new(result, lines));
     }
     let store =
         AccessStore::initialize(&profile, &vault, &data).map_err(|error| error.to_string())?;
@@ -1248,12 +1313,10 @@ fn setup(args: &Arguments) -> Result<Output, String> {
         "Created client {name} and saved its token to {}.",
         receipt.path.display()
     )];
-    if let Some(launch) = launch {
+    if let Some(launch) = &launch {
         lines.push(format!("1. Start the authenticated server: {launch}"));
-        if url.scheme() == "https" {
-            lines.push(format!(
-                "   Route your HTTPS proxy's {url} endpoint to http://127.0.0.1:37842/mcp."
-            ));
+        if let Some(route) = &proxy_route {
+            lines.push(format!("   {route}"));
         }
         lines.push(format!(
             "2. Merge {} into the {adapter} MCP configuration and reconnect.",
@@ -1262,17 +1325,24 @@ fn setup(args: &Arguments) -> Result<Output, String> {
         if args.value("client-token-file").is_some() {
             lines.push(format!("   On the client machine, place the token at {} using your secure transfer method.", client_token.display()));
         }
-        lines.push(format!("3. Check the connection: obsidian-mcp access doctor --access-file {} --token-file {} --url {}", quote_path(&profile), quote_path(&receipt.path), quote(url.as_str())));
+        if let Some(doctor) = &backend_doctor {
+            lines.push(format!("3. Check the authenticated backend: {doctor}"));
+        }
+        if let Some(doctor) = &public_doctor {
+            lines.push(format!(
+                "   After configuring the proxy, check its public endpoint: {doctor}"
+            ));
+        }
     } else {
         lines.push(format!("Merge {} into the {adapter} MCP configuration and reconnect. The client starts the restricted server process.", config_path.display()));
         lines.push("This delegates MCP permissions; the launching OS account retains its existing filesystem authority.".into());
     }
     lines.push("Existing unauthenticated servers and client settings were not changed. Embedding settings were not enabled or changed.".into());
 
-    Ok(Output::new(
-        json!({"client_id":name,"credential_id":receipt.credential_id,"access_file":profile,"token_file":receipt.path,"client_token_file":client_token,"configuration_file":config_path,"transport":transport,"url":(transport == "http").then_some(url.as_str()),"revision":receipt.revision}),
-        lines,
-    ))
+    result["credential_id"] = json!(receipt.credential_id);
+    result["token_file"] = json!(receipt.path);
+    result["revision"] = json!(receipt.revision);
+    Ok(Output::new(result, lines))
 }
 
 fn validate_options(args: &Arguments) -> Result<(), String> {
@@ -1445,29 +1515,76 @@ fn helper_command(binary: &Path, token: &Path) -> Result<String, String> {
     }
 }
 
-fn setup_url(args: &Arguments) -> Result<reqwest::Url, String> {
-    let mut url = validated_url(args.text("url")?.unwrap_or(DEFAULT_URL))?;
-    if url.scheme() != "http" {
-        return Ok(url);
+struct SetupEndpoint {
+    public_url: reqwest::Url,
+    backend_url: reqwest::Url,
+}
+
+impl SetupEndpoint {
+    fn backend_host_header(&self) -> Result<String, String> {
+        let host = self
+            .backend_url
+            .host_str()
+            .ok_or("backend endpoint has no host")?;
+        let port = self
+            .backend_url
+            .port_or_known_default()
+            .ok_or("backend endpoint has no port")?;
+        Ok(format!("{host}:{port}"))
     }
-    let host = local_setup_host(&url);
-    let port = url.port_or_known_default().unwrap_or(37842);
-    if available_port(host, port)? {
-        return Ok(url);
+}
+
+fn setup_endpoint(args: &Arguments) -> Result<SetupEndpoint, String> {
+    let mut public_url = validated_url(args.text("url")?.unwrap_or(DEFAULT_URL))?;
+    let direct = public_url.scheme() == "http";
+    if direct && public_url.path() != "/mcp" {
+        return Err("Direct HTTP setup uses the server's /mcp path. Use /mcp here; 'access config --url' can select a separately configured proxy path.".into());
     }
-    if args.value("url").is_some() {
-        return Err(format!(
-            "Port {port} is already in use. Existing servers were not changed; choose another loopback port with --url http://127.0.0.1:PORT/mcp."
-        ));
-    }
-    for port in 37843..=37942 {
-        if available_port(host, port)? {
-            url.set_port(Some(port))
-                .map_err(|_| "could not select the setup port")?;
-            return Ok(url);
+    let host = if direct {
+        local_setup_host(&public_url)
+    } else {
+        "127.0.0.1"
+    };
+    let preferred = if direct {
+        public_url
+            .port_or_known_default()
+            .ok_or("setup endpoint has no port")?
+    } else {
+        37842
+    };
+    let port = if available_port(host, preferred)? {
+        preferred
+    } else {
+        if direct && args.value("url").is_some() {
+            return Err(format!(
+                "Port {preferred} is already in use. Existing servers were not changed; choose another loopback port with --url http://127.0.0.1:PORT/mcp."
+            ));
         }
+        let mut selected = None;
+        for candidate in 37843..=37942 {
+            if available_port(host, candidate)? {
+                selected = Some(candidate);
+                break;
+            }
+        }
+        selected.ok_or("No free setup backend port was found; free a loopback port in 37842–37942, or set up a local HTTP endpoint first.")?
+    };
+    if direct {
+        public_url
+            .set_port(Some(port))
+            .map_err(|_| "could not select the setup port")?;
     }
-    Err("No free setup port was found; select one explicitly with --url".into())
+    let authority = if host == "::1" {
+        format!("[::1]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    let backend_url = reqwest::Url::parse(&format!("http://{authority}/mcp"))
+        .map_err(|_| "could not construct the setup backend endpoint")?;
+    Ok(SetupEndpoint {
+        public_url,
+        backend_url,
+    })
 }
 
 fn available_port(host: &str, port: u16) -> Result<bool, String> {
@@ -1727,20 +1844,43 @@ fn validated_url(value: &str) -> Result<reqwest::Url, String> {
     Ok(url)
 }
 
+fn executable_invocation(binary: &Path) -> String {
+    #[cfg(windows)]
+    {
+        format!("& {}", quote_path(binary))
+    }
+    #[cfg(not(windows))]
+    {
+        quote_path(binary)
+    }
+}
+
 fn launch_command(profile: &Path, vault: &Path, url: &str) -> Result<String, String> {
     let url = validated_url(url)?;
-    let port = if url.scheme() == "http" {
-        url.port_or_known_default().unwrap_or(37842)
-    } else {
-        37842
-    };
+    if url.scheme() != "http" || url.path() != "/mcp" {
+        return Err("server launch commands require a loopback HTTP /mcp backend".into());
+    }
+    let port = url
+        .port_or_known_default()
+        .ok_or("backend endpoint has no port")?;
     let binary = std::env::current_exe().map_err(|error| error.to_string())?;
     let host = local_setup_host(&url);
     Ok(format!(
         "{} --http --host {host} --port {port} --access-file {} {}",
-        quote_path(&binary),
+        executable_invocation(&binary),
         quote_path(profile),
         quote_path(vault)
+    ))
+}
+
+fn doctor_command(profile: &Path, token: &Path, url: &reqwest::Url) -> Result<String, String> {
+    let binary = std::env::current_exe().map_err(|error| error.to_string())?;
+    Ok(format!(
+        "{} access doctor --access-file {} --token-file {} --url {}",
+        executable_invocation(&binary),
+        quote_path(profile),
+        quote_path(token),
+        quote(url.as_str())
     ))
 }
 

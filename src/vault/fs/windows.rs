@@ -18,7 +18,7 @@ use windows_sys::Wdk::Storage::FileSystem::{
     FileRenameInformation, FileRenameInformationEx, NtCreateFile, NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_NO_MORE_FILES, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
+    ERROR_NO_MORE_FILES, HANDLE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -38,6 +38,16 @@ fn open_relative(
     disposition: u32,
     options: u32,
 ) -> io::Result<File> {
+    open_relative_handle(parent.as_raw_handle(), name, access, disposition, options)
+}
+
+fn open_relative_handle(
+    parent: HANDLE,
+    name: &OsStr,
+    access: u32,
+    disposition: u32,
+    options: u32,
+) -> io::Result<File> {
     let mut wide: Vec<u16> = name.encode_wide().collect();
     let length = u16::try_from(size_of_val(wide.as_slice())).map_err(io::Error::other)?;
     wide.push(0);
@@ -48,7 +58,7 @@ fn open_relative(
     };
     let attributes = OBJECT_ATTRIBUTES {
         Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
-        RootDirectory: parent.as_raw_handle(),
+        RootDirectory: parent,
         ObjectName: &string,
         Attributes: OBJ_CASE_INSENSITIVE,
         ..Default::default()
@@ -79,6 +89,18 @@ fn open_relative(
     }
     // SAFETY: a successful synchronous NtCreateFile returned one owned handle.
     Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+/// Reopen the retained directory itself. Unlike ReOpenFile, this native call
+/// supports directories and does not resolve an ambient pathname.
+pub(crate) fn reopen_directory(directory: &File, access: u32) -> io::Result<File> {
+    open_relative_handle(
+        directory.as_raw_handle(),
+        OsStr::new(""),
+        access,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE,
+    )
 }
 
 pub(super) fn create_child_dir(parent: &Dir, name: &OsStr) -> io::Result<()> {

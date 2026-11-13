@@ -565,7 +565,7 @@ impl Vault {
         F: FnOnce(Self) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = VaultResult<T>> + Send + 'static,
     {
-        self.check_mutation_scope()?;
+        self.check_mutation_scope().await?;
         let admission = Arc::clone(&self.background.admission).acquire_owned();
         let permit = match deadline {
             Some(deadline) => tokio::time::timeout_at(deadline, admission)
@@ -724,7 +724,7 @@ impl Vault {
     pub async fn storage(&self) -> VaultResult<Storage> {
         if let Some(source) = self.inner.source.get() {
             if self.is_authenticated() {
-                self.check_access_current()?;
+                self.check_access_current_async().await?;
                 return Ok(Storage::Local(self.authenticated_root()?));
             }
             return Ok(source.clone());
@@ -792,6 +792,31 @@ impl Vault {
             ));
         }
         Ok(())
+    }
+
+    /// Run a complete synchronous catalog operation away from async workers
+    /// when refreshing the selected authorized corpus can block on source I/O.
+    pub(crate) async fn catalog_work<T, F>(&self, work: F) -> VaultResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Vault) -> VaultResult<T> + Send + 'static,
+    {
+        let vault = self.clone();
+        if self.is_authenticated() {
+            source_work(move || work(vault)).await
+        } else {
+            work(vault)
+        }
+    }
+
+    async fn require_catalog_async(&self) -> VaultResult<()> {
+        self.catalog_work(|vault| vault.require_catalog()).await
+    }
+
+    #[cfg(has_embeddings)]
+    pub(crate) async fn require_semantic_catalog_async(&self) -> VaultResult<()> {
+        self.catalog_work(|vault| vault.require_semantic_catalog())
+            .await
     }
 
     #[cfg(has_embeddings)]
@@ -1518,12 +1543,26 @@ impl Vault {
     ) -> VaultResult<Vec<PathBuf>> {
         if self.is_authenticated() {
             let folder = Path::new(config.folder.as_deref().unwrap_or(""));
+            let actual = match self.access_canonical_existing(folder).await {
+                Ok(actual) => actual,
+                Err(error) if error.is_not_found() => return Ok(Vec::new()),
+                Err(error) => return Err(error),
+            };
             let files = match self.access_list_files(folder, true, None, true).await {
                 Ok(files) => files,
                 Err(error) if error.is_not_found() => return Ok(Vec::new()),
                 Err(error) => return Err(error),
             };
-            return periodic::filter_recent_paths(config, files, limit);
+            let configured_paths = files
+                .into_iter()
+                .map(|file| {
+                    let suffix = file
+                        .strip_prefix(&actual)
+                        .map_err(|_| VaultError::OutsideVault(file.clone()))?;
+                    path::logical_join(folder, suffix)
+                })
+                .collect::<VaultResult<Vec<_>>>()?;
+            return periodic::filter_recent_paths(config, configured_paths, limit);
         }
         let source = self.storage().await?;
         if let Some(root) = source.local_root() {
@@ -2164,7 +2203,7 @@ impl Vault {
     }
 
     pub async fn get_note_metadata(&self, path: &Path) -> VaultResult<NoteMetadata> {
-        self.require_catalog()?;
+        self.require_catalog_async().await?;
         let actual_path = self.canonical_existing_relative_path(path).await?;
         self.read_index()
             .get_note(&actual_path)
@@ -2222,7 +2261,7 @@ impl Vault {
         fuzzy: bool,
         fields: Option<&[SearchField]>,
     ) -> VaultResult<Vec<SearchResult>> {
-        self.require_catalog()?;
+        self.require_catalog_async().await?;
         if let Some(tv) = self.selected_tantivy() {
             return self
                 .tantivy_search_with_context(tv, query, context_len, max_results, fuzzy, fields)
@@ -2275,7 +2314,7 @@ impl Vault {
         context_len: usize,
         limit: Option<usize>,
     ) -> VaultResult<Vec<SearchResult>> {
-        self.require_catalog()?;
+        self.require_catalog_async().await?;
         if pattern.len() > 1000 {
             return Err(VaultError::InvalidRegex {
                 pattern: pattern.into(),
@@ -2644,7 +2683,7 @@ impl Vault {
     }
 
     pub async fn backlinks(&self, path: &Path) -> VaultResult<Vec<NoteMetadata>> {
-        self.require_catalog()?;
+        self.require_catalog_async().await?;
         let actual_path = self.canonical_existing_relative_path(path).await?;
         Ok(self
             .read_index()
@@ -2655,7 +2694,7 @@ impl Vault {
     }
 
     pub async fn outgoing_links(&self, path: &Path) -> VaultResult<Vec<WikiLink>> {
-        self.require_catalog()?;
+        self.require_catalog_async().await?;
         let actual_path = self.canonical_existing_relative_path(path).await?;
         Ok(self
             .read_index()
@@ -2702,7 +2741,16 @@ impl Vault {
     }
 
     /// Validate that a relative path doesn't escape the vault root.
+    /// Authenticated views validate caller syntax here; source operations check
+    /// authority and physical containment without observing hidden paths first.
     pub async fn validate_path(&self, path: &Path) -> VaultResult<()> {
+        if self.is_authenticated() {
+            let normalized = path::normalize_relative(path)?;
+            path::VaultPath::parse(normalized.to_str().ok_or_else(|| {
+                VaultError::InvalidPath("vault-relative paths must be UTF-8".into())
+            })?)?;
+            return Ok(());
+        }
         self.storage().await?.resolve_for_write(path).await?;
         Ok(())
     }
@@ -2798,7 +2846,7 @@ impl Vault {
         fuzzy: bool,
         fields: Option<&[SearchField]>,
     ) -> VaultResult<Vec<SearchResult>> {
-        self.require_catalog()?;
+        self.require_catalog_async().await?;
         let tv = Arc::clone(tv);
         let search_query = query.to_owned();
         let fields = fields.map(<[SearchField]>::to_vec);
@@ -2992,8 +3040,8 @@ impl Vault {
         Ok(results)
     }
 
-    fn check_mutation_scope(&self) -> VaultResult<()> {
-        self.check_access_current()?;
+    async fn check_mutation_scope(&self) -> VaultResult<()> {
+        self.check_access_current_async().await?;
         if self.read_scope.is_some() {
             return Err(VaultError::Other(
                 "private memory scope is read-only".into(),
@@ -3003,9 +3051,9 @@ impl Vault {
     }
 
     async fn lock_mutations(&self) -> VaultResult<tokio::sync::MutexGuard<'_, ()>> {
-        self.check_mutation_scope()?;
+        self.check_mutation_scope().await?;
         let lock = self.inner.mutations.lock().await;
-        self.check_mutation_scope()?;
+        self.check_mutation_scope().await?;
         Ok(lock)
     }
 

@@ -557,6 +557,10 @@ impl AuthorizedClient {
         self.permit().map(drop)
     }
 
+    pub async fn current_async(&self) -> AccessResult<()> {
+        self.permit_async().await.map(drop)
+    }
+
     pub fn check(&self, action: AccessAction, requested: &Path, actual: &Path) -> AccessResult<()> {
         self.permit()?.check(action, requested, actual)
     }
@@ -566,6 +570,19 @@ impl AuthorizedClient {
     }
     pub fn try_permit(&self) -> AccessResult<AccessPermit> {
         self.acquire(true)
+    }
+
+    /// Wait for policy publication without blocking an async runtime worker.
+    /// The returned permit still belongs only around synchronous work.
+    pub async fn permit_async(&self) -> AccessResult<AccessPermit> {
+        loop {
+            match self.try_permit() {
+                Err(AccessError::Busy) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                result => return result,
+            }
+        }
     }
 
     fn acquire(&self, nonblocking: bool) -> AccessResult<AccessPermit> {
@@ -1320,6 +1337,32 @@ mod tests {
         assert!(matches!(client.try_permit(), Err(AccessError::Busy)));
         drop(writer);
         assert!(client.try_permit().is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_admission_allows_the_runtime_to_release_a_policy_writer() {
+        let fixture = Fixture::new();
+        let client = fixture.issue();
+        let writer = fixture.store.lock(true, false).unwrap();
+        let (release, released) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            // A blocking regression must fail without hanging the test runner.
+            let _ = released.recv_timeout(Duration::from_secs(1));
+            drop(writer);
+        });
+        let admission = client.current_async();
+        tokio::pin!(admission);
+        tokio::select! {
+            result = &mut admission => panic!("admission bypassed the policy writer: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => release.send(()).unwrap(),
+        }
+        tokio::time::timeout(Duration::from_secs(1), admission)
+            .await
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        // current_async must drop its shared permit before returning.
+        assert!(fixture.store.lock(true, true).is_ok());
     }
 
     #[test]

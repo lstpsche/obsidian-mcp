@@ -659,12 +659,6 @@ impl ObsidianMcp {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for ObsidianMcp {
-    // HTTP schema validation is shared by tool name across all principals. Its
-    // canonical definitions must not depend on which client primes that cache.
-    fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
-        Self::tool_router().get(name).cloned()
-    }
-
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
@@ -684,7 +678,7 @@ impl ServerHandler for ObsidianMcp {
             .find(|name| *name == request.name.as_ref())
             .unwrap_or("unknown");
         let action = invocation_action(tool, request.arguments.as_ref());
-        let router = self.authorized_router(&client, &context)?;
+        let router = self.authorized_router(&client, &context).await?;
         let vault = self.vault.clone();
         let request_client = client.clone();
         let vault = tokio::task::spawn_blocking(move || vault.with_access(request_client))
@@ -738,7 +732,8 @@ impl ServerHandler for ObsidianMcp {
         // Results can outlive source/provider waits. HTTP additionally checks at
         // actual outbound frame publication; stdio checks here before handoff.
         let _permit = client
-            .permit()
+            .permit_async()
+            .await
             .map_err(|error| ErrorData::from(VaultError::from(error)))?;
         result.map_err(authenticated_error)
     }
@@ -750,17 +745,21 @@ impl ServerHandler for ObsidianMcp {
     ) -> Result<rmcp::model::ListToolsResult, ErrorData> {
         let client = self.request_client(&context)?;
         let router = match &client {
-            Some(client) => self.authorized_router(client, &context)?,
+            Some(client) => self.authorized_router(client, &context).await?,
             None => self.tool_router.clone(),
         };
         let modern = context
             .protocol_version()
             .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
-        let _permit = client
-            .as_ref()
-            .map(AuthorizedClient::permit)
-            .transpose()
-            .map_err(|error| ErrorData::from(VaultError::from(error)))?;
+        let _permit = match &client {
+            Some(client) => Some(
+                client
+                    .permit_async()
+                    .await
+                    .map_err(|error| ErrorData::from(VaultError::from(error)))?,
+            ),
+            None => None,
+        };
         Ok(rmcp::model::ListToolsResult {
             result_type: Some(rmcp::model::ResultType::COMPLETE),
             tools: router.list_all(),
@@ -845,13 +844,14 @@ impl ObsidianMcp {
         })
     }
 
-    fn authorized_router(
+    async fn authorized_router(
         &self,
         client: &AuthorizedClient,
         context: &rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<ToolRouter<Self>, ErrorData> {
         let permit = client
-            .permit()
+            .permit_async()
+            .await
             .map_err(|error| ErrorData::from(VaultError::from(error)))?;
         let policy = permit.policy();
         let mut router = self.tool_router.clone();
@@ -874,7 +874,7 @@ impl ObsidianMcp {
             let filter = filter
                 .to_str()
                 .map_err(|_| ErrorData::invalid_params("Invalid X-Obsidian-Tools header", None))?;
-            for name in crate::config::ToolFilter::parse(filter)
+            for name in crate::config::ToolFilter::parse_authenticated(filter)
                 .map_err(|_| ErrorData::invalid_params("Invalid X-Obsidian-Tools filter", None))?
                 .disabled_tools()
             {

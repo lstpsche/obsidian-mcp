@@ -13,7 +13,11 @@ fn binary() -> PathBuf {
 }
 
 fn command() -> Command {
-    let mut command = Command::new(binary());
+    command_at(&binary())
+}
+
+fn command_at(executable: &Path) -> Command {
+    let mut command = Command::new(executable);
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
         if name.starts_with("OBSIDIAN_") || name.starts_with("OPENAI_") {
@@ -649,10 +653,20 @@ fn setup_rejects_an_ephemeral_client_url_before_creating_state() {
 #[test]
 fn ipv6_setup_keeps_the_generated_server_and_client_endpoint_consistent() {
     let fixture = Fixture::new();
-    let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
+    // A released :0 port can be reused by parallel outgoing connections before
+    // setup probes it. Keep this fixture below automatic client-port ranges.
+    let listener = (10000u16..10100)
+        .find_map(
+            |port| match std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)) {
+                Ok(listener) => Some(listener),
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => None,
+                Err(error) => panic!("could not reserve IPv6 setup fixture port: {error}"),
+            },
+        )
+        .expect("a private IPv6 fixture port should be available");
     let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    let output = command()
+    let mut process = command();
+    process
         .arg("setup")
         .arg(&fixture.vault)
         .arg("--access-file")
@@ -665,9 +679,9 @@ fn ipv6_setup_keeps_the_generated_server_and_client_endpoint_consistent() {
             "--url",
             &format!("http://[::1]:{port}/mcp"),
             "--dry-run",
-        ])
-        .output()
-        .unwrap();
+        ]);
+    drop(listener);
+    let output = process.output().unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -730,4 +744,362 @@ fn stdio_setup_preview_uses_client_started_process_instructions() {
     assert!(!text.contains("--http"));
     assert!(!text.contains("http://"));
     assert!(!fixture.profile.parent().unwrap().exists());
+}
+
+fn preview_paths(fixture: &Fixture, client: &str, provider: &str) -> Vec<String> {
+    let result = success(
+        fixture
+            .command()
+            .args(["preview", client, "--json"])
+            .env("OBSIDIAN_EMBEDDINGS", "true")
+            .env("OBSIDIAN_EMBEDDING_PROVIDER", "api")
+            .env("OBSIDIAN_EMBEDDING_API_BASE", provider)
+            .env("OBSIDIAN_EMBEDDING_API_MODEL", "text-embedding-3-small")
+            .env("OBSIDIAN_EMBEDDING_API_KEY", "synthetic-provider-key")
+            .output()
+            .unwrap(),
+    );
+    result["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn preview_lists_regular_files_for_directory_whole_vault_and_exact_file_grants() {
+    let fixture = Fixture::new();
+    std::fs::create_dir_all(fixture.vault.join("Shared/nested/empty")).unwrap();
+    std::fs::write(fixture.vault.join("Shared/nested/other.md"), "another note").unwrap();
+    std::fs::write(fixture.vault.join("Shared/attachment.bin"), b"attachment").unwrap();
+    std::fs::write(fixture.vault.join("root.md"), "root note").unwrap();
+    fixture.initialize();
+    fixture.add("shared", false);
+    success(
+        fixture
+            .command()
+            .args([
+                "client",
+                "add",
+                "whole",
+                "--directory",
+                "",
+                "--deny-directory",
+                "Private",
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+    success(
+        fixture
+            .command()
+            .args([
+                "client",
+                "add",
+                "exact",
+                "--file",
+                "Shared/note.md",
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+    let provider = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    provider.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/v1", provider.local_addr().unwrap());
+    let shared = vec![
+        "Shared/attachment.bin",
+        "Shared/nested/other.md",
+        "Shared/note.md",
+    ];
+    assert_eq!(preview_paths(&fixture, "shared", &url), shared);
+    let mut whole = shared.clone();
+    whole.push("root.md");
+    assert_eq!(preview_paths(&fixture, "whole", &url), whole);
+    assert_eq!(preview_paths(&fixture, "exact", &url), ["Shared/note.md"]);
+    assert!(!fixture.vault.join(".obsidian-mcp").exists());
+    assert_eq!(
+        provider.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn preview_omits_unsafe_aliases_and_hardlinks_without_losing_permitted_files() {
+    let fixture = Fixture::new();
+    let external = fixture._directory.path().join("outside.md");
+    std::fs::write(&external, "outside source").unwrap();
+    std::fs::create_dir_all(fixture.vault.join("Shared/nested")).unwrap();
+    std::os::unix::fs::symlink("note.md", fixture.vault.join("Shared/allowed.md")).unwrap();
+    std::os::unix::fs::symlink(
+        "../Private/secret.md",
+        fixture.vault.join("Shared/denied.md"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("missing.md", fixture.vault.join("Shared/dangling.md")).unwrap();
+    std::os::unix::fs::symlink(&external, fixture.vault.join("Shared/outside.md")).unwrap();
+    std::os::unix::fs::symlink("nested", fixture.vault.join("Shared/directory-alias")).unwrap();
+    std::fs::hard_link(&external, fixture.vault.join("Shared/hardlink.md")).unwrap();
+    fixture.initialize();
+    fixture.add("reader", false);
+    let paths = preview_paths(&fixture, "reader", "http://127.0.0.1:1/v1");
+    assert_eq!(paths, ["Shared/allowed.md", "Shared/note.md"]);
+    assert!(!fixture.vault.join(".obsidian-mcp").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn preview_preserves_a_real_read_permission_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize();
+    fixture.add("reader", false);
+    let note = fixture.vault.join("Shared/note.md");
+    std::fs::set_permissions(&note, std::fs::Permissions::from_mode(0)).unwrap();
+    let output = fixture
+        .command()
+        .args(["preview", "reader", "--json"])
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&note, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .to_ascii_lowercase()
+            .contains("permission denied")
+    );
+}
+
+struct OccupiedDefaultBackend {
+    _serial: std::sync::MutexGuard<'static, ()>,
+    listener: Option<std::net::TcpListener>,
+}
+
+fn occupy_default_backend() -> OccupiedDefaultBackend {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let serial = SERIAL.lock().unwrap();
+    let listener = match std::net::TcpListener::bind("127.0.0.1:37842") {
+        Ok(listener) => Some(listener),
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => None,
+        Err(error) => panic!("could not qualify the default loopback port: {error}"),
+    };
+    OccupiedDefaultBackend {
+        _serial: serial,
+        listener,
+    }
+}
+
+#[test]
+fn https_setup_preserves_public_route_and_selects_a_separate_free_backend() {
+    let listener = occupy_default_backend();
+    let fixture = Fixture::new();
+    let out = fixture.profile.parent().unwrap().join("https-client.json");
+    let public = "https://notes.example.test/assistant/mcp";
+    let result = success(
+        command()
+            .arg("setup")
+            .arg(&fixture.vault)
+            .arg("--access-file")
+            .arg(&fixture.profile)
+            .args([
+                "--name",
+                "assistant",
+                "--directory",
+                "Shared",
+                "--client",
+                "claude-code",
+                "--url",
+                public,
+                "--out",
+            ])
+            .arg(&out)
+            .arg("--json")
+            .output()
+            .unwrap(),
+    );
+    let backend = reqwest::Url::parse(result["backend_url"].as_str().unwrap()).unwrap();
+    let port = backend.port().unwrap();
+    assert_ne!(port, 37842);
+    assert_eq!(backend.scheme(), "http");
+    assert_eq!(backend.host_str(), Some("127.0.0.1"));
+    assert_eq!(backend.path(), "/mcp");
+    assert_eq!(result["url"], public);
+    assert_eq!(result["proxy_upstream"], backend.as_str());
+    assert_eq!(result["proxy_host_header"], format!("127.0.0.1:{port}"));
+    assert!(
+        result["server_command"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("--host 127.0.0.1 --port {port}"))
+    );
+    assert!(
+        result["doctor_command"]
+            .as_str()
+            .unwrap()
+            .contains(backend.as_str())
+    );
+    assert!(
+        result["public_doctor_command"]
+            .as_str()
+            .unwrap()
+            .contains(public)
+    );
+    let configuration: Value = serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
+    assert_eq!(configuration["mcpServers"]["assistant"]["url"], public);
+    if listener.listener.is_some() {
+        assert_eq!(
+            std::net::TcpListener::bind("127.0.0.1:37842")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+    }
+}
+
+#[test]
+fn https_setup_preview_prints_its_selected_upstream_and_both_connection_checks() {
+    let _listener = occupy_default_backend();
+    let fixture = Fixture::new();
+    let public = "https://notes.example.test/assistant/mcp";
+    let output = command()
+        .arg("setup")
+        .arg(&fixture.vault)
+        .arg("--access-file")
+        .arg(&fixture.profile)
+        .args([
+            "--name",
+            "assistant",
+            "--directory",
+            "Shared",
+            "--url",
+            public,
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    let launch = text
+        .lines()
+        .find(|line| line.contains(" --http --host "))
+        .unwrap();
+    let port = launch
+        .split_once("--port ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .next()
+        .unwrap();
+    assert_ne!(port, "37842");
+    let backend = format!("http://127.0.0.1:{port}/mcp");
+    assert!(text.contains(&format!(
+        "Route your HTTPS proxy's {public} endpoint to {backend}"
+    )));
+    assert!(text.contains(&format!("forward Host as 127.0.0.1:{port}")));
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("Check the backend:") && line.contains(&backend))
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.contains("check its public endpoint:") && line.contains(public))
+    );
+    assert!(!fixture.profile.parent().unwrap().exists());
+}
+
+#[test]
+fn explicit_http_setup_does_not_reuse_an_occupied_listener() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let fixture = Fixture::new();
+    let output = command()
+        .arg("setup")
+        .arg(&fixture.vault)
+        .arg("--access-file")
+        .arg(&fixture.profile)
+        .args([
+            "--name",
+            "assistant",
+            "--directory",
+            "Shared",
+            "--url",
+            &endpoint,
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("already in use"));
+    assert!(!fixture.profile.parent().unwrap().exists());
+    assert_eq!(
+        std::net::TcpListener::bind(listener.local_addr().unwrap())
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+}
+
+#[test]
+fn direct_http_setup_rejects_a_path_that_the_server_does_not_serve() {
+    let fixture = Fixture::new();
+    let output = command()
+        .arg("setup")
+        .arg(&fixture.vault)
+        .arg("--access-file")
+        .arg(&fixture.profile)
+        .args([
+            "--name",
+            "assistant",
+            "--directory",
+            "Shared",
+            "--url",
+            "http://127.0.0.1:37842/not-mcp",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("server's /mcp path"));
+    assert!(!fixture.profile.parent().unwrap().exists());
+}
+
+#[test]
+fn printed_launch_invokes_an_executable_path_with_spaces_for_the_native_shell() {
+    let fixture = Fixture::new();
+    let directory = fixture._directory.path().join("binary with spaces");
+    std::fs::create_dir(&directory).unwrap();
+    let executable = directory.join(format!("obsidian-mcp{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(binary(), &executable).unwrap();
+    let output = command_at(&executable)
+        .arg("init")
+        .arg(&fixture.vault)
+        .arg("--access-file")
+        .arg(&fixture.profile)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    let launch = text
+        .lines()
+        .find(|line| line.contains(" --http --host "))
+        .unwrap();
+    assert!(launch.contains("binary with spaces"));
+    #[cfg(windows)]
+    assert!(launch.starts_with("& '"), "{launch}");
+    #[cfg(not(windows))]
+    assert!(launch.starts_with('\''), "{launch}");
 }

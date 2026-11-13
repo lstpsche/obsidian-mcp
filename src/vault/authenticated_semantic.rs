@@ -62,13 +62,19 @@ impl ActivatedClient {
     }
 }
 
+#[derive(Default)]
+struct SemanticRevisions {
+    generation: Option<u64>,
+    notes: HashMap<OsString, String>,
+}
+
 struct SemanticEntry {
     source: Weak<VaultInner>,
     root: VaultRoot,
     projection: Arc<AuthorizedProjection>,
     holders: Mutex<HashMap<String, ActivatedClient>>,
     runtime: OnceLock<EmbeddingRuntime>,
-    revisions: Mutex<HashMap<OsString, String>>,
+    revisions: Mutex<SemanticRevisions>,
     last_error: Mutex<Option<String>>,
     diagnostic_id: String,
 }
@@ -105,7 +111,7 @@ impl SemanticEntry {
             permit.check(Action::Read, path, path)?;
             drop(permit);
             let actual = self.root.resolve_existing(path)?.relative;
-            self.root.validate_access_file(&actual)?;
+            self.root.validate_access_file_exact(&actual)?;
             let (_, permit) = self.holder()?;
             permit.check(Action::Read, path, &actual)?;
             return Ok(Box::new(permit));
@@ -121,6 +127,21 @@ impl SemanticEntry {
             .source
             .upgrade()
             .ok_or_else(|| authorization_error("semantic source owner has stopped"))?;
+        let mut previous = self
+            .revisions
+            .lock()
+            .map_err(|_| authorization_error("semantic revision state is unavailable"))?;
+        let generation = source
+            .index
+            .read()
+            .map_err(|_| authorization_error("semantic source lock is unavailable"))?
+            .generation();
+        if !retry_unpublished
+            && previous.generation == Some(generation)
+            && self.projection.is_ready()
+        {
+            return Ok(());
+        }
         let config = source
             .authenticated_config
             .as_ref()
@@ -135,7 +156,7 @@ impl SemanticEntry {
                     permit.check(Action::Read, path, path)?;
                     drop(permit);
                     let actual = self.root.resolve_existing(path)?.relative;
-                    self.root.validate_access_file(&actual)?;
+                    self.root.validate_access_file_exact(&actual)?;
                     holder.permit()?.check(Action::Read, path, &actual)?;
                     let raw = self
                         .root
@@ -144,32 +165,33 @@ impl SemanticEntry {
                     permit.check(Action::Read, path, &actual)?;
                     Ok(raw)
                 })?;
-        let current = projection
+        let index = projection
             .index
             .read()
-            .map_err(|_| authorization_error("semantic projection lock is unavailable"))?
-            .authorized_snapshot(|_| true)?
-            .revisions;
-        let mut previous = self
-            .revisions
-            .lock()
-            .map_err(|_| authorization_error("semantic revision state is unavailable"))?;
+            .map_err(|_| authorization_error("semantic projection lock is unavailable"))?;
+        let current = index.source_revisions_snapshot()?;
+        drop(index);
         if let Some(runtime) = self.runtime.get() {
             for (path, revision) in &current {
-                if previous.get(path) != Some(revision)
+                if previous.notes.get(path) != Some(revision)
                     || (retry_unpublished
                         && !runtime.has_current_or_pending(Path::new(path), revision))
                 {
                     runtime.submit_upsert(Path::new(path));
                 }
             }
-            for path in previous.keys() {
+            for path in previous.notes.keys() {
                 if !current.contains_key(path) {
                     runtime.submit(Path::new(path), PendingKind::Remove);
                 }
             }
         }
-        *previous = current;
+        *previous = SemanticRevisions {
+            // Source changes outside this corpus can leave its projection
+            // generation unchanged. Remember the source observation instead.
+            generation: Some(generation),
+            notes: current,
+        };
         Ok(())
     }
 
@@ -495,12 +517,15 @@ impl AuthenticatedSemanticRegistry {
             .join(cache_key(vault, client))
             .join("embeddings.bin");
         let cache = CacheFile::new(cache_root, relative);
-        let initial_revisions = projection
+        let index = projection
             .index
             .read()
-            .map_err(|_| authorization_error("semantic projection lock is unavailable"))?
-            .authorized_snapshot(|_| true)?
-            .revisions;
+            .map_err(|_| authorization_error("semantic projection lock is unavailable"))?;
+        let initial_revisions = SemanticRevisions {
+            generation: Some(index.generation()),
+            notes: index.source_revisions_snapshot()?,
+        };
+        drop(index);
         let entry = Arc::new(SemanticEntry {
             source: Arc::downgrade(&vault.inner),
             root: root.clone(),
@@ -626,7 +651,7 @@ impl Vault {
                 permit.check(Action::Read, path, path)?;
                 drop(permit);
                 let actual = root.resolve_existing(path)?.relative;
-                root.validate_access_file(&actual)?;
+                root.validate_access_file_exact(&actual)?;
                 let permit = client.permit()?;
                 permit.check(Action::Read, path, &actual)?;
                 return Ok(Box::new(permit));
@@ -683,8 +708,7 @@ mod tests {
     use super::*;
     use crate::access::clients::{ClientPolicy, Grant, Role};
 
-    #[tokio::test]
-    async fn stale_retirement_cannot_remove_a_replacement_or_revalidated_owner() {
+    async fn reader_fixture() -> (tempfile::TempDir, AccessStore, Vault, AuthorizedClient) {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("vault");
         std::fs::create_dir(&root).unwrap();
@@ -720,6 +744,58 @@ mod tests {
             .unwrap()
             .with_access(client.clone())
             .unwrap();
+        (directory, store, vault, client)
+    }
+
+    #[tokio::test]
+    async fn idle_reconciliation_skips_projection_snapshots_but_checks_live_authority() {
+        let (_directory, store, vault, client) = reader_fixture().await;
+        let projection = Arc::clone(vault.projection.as_ref().unwrap());
+        let generation = vault.inner.index.read().unwrap().generation();
+        let entry = Arc::new(SemanticEntry {
+            source: Arc::downgrade(&vault.inner),
+            root: vault.authenticated_root().unwrap(),
+            projection: Arc::clone(&projection),
+            holders: Mutex::new(HashMap::from([(
+                client.client_id().into(),
+                ActivatedClient::from_client(&client),
+            )])),
+            runtime: OnceLock::new(),
+            revisions: Mutex::new(SemanticRevisions {
+                generation: Some(generation),
+                notes: HashMap::new(),
+            }),
+            last_error: Mutex::new(None),
+            diagnostic_id: "idle-fixture".into(),
+        });
+        // The unchanged pass must not need even a projection read lock. Holding
+        // it distinguishes the generation fast path from snapshot-and-compare.
+        let projection_guard = projection.index.write().unwrap();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let worker_entry = Arc::clone(&entry);
+        let worker = std::thread::spawn(move || {
+            finished_tx.send(worker_entry.reconcile(false)).unwrap();
+        });
+        let result = finished_rx.recv_timeout(Duration::from_secs(1));
+        drop(projection_guard);
+        worker.join().unwrap();
+        result
+            .expect("idle pass must skip the projection snapshot")
+            .unwrap();
+        // Explicit activation keeps its repair pass even without source edits.
+        entry.reconcile(true).unwrap();
+        store
+            .update(None, |policy| {
+                policy.clients.get_mut("reader").unwrap().enabled = false;
+                Ok(())
+            })
+            .unwrap();
+        assert!(entry.reconcile(false).is_err());
+    }
+
+    #[tokio::test]
+    async fn stale_retirement_cannot_remove_a_replacement_or_revalidated_owner() {
+        let (_directory, store, vault, client) = reader_fixture().await;
         let make_entry = || {
             Arc::new(SemanticEntry {
                 source: Arc::downgrade(&vault.inner),
@@ -727,7 +803,7 @@ mod tests {
                 projection: Arc::clone(vault.projection.as_ref().unwrap()),
                 holders: Mutex::new(HashMap::new()),
                 runtime: OnceLock::new(),
-                revisions: Mutex::new(HashMap::new()),
+                revisions: Mutex::new(SemanticRevisions::default()),
                 last_error: Mutex::new(None),
                 diagnostic_id: "retirement-fixture".into(),
             })

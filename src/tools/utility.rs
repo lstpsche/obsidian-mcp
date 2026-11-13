@@ -118,7 +118,21 @@ async fn embedding_info(vault: &Vault, runtime: &SemanticRuntime) -> EmbeddingIn
     if vault.is_remote() || runtime.uses_local_backend() {
         #[cfg(has_embeddings)]
         {
-            let status = vault.embedding_status().map(|status| EmbeddingSnapshot {
+            let status = match vault
+                .catalog_work(|vault| Ok(vault.embedding_status()))
+                .await
+            {
+                Ok(status) => status,
+                Err(error) => {
+                    return EmbeddingInfo {
+                        source: EmbeddingSource::Local,
+                        availability: EmbeddingAvailability::Unavailable,
+                        status: None,
+                        error: Some(error.to_string()),
+                    };
+                }
+            };
+            let status = status.map(|status| EmbeddingSnapshot {
                 phase: match status.phase {
                     crate::vault::embedding_runtime::EmbeddingPhase::Warming => {
                         SemanticPhase::Warming
@@ -215,7 +229,7 @@ pub async fn vault_info(
     runtime: &SemanticRuntime,
     _params: VaultInfoParams,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    let stats = vault.vault_stats();
+    let stats = vault.catalog_work(|vault| vault.vault_stats()).await;
     let source = vault.source_status();
     let vault_name = crate::vault::path::logical_file_name(vault.root())
         .unwrap_or_default()

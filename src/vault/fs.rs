@@ -6,9 +6,9 @@ mod windows;
 pub use root::VaultRoot;
 pub(crate) use root::is_link;
 #[cfg(windows)]
-pub(crate) use windows::dir_entries;
-#[cfg(windows)]
 use windows::{create_child_dir, remove_entry};
+#[cfg(windows)]
+pub(crate) use windows::{dir_entries, reopen_directory};
 
 use std::ffi::OsStr;
 use std::fs::File;

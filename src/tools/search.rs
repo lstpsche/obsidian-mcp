@@ -135,9 +135,9 @@ pub async fn search_metadata(
     let search_type = params.search_type.as_str();
 
     if search_type.eq_ignore_ascii_case("tag") {
-        search_metadata_tag(vault, &params)
+        search_metadata_tag(vault, &params).await
     } else if search_type.eq_ignore_ascii_case("frontmatter") {
-        search_metadata_frontmatter(vault, &params)
+        search_metadata_frontmatter(vault, &params).await
     } else {
         Err(rmcp::ErrorData::new(
             ErrorCode::INVALID_PARAMS,
@@ -147,7 +147,7 @@ pub async fn search_metadata(
     }
 }
 
-fn search_metadata_tag(
+async fn search_metadata_tag(
     vault: &Vault,
     params: &SearchMetadataParams,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
@@ -158,52 +158,64 @@ fn search_metadata_tag(
             None::<serde_json::Value>,
         )
     })?;
-    let tag = tag.strip_prefix('#').unwrap_or(tag);
+    let tag = tag.strip_prefix('#').unwrap_or(tag).to_owned();
     let include_nested = params.include_nested.unwrap_or(true);
 
-    let results = if include_nested {
-        vault.search_by_tag_prefix(tag)?
-    } else {
-        vault.search_by_tag(tag)?
-    };
+    let results = vault
+        .catalog_work(move |vault| {
+            if include_nested {
+                vault.search_by_tag_prefix(&tag)
+            } else {
+                vault.search_by_tag(&tag)
+            }
+        })
+        .await?;
 
     super::output::results(results)
 }
 
-fn search_metadata_frontmatter(
+async fn search_metadata_frontmatter(
     vault: &Vault,
     params: &SearchMetadataParams,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    let field = params.field.as_deref().ok_or_else(|| {
-        rmcp::ErrorData::new(
-            ErrorCode::INVALID_PARAMS,
-            "'field' is required when type is \"frontmatter\"",
-            None::<serde_json::Value>,
-        )
-    })?;
+    let field = params
+        .field
+        .as_deref()
+        .ok_or_else(|| {
+            rmcp::ErrorData::new(
+                ErrorCode::INVALID_PARAMS,
+                "'field' is required when type is \"frontmatter\"",
+                None::<serde_json::Value>,
+            )
+        })?
+        .to_owned();
     let operator = params.operator.clone().unwrap_or_default();
 
     let results = match operator {
-        FrontmatterOperator::Exists => vault.search_frontmatter_exists(field)?,
-        FrontmatterOperator::Eq => {
-            let value = params.value.as_ref().ok_or_else(|| {
-                rmcp::ErrorData::new(
-                    ErrorCode::INVALID_PARAMS,
-                    "'value' is required for 'eq' operator",
-                    None::<serde_json::Value>,
-                )
-            })?;
-            vault.search_frontmatter(field, value)?
+        FrontmatterOperator::Exists => {
+            vault
+                .catalog_work(move |vault| vault.search_frontmatter_exists(&field))
+                .await?
         }
-        FrontmatterOperator::Contains => {
-            let value = params.value.as_ref().ok_or_else(|| {
+        FrontmatterOperator::Eq | FrontmatterOperator::Contains => {
+            let contains = matches!(operator, FrontmatterOperator::Contains);
+            let value = params.value.clone().ok_or_else(|| {
+                let name = if contains { "contains" } else { "eq" };
                 rmcp::ErrorData::new(
                     ErrorCode::INVALID_PARAMS,
-                    "'value' is required for 'contains' operator",
+                    format!("'value' is required for '{name}' operator"),
                     None::<serde_json::Value>,
                 )
             })?;
-            vault.search_frontmatter_contains(field, value)?
+            vault
+                .catalog_work(move |vault| {
+                    if contains {
+                        vault.search_frontmatter_contains(&field, &value)
+                    } else {
+                        vault.search_frontmatter(&field, &value)
+                    }
+                })
+                .await?
         }
     };
 
@@ -300,16 +312,19 @@ pub async fn search_semantic(
         } else {
             result
         }
-    }
-    .map_err(|error| {
-        if vault.is_authenticated() {
-            authenticated_semantic_tool_error(vault, error)
-        } else if vault.is_scoped() {
-            scoped_semantic_tool_error(error)
-        } else {
-            to_semantic_tool_error(error)
+    };
+    let results = match results {
+        Ok(results) => results,
+        Err(error) => {
+            return Err(if vault.is_authenticated() {
+                authenticated_semantic_tool_error(vault, error).await
+            } else if vault.is_scoped() {
+                scoped_semantic_tool_error(error)
+            } else {
+                to_semantic_tool_error(error)
+            });
         }
-    })?;
+    };
 
     super::output::results(results)
 }
@@ -334,7 +349,9 @@ async fn search_semantic_daemon(
         .attachments
         .handle(vault, client, &runtime.local_fallback_active, None)
         .await?;
-    let allowed_paths = vault.indexed_paths();
+    let allowed_paths = vault
+        .catalog_work(|vault| Ok(vault.indexed_paths()))
+        .await?;
     let hybrid = lexical_prefetch.then_some((runtime.prefetch_count.max(top_k), alpha));
     let query = async |attachment: &crate::client::semantic_daemon::VaultAttachment| {
         client
@@ -409,7 +426,9 @@ async fn search_semantic_local(
     let scoring_vault = vault.clone();
     let scoring_query = query.to_owned();
     let hits = tokio::task::spawn_blocking(move || {
-        scoring_vault.activate_embeddings();
+        if !scoring_vault.is_authenticated() {
+            scoring_vault.activate_embeddings();
+        }
         if lexical_prefetch {
             scoring_vault.search_hybrid_ranked(
                 &scoring_query,
@@ -450,7 +469,7 @@ async fn search_semantic_local(
     };
     // Source context acquisition may discover that the authority which admitted
     // these observations has changed. Ordinary outages can still return hits.
-    vault.require_semantic_catalog()?;
+    vault.require_semantic_catalog_async().await?;
     for result in &results {
         vault
             .check_result_revision(&result.path, &result.source_revision)
@@ -515,7 +534,7 @@ fn scoped_semantic_tool_error(error: VaultError) -> rmcp::ErrorData {
     )
 }
 
-fn authenticated_semantic_tool_error(vault: &Vault, error: VaultError) -> rmcp::ErrorData {
+async fn authenticated_semantic_tool_error(vault: &Vault, error: VaultError) -> rmcp::ErrorData {
     if matches!(
         error,
         VaultError::EmbeddingInputTooLong { .. }
@@ -526,15 +545,25 @@ fn authenticated_semantic_tool_error(vault: &Vault, error: VaultError) -> rmcp::
         return error.into();
     }
     #[cfg(has_embeddings)]
-    if vault.embedding_status().is_some_and(|status| {
-        status.phase == crate::vault::embedding_runtime::EmbeddingPhase::Warming
-            && !status.queryable
-    }) {
-        return rmcp::ErrorData::new(
-            ErrorCode::INVALID_REQUEST,
-            "Semantic search is warming; retry shortly",
-            Some(serde_json::json!({"code": "semantic_warming"})),
-        );
+    match vault
+        .catalog_work(|vault| Ok(vault.embedding_status()))
+        .await
+    {
+        Ok(Some(status))
+            if status.phase == crate::vault::embedding_runtime::EmbeddingPhase::Warming
+                && !status.queryable =>
+        {
+            return rmcp::ErrorData::new(
+                ErrorCode::INVALID_REQUEST,
+                "Semantic search is warming; retry shortly",
+                Some(serde_json::json!({"code": "semantic_warming"})),
+            );
+        }
+        Err(error) => tracing::warn!(
+            error_category = error.diagnostic_category(),
+            "authenticated semantic status worker failed"
+        ),
+        _ => {}
     }
     #[cfg(not(has_embeddings))]
     let _ = vault;
@@ -566,6 +595,71 @@ mod tests {
     use serde_json::json;
     #[cfg(unix)]
     use tokio::io::{AsyncWriteExt, BufReader};
+
+    #[cfg(has_embeddings)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticated_semantic_error_status_does_not_block_on_a_policy_writer() {
+        use crate::access::clients::{ClientPolicy, Grant, Role};
+        use crate::access::store::AccessStore;
+        use std::time::{Duration, Instant};
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("vault");
+        std::fs::create_dir(&root).unwrap();
+        let data = directory.path().join("private/data");
+        let store =
+            AccessStore::initialize(&directory.path().join("private/access.json"), &root, &data)
+                .unwrap();
+        store
+            .update(None, |policy| {
+                policy.clients.insert(
+                    "reader".into(),
+                    ClientPolicy {
+                        grants: vec![Grant {
+                            id: "root-read".into(),
+                            directory: Some(String::new()),
+                            file: None,
+                            role: Role::Reader,
+                        }],
+                        ..Default::default()
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        let token_path = directory.path().join("private/reader.token");
+        store.issue_token("reader", &token_path, None).unwrap();
+        let token = crate::access::store::read_token_file(&token_path).unwrap();
+        let mut config = test_config(&root);
+        config.mcp_data_dir = Some(data);
+        let vault = Vault::open_authenticated(&config)
+            .await
+            .unwrap()
+            .with_access(store.authenticate(token.as_str()).unwrap())
+            .unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            store.update(None, |_| {
+                entered_tx.send(()).unwrap();
+                // A blocked executor must fail this test within a fixed bound.
+                let _ = release_rx.recv_timeout(Duration::from_secs(2));
+                Ok(())
+            })
+        });
+        entered_rx.await.unwrap();
+        let started = Instant::now();
+        let (error, ()) = tokio::join!(
+            authenticated_semantic_tool_error(&vault, VaultError::Embedding("unavailable".into())),
+            async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let _ = release_tx.send(());
+            }
+        );
+        writer.join().unwrap().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(error.data.unwrap()["code"], "semantic_unavailable");
+    }
 
     #[test]
     fn scoped_semantic_failures_do_not_expose_source_inventory_or_other_audiences() {

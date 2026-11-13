@@ -9,7 +9,7 @@ keywords = ["mcp", "obsidian", "vault", "ai"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
-rmcp = { version = "3.5.1", features = ["server", "transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "3.9.0", features = ["server", "transport-io", "transport-streamable-http-server"] }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

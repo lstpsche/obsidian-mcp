@@ -20,7 +20,7 @@ Setup creates a protected profile, a token file and a configuration snippet outs
 2. Merge the generated snippet into the selected MCP client's configuration, then reconnect.
 3. Run the generated `access doctor` command to check the endpoint.
 
-A server already using the default port is left alone; setup chooses another available loopback port. An explicitly selected occupied port produces an error. Copy the endpoint printed by setup into any additional client configuration.
+A server already using the default port is left alone; setup chooses another available loopback port. An explicitly selected occupied loopback HTTP port produces an error. Direct HTTP setup uses `/mcp`, the endpoint served by the binary. Copy the endpoint printed by setup into any additional client configuration. On Windows, printed commands use PowerShell syntax, including `&` before a quoted executable path.
 
 For noninteractive setup, provide the client and resources explicitly:
 
@@ -81,6 +81,10 @@ Restricted stdio revalidates authorization for operations. It does not isolate a
 
 Authenticated HTTP binds to loopback. For another machine, put HTTPS in front of the loopback backend or use a protected SSH forward. Keep the backend endpoint private and preserve the MCP and Authorization headers through the proxy. Native clients can omit Origin; browser-origin requests are rejected by default. Public `/health` reports process status, not vault contents or authorization success.
 
+When setup receives an HTTPS `--url`, that is the public client endpoint, which may use a proxy path such as `/assistant/mcp`. Setup independently selects a free loopback backend and prints its exact launch command, proxy upstream and Host value. An occupied default backend port is never reused. Check the authenticated backend with the printed doctor command before routing the proxy, then run the separate public-endpoint check after configuring it. Setup does not start either service.
+
+With `--json`, `url` is the public client URL and `backend_url` is the selected local `/mcp` endpoint. `server_command`, `doctor_command`, `public_doctor_command`, `proxy_upstream` and `proxy_host_header` contain the corresponding setup instructions. Use those selected values rather than assuming port `37842` is available.
+
 The backend also validates `Host`. Forward its loopback address and port, rather than the public hostname, while preserving Authorization and every MCP request header. For an existing nginx TLS virtual host, add a location such as:
 
 ```nginx
@@ -96,7 +100,7 @@ location = /mcp {
 }
 ```
 
-If setup selected another backend port, change both occurrences of `37842`. Keep Origin validation active; native clients omit Origin, and the proxy must not strip it to bypass a browser-origin rejection. Request-header forwarding and the explicit header overrides follow nginx's [proxy module directives](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_set_header).
+Replace both occurrences of `37842` with the selected backend port. If the public URL uses another path, change the `location` selector to that public path while keeping the upstream `/mcp` path. Keep Origin validation active; native clients omit Origin, and the proxy must not strip it to bypass a browser-origin rejection. Request-header forwarding and the explicit header overrides follow nginx's [proxy module directives](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_set_header).
 
 A helper runs on the client machine. Its binary and token paths must exist there; a server-side token file is not automatically available remotely. Generate the snippet with `--client-token-file` and `--binary` when those paths differ:
 
@@ -150,7 +154,7 @@ obsidian-mcp access preview shared-helper \
   --access-file /absolute/private-profile/access.json
 ```
 
-`check` evaluates policy and explains the matching rule; it does not prove a file exists or is readable on disk. `preview` lists permitted paths without printing note contents or starting embeddings. Use `--max-results` to change its bounded output limit.
+`check` evaluates policy and explains the matching rule; it does not prove a file exists or is readable on disk. `preview` lists permitted regular file paths without printing note contents or starting embeddings. Directories are traversal containers, not preview results. Unsafe or missing aliases and files with multiple hard links are omitted; genuine I/O failures remain errors. Use `--max-results` to change its bounded output limit.
 
 The `client list` command prints safe client, rule and credential IDs. Use those IDs to remove one rule with `rules remove CLIENT RULE_ID` or revoke one credential with `token revoke CLIENT CREDENTIAL_ID`. Add a grant with `grant CLIENT --directory PATH --role reader|editor`; add a denial with `deny CLIENT --directory PATH`. `--file` selects an exact file for either command.
 

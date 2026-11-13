@@ -349,6 +349,21 @@ impl VaultIndex {
         self.generation
     }
 
+    /// Copy only exact note revisions for semantic change detection. Metadata,
+    /// attachments and link structures remain in the retained projection.
+    #[cfg(has_embeddings)]
+    pub(crate) fn source_revisions_snapshot(&self) -> VaultResult<HashMap<OsString, String>> {
+        self.notes
+            .keys()
+            .map(|path| {
+                let revision = self.source_revisions.get(path).ok_or_else(|| {
+                    VaultError::Other("authorized source metadata requires reconciliation".into())
+                })?;
+                Ok((path.clone(), revision.clone()))
+            })
+            .collect()
+    }
+
     fn mark_changed(&mut self) {
         self.generation = self.generation.wrapping_add(1);
     }

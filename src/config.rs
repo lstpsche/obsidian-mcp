@@ -218,6 +218,15 @@ pub enum ToolFilter {
 
 impl ToolFilter {
     pub fn parse(raw: &str) -> Result<Self, String> {
+        Self::parse_inner(raw, true)
+    }
+
+    /// Parse delegated input without logging caller-supplied tool names.
+    pub fn parse_authenticated(raw: &str) -> Result<Self, String> {
+        Self::parse_inner(raw, false)
+    }
+
+    fn parse_inner(raw: &str, report_unknown: bool) -> Result<Self, String> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return Ok(Self::Full);
@@ -230,7 +239,7 @@ impl ToolFilter {
                 .filter(|s| !s.is_empty())
                 .collect();
             for name in &tools {
-                if !ALL_TOOL_NAMES.contains(&name.as_str()) {
+                if report_unknown && !ALL_TOOL_NAMES.contains(&name.as_str()) {
                     tracing::warn!(tool = %name, "unknown tool name in deny-list, ignoring");
                 }
             }
@@ -258,7 +267,7 @@ impl ToolFilter {
             .filter(|s| !s.is_empty())
             .collect();
         for name in &tools {
-            if !ALL_TOOL_NAMES.contains(&name.as_str()) {
+            if report_unknown && !ALL_TOOL_NAMES.contains(&name.as_str()) {
                 tracing::warn!(tool = %name, "unknown tool name in allow-list, ignoring");
             }
         }

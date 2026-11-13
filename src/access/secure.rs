@@ -170,7 +170,9 @@ impl ProtectedDirectory {
 
     pub fn sync(&self) -> AccessResult<()> {
         #[cfg(unix)]
-        self.directory.try_clone()?.into_std_file().sync_all()?;
+        // cap-std retains O_PATH handles on Linux. Open "." relative to the
+        // retained directory with read access so fsync can flush its entries.
+        self.directory.open(".")?.sync_all()?;
         // Windows does not support FlushFileBuffers for an ordinary directory
         // handle. File contents are flushed before atomic namespace publication.
         Ok(())
@@ -380,13 +382,22 @@ fn open_canonical_directory(path: &Path) -> AccessResult<Dir> {
         }
     }
     let mut directory = Dir::open_ambient_dir(base, cap_std::ambient_authority())?;
-    validate_directory(&directory, false)?;
-    for name in names {
+    validate_ancestor(&directory, 0)?;
+    for (index, name) in names.into_iter().enumerate() {
         validate_name(name)?;
         directory = directory.open_dir_nofollow(name)?;
-        validate_directory(&directory, false)?;
+        validate_ancestor(&directory, index + 1)?;
     }
     Ok(directory)
+}
+
+fn validate_ancestor(directory: &Dir, depth: usize) -> AccessResult<()> {
+    validate_directory(directory, false).map_err(|error| match error {
+        AccessError::Configuration(message) => {
+            AccessError::Configuration(format!("ancestor validation at depth {depth}: {message}"))
+        }
+        error => error,
+    })
 }
 
 fn validate_directory(directory: &Dir, private: bool) -> AccessResult<()> {
@@ -403,7 +414,7 @@ fn validate_directory(directory: &Dir, private: bool) -> AccessResult<()> {
         let owner = unsafe { libc::geteuid() };
         let mode = metadata.mode();
         let trusted_ancestor = metadata.uid() == 0 || metadata.uid() == owner;
-        let sticky_root = metadata.uid() == 0 && mode & u32::from(libc::S_ISVTX) != 0;
+        let sticky_root = metadata.uid() == 0 && mode & 0o1000 != 0;
         if !trusted_ancestor
             || (mode & 0o022 != 0 && !sticky_root)
             || (private && (metadata.uid() != owner || mode & 0o077 != 0))
@@ -494,4 +505,19 @@ fn fault(point: FailurePoint) -> AccessResult<()> {
         return Err(std::io::Error::other("injected protected-file failure").into());
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directory_sync_uses_the_retained_directory_after_rename() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("private");
+        let directory = ProtectedDirectory::open(&path, true).unwrap();
+        std::fs::rename(&path, temporary.path().join("moved")).unwrap();
+        assert!(!path.exists());
+        directory.sync().unwrap();
+    }
 }
