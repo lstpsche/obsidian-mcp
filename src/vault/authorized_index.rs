@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use sha2::{Digest, Sha256};
 
-use crate::access::clients::{AccessAction, ClientPolicy};
+use crate::access::clients::ClientPolicy;
 use crate::error::{VaultError, VaultResult};
 
 use super::index::{AuthorizedSnapshot, VaultIndex};
@@ -133,10 +133,11 @@ impl AuthorizedProjectionRegistry {
         tantivy_enabled: bool,
         read_source: impl Fn(&Path) -> VaultResult<String>,
     ) -> VaultResult<Arc<AuthorizedProjection>> {
+        let allows = policy.read_filter();
         let snapshot = source
             .read()
             .map_err(|_| projection_error("source index lock poisoned"))?
-            .authorized_snapshot(|path| policy.allows(AccessAction::Read, path))?;
+            .authorized_snapshot(allows)?;
         let fingerprint = fingerprint(&snapshot)?;
         if state.fingerprint == Some(fingerprint)
             && let Some(projection) = &state.projection

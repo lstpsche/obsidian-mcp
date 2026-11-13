@@ -1962,6 +1962,29 @@ async fn authenticated_trace_logging_omits_tokens_note_bodies_and_denied_parse_d
         "---\nprivate: [unterminated-yaml-marker\n---\ndenied-parse-source-marker\n",
     )
     .unwrap();
+    #[cfg(unix)]
+    {
+        std::fs::write(
+            fixture.vault.join("Private/private-native\\path-canary.md"),
+            "hidden native name",
+        )
+        .unwrap();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut name = b"private-non-utf8-canary-".to_vec();
+        name.extend_from_slice(b"\xff.md");
+        std::fs::write(
+            fixture
+                .vault
+                .join("Private")
+                .join(std::ffi::OsString::from_vec(name)),
+            "hidden non-UTF-8 name",
+        )
+        .unwrap();
+    }
     let token = fixture.tokens["reader"].clone();
     let command = fixture.command(true);
     let captured = CapturedServer::start(fixture, command).await;
@@ -2016,6 +2039,8 @@ async fn authenticated_trace_logging_omits_tokens_note_bodies_and_denied_parse_d
     let stderr = captured.finish().await;
     assert!(stderr.contains("authenticated invocation finished"));
     assert!(stderr.contains("protected index build"));
+    #[cfg(unix)]
+    assert!(stderr.contains("protected vault traversal"));
     for forbidden in [
         token.as_str(),
         "visible-path-marker",
@@ -2027,6 +2052,8 @@ async fn authenticated_trace_logging_omits_tokens_note_bodies_and_denied_parse_d
         "private-single-filter-canary",
         "private-list-filter-canary",
         "private-deny-filter-canary",
+        "private-native",
+        "private-non-utf8-canary",
     ] {
         assert!(
             !stderr.contains(forbidden),

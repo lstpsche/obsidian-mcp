@@ -1588,7 +1588,12 @@ fn setup_endpoint(args: &Arguments) -> Result<SetupEndpoint, String> {
 }
 
 fn available_port(host: &str, port: u16) -> Result<bool, String> {
-    match std::net::TcpListener::bind((host, port)) {
+    let endpoint = std::net::SocketAddr::new(
+        host.parse()
+            .map_err(|error| format!("Cannot use local host {host}: {error}"))?,
+        port,
+    );
+    match crate::http_process::bind_available_tcp(endpoint) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::AddrInUse => Ok(false),
         Err(error) => Err(format!("Cannot use local endpoint {host}:{port}: {error}")),

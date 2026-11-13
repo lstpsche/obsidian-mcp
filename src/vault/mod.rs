@@ -3137,6 +3137,14 @@ impl Vault {
     }
 
     fn reindex_local(&self, path: &Path) -> VaultResult<()> {
+        self.reindex_source_local(path)?;
+        self.refresh_authorized_projection()?;
+        #[cfg(has_embeddings)]
+        self.notify_authenticated_semantics();
+        Ok(())
+    }
+
+    fn reindex_source_local(&self, path: &Path) -> VaultResult<()> {
         let filesystem = self
             .inner
             .filesystem
@@ -3185,12 +3193,7 @@ impl Vault {
                 "{error}; search flush failed: {flush}"
             ))),
             (Err(error), _) | (_, Err(error)) => Err(error),
-            _ => {
-                self.refresh_authorized_projection()?;
-                #[cfg(has_embeddings)]
-                self.notify_authenticated_semantics();
-                Ok(())
-            }
+            _ => Ok(()),
         }
     }
 

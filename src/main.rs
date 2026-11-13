@@ -253,7 +253,11 @@ async fn serve_http(
         .merge(mcp_router);
 
     let addr = std::net::SocketAddr::new(config.http_host, config.http_port);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = if access_required {
+        http_process::bind_available_tcp(addr)?.listen(128)?
+    } else {
+        tokio::net::TcpListener::bind(addr).await?
+    };
     let addr = listener.local_addr()?;
     tracing::info!(%addr, "HTTP MCP server listening");
 

@@ -387,6 +387,7 @@ fn generated_configuration_contains_file_helper_not_plaintext_and_never_overwrit
 
 #[test]
 fn setup_generates_explicit_optional_launch_and_client_configuration() {
+    let _listener = occupy_default_backend();
     let fixture = Fixture::new();
     let out = fixture.profile.parent().unwrap().join("assistant.toml");
     let result = success(
@@ -411,6 +412,8 @@ fn setup_generates_explicit_optional_launch_and_client_configuration() {
     );
     assert_eq!(result["client_id"], "assistant");
     assert_eq!(result["transport"], "http");
+    let backend = reqwest::Url::parse(result["backend_url"].as_str().unwrap()).unwrap();
+    assert_ne!(backend.port(), Some(37842));
     assert!(out.exists());
     assert!(!fixture.vault.join(".obsidian-mcp").exists());
     let config = std::fs::read_to_string(&out).unwrap();
@@ -861,7 +864,7 @@ fn preview_preserves_a_real_read_permission_failure() {
     fixture.initialize();
     fixture.add("reader", false);
     let note = fixture.vault.join("Shared/note.md");
-    std::fs::set_permissions(&note, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&note, std::fs::Permissions::from_mode(0o0)).unwrap();
     let output = fixture
         .command()
         .args(["preview", "reader", "--json"])
@@ -881,10 +884,28 @@ struct OccupiedDefaultBackend {
     listener: Option<std::net::TcpListener>,
 }
 
+fn wildcard_listener(endpoint: &str) -> std::io::Result<std::net::TcpListener> {
+    let endpoint: std::net::SocketAddr = endpoint.parse().unwrap();
+    let socket = if endpoint.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    // Do not attach the fixture beside a listener owned by another process.
+    socket.set_reuseaddr(false)?;
+    socket.bind(endpoint)?;
+    socket.set_reuseaddr(cfg!(unix))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()?;
+    let _entered = runtime.enter();
+    socket.listen(128)?.into_std()
+}
+
 fn occupy_default_backend() -> OccupiedDefaultBackend {
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let serial = SERIAL.lock().unwrap();
-    let listener = match std::net::TcpListener::bind("127.0.0.1:37842") {
+    let listener = match wildcard_listener("0.0.0.0:37842") {
         Ok(listener) => Some(listener),
         Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => None,
         Err(error) => panic!("could not qualify the default loopback port: {error}"),
@@ -953,8 +974,11 @@ fn https_setup_preserves_public_route_and_selects_a_separate_free_backend() {
     let configuration: Value = serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
     assert_eq!(configuration["mcpServers"]["assistant"]["url"], public);
     if listener.listener.is_some() {
+        let probe = tokio::net::TcpSocket::new_v4().unwrap();
+        probe.set_reuseaddr(false).unwrap();
         assert_eq!(
-            std::net::TcpListener::bind("127.0.0.1:37842")
+            probe
+                .bind("127.0.0.1:37842".parse().unwrap())
                 .unwrap_err()
                 .kind(),
             std::io::ErrorKind::AddrInUse
@@ -1019,34 +1043,162 @@ fn https_setup_preview_prints_its_selected_upstream_and_both_connection_checks()
 
 #[test]
 fn explicit_http_setup_does_not_reuse_an_occupied_listener() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+    use std::io::Read;
+
+    for address in ["127.0.0.1:0", "0.0.0.0:0", "[::]:0"] {
+        let listener = wildcard_listener(address).unwrap();
+        let bound = listener.local_addr().unwrap();
+        let host = if bound.is_ipv4() {
+            "127.0.0.1"
+        } else {
+            "[::1]"
+        };
+        let endpoint = format!("http://{host}:{}/mcp", bound.port());
+        let fixture = Fixture::new();
+        let output = command()
+            .arg("setup")
+            .arg(&fixture.vault)
+            .arg("--access-file")
+            .arg(&fixture.profile)
+            .args([
+                "--name",
+                "assistant",
+                "--directory",
+                "Shared",
+                "--url",
+                &endpoint,
+                "--dry-run",
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{endpoint}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("already in use"));
+        assert!(!fixture.profile.parent().unwrap().exists());
+        assert_eq!(listener.local_addr().unwrap(), bound);
+        let (mut probe, _) = listener.accept().unwrap();
+        probe.set_nonblocking(false).unwrap();
+        probe
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        assert_eq!(probe.read(&mut [0]).unwrap(), 0);
+    }
+}
+
+#[tokio::test]
+async fn authenticated_startup_does_not_attach_beside_an_ordinary_wildcard_listener() {
+    use std::process::Stdio;
+    use std::time::Duration;
+
     let fixture = Fixture::new();
-    let output = command()
-        .arg("setup")
-        .arg(&fixture.vault)
-        .arg("--access-file")
-        .arg(&fixture.profile)
-        .args([
-            "--name",
-            "assistant",
-            "--directory",
-            "Shared",
-            "--url",
-            &endpoint,
-            "--dry-run",
-        ])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("already in use"));
-    assert!(!fixture.profile.parent().unwrap().exists());
-    assert_eq!(
-        std::net::TcpListener::bind(listener.local_addr().unwrap())
-            .unwrap_err()
-            .kind(),
-        std::io::ErrorKind::AddrInUse
-    );
+    fixture.initialize();
+    for wildcard in ["0.0.0.0", "::"] {
+        let mut ordinary = http_listening::isolated_command(binary())
+            .arg(&fixture.vault)
+            .args(["--http", "--host", wildcard, "--port", "0"])
+            .env("OBSIDIAN_EMBEDDINGS", "false")
+            .env("OBSIDIAN_WATCH", "false")
+            .env("OBSIDIAN_LOG_LEVEL", "info")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let address = http_listening::ready(&mut ordinary).await.unwrap();
+        let host = if address.is_ipv4() {
+            "127.0.0.1"
+        } else {
+            "::1"
+        };
+        let mut authenticated = http_listening::isolated_command(binary());
+        authenticated
+            .arg(&fixture.vault)
+            .args(["--http", "--host", host, "--port"])
+            .arg(address.port().to_string())
+            .arg("--access-file")
+            .arg(&fixture.profile)
+            .env("OBSIDIAN_EMBEDDINGS", "false")
+            .env("OBSIDIAN_WATCH", "false")
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(10), authenticated.output())
+            .await
+            .expect("authenticated server attached beside the ordinary listener")
+            .unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+        assert!(error.contains("addrinuse"), "{error}");
+        assert!(ordinary.try_wait().unwrap().is_none());
+        let authority = if address.is_ipv4() {
+            format!("127.0.0.1:{}", address.port())
+        } else {
+            format!("[::1]:{}", address.port())
+        };
+        let health = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{authority}/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::OK);
+        ordinary.kill().await.unwrap();
+        ordinary.wait().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn authenticated_server_restarts_immediately_after_closing_a_connection() {
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let fixture = Fixture::new();
+    fixture.initialize();
+    let launch = |host: &str, port: u16| {
+        let mut command = http_listening::isolated_command(binary());
+        command
+            .arg(&fixture.vault)
+            .args(["--http", "--host", host, "--port"])
+            .arg(port.to_string())
+            .arg("--access-file")
+            .arg(&fixture.profile)
+            .env("OBSIDIAN_EMBEDDINGS", "false")
+            .env("OBSIDIAN_WATCH", "false")
+            .env("OBSIDIAN_LOG_LEVEL", "info")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        command
+    };
+    for host in ["127.0.0.1", "::1"] {
+        let mut server = launch(host, 0).spawn().unwrap();
+        let address = http_listening::ready(&mut server).await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(
+                format!("GET /health HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+            .await
+            .expect("server did not close the HTTP connection")
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        client.shutdown().await.unwrap();
+        drop(client);
+        server.kill().await.unwrap();
+        server.wait().await.unwrap();
+        let mut restarted = launch(host, address.port()).spawn().unwrap();
+        assert_eq!(
+            http_listening::ready(&mut restarted).await.unwrap(),
+            address
+        );
+        restarted.kill().await.unwrap();
+        restarted.wait().await.unwrap();
+    }
 }
 
 #[test]
@@ -1073,8 +1225,9 @@ fn direct_http_setup_rejects_a_path_that_the_server_does_not_serve() {
     assert!(!fixture.profile.parent().unwrap().exists());
 }
 
+#[cfg(windows)]
 #[test]
-fn printed_launch_invokes_an_executable_path_with_spaces_for_the_native_shell() {
+fn printed_windows_launch_invokes_an_executable_path_with_spaces() {
     let fixture = Fixture::new();
     let directory = fixture._directory.path().join("binary with spaces");
     std::fs::create_dir(&directory).unwrap();
@@ -1098,8 +1251,5 @@ fn printed_launch_invokes_an_executable_path_with_spaces_for_the_native_shell() 
         .find(|line| line.contains(" --http --host "))
         .unwrap();
     assert!(launch.contains("binary with spaces"));
-    #[cfg(windows)]
     assert!(launch.starts_with("& '"), "{launch}");
-    #[cfg(not(windows))]
-    assert!(launch.starts_with('\''), "{launch}");
 }

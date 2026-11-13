@@ -1,11 +1,43 @@
 //! Ownership checks for the HTTP listener controlled by the local CLI.
 
 use std::io;
-use std::net::SocketAddr;
-#[cfg(unix)]
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::path::Path;
 use std::time::Duration;
+
+pub(crate) fn bind_available_tcp(endpoint: SocketAddr) -> io::Result<tokio::net::TcpSocket> {
+    if endpoint.port() != 0 && endpoint_is_reachable(endpoint)? {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("{endpoint} already has a listener"),
+        ));
+    }
+    let socket = if endpoint.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    // Retain Mio's platform policy so closed connections do not block a restart.
+    socket.set_reuseaddr(cfg!(unix))?;
+    socket.bind(endpoint)?;
+    Ok(socket)
+}
+
+fn endpoint_is_reachable(endpoint: SocketAddr) -> io::Result<bool> {
+    let connect_ip = match endpoint.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    match TcpStream::connect_timeout(
+        &SocketAddr::new(connect_ip, endpoint.port()),
+        Duration::from_millis(200),
+    ) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => Ok(false),
+        Err(error) => Err(error),
+    }
+}
 
 pub(crate) fn listener_pid(endpoint: SocketAddr) -> io::Result<Option<u32>> {
     if endpoint.port() == 0 {
@@ -14,21 +46,7 @@ pub(crate) fn listener_pid(endpoint: SocketAddr) -> io::Result<Option<u32>> {
     // Unix lsof can hide another user's listener. Windows supplies the
     // system-wide owner table directly, including an empty endpoint.
     #[cfg(unix)]
-    let reachable = {
-        let connect_ip = match endpoint.ip() {
-            IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
-            IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
-            ip => ip,
-        };
-        match TcpStream::connect_timeout(
-            &SocketAddr::new(connect_ip, endpoint.port()),
-            Duration::from_millis(200),
-        ) {
-            Ok(_) => true,
-            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => false,
-            Err(error) => return Err(error),
-        }
-    };
+    let reachable = endpoint_is_reachable(endpoint)?;
     #[cfg(unix)]
     if !reachable && !endpoint.ip().is_unspecified() {
         return Ok(None);
@@ -594,10 +612,72 @@ mod platform {
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
     use std::process::{Child, Command, Stdio};
 
     const LISTENER_READY: &str = "test listener address: ";
+
+    #[test]
+    fn checked_tcp_bind_accepts_a_free_endpoint_without_a_runtime() {
+        for endpoint in ["127.0.0.1:0", "[::1]:0"] {
+            let socket = bind_available_tcp(endpoint.parse().unwrap()).unwrap();
+            let bound = socket.local_addr().unwrap();
+            assert_ne!(bound.port(), 0);
+        }
+    }
+
+    #[test]
+    fn checked_tcp_bind_rejects_a_live_wildcard_listener_without_sending_bytes() {
+        for endpoint in ["0.0.0.0:0", "[::]:0"] {
+            let listener = TcpListener::bind(endpoint).unwrap();
+            let bound = listener.local_addr().unwrap();
+            let loopback = if bound.is_ipv4() {
+                IpAddr::V4(Ipv4Addr::LOCALHOST)
+            } else {
+                IpAddr::V6(Ipv6Addr::LOCALHOST)
+            };
+            assert_eq!(
+                bind_available_tcp(SocketAddr::new(loopback, bound.port()))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::AddrInUse
+            );
+            listener.set_nonblocking(true).unwrap();
+            let (mut probe, _) = listener.accept().unwrap();
+            probe.set_nonblocking(false).unwrap();
+            probe
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            assert_eq!(std::io::Read::read(&mut probe, &mut [0]).unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn checked_tcp_bind_allows_immediate_restart_after_server_active_close() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for endpoint in ["127.0.0.1:0", "[::1]:0"] {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let listener = bind_available_tcp(endpoint.parse().unwrap())
+                    .unwrap()
+                    .listen(128)
+                    .unwrap();
+                let bound = listener.local_addr().unwrap();
+                let mut client = tokio::net::TcpStream::connect(bound).await.unwrap();
+                let (mut server, _) = listener.accept().await.unwrap();
+                server.shutdown().await.unwrap();
+                assert_eq!(client.read_to_end(&mut Vec::new()).await.unwrap(), 0);
+                drop(client);
+                assert_eq!(server.read_to_end(&mut Vec::new()).await.unwrap(), 0);
+                drop(server);
+                drop(listener);
+                let restarted = bind_available_tcp(bound).unwrap().listen(128).unwrap();
+                assert_eq!(restarted.local_addr().unwrap(), bound);
+            })
+            .await
+            .expect("controlled active-close restart timed out");
+        }
+    }
 
     #[test]
     fn process_listener_fixture() {

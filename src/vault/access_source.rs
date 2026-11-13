@@ -134,6 +134,37 @@ impl Vault {
         let config = self.inner.authenticated_config.as_ref().ok_or_else(|| {
             VaultError::Authorization("authenticated source configuration is missing".into())
         })?;
+        let missing = std::cell::RefCell::new(None);
+        let projected = self.inner.authorized_indices.project(
+            &self.inner.index,
+            client.policy(),
+            config.tantivy,
+            |path| {
+                let content = self.read_access_native(path, None);
+                if content.as_ref().is_err_and(VaultError::is_not_found) {
+                    *missing.borrow_mut() = Some(path.to_owned());
+                }
+                content
+            },
+        );
+        let repair = match &projected {
+            Err(VaultError::SourceChanged { path, .. }) => Some(path.clone()),
+            Err(error) if error.is_not_found() => missing.into_inner(),
+            _ => None,
+        };
+        let Some(path) = repair else {
+            return projected;
+        };
+
+        // A source observation can be superseded before projection reads it.
+        // Reconcile that exact admitted key in the shared owner, then require
+        // one complete current projection. Further races and other errors remain
+        // visible; no previous or partial catalog is returned as a substitute.
+        client.check(Action::Read, &path, &path)?;
+        self.reindex_source_local(&path)?;
+        client.current()?;
+        #[cfg(has_embeddings)]
+        self.notify_authenticated_semantics();
         self.inner.authorized_indices.project(
             &self.inner.index,
             client.policy(),
@@ -916,6 +947,121 @@ mod tests {
                 .unwrap();
             writer.join().unwrap().unwrap();
         }
+    }
+
+    async fn source_view_reconciles_intervening_change(deleted: bool) {
+        let f = fixture(vec![directory("Shared", Role::Editor)], vec![]).await;
+        assert!(!f.vault.watch_enabled());
+        f.vault
+            .create_note(Path::new("Shared/other.md"), "unrelated source", None)
+            .await
+            .unwrap();
+        std::fs::write(f.root.join("Shared/note.md"), "indexed precursor").unwrap();
+        f.vault
+            .write_index()
+            .refresh_file(
+                f.vault.inner.filesystem.as_ref().unwrap(),
+                Path::new("Shared/note.md"),
+                f.vault.exclude(),
+                None,
+                #[cfg(has_embeddings)]
+                false,
+            )
+            .unwrap();
+        if deleted {
+            std::fs::remove_file(f.root.join("Shared/note.md")).unwrap();
+        } else {
+            std::fs::write(
+                f.root.join("Shared/note.md"),
+                "---\ntags: [current]\n---\ncurrent source",
+            )
+            .unwrap();
+        }
+        let selected = f
+            .vault
+            .with_access(f.vault.access_client().unwrap().clone())
+            .expect("a stable intervening source change must reconcile without a watcher");
+        assert_eq!(
+            selected
+                .read_note(Path::new("Shared/other.md"))
+                .await
+                .unwrap(),
+            "unrelated source"
+        );
+        if deleted {
+            assert_eq!(selected.vault_stats().unwrap().total_notes, 1);
+            assert!(matches!(
+                selected
+                    .get_note_metadata(Path::new("Shared/note.md"))
+                    .await,
+                Err(VaultError::NoteNotFound(_))
+            ));
+        } else {
+            assert_eq!(selected.vault_stats().unwrap().total_notes, 2);
+            let notes = selected.search_by_tag("current").unwrap();
+            assert_eq!(notes.len(), 1);
+            assert_eq!(notes[0].path, Path::new("Shared/note.md"));
+            assert_eq!(
+                f.vault
+                    .inner
+                    .index
+                    .read()
+                    .unwrap()
+                    .get_note(Path::new("Shared/note.md"))
+                    .unwrap()
+                    .tags,
+                ["current"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn source_view_reconciles_a_note_edited_after_its_index_observation() {
+        source_view_reconciles_intervening_change(false).await;
+    }
+
+    #[tokio::test]
+    async fn source_view_reconciles_a_note_deleted_after_its_index_observation() {
+        source_view_reconciles_intervening_change(true).await;
+    }
+
+    #[tokio::test]
+    async fn source_reconciliation_is_bounded_and_never_publishes_a_partial_catalog() {
+        let f = fixture(vec![directory("Shared", Role::Editor)], vec![]).await;
+        f.vault
+            .create_note(Path::new("Shared/other.md"), "other original", None)
+            .await
+            .unwrap();
+        for path in ["Shared/note.md", "Shared/other.md"] {
+            std::fs::write(f.root.join(path), "indexed precursor").unwrap();
+            f.vault
+                .write_index()
+                .refresh_file(
+                    f.vault.inner.filesystem.as_ref().unwrap(),
+                    Path::new(path),
+                    f.vault.exclude(),
+                    None,
+                    #[cfg(has_embeddings)]
+                    false,
+                )
+                .unwrap();
+            std::fs::write(
+                f.root.join(path),
+                "---\ntags: [current]\n---\ncurrent source",
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            f.vault.with_access(f.vault.access_client().unwrap().clone()),
+            Err(VaultError::SourceChanged { path, .. }) if path == Path::new("Shared/other.md")
+        ));
+        assert!(!f.vault.projection.as_ref().unwrap().is_ready());
+        let recovered = f
+            .vault
+            .with_access(f.vault.access_client().unwrap().clone())
+            .unwrap();
+        assert_eq!(recovered.search_by_tag("current").unwrap().len(), 2);
+        assert_eq!(recovered.vault_stats().unwrap().total_notes, 2);
     }
 
     #[tokio::test]

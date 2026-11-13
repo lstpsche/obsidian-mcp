@@ -9,8 +9,8 @@ use std::ptr;
 
 use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
-    SE_FILE_OBJECT, SetSecurityInfo,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    ConvertStringSidToSidW, GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
 };
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
@@ -35,6 +35,10 @@ const ALLOWED_ACE: u8 = 0;
 const DENIED_ACE: u8 = 1;
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const GENERIC_ALL: u32 = 0x1000_0000;
+// Windows Resource Protection owns system ancestors through this exact service.
+// https://learn.microsoft.com/en-us/archive/msdn-magazine/2008/november/access-control-understanding-windows-file-and-registry-permissions
+const TRUSTED_INSTALLER_SID: &str =
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
 
 struct LocalAllocation(PSECURITY_DESCRIPTOR);
 impl Drop for LocalAllocation {
@@ -90,6 +94,25 @@ fn trusted(sid: PSID, owner: PSID) -> bool {
             || IsWellKnownSid(sid, WinLocalSystemSid) != 0
             || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
     }
+}
+
+fn trusted_installer_sid() -> AccessResult<LocalAllocation> {
+    let text: Vec<u16> = TRUSTED_INSTALLER_SID
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let mut sid = ptr::null_mut();
+    if unsafe { ConvertStringSidToSidW(text.as_ptr(), &mut sid) } == 0 {
+        return Err(native_error(
+            "parse_system_owner",
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(LocalAllocation(sid))
+}
+
+fn trusted_for_scope(sid: PSID, user: PSID, installer: PSID, private: bool) -> bool {
+    trusted(sid, user) || (!private && unsafe { EqualSid(sid, installer) } != 0)
 }
 
 fn owner_category(sid: PSID, user: PSID) -> &'static str {
@@ -248,9 +271,21 @@ fn validate_acl(file: &File, private: bool, directory: bool, creating: bool) -> 
         ));
     }
     let descriptor = LocalAllocation(descriptor);
+    validate_descriptor(descriptor.0, owner, acl, user_sid, private, creating)
+}
+
+fn validate_descriptor(
+    descriptor: PSECURITY_DESCRIPTOR,
+    owner: PSID,
+    acl: *mut ACL,
+    user_sid: PSID,
+    private: bool,
+    creating: bool,
+) -> AccessResult<()> {
+    let installer = trusted_installer_sid()?;
     if owner.is_null()
         || acl.is_null()
-        || !trusted(owner, user_sid)
+        || !trusted_for_scope(owner, user_sid, installer.0, private)
         || (private && unsafe { EqualSid(owner, user_sid) } == 0)
     {
         let scope = if private { "private" } else { "ancestor" };
@@ -275,7 +310,7 @@ fn validate_acl(file: &File, private: bool, directory: bool, creating: bool) -> 
     }
     let mut control = 0;
     let mut revision = 0;
-    if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0 {
+    if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
         return Err(io::Error::last_os_error().into());
     }
     if private && control & SE_DACL_PROTECTED == 0 {
@@ -337,7 +372,7 @@ fn validate_acl(file: &File, private: bool, directory: bool, creating: bool) -> 
         let inherited_owner =
             inherit_only && inheritable && unsafe { IsWellKnownSid(sid, WinCreatorOwnerSid) } != 0;
         if ace.Mask != 0
-            && !trusted(sid, user_sid)
+            && !trusted_for_scope(sid, user_sid, installer.0, private)
             && !inherited_owner
             && (private
                 || (creating && inheritable)
@@ -370,6 +405,68 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::process::Command;
+    use windows_sys::Win32::Security::GetSecurityDescriptorOwner;
+
+    fn check_descriptor(
+        owner: &str,
+        extra_grants: &str,
+        private: bool,
+        creating: bool,
+    ) -> AccessResult<()> {
+        let user = user_token()?;
+        let user_sid = user_sid(&user);
+        let user_text = sid_string(user_sid)?;
+        let text = format!("O:{owner}D:P(A;;FA;;;{user_text}){extra_grants}");
+        let text: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+        let mut descriptor = ptr::null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                text.as_ptr(),
+                1,
+                &mut descriptor,
+                ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+        let descriptor = LocalAllocation(descriptor);
+        let mut owner = ptr::null_mut();
+        let mut acl = ptr::null_mut();
+        let mut defaulted = 0;
+        let mut present = 0;
+        if unsafe { GetSecurityDescriptorOwner(descriptor.0, &mut owner, &mut defaulted) } == 0
+            || unsafe {
+                GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut acl, &mut defaulted)
+            } == 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+        validate_descriptor(descriptor.0, owner, acl, user_sid, private, creating)
+    }
+
+    #[test]
+    fn windows_trusted_installer_is_limited_to_ancestor_ownership_and_grants() {
+        let user = user_token().unwrap();
+        let user = sid_string(user_sid(&user)).unwrap();
+        let installer_grant = format!("(A;OICI;FA;;;{TRUSTED_INSTALLER_SID})");
+        assert!(check_descriptor(TRUSTED_INSTALLER_SID, &installer_grant, false, false).is_ok());
+        assert!(check_descriptor(TRUSTED_INSTALLER_SID, "", true, false).is_err());
+        assert!(check_descriptor(&user, &installer_grant, true, false).is_err());
+        assert!(check_descriptor(&user, &installer_grant, false, true).is_ok());
+        // An ordinary broad grant remains unsafe even below a trusted system owner.
+        assert!(check_descriptor(TRUSTED_INSTALLER_SID, "(A;;FA;;;WD)", false, false).is_err());
+    }
+
+    #[test]
+    fn windows_other_service_sids_cannot_own_or_mutate_access_ancestors() {
+        let user = user_token().unwrap();
+        let user = sid_string(user_sid(&user)).unwrap();
+        let other = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478465";
+        assert!(check_descriptor(other, "", false, false).is_err());
+        assert!(check_descriptor(&user, &format!("(A;;FA;;;{other})"), false, false).is_err());
+        assert!(check_descriptor(&user, &format!("(A;OICIIO;FA;;;{other})"), false, true).is_err());
+    }
 
     fn directory_handle(path: &Path) -> File {
         cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority())

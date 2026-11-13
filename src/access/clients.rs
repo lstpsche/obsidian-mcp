@@ -286,6 +286,42 @@ impl ClientPolicy {
         self.decision(action, path).allowed
     }
 
+    /// Prepare immutable read selectors before filtering a source snapshot.
+    pub(crate) fn read_filter(&self) -> impl Fn(&Path) -> bool {
+        let enabled = self.enabled;
+        let grants = self
+            .grants
+            .iter()
+            .filter_map(|grant| resource(&grant.directory, &grant.file).ok())
+            .collect::<Vec<_>>();
+        let denies = self
+            .denies
+            .iter()
+            .map(|deny| {
+                let mut selector = resource(&deny.directory, &deny.file)?;
+                selector.components = guard_components(&selector.components);
+                Ok(selector)
+            })
+            .collect::<Result<Vec<_>, PolicyError>>();
+        move |path| {
+            if !enabled {
+                return false;
+            }
+            let Some(parts) = runtime_components(path) else {
+                return false;
+            };
+            if parts.iter().any(|part| reserved_component(part)) {
+                return false;
+            }
+            let Ok(denies) = &denies else {
+                return false;
+            };
+            let guarded = guard_components(&parts);
+            !denies.iter().any(|deny| deny.matches(&guarded))
+                && grants.iter().any(|grant| grant.matches(&parts))
+        }
+    }
+
     pub fn decision(&self, action: AccessAction, path: &Path) -> AccessDecision {
         let decision = |allowed, reason, rule_id| AccessDecision {
             allowed,
@@ -783,6 +819,158 @@ mod tests {
         client.denies = vec![Deny::directory("private", "A/B")];
         assert!(client.allows(AccessAction::Read, Path::new("A／B/note.md")));
         assert_eq!(deny_guard_component("A／B"), "a/b");
+    }
+
+    #[test]
+    fn prepared_read_filter_matches_decisions_for_exact_and_guarded_paths() {
+        let mut broad = client();
+        broad.denies = vec![
+            Deny::directory("private", "Private/"),
+            Deny::file("german", "Straße.md"),
+            Deny::directory("composed", "Café"),
+            Deny::directory("separate", "A/B"),
+        ];
+        broad
+            .grants
+            .push(Grant::file("exception", "Private/allowed.md", Role::Editor));
+        let narrow = ClientPolicy {
+            grants: vec![
+                Grant::directory("shared", "Shared/", Role::Reader),
+                Grant::file("exact", "Exact/Deep/note.md", Role::Editor),
+                Grant::directory("unicode", "Café/資料", Role::Reader),
+            ],
+            denies: vec![Deny::file("secret", "Shared/Secret.md")],
+            ..Default::default()
+        };
+        let mut disabled = broad.clone();
+        disabled.enabled = false;
+        let mut all_denied = broad.clone();
+        all_denied.denies.push(Deny::directory("all", ""));
+        for policy in [
+            ClientPolicy::default(),
+            broad,
+            narrow.clone(),
+            disabled,
+            all_denied,
+        ] {
+            let allows = policy.read_filter();
+            for folder in [
+                "",
+                "Shared",
+                "Ｓｈａｒｅｄ",
+                "shared",
+                "Exact",
+                "Exact/Deep",
+                "Private",
+                "PRIVATE",
+                "Ｐｒｉｖａｔｅ",
+                "Pri\u{200d}vate",
+                "Private-old",
+                "Café",
+                "Cafe\u{301}",
+                "Café/資料",
+                "Cafe\u{301}/資料",
+                "A/B",
+                "A／B",
+                ".obsidian",
+                "．obsidian",
+                "Shared/.hidden",
+                "Shared/\u{200d}.hidden",
+                "..",
+                "/outside",
+            ] {
+                for name in [
+                    "",
+                    "note.md",
+                    "Secret.md",
+                    "secret.md",
+                    "STRASSE.md",
+                    "Straße.md",
+                    "note.md-more",
+                ] {
+                    let path = if folder.is_empty() || name.is_empty() {
+                        format!("{folder}{name}")
+                    } else {
+                        format!("{folder}/{name}")
+                    };
+                    assert_eq!(
+                        allows(Path::new(&path)),
+                        policy.allows(AccessAction::Read, Path::new(&path)),
+                        "{path}"
+                    );
+                }
+            }
+        }
+        let allows = narrow.read_filter();
+        assert!(narrow.allows_container(Path::new("Exact/Deep")));
+        assert!(!allows(Path::new("Exact/Deep")));
+        assert!(allows(Path::new("Exact/Deep/note.md")));
+        assert!(!allows(Path::new("Exact/Deep/other.md")));
+        assert!(!allows(Path::new("Ｓｈａｒｅｄ/note.md")));
+        assert!(!allows(Path::new("Cafe\u{301}/資料/note.md")));
+    }
+
+    #[test]
+    fn prepared_read_filter_preserves_unvalidated_policy_and_invalid_path_behavior() {
+        let mut invalid_grant = client();
+        invalid_grant.grants.insert(
+            0,
+            Grant {
+                id: "invalid".into(),
+                directory: Some("Shared".into()),
+                file: Some("Shared/note.md".into()),
+                role: Role::Reader,
+            },
+        );
+        let mut invalid_metadata = client();
+        invalid_metadata.grants[0].id = String::new();
+        invalid_metadata.credentials.push(Credential {
+            id: String::new(),
+            digest: String::new(),
+            created_at: -1,
+            expires_at: None,
+            revoked: false,
+        });
+        let mut invalid_denial = client();
+        invalid_denial.denies.push(Deny {
+            id: "invalid".into(),
+            directory: None,
+            file: None,
+        });
+        let paths = [
+            "Shared/note.md".to_owned(),
+            "Shared//note.md".to_owned(),
+            "Shared/./note.md".to_owned(),
+            "Shared/note.md:stream".to_owned(),
+            "Shared/note.md.".to_owned(),
+            "Shared/note.md ".to_owned(),
+            "Shared/NUL.md".to_owned(),
+            "Shared/a\u{0}b.md".to_owned(),
+            "Shared\\note.md".to_owned(),
+            "../outside.md".to_owned(),
+            "x".repeat(MAX_PATH_BYTES + 1),
+            vec!["x"; MAX_PATH_COMPONENTS + 1].join("/"),
+        ];
+        for policy in [invalid_grant, invalid_metadata, invalid_denial] {
+            assert!(policy.validate().is_err());
+            let allows = policy.read_filter();
+            for path in &paths {
+                assert_eq!(
+                    allows(Path::new(path)),
+                    policy.allows(AccessAction::Read, Path::new(path)),
+                    "{path:?}"
+                );
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let path = PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]));
+            assert_eq!(
+                client().read_filter()(&path),
+                client().allows(AccessAction::Read, &path)
+            );
+        }
     }
 
     #[test]

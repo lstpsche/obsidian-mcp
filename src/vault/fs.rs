@@ -522,7 +522,14 @@ impl VaultRoot {
                 let native = base.join(name);
                 let path = match vault_path::portable_native(&native) {
                     Err(error @ VaultError::InvalidPath(_)) => {
-                        tracing::warn!(path = %native.display(), %error, "skipping an unrepresentable vault entry");
+                        if self.content_is_restricted() {
+                            tracing::warn!(
+                                error_category = error.diagnostic_category(),
+                                "skipping an unrepresentable entry during protected vault traversal"
+                            );
+                        } else {
+                            tracing::warn!(path = %native.display(), %error, "skipping an unrepresentable vault entry");
+                        }
                         continue;
                     }
                     other => other?,
