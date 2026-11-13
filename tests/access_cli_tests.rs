@@ -1094,16 +1094,13 @@ fn https_setup_preserves_public_route_and_selects_a_separate_free_backend() {
     );
     let configuration: Value = serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
     assert_eq!(configuration["mcpServers"]["assistant"]["url"], public);
-    if listener.listener.is_some() {
-        let probe = tokio::net::TcpSocket::new_v4().unwrap();
-        probe.set_reuseaddr(false).unwrap();
-        assert_eq!(
-            probe
-                .bind("127.0.0.1:37842".parse().unwrap())
-                .unwrap_err()
-                .kind(),
-            std::io::ErrorKind::AddrInUse
-        );
+    if let Some(held) = listener.listener.as_ref() {
+        let endpoint = "127.0.0.1:37842".parse().unwrap();
+        let _probe =
+            std::net::TcpStream::connect_timeout(&endpoint, std::time::Duration::from_secs(2))
+                .unwrap();
+        let (accepted, _) = held.accept().unwrap();
+        assert_eq!(accepted.local_addr().unwrap(), endpoint);
     }
 }
 
