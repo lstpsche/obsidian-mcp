@@ -51,6 +51,15 @@ pub(super) struct PendingVaultInfo {
 pub(super) enum VaultInfoOutput {
     Ready(VaultInfo),
     Pending(PendingVaultInfo),
+    Authenticated(AuthenticatedVaultInfo),
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(super) struct AuthenticatedVaultInfo {
+    #[serde(flatten)]
+    stats: VaultStats,
+    vault_name: String,
+    embeddings: EmbeddingInfo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -216,6 +225,23 @@ pub async fn vault_info(
         .resolved_mcp_data()
         .and_then(|path| (Some(path) != vault.mcp_home()).then(|| path.display().to_string()));
     let mut embeddings = embedding_info(vault, runtime).await;
+    if vault.is_authenticated() {
+        if let Some(status) = &mut embeddings.status
+            && status.last_error.is_some()
+        {
+            status.last_error =
+                Some("Semantic indexing is unavailable; contact the vault owner".into());
+        }
+        if embeddings.error.is_some() {
+            embeddings.error =
+                Some("Semantic service is unavailable; contact the vault owner".into());
+        }
+        return super::output::json(&VaultInfoOutput::Authenticated(AuthenticatedVaultInfo {
+            stats: stats?,
+            vault_name,
+            embeddings,
+        }));
+    }
     if vault.is_scoped() {
         embeddings.status = None;
         if embeddings.error.is_some() {
@@ -273,6 +299,13 @@ pub async fn open_in_obsidian(
     vault: &Vault,
     params: OpenInObsidianParams,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
+    if vault.is_authenticated() {
+        return Err(rmcp::ErrorData::new(
+            rmcp::model::ErrorCode::INVALID_REQUEST,
+            "Opening the owner's Obsidian application is unavailable to authenticated clients",
+            None::<serde_json::Value>,
+        ));
+    }
     if vault.is_remote() {
         return Err(rmcp::ErrorData::new(
             rmcp::model::ErrorCode::INVALID_REQUEST,

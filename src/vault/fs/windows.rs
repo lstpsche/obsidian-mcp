@@ -206,7 +206,7 @@ impl EntryType {
 
 pub(crate) fn dir_entries(
     dir: &Dir,
-) -> io::Result<impl Iterator<Item = io::Result<DirectoryEntry>>> {
+) -> io::Result<impl Iterator<Item = io::Result<DirectoryEntry>> + Send + use<>> {
     let file = open_relative(
         dir,
         OsStr::new(""),

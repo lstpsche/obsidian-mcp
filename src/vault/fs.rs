@@ -91,12 +91,21 @@ impl VaultRoot {
     }
 
     pub fn file_stat(&self, path: &Path) -> VaultResult<FileStat> {
+        if self.content_is_restricted() {
+            let file = self.open_file(path)?;
+            return Ok(stat_from_metadata(&file.metadata()?));
+        }
         let meta = self.target_metadata(path)?;
         Ok(file_times(
             meta.len(),
             meta.created().map(|t| t.into_std()),
             meta.modified().map(|t| t.into_std()),
         ))
+    }
+
+    pub(crate) fn file_stat_exact(&self, path: &Path) -> VaultResult<FileStat> {
+        let file = self.open_exact(path)?;
+        Ok(stat_from_metadata(&file.metadata()?))
     }
 
     pub fn read_file(&self, path: &Path) -> VaultResult<String> {
@@ -138,11 +147,18 @@ impl VaultRoot {
         path: &Path,
         read: impl FnOnce(&mut File) -> VaultResult<T>,
     ) -> VaultResult<T> {
-        let mut file = self.open_exact(path)?;
-        self.verify_observed(path, &file)?;
-        let result = read(&mut file)?;
-        self.verify_observed(path, &file)?;
-        Ok(result)
+        if self.content_is_restricted() {
+            vault_path::portable_native(path)?;
+        }
+        let result = (|| {
+            let mut file = self.open_exact(path)?;
+            self.verify_observed(path, &file)?;
+            let result = read(&mut file)?;
+            self.check_content_file(&file, path)?;
+            self.verify_observed(path, &file)?;
+            Ok(result)
+        })();
+        self.content_result(path, result)
     }
 
     pub fn write_file(&self, path: &Path, content: &str) -> VaultResult<PathBuf> {
@@ -157,10 +173,35 @@ impl VaultRoot {
         self.write(path, content, WriteMode::Append)
     }
 
+    /// Mutate a physical key without following a replacement alias after admission.
+    pub(crate) fn write_file_exact(&self, path: &Path, content: &str) -> VaultResult<PathBuf> {
+        self.write_exact(path, content, WriteMode::Replace)
+    }
+
+    pub(crate) fn create_file_exact(&self, path: &Path, content: &str) -> VaultResult<PathBuf> {
+        self.write_exact(path, content, WriteMode::Create)
+    }
+
+    pub(crate) fn append_file_exact(&self, path: &Path, content: &str) -> VaultResult<PathBuf> {
+        self.write_exact(path, content, WriteMode::Append)
+    }
+
+    fn write_exact(&self, path: &Path, content: &str, mode: WriteMode) -> VaultResult<PathBuf> {
+        vault_path::portable_native(path)?;
+        self.content_result(path, self.write_resolved(path, content, mode))?;
+        Ok(path.to_owned())
+    }
+
     fn write(&self, path: &Path, content: &str, mode: WriteMode) -> VaultResult<PathBuf> {
-        let actual = self.resolve_for_write(path)?.relative;
-        self.write_resolved(&actual, content, mode)?;
-        Ok(actual)
+        if self.content_is_restricted() {
+            vault_path::normalize_relative(path)?;
+        }
+        let result = (|| {
+            let actual = self.resolve_for_write(path)?.relative;
+            self.write_resolved(&actual, content, mode)?;
+            Ok(actual)
+        })();
+        self.content_result(path, result)
     }
 
     fn write_resolved(&self, path: &Path, content: &str, mode: WriteMode) -> VaultResult<()> {
@@ -168,7 +209,17 @@ impl VaultRoot {
         let mut options = OpenOptions::new();
         options.write(true).append(mode == WriteMode::Append);
         match parent.symlink_metadata(name) {
+            Ok(metadata)
+                if self.content_is_restricted() && (is_link(&metadata) || !metadata.is_file()) =>
+            {
+                return Err(VaultError::InvalidPath(
+                    "admitted content entry changed type".into(),
+                ));
+            }
             Ok(_) if mode == WriteMode::Create => {
+                if self.content_is_restricted() {
+                    let _existing = self.open_exact(path)?;
+                }
                 return Err(VaultError::AlreadyExists(path.to_owned()));
             }
             Ok(metadata) if is_link(&metadata) || !metadata.is_file() => {
@@ -190,6 +241,7 @@ impl VaultRoot {
                 }
                 error => error,
             })?;
+        self.check_content_file(&file, path)?;
         if mode == WriteMode::Replace {
             file.set_len(0)?;
         }
@@ -199,48 +251,141 @@ impl VaultRoot {
 
     /// Unlink the selected entry; an in-vault alias never unlinks its target.
     pub fn delete_file(&self, path: &Path) -> VaultResult<PathBuf> {
-        let actual = self.resolve_entry(path, false)?;
-        let (parent, name) = self.parent(&actual, false)?;
-        let metadata = parent.symlink_metadata(name).map_err(map_not_found(path))?;
-        if is_link(&metadata) {
-            self.link_target(&actual, path)?;
+        if self.content_is_restricted() {
+            vault_path::normalize_relative(path)?;
         }
-        remove_entry(&parent, name, metadata.is_dir())?;
-        Ok(actual)
+        let result = (|| {
+            let actual = self.resolve_entry(path, false)?;
+            let (parent, name) = self.parent(&actual, false)?;
+            let metadata = parent.symlink_metadata(name).map_err(map_not_found(path))?;
+            if self.content_is_restricted() {
+                let file = self.open_file(path)?;
+                self.check_content_file(&file, path)?;
+            }
+            if is_link(&metadata) {
+                self.link_target(&actual, path)?;
+            }
+            remove_entry(&parent, name, metadata.is_dir())?;
+            Ok(actual)
+        })();
+        self.content_result(path, result)
     }
 
     pub fn move_file(&self, from: &Path, to: &Path) -> VaultResult<MoveResult> {
-        let source = self.resolve_entry(from, false)?;
-        let (source_dir, source_name) = self.parent(&source, false)?;
-        // Check the effective target while keeping the original entry as the
-        // object to rename. Validate before creating any destination directory.
-        let resolved = self.resolve_existing(from)?;
-        if !self.entry_metadata_exact(&resolved.relative)?.is_file() {
-            return Err(VaultError::InvalidPath(format!(
-                "note move requires a regular file: {}",
-                from.display()
-            )));
+        if self.content_is_restricted() {
+            vault_path::normalize_relative(from)?;
+            vault_path::normalize_relative(to)?;
         }
-        let destination = self.resolve_entry(to, true)?;
+        let result = (|| {
+            let source = self.resolve_entry(from, false)?;
+            let (source_dir, source_name) = self.parent(&source, false)?;
+            // Check the effective target while keeping the original entry as the
+            // object to rename. Validate before creating any destination directory.
+            let resolved = self.resolve_existing(from)?;
+            if !self.entry_metadata_exact(&resolved.relative)?.is_file() {
+                return Err(VaultError::InvalidPath(format!(
+                    "note move requires a regular file: {}",
+                    from.display()
+                )));
+            }
+            if self.content_is_restricted() {
+                let file = self.open_file(from)?;
+                self.check_content_file(&file, from)?;
+            }
+            let destination = self.resolve_entry(to, true)?;
+            self.rename_entries(&source_dir, source_name, &source, &destination, to)
+        })();
+        self.content_result(from, result)
+    }
+
+    pub(crate) fn delete_entry_exact(&self, entry: &Path) -> VaultResult<PathBuf> {
+        vault_path::portable_native(entry)?;
+        let result = (|| {
+            let (parent, name) = self.parent(entry, false)?;
+            let metadata = parent
+                .symlink_metadata(name)
+                .map_err(map_not_found(entry))?;
+            if metadata.is_file() && !is_link(&metadata) {
+                let _file = self.open_exact(entry)?;
+            } else if !is_link(&metadata) {
+                return Err(VaultError::InvalidPath(
+                    "note deletion requires a regular file".into(),
+                ));
+            }
+            remove_entry(&parent, name, false)?;
+            Ok(entry.to_owned())
+        })();
+        self.content_result(entry, result)
+    }
+
+    pub(crate) fn move_entry_exact(
+        &self,
+        entry: &Path,
+        destination: &Path,
+        target: &Path,
+    ) -> VaultResult<MoveResult> {
+        vault_path::portable_native(entry)?;
+        vault_path::portable_native(destination)?;
+        vault_path::portable_native(target)?;
+        let result = (|| {
+            let (source_dir, source_name) = self.parent(entry, false)?;
+            let metadata = source_dir
+                .symlink_metadata(source_name)
+                .map_err(map_not_found(entry))?;
+            if !metadata.is_file() && !is_link(&metadata) {
+                return Err(VaultError::InvalidPath(
+                    "note move requires a regular file".into(),
+                ));
+            }
+            let _target = self.open_exact(target)?;
+            self.rename_entries(&source_dir, source_name, entry, destination, destination)
+        })();
+        self.content_result(entry, result)
+    }
+
+    fn rename_entries(
+        &self,
+        source_dir: &Dir,
+        source_name: &OsStr,
+        source: &Path,
+        destination: &Path,
+        requested_destination: &Path,
+    ) -> VaultResult<MoveResult> {
         if source.parent() != destination.parent()
             && is_link(&source_dir.symlink_metadata(source_name)?)
             && source_dir.read_link_contents(source_name)?.is_relative()
         {
             return Err(VaultError::InvalidPath(format!(
                 "cannot move a relative note symlink to another directory: {}",
-                from.display()
+                source.display()
             )));
         }
-        let (destination_dir, destination_name) = self.parent(&destination, true)?;
-        rename_exclusive(&source_dir, source_name, &destination_dir, destination_name).map_err(
+        let (destination_dir, destination_name) = self.parent(destination, true)?;
+        if self.content_is_restricted() {
+            match destination_dir.symlink_metadata(destination_name) {
+                Ok(metadata) if is_link(&metadata) || !metadata.is_file() => {
+                    return Err(VaultError::InvalidPath(
+                        "admitted destination entry changed type".into(),
+                    ));
+                }
+                Ok(_) => {
+                    let _existing = self.open_exact(destination)?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        rename_exclusive(source_dir, source_name, &destination_dir, destination_name).map_err(
             |error| match error.kind() {
-                io::ErrorKind::AlreadyExists => VaultError::AlreadyExists(to.to_owned()),
+                io::ErrorKind::AlreadyExists => {
+                    VaultError::AlreadyExists(requested_destination.to_owned())
+                }
                 _ => VaultError::Io(error),
             },
         )?;
         Ok(MoveResult {
-            from: source,
-            to: destination,
+            from: source.to_owned(),
+            to: destination.to_owned(),
         })
     }
 

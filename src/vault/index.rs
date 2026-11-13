@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+use cap_fs_ext::MetadataExt;
 use regex::Regex;
 
 use crate::error::{MutationOutcome, StorageErrorKind, VaultError, VaultResult};
@@ -74,6 +75,7 @@ impl WatchPaths {
 }
 
 pub struct VaultIndex {
+    generation: u64,
     notes: HashMap<OsString, NoteMetadata>,
     source_revisions: HashMap<OsString, String>,
     tags: HashMap<String, HashSet<OsString>>,
@@ -83,7 +85,7 @@ pub struct VaultIndex {
     attachments: HashMap<OsString, u64>,
     attachment_bytes: u64,
     filesystem: Option<fs::VaultRoot>,
-    read_contents: Option<HashMap<OsString, String>>,
+    read_contents: Option<Arc<HashMap<OsString, Arc<str>>>>,
     exclude: Arc<ExcludeSet>,
     excluded_note_paths: HashSet<OsString>,
     source_batch: bool,
@@ -92,10 +94,23 @@ pub struct VaultIndex {
     waiting_for_lexical: HashMap<OsString, tantivy::Opstamp>,
 }
 
+/// Owned observations for one readable policy. Raw note content is acquired
+/// separately, after releasing the source index lock.
+pub(crate) struct AuthorizedSnapshot {
+    pub generation: u64,
+    pub notes: HashMap<OsString, NoteMetadata>,
+    pub revisions: HashMap<OsString, String>,
+    pub attachments: HashMap<OsString, u64>,
+    pub excluded: HashSet<OsString>,
+    filesystem: Option<fs::VaultRoot>,
+    exclude: Arc<ExcludeSet>,
+}
+
 impl VaultIndex {
     /// Create an empty index (useful for tests and pre-initialization).
     pub fn empty() -> Self {
         Self {
+            generation: 0,
             notes: HashMap::new(),
             source_revisions: HashMap::new(),
             tags: HashMap::new(),
@@ -183,7 +198,9 @@ impl VaultIndex {
         let (total, _) = match self.observed_byte_totals(path, stat.size, false) {
             Ok(totals) => totals,
             Err(error) => {
-                self.source_revisions.remove(path.as_os_str());
+                if self.source_revisions.remove(path.as_os_str()).is_some() {
+                    self.mark_changed();
+                }
                 return Err(error);
             }
         };
@@ -191,6 +208,7 @@ impl VaultIndex {
             note.stat = stat;
         }
         self.stats.vault_size_bytes = total;
+        self.mark_changed();
         Ok(true)
     }
 
@@ -241,6 +259,7 @@ impl VaultIndex {
                     self.attachment_bytes = attachment_bytes;
                     self.stats.total_files += 1;
                     self.stats.vault_size_bytes = total;
+                    self.mark_changed();
                 }
                 Ok(None)
             }
@@ -316,6 +335,96 @@ impl VaultIndex {
         );
         view.rebuild_backlinks();
         view.recompute_stats();
+        view.read_contents = Some(Arc::new(
+            contents
+                .into_iter()
+                .map(|(path, content)| (path, Arc::from(content)))
+                .collect(),
+        ));
+        view
+    }
+
+    /// Revision of the source inventory, independent of a client's readable corpus.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn mark_changed(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Copy eligible source observations without reading source files or resolving
+    /// links against the broader namespace. Expensive projection work belongs
+    /// outside the source index lock.
+    pub(crate) fn authorized_snapshot(
+        &self,
+        allows: impl Fn(&Path) -> bool,
+    ) -> VaultResult<AuthorizedSnapshot> {
+        let mut notes = HashMap::new();
+        let mut revisions = HashMap::new();
+        for (path, metadata) in &self.notes {
+            if !allows(Path::new(path)) {
+                continue;
+            }
+            let revision = self.source_revisions.get(path).ok_or_else(|| {
+                VaultError::Other("authorized source metadata requires reconciliation".into())
+            })?;
+            notes.insert(path.clone(), metadata.clone());
+            revisions.insert(path.clone(), revision.clone());
+        }
+        Ok(AuthorizedSnapshot {
+            generation: self.generation,
+            notes,
+            revisions,
+            attachments: self
+                .attachments
+                .iter()
+                .filter(|(path, _)| allows(Path::new(path)))
+                .map(|(path, size)| (path.clone(), *size))
+                .collect(),
+            excluded: self
+                .excluded_note_paths
+                .iter()
+                .filter(|path| allows(Path::new(path)))
+                .cloned()
+                .collect(),
+            filesystem: self.filesystem.clone(),
+            exclude: Arc::clone(&self.exclude),
+        })
+    }
+
+    /// Publish complete authorized observations. Literal wikilinks are part of
+    /// readable source, while resolution, backlinks and statistics use only this
+    /// snapshot's namespace. Hidden targets never influence classification.
+    pub(crate) fn from_authorized_snapshot(
+        snapshot: &AuthorizedSnapshot,
+        contents: Arc<HashMap<OsString, Arc<str>>>,
+    ) -> Self {
+        let mut view = Self::for_source(Arc::clone(&snapshot.exclude));
+        view.generation = snapshot.generation;
+        view.filesystem = snapshot.filesystem.clone();
+        view.notes = snapshot.notes.clone();
+        view.source_revisions = snapshot.revisions.clone();
+        view.attachments = snapshot.attachments.clone();
+        view.attachment_bytes = view.attachments.values().sum();
+        view.excluded_note_paths = snapshot.excluded.clone();
+        for (path, metadata) in &view.notes {
+            for tag in &metadata.tags {
+                view.tags
+                    .entry(tag.to_lowercase())
+                    .or_default()
+                    .insert(path.clone());
+            }
+        }
+        view.link_resolver = build_link_resolver(
+            &view
+                .notes
+                .values()
+                .map(|note| note.path.clone())
+                .collect::<Vec<_>>(),
+        );
+        view.rebuild_backlinks();
+        view.recompute_stats();
         view.read_contents = Some(contents);
         view
     }
@@ -369,7 +478,10 @@ impl VaultIndex {
                         Err(error) if fs::skip_changed_entry(&error) => return Ok(()),
                         Err(error) => return Err(error),
                     };
-                    if metadata.is_file() && !fs::is_link(&metadata) {
+                    if metadata.is_file()
+                        && !fs::is_link(&metadata)
+                        && (!filesystem.content_is_restricted() || metadata.nlink() == 1)
+                    {
                         observed_bytes = observed_bytes
                             .checked_add(metadata.len())
                             .ok_or_else(|| inventory_size_error(path))?;
@@ -410,7 +522,14 @@ impl VaultIndex {
                         index.notes.insert(path.as_os_str().to_owned(), metadata);
                     }
                     Err(error) => {
-                        tracing::warn!(path = %path.display(), %error, "skipping unparseable note during index build")
+                        if filesystem.content_is_restricted() {
+                            tracing::warn!(
+                                category = error.diagnostic_category(),
+                                "skipping invalid note during protected index build"
+                            );
+                        } else {
+                            tracing::warn!(path = %path.display(), %error, "skipping unparseable note during index build");
+                        }
                     }
                 },
             }
@@ -428,7 +547,14 @@ impl VaultIndex {
         index.recompute_stats();
         index.filesystem = Some(filesystem);
         index.exclude = exclude;
+        index.mark_changed();
         Ok(index)
+    }
+
+    pub(crate) fn content_is_restricted(&self) -> bool {
+        self.filesystem
+            .as_ref()
+            .is_some_and(fs::VaultRoot::content_is_restricted)
     }
 
     pub(crate) fn filesystem(&self, root: &Path) -> VaultResult<fs::VaultRoot> {
@@ -488,8 +614,8 @@ impl VaultIndex {
         }
         let exclude = Arc::clone(&self.exclude);
         let result = self.update_file(&filesystem, &actual, &exclude, true);
-        if result.is_err() {
-            self.source_revisions.remove(actual.as_os_str());
+        if result.is_err() && self.source_revisions.remove(actual.as_os_str()).is_some() {
+            self.mark_changed();
         }
         if result.is_err()
             && !matches!(
@@ -506,6 +632,7 @@ impl VaultIndex {
     }
 
     fn replace_note(&mut self, path: &Path, metadata: NoteMetadata, total_bytes: u64) {
+        self.mark_changed();
         #[cfg(has_embeddings)]
         self.waiting_for_lexical.remove(path.as_os_str());
         let was_existing = self.notes.contains_key(path.as_os_str());
@@ -552,7 +679,12 @@ impl VaultIndex {
     pub fn remove_file(&mut self, path: &Path) {
         let path = logical_separators(path);
         let path = path.as_ref();
-        self.source_revisions.remove(path.as_os_str());
+        if self.tracks(path) {
+            self.mark_changed();
+        }
+        if self.source_revisions.remove(path.as_os_str()).is_some() {
+            self.mark_changed();
+        }
         if self.tracks(path)
             && let Some(paths) = self.watch_paths.get_mut()
         {
@@ -622,6 +754,10 @@ impl VaultIndex {
             }
             Err(error) => return Err(error),
         };
+        if filesystem.content_is_restricted() && metadata.nlink() != 1 {
+            self.remove_file(path);
+            return Ok(None);
+        }
         let (content, stat) = if matches!(classify(path, exclude), FileClass::Note) {
             let (content, stat) = filesystem.read_observed_with_stat(path)?;
             (Some(content), stat)
@@ -672,7 +808,9 @@ impl VaultIndex {
                 ..
             })
         ) {
-            self.source_revisions.remove(path.as_os_str());
+            if self.source_revisions.remove(path.as_os_str()).is_some() {
+                self.mark_changed();
+            }
             return update.map(|_| false);
         }
         if update.is_err() {
@@ -887,6 +1025,7 @@ impl VaultIndex {
             self.track_watch_path(path);
             self.excluded_note_paths.insert(path.as_os_str().to_owned());
             self.stats.excluded_notes += 1;
+            self.mark_changed();
         }
     }
 
@@ -1114,7 +1253,9 @@ impl VaultIndex {
                     .get(path)
                     .cloned()
                     .ok_or_else(|| VaultError::NoteNotFound(PathBuf::from(path))),
-                None => filesystem.read_observed(Path::new(path)),
+                None => filesystem
+                    .read_observed(Path::new(path))
+                    .map(Arc::<str>::from),
             };
             let content = match observed {
                 Ok(c) => c,
@@ -1655,6 +1796,44 @@ mod tests {
                 )
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn restricted_inventory_omits_hardlinked_attachments_without_changing_ordinary_inventory()
+    {
+        let directory = TempDir::new().unwrap();
+        stdfs::create_dir_all(directory.path().join("Shared")).unwrap();
+        stdfs::create_dir_all(directory.path().join("Private")).unwrap();
+        stdfs::write(directory.path().join("Private/source.md"), "private source").unwrap();
+        stdfs::hard_link(
+            directory.path().join("Private/source.md"),
+            directory.path().join("Shared/image.txt"),
+        )
+        .unwrap();
+        let root = fs::VaultRoot::open(directory.path()).unwrap();
+        let ordinary = VaultIndex::build_rooted(root.clone(), empty_exclude())
+            .await
+            .unwrap();
+        assert_eq!(ordinary.stats().total_files, 2);
+        let mut restricted = VaultIndex::build_rooted(root.restricted_content(), empty_exclude())
+            .await
+            .unwrap();
+        assert_eq!(restricted.stats().total_files, 0);
+        assert_eq!(restricted.stats().vault_size_bytes, 0);
+        stdfs::write(directory.path().join("Shared/visible.txt"), "visible").unwrap();
+        restricted
+            .reindex_file(directory.path(), Path::new("Shared/visible.txt"))
+            .unwrap();
+        assert_eq!(restricted.stats().total_files, 1);
+        stdfs::hard_link(
+            directory.path().join("Shared/visible.txt"),
+            directory.path().join("Private/alias.txt"),
+        )
+        .unwrap();
+        restricted
+            .reindex_file(directory.path(), Path::new("Shared/visible.txt"))
+            .unwrap();
+        assert_eq!(restricted.stats().total_files, 0);
     }
 
     #[test]

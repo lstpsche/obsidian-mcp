@@ -1,0 +1,1221 @@
+//! Delegated source admission over the retained vault owner.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::access::clients::{Action, DecisionReason};
+use crate::access::store::AuthorizedClient;
+use crate::config::Config;
+use crate::error::{VaultError, VaultResult};
+use crate::models::FileStat;
+
+use super::fs::{MoveResult, VaultRoot};
+use super::{Vault, path, source, source_work};
+
+impl Vault {
+    /// Open one local source owner without activating an unrestricted search provider.
+    pub async fn open_authenticated(config: &Config) -> VaultResult<Self> {
+        if config.sftp_location()?.is_some() {
+            return Err(VaultError::Authorization(
+                "authenticated clients require a local vault source".into(),
+            ));
+        }
+        if config.mcp_data_dir.is_none() {
+            return Err(VaultError::Authorization(
+                "authenticated clients require external machine data".into(),
+            ));
+        }
+        let root = VaultRoot::open(&config.vault_path)?;
+        let machine = config
+            .mcp_data_dir
+            .as_ref()
+            .ok_or_else(|| VaultError::Authorization("external machine data is missing".into()))?
+            .canonicalize()?;
+        if machine.starts_with(root.path()) {
+            return Err(VaultError::Authorization(
+                "authenticated machine data must be outside the vault".into(),
+            ));
+        }
+        let mut source_config = config.clone();
+        source_config.tantivy = false;
+        source_config.embeddings = false;
+        Self::open_inner(&source_config, None, false, Some(config.clone())).await
+    }
+
+    /// Select an immutable client policy while retaining shared source mutation ownership.
+    pub fn with_access(&self, client: AuthorizedClient) -> VaultResult<Self> {
+        if !self.is_authenticated() || self.is_remote() {
+            return Err(VaultError::Authorization(
+                "client authorization requires an authenticated local source owner".into(),
+            ));
+        }
+        client.current()?;
+        let source = self.inner.filesystem.as_ref().ok_or_else(|| {
+            VaultError::Authorization("authenticated local source is missing".into())
+        })?;
+        let named = VaultRoot::open(&client.source().canonical_path)?;
+        if source.path().as_os_str() != client.source().canonical_path.as_os_str()
+            || !source.same_root(&named)?
+        {
+            return Err(VaultError::Authorization(
+                "client policy belongs to a different source; reopen the authenticated vault"
+                    .into(),
+            ));
+        }
+        client.current()?;
+        let mut view = self.clone();
+        view.access = Some(client);
+        let projection = view.project_access()?;
+        tracing::debug!(policy = %view.require_access()?.read_policy_key(), "selected authorized corpus");
+        view.projection = Some(projection);
+        Ok(view)
+    }
+
+    pub fn is_authenticated(&self) -> bool {
+        self.inner.authenticated_config.is_some()
+    }
+
+    pub fn access_client(&self) -> Option<&AuthorizedClient> {
+        self.access.as_ref()
+    }
+
+    pub(crate) fn check_access_current(&self) -> VaultResult<()> {
+        if self.is_authenticated() {
+            self.require_access()?.current()?;
+        }
+        Ok(())
+    }
+
+    fn require_access(&self) -> VaultResult<&AuthorizedClient> {
+        self.access.as_ref().ok_or_else(|| {
+            VaultError::Authorization("authenticated invocation context is missing".into())
+        })
+    }
+
+    pub(crate) fn authenticated_root(&self) -> VaultResult<VaultRoot> {
+        self.inner
+            .filesystem
+            .as_ref()
+            .map(VaultRoot::restricted_content)
+            .ok_or_else(|| {
+                VaultError::Authorization("authenticated local source is missing".into())
+            })
+    }
+
+    fn project_access(&self) -> VaultResult<Arc<super::authorized_index::AuthorizedProjection>> {
+        let client = self.require_access()?;
+        let permit = client.permit()?;
+        let now = chrono::Utc::now().timestamp();
+        let readable_policies = permit
+            .snapshot()
+            .policy
+            .clients
+            .values()
+            .filter(|policy| {
+                policy.enabled
+                    && policy.credentials.iter().any(|credential| {
+                        !credential.revoked
+                            && credential.expires_at.is_none_or(|expiry| expiry > now)
+                    })
+            })
+            .map(|policy| policy.read_policy_hash())
+            .collect();
+        self.inner
+            .authorized_indices
+            .retain_read_policies(&readable_policies)?;
+        drop(permit);
+        let config = self.inner.authenticated_config.as_ref().ok_or_else(|| {
+            VaultError::Authorization("authenticated source configuration is missing".into())
+        })?;
+        self.inner.authorized_indices.project(
+            &self.inner.index,
+            client.policy(),
+            config.tantivy,
+            |path| self.read_access_native(path, None),
+        )
+    }
+
+    pub(crate) fn refresh_authorized_projection(&self) -> VaultResult<()> {
+        if self.is_authenticated() {
+            let current = self.project_access()?;
+            if let Some(selected) = &self.projection
+                && (!selected.is_ready() || !Arc::ptr_eq(selected, &current))
+            {
+                return Err(VaultError::Authorization(
+                    "authorized corpus changed; reopen the authorized view".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_access_path(
+        &self,
+        root: &VaultRoot,
+        requested: &Path,
+        allow_missing: bool,
+    ) -> VaultResult<(PathBuf, PathBuf)> {
+        let client = self.require_access()?;
+        client.current()?;
+        let requested = path::normalize_relative(requested)?;
+        let decision = client.policy().decision(Action::Read, &requested);
+        if decision.reason == DecisionReason::InvalidPath {
+            return Err(VaultError::InvalidPath(
+                "expected a normalized vault-relative content path".into(),
+            ));
+        }
+        if matches!(
+            decision.reason,
+            DecisionReason::Denied | DecisionReason::Disabled | DecisionReason::ReservedPath
+        ) {
+            return Err(VaultError::AccessDenied {
+                path: requested,
+                visible: false,
+            });
+        }
+        let resolved = if allow_missing {
+            root.resolve_access_for_write(&requested)
+        } else {
+            root.resolve_access_existing(&requested)
+        };
+        let (logical, target) = resolved.map_err(|error| {
+            if !decision.allowed && !client.policy().allows_container(&requested) {
+                VaultError::AccessDenied {
+                    path: requested.clone(),
+                    visible: false,
+                }
+            } else {
+                error
+            }
+        })?;
+        Ok((logical, target.relative))
+    }
+
+    pub(crate) fn read_access_native(
+        &self,
+        requested: &Path,
+        max_bytes: Option<usize>,
+    ) -> VaultResult<String> {
+        let client = self.require_access()?;
+        let root = self.authenticated_root()?;
+        let (requested, actual) = self.resolve_access_path(&root, requested, false)?;
+        self.check_scope_path(&requested)?;
+        {
+            let permit = client.permit()?;
+            permit.check(Action::Read, &requested, &actual)?;
+        }
+        let content = match max_bytes {
+            Some(max_bytes) => root.read_exact_bounded(&actual, max_bytes)?,
+            None => root.read_observed(&actual)?,
+        };
+        self.check_content_scope(&actual, &content)?;
+        client.check(Action::Read, &requested, &actual)?;
+        Ok(content)
+    }
+
+    /// Scored evidence may retain an unavailable source, but never a source
+    /// which resolves to a resource outside the current client's authority.
+    pub(crate) async fn check_access_result(&self, path: &Path) -> VaultResult<()> {
+        let vault = self.clone();
+        let path = path.to_owned();
+        source_work(move || {
+            let client = vault.require_access()?;
+            client.check(Action::Read, &path, &path)?;
+            let root = vault.authenticated_root()?;
+            match root.resolve_existing(&path) {
+                Ok(actual) => {
+                    client.check(Action::Read, &path, &actual.relative)?;
+                    if let Err(error @ VaultError::AccessDenied { .. }) =
+                        root.validate_access_file_exact(&actual.relative)
+                    {
+                        return Err(error);
+                    }
+                }
+                Err(VaultError::Io(_)) => (),
+                Err(error) if error.is_not_found() => (),
+                Err(error) => return Err(error),
+            }
+            // Missing/unreadable/changed source is represented by the semantic
+            // renderer's revision-bound context_error rather than mixed bytes.
+            client.current()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn access_is_file(&self, requested: &Path) -> VaultResult<bool> {
+        let vault = self.clone();
+        let requested = requested.to_owned();
+        source_work(move || {
+            let client = vault.require_access()?;
+            let root = vault.authenticated_root()?;
+            let (requested, actual) = match vault.resolve_access_path(&root, &requested, false) {
+                Ok(resolved) => resolved,
+                Err(error) if error.is_not_found() => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            client.check(Action::Read, &requested, &actual)?;
+            match root.validate_access_file_exact(&actual) {
+                Ok(()) => Ok(true),
+                Err(error) if error.is_not_found() => Ok(false),
+                Err(error) => Err(error),
+            }
+        })
+        .await
+    }
+
+    pub(crate) async fn access_file_stat(&self, requested: &Path) -> VaultResult<FileStat> {
+        let vault = self.clone();
+        let requested = requested.to_owned();
+        source_work(move || {
+            let client = vault.require_access()?;
+            let root = vault.authenticated_root()?;
+            let (requested, actual) = vault.resolve_access_path(&root, &requested, false)?;
+            client.check(Action::Read, &requested, &actual)?;
+            let stat = root.file_stat_exact(&actual)?;
+            client.check(Action::Read, &requested, &actual)?;
+            Ok(stat)
+        })
+        .await
+    }
+
+    pub(crate) async fn access_canonical_existing(&self, requested: &Path) -> VaultResult<PathBuf> {
+        let vault = self.clone();
+        let requested = requested.to_owned();
+        source_work(move || {
+            let client = vault.require_access()?;
+            client.current()?;
+            let root = vault.authenticated_root()?;
+            let (requested, actual) = vault.resolve_access_path(&root, &requested, false)?;
+            if !client.policy().allows_container(&requested)
+                && !client.policy().allows(Action::Read, &requested)
+            {
+                return Err(VaultError::AccessDenied {
+                    path: requested,
+                    visible: false,
+                });
+            }
+            if root.entry_metadata_exact(&actual)?.is_dir() {
+                if !client.policy().allows_container(&actual) {
+                    return Err(VaultError::AccessDenied {
+                        path: requested,
+                        visible: false,
+                    });
+                }
+                client.current()?;
+            } else {
+                client.check(Action::Read, &requested, &actual)?;
+                root.validate_access_file_exact(&actual)?;
+            }
+            Ok(actual)
+        })
+        .await
+    }
+
+    pub(crate) async fn access_list_files(
+        &self,
+        requested: &Path,
+        recursive: bool,
+        glob: Option<&str>,
+        regular_only: bool,
+    ) -> VaultResult<Vec<PathBuf>> {
+        let vault = self.clone();
+        let requested = requested.to_owned();
+        let glob = glob.map(str::to_owned);
+        source_work(move || {
+            let client = vault.require_access()?;
+            client.current()?;
+            let root = vault.authenticated_root()?;
+            let (requested, actual) = vault
+                .resolve_access_path(&root, &requested, false)
+                .map_err(|error| {
+                    if error.is_not_found() {
+                        VaultError::DirectoryNotFound(requested.clone())
+                    } else {
+                        error
+                    }
+                })?;
+            if !client.policy().allows_container(&requested) {
+                return Err(VaultError::AccessDenied {
+                    path: requested,
+                    visible: false,
+                });
+            }
+            if !client.policy().allows_container(&actual) {
+                return Err(VaultError::AccessDenied {
+                    path: requested,
+                    visible: false,
+                });
+            }
+            let matcher = glob
+                .as_deref()
+                .map(|pattern| {
+                    globset::Glob::new(pattern)
+                        .map(|glob| glob.compile_matcher())
+                        .map_err(|error| {
+                            VaultError::InvalidPath(format!("invalid glob pattern: {error}"))
+                        })
+                })
+                .transpose()?;
+            let source_base = actual.clone();
+            let mut pending = vec![actual];
+            let mut paths = Vec::new();
+            while let Some(directory) = pending.pop() {
+                client.current()?;
+                let directory_handle = match root.open_dir_exact(&directory) {
+                    Ok(directory) => directory,
+                    Err(VaultError::AccessDenied { .. }) if directory != source_base => continue,
+                    Err(error) => return Err(error),
+                };
+                let entries = super::fs::dir_entries(&directory_handle)?;
+                for entry in entries {
+                    let entry = entry?;
+                    let raw = directory.join(entry.file_name());
+                    let Ok(path) = path::portable_native(&raw) else {
+                        continue;
+                    };
+                    if !super::exclude::is_visible_path(&path) {
+                        continue;
+                    }
+                    let suffix = path
+                        .strip_prefix(&source_base)
+                        .map_err(|_| VaultError::OutsideVault(path.clone()))?;
+                    let logical = path::logical_join(&requested, suffix)?;
+                    if !client.policy().allows_container(&logical)
+                        && !client.policy().allows(Action::Read, &logical)
+                    {
+                        continue;
+                    }
+                    if !client.policy().allows_container(&path)
+                        && !client.policy().allows(Action::Read, &path)
+                    {
+                        continue;
+                    }
+                    let kind = entry.file_type()?;
+                    let visible = if kind.is_dir() {
+                        let visible = client.policy().allows_container(&path)
+                            && client.policy().allows_container(&logical);
+                        if visible && recursive {
+                            pending.push(path.clone());
+                        }
+                        visible && !regular_only
+                    } else {
+                        match root.resolve_existing(&path) {
+                            Ok(target) => {
+                                let metadata = match root.entry_metadata_exact(&target.relative) {
+                                    Ok(metadata) => metadata,
+                                    Err(VaultError::AccessDenied { .. }) => continue,
+                                    Err(error) if error.is_not_found() => continue,
+                                    Err(error) => return Err(error),
+                                };
+                                if metadata.is_dir() {
+                                    !regular_only
+                                        && client.policy().allows_container(&logical)
+                                        && client.policy().allows_container(&target.relative)
+                                } else if metadata.is_file()
+                                    && client.policy().allows(Action::Read, &logical)
+                                    && client.policy().allows(Action::Read, &target.relative)
+                                {
+                                    match root.validate_access_file_exact(&target.relative) {
+                                        Ok(()) => true,
+                                        Err(VaultError::AccessDenied { .. }) => false,
+                                        Err(error) if error.is_not_found() => false,
+                                        Err(error) => return Err(error),
+                                    }
+                                } else {
+                                    false
+                                }
+                            }
+                            Err(
+                                VaultError::AccessDenied { .. }
+                                | VaultError::OutsideVault(_)
+                                | VaultError::InvalidPath(_),
+                            ) => false,
+                            Err(error) if error.is_not_found() => false,
+                            Err(error) => return Err(error),
+                        }
+                    };
+                    if visible
+                        && matcher
+                            .as_ref()
+                            .is_none_or(|matcher| matcher.is_match(&logical))
+                    {
+                        paths.push(logical);
+                    }
+                }
+            }
+            client.current()?;
+            paths.sort();
+            Ok(paths)
+        })
+        .await
+    }
+
+    async fn access_write_source(
+        &self,
+        requested: &Path,
+        content: &str,
+        expected: Option<&str>,
+        create_only: bool,
+        append: bool,
+    ) -> VaultResult<PathBuf> {
+        let vault = self.clone();
+        let requested = requested.to_owned();
+        let content = content.to_owned();
+        let expected = expected.map(str::to_owned);
+        source_work(move || {
+            let root = vault.authenticated_root()?;
+            let client = vault.require_access()?;
+            let (requested, actual) = vault.resolve_access_path(&root, &requested, true)?;
+            client.check(Action::Read, &requested, &actual)?;
+            let exists = match root.entry_metadata_exact(&actual) {
+                Ok(metadata) => {
+                    if !metadata.is_file() {
+                        return Err(VaultError::AccessDenied {
+                            path: requested,
+                            visible: false,
+                        });
+                    }
+                    true
+                }
+                Err(error) if error.is_not_found() => false,
+                Err(error) => return Err(error),
+            };
+            let action = if create_only || !exists {
+                Action::Create
+            } else {
+                Action::Update
+            };
+            {
+                let permit = client.permit()?;
+                permit.check(action, &requested, &actual)?;
+                if expected.is_some() || (append && exists) {
+                    permit.check(Action::Read, &requested, &actual)?;
+                }
+            }
+            if let Some(expected) = expected {
+                let current = root.read_observed(&actual)?;
+                source::SourceSnapshot::new(current).check_revision(&actual, Some(&expected))?;
+                client.check(Action::Update, &requested, &actual)?;
+            }
+            if create_only {
+                root.create_file_exact(&actual, &content)
+            } else if append {
+                root.append_file_exact(&actual, &content)
+            } else {
+                root.write_file_exact(&actual, &content)
+            }
+        })
+        .await
+    }
+
+    pub(crate) async fn write_source(&self, path: &Path, content: &str) -> VaultResult<PathBuf> {
+        if self.is_authenticated() {
+            self.access_write_source(path, content, None, false, false)
+                .await
+        } else {
+            self.storage().await?.write_file(path, content).await
+        }
+    }
+
+    pub(crate) async fn create_source(&self, path: &Path, content: &str) -> VaultResult<PathBuf> {
+        if self.is_authenticated() {
+            self.access_write_source(path, content, None, true, false)
+                .await
+        } else {
+            self.storage().await?.create_file(path, content).await
+        }
+    }
+
+    pub(crate) async fn replace_source(
+        &self,
+        path: &Path,
+        content: &str,
+        expected: &str,
+    ) -> VaultResult<PathBuf> {
+        if self.is_authenticated() {
+            self.access_write_source(path, content, Some(expected), false, false)
+                .await
+        } else {
+            self.storage()
+                .await?
+                .write_file_if_revision(path, content, expected)
+                .await
+        }
+    }
+
+    pub(crate) async fn append_source(&self, path: &Path, content: &str) -> VaultResult<PathBuf> {
+        if self.is_authenticated() {
+            self.access_write_source(path, content, None, false, true)
+                .await
+        } else {
+            let root =
+                self.storage().await?.local_root().cloned().ok_or_else(|| {
+                    VaultError::Other("native append requires local source".into())
+                })?;
+            let path = path.to_owned();
+            let content = content.to_owned();
+            source_work(move || root.append_file(&path, &content)).await
+        }
+    }
+
+    pub(crate) async fn delete_source(&self, requested: &Path) -> VaultResult<PathBuf> {
+        if !self.is_authenticated() {
+            return self.storage().await?.delete_file(requested).await;
+        }
+        let vault = self.clone();
+        let requested = requested.to_owned();
+        source_work(move || {
+            let client = vault.require_access()?;
+            let root = vault.authenticated_root()?;
+            let (logical, target) = vault.resolve_access_path(&root, &requested, false)?;
+            let entry = root.resolve_entry(&requested, false)?;
+            root.validate_access_file_exact(&target)?;
+            {
+                let permit = client.permit()?;
+                permit.check(Action::Delete, &logical, &entry)?;
+                permit.check(Action::Delete, &logical, &target)?;
+            }
+            root.delete_entry_exact(&entry)
+        })
+        .await
+    }
+
+    pub(crate) async fn move_source(
+        &self,
+        requested: &Path,
+        destination: &Path,
+    ) -> VaultResult<MoveResult> {
+        if !self.is_authenticated() {
+            return self
+                .storage()
+                .await?
+                .move_file(requested, destination)
+                .await;
+        }
+        let vault = self.clone();
+        let requested = requested.to_owned();
+        let destination = destination.to_owned();
+        source_work(move || {
+            let client = vault.require_access()?;
+            let root = vault.authenticated_root()?;
+            let (logical, target) = vault.resolve_access_path(&root, &requested, false)?;
+            let (logical_to, to_target) = vault.resolve_access_path(&root, &destination, true)?;
+            let entry = root.resolve_entry(&requested, false)?;
+            let to = root.resolve_entry(&destination, true)?;
+            root.validate_access_file_exact(&target)?;
+            {
+                let permit = client.permit()?;
+                permit.check(Action::Delete, &logical, &entry)?;
+                permit.check(Action::Delete, &logical, &target)?;
+                permit.check(Action::Read, &logical, &target)?;
+                permit.check(Action::Create, &logical_to, &to)?;
+                permit.check(Action::Create, &logical_to, &to_target)?;
+            }
+            root.move_entry_exact(&entry, &to, &target)
+        })
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::access::clients::{ClientPolicy, Deny, Grant, Role};
+    use crate::access::store::AccessStore;
+    use crate::models::NotePeriod;
+
+    struct Fixture {
+        _temporary: tempfile::TempDir,
+        root: PathBuf,
+        store: AccessStore,
+        vault: Vault,
+    }
+
+    async fn fixture(grants: Vec<Grant>, denies: Vec<Deny>) -> Fixture {
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = temporary.path().canonicalize().unwrap();
+        let root = parent.join("vault");
+        std::fs::create_dir_all(root.join("Shared")).unwrap();
+        std::fs::create_dir_all(root.join("Private")).unwrap();
+        std::fs::create_dir_all(root.join(".obsidian")).unwrap();
+        std::fs::write(root.join("Shared/note.md"), "original").unwrap();
+        std::fs::write(root.join("Private/note.md"), "private source").unwrap();
+        std::fs::write(root.join("Private/template.md"), "private template").unwrap();
+        std::fs::write(
+            root.join(".obsidian/daily-notes.json"),
+            r#"{"folder":"Shared/Daily","template":"Private/template"}"#,
+        )
+        .unwrap();
+        let data = parent.join("state/data");
+        let store =
+            AccessStore::initialize(&parent.join("state/access.json"), &root, &data).unwrap();
+        store
+            .update(None, |policy| {
+                policy.clients.insert(
+                    "client".into(),
+                    ClientPolicy {
+                        grants,
+                        denies,
+                        ..Default::default()
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        let output = parent.join("state/client.token");
+        store.issue_token("client", &output, None).unwrap();
+        let token = std::fs::read_to_string(output).unwrap();
+        let client = store.authenticate(token.trim()).unwrap();
+        let mut config = crate::test_helpers::test_config(&root);
+        config.mcp_data_dir = Some(data);
+        let vault = Vault::open_authenticated(&config)
+            .await
+            .unwrap()
+            .with_access(client)
+            .unwrap();
+        Fixture {
+            _temporary: temporary,
+            root,
+            store,
+            vault,
+        }
+    }
+
+    fn directory(path: &str, role: Role) -> Grant {
+        Grant {
+            id: "grant".into(),
+            directory: Some(path.into()),
+            file: None,
+            role,
+        }
+    }
+
+    fn deny_private() -> Deny {
+        Deny {
+            id: "private".into(),
+            directory: Some("Private".into()),
+            file: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn content_authority_preserves_shared_edits_and_reserves_owner_paths() {
+        let f = fixture(vec![directory("", Role::Editor)], vec![deny_private()]).await;
+        assert_eq!(
+            f.vault
+                .read_note(Path::new("Shared/note.md"))
+                .await
+                .unwrap(),
+            "original"
+        );
+        for path in [
+            "Private/note.md",
+            ".obsidian/daily-notes.json",
+            ".obsidian-mcp/ignore",
+            ".git/config",
+        ] {
+            assert!(
+                matches!(
+                    f.vault.read_note(Path::new(path)).await,
+                    Err(VaultError::AccessDenied { visible: false, .. })
+                ),
+                "{path}"
+            );
+            assert!(
+                matches!(
+                    f.vault.write_note(Path::new(path), "blocked").await,
+                    Err(VaultError::AccessDenied { visible: false, .. })
+                ),
+                "{path}"
+            );
+        }
+        f.vault
+            .write_note(Path::new("Shared/note.md"), "updated")
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("Shared/note.md")).unwrap(),
+            "updated"
+        );
+        assert!(f.vault.delete_note(Path::new("Shared")).await.is_err());
+        assert!(
+            f.vault
+                .move_note(Path::new("Shared"), Path::new("moved"))
+                .await
+                .is_err()
+        );
+        assert!(f.root.join("Shared/note.md").exists());
+    }
+
+    #[tokio::test]
+    async fn exact_file_grant_creates_only_necessary_ancestors() {
+        let grant = Grant {
+            id: "exact".into(),
+            directory: None,
+            file: Some("Shared/New/deep/note.md".into()),
+            role: Role::Editor,
+        };
+        let f = fixture(vec![grant], vec![]).await;
+        f.vault
+            .create_note(Path::new("Shared/New/deep/note.md"), "created", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            f.vault
+                .list_files(Path::new("Shared"), true, None)
+                .await
+                .unwrap(),
+            vec![
+                PathBuf::from("Shared/New"),
+                PathBuf::from("Shared/New/deep"),
+                PathBuf::from("Shared/New/deep/note.md")
+            ]
+        );
+        assert!(
+            f.vault
+                .create_note(Path::new("Shared/New/deep/sibling.md"), "denied", None)
+                .await
+                .is_err()
+        );
+        assert!(!f.root.join("Shared/New/deep/sibling.md").exists());
+    }
+
+    #[tokio::test]
+    async fn denied_template_does_not_become_missing_template_content() {
+        let f = fixture(vec![directory("Shared", Role::Editor)], vec![]).await;
+        let error = f
+            .vault
+            .create_periodic_note(&NotePeriod::Daily, None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            VaultError::AccessDenied { visible: false, .. }
+        ));
+        assert!(!f.root.join("Shared/Daily").exists());
+    }
+
+    #[tokio::test]
+    async fn read_only_client_cannot_write_through_mixed_operations() {
+        let f = fixture(vec![directory("Shared", Role::Reader)], vec![]).await;
+        assert!(matches!(
+            f.vault
+                .write_note(Path::new("Shared/note.md"), "denied")
+                .await,
+            Err(VaultError::AccessDenied { visible: true, .. })
+        ));
+        assert!(
+            f.vault
+                .append_note(Path::new("Shared/new.md"), "denied")
+                .await
+                .is_err()
+        );
+        assert!(
+            f.vault
+                .set_frontmatter_field(
+                    Path::new("Shared/note.md"),
+                    "title",
+                    serde_json::json!("denied")
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("Shared/note.md")).unwrap(),
+            "original"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_alias_spelling_does_not_expand_symlink_authority() {
+        let f = fixture(vec![directory("Shared", Role::Editor)], vec![]).await;
+        std::fs::write(f.root.join("Shared/café.md"), "unicode").unwrap();
+        assert_eq!(
+            f.vault
+                .read_note(Path::new("Shared/cafe\u{301}.md"))
+                .await
+                .unwrap(),
+            "unicode"
+        );
+        if f.root.join("shared/note.md").exists() {
+            assert_eq!(
+                f.vault
+                    .read_note(Path::new("shared/note.md"))
+                    .await
+                    .unwrap(),
+                "original"
+            );
+            f.vault
+                .write_note(Path::new("shared/note.md"), "native alias")
+                .await
+                .unwrap();
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("Shared", f.root.join("Alias")).unwrap();
+            assert!(matches!(
+                f.vault.read_note(Path::new("Alias/note.md")).await,
+                Err(VaultError::AccessDenied { .. })
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegated_operations_reject_hardlinks_without_changing_the_other_name() {
+        let f = fixture(vec![directory("Shared", Role::Editor)], vec![]).await;
+        let outside = f.root.parent().unwrap().join("outside.md");
+        std::fs::write(&outside, "external original").unwrap();
+        std::fs::hard_link(&outside, f.root.join("Shared/linked.md")).unwrap();
+        assert!(matches!(
+            f.vault.read_note(Path::new("Shared/linked.md")).await,
+            Err(VaultError::AccessDenied { .. })
+        ));
+        assert!(matches!(
+            f.vault
+                .write_note(Path::new("Shared/linked.md"), "denied")
+                .await,
+            Err(VaultError::AccessDenied { .. })
+        ));
+        assert!(matches!(
+            f.vault
+                .create_note(Path::new("Shared/linked.md"), "denied", None)
+                .await,
+            Err(VaultError::AccessDenied { .. })
+        ));
+        assert!(matches!(
+            f.vault
+                .move_note(Path::new("Shared/note.md"), Path::new("Shared/linked.md"))
+                .await,
+            Err(VaultError::AccessDenied { .. })
+        ));
+        assert!(f.root.join("Shared/note.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(outside).unwrap(),
+            "external original"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutation_waiting_for_shared_owner_cannot_keep_revoked_authority() {
+        let f = fixture(vec![directory("Shared", Role::Editor)], vec![]).await;
+        let owner = f.vault.clone();
+        let lock = owner.inner.mutations.lock().await;
+        let writer = f.vault.clone();
+        let task = tokio::spawn(async move {
+            writer
+                .write_note(Path::new("Shared/note.md"), "late write")
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while owner.background.admission.available_permits() == 16 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        f.store
+            .update(None, |policy| {
+                policy.clients.get_mut("client").unwrap().enabled = false;
+                Ok(())
+            })
+            .unwrap();
+        drop(lock);
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("Shared/note.md")).unwrap(),
+            "original"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_for_another_vault_cannot_select_this_source() {
+        let first = fixture(vec![directory("", Role::Editor)], vec![]).await;
+        let second = fixture(vec![directory("", Role::Editor)], vec![]).await;
+        let other = second.vault.access_client().unwrap().clone();
+        assert!(matches!(
+            first.vault.with_access(other),
+            Err(VaultError::Authorization(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(first.root.join("Shared/note.md")).unwrap(),
+            "original"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rebound_client_cannot_reuse_an_old_root_at_the_same_path() {
+        let fixture = fixture(vec![directory("", Role::Editor)], vec![]).await;
+        let original = fixture.root.with_file_name("retained-original");
+        std::fs::rename(&fixture.root, &original).unwrap();
+        std::fs::create_dir_all(fixture.root.join("Shared")).unwrap();
+        std::fs::write(fixture.root.join("Shared/note.md"), "replacement source").unwrap();
+        fixture
+            .store
+            .update(None, |policy| {
+                policy.source = crate::access::clients::SourceIdentity::capture(&fixture.root)?;
+                Ok(())
+            })
+            .unwrap();
+        let reopened_store = AccessStore::open(fixture.store.path()).unwrap();
+        let token = crate::access::store::read_token_file(
+            &fixture.root.parent().unwrap().join("state/client.token"),
+        )
+        .unwrap();
+        let rebound = reopened_store.authenticate(token.expose()).unwrap();
+        assert!(matches!(
+            fixture.vault.with_access(rebound.clone()),
+            Err(VaultError::Authorization(_))
+        ));
+        let mut config = crate::test_helpers::test_config(&fixture.root);
+        config.mcp_data_dir = Some(reopened_store.snapshot().unwrap().policy.data_dir);
+        let reopened = Vault::open_authenticated(&config)
+            .await
+            .unwrap()
+            .with_access(rebound)
+            .unwrap();
+        assert_eq!(
+            reopened
+                .read_note(Path::new("Shared/note.md"))
+                .await
+                .unwrap(),
+            "replacement source"
+        );
+        assert_eq!(
+            std::fs::read_to_string(original.join("Shared/note.md")).unwrap(),
+            "original"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_result_admission_retains_changed_and_missing_authorized_source() {
+        let fixture = fixture(vec![directory("Shared", Role::Reader)], vec![]).await;
+        let path = Path::new("Shared/note.md");
+        let revision = super::source::source_revision("original");
+        std::fs::write(fixture.root.join(path), "changed source").unwrap();
+        fixture
+            .vault
+            .check_result_revision(path, &revision)
+            .await
+            .unwrap();
+        std::fs::remove_file(fixture.root.join(path)).unwrap();
+        fixture
+            .vault
+            .check_result_revision(path, &revision)
+            .await
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .vault
+                .check_result_revision(Path::new("Private/note.md"), &revision)
+                .await,
+            Err(VaultError::AccessDenied { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_and_dangling_aliases_are_hidden_at_every_delegated_boundary() {
+        let fixture = fixture(vec![directory("Shared", Role::Editor)], vec![]).await;
+        let external = fixture
+            .root
+            .parent()
+            .unwrap()
+            .join("undisclosed-external.md");
+        std::fs::write(&external, "external marker").unwrap();
+        let missing = fixture
+            .root
+            .parent()
+            .unwrap()
+            .join("undisclosed-missing.md");
+        for (name, target) in [("outside.md", &external), ("dangling.md", &missing)] {
+            let relative = PathBuf::from(format!("Shared/{name}"));
+            std::os::unix::fs::symlink(target, fixture.root.join(&relative)).unwrap();
+            let errors = [
+                fixture.vault.read_note(&relative).await.unwrap_err(),
+                fixture
+                    .vault
+                    .write_note(&relative, "blocked")
+                    .await
+                    .unwrap_err(),
+                fixture
+                    .vault
+                    .create_note(&relative, "blocked", None)
+                    .await
+                    .unwrap_err(),
+                fixture.vault.file_stat(&relative).await.unwrap_err(),
+                fixture.vault.delete_note(&relative).await.unwrap_err(),
+                fixture
+                    .vault
+                    .move_note(&relative, Path::new("Shared/moved.md"))
+                    .await
+                    .unwrap_err(),
+                fixture
+                    .vault
+                    .move_note(Path::new("Shared/note.md"), &relative)
+                    .await
+                    .unwrap_err(),
+                fixture
+                    .vault
+                    .check_result_revision(&relative, "old evidence")
+                    .await
+                    .unwrap_err(),
+            ];
+            for error in errors {
+                assert!(matches!(
+                    error,
+                    VaultError::AccessDenied { visible: false, .. }
+                ));
+                let outward: rmcp::ErrorData = error.into();
+                assert_eq!(outward.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND);
+                assert_eq!(outward.message, "Resource not found");
+                assert!(outward.data.is_none());
+            }
+            assert!(
+                fixture
+                    .root
+                    .join(&relative)
+                    .symlink_metadata()
+                    .unwrap()
+                    .is_symlink()
+            );
+        }
+        let outside_directory = fixture.root.parent().unwrap().join("external-directory");
+        std::fs::create_dir(&outside_directory).unwrap();
+        std::os::unix::fs::symlink(
+            &outside_directory,
+            fixture.root.join("Shared/outside-directory"),
+        )
+        .unwrap();
+        assert!(matches!(
+            fixture
+                .vault
+                .list_files(Path::new("Shared/outside-directory"), true, None)
+                .await,
+            Err(VaultError::AccessDenied { visible: false, .. })
+        ));
+        assert_eq!(
+            fixture
+                .vault
+                .list_files(Path::new("Shared"), true, None)
+                .await
+                .unwrap(),
+            vec![PathBuf::from("Shared/note.md")]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&external).unwrap(),
+            "external marker"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("Shared/note.md")).unwrap(),
+            "original"
+        );
+
+        // These are also the physical reopen primitives used after source
+        // admission, so late link replacement cannot change the public error.
+        let delegated_root = fixture.vault.authenticated_root().unwrap();
+        assert!(matches!(
+            delegated_root.open_exact(Path::new("Shared/outside.md")),
+            Err(VaultError::AccessDenied { .. })
+        ));
+        assert!(matches!(
+            delegated_root.write_file(Path::new("Shared/outside.md"), "blocked"),
+            Err(VaultError::AccessDenied { .. })
+        ));
+        let owner_root = VaultRoot::open(&fixture.root).unwrap();
+        assert!(matches!(
+            owner_root.read_file(Path::new("Shared/outside.md")),
+            Err(VaultError::OutsideVault(_))
+        ));
+        assert!(matches!(
+            owner_root.read_file(Path::new("Shared/dangling.md")),
+            Err(VaultError::InvalidPath(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_caller_paths_remain_parameter_errors() {
+        let fixture = fixture(vec![directory("Shared", Role::Editor)], vec![]).await;
+        for path in [
+            PathBuf::from("../outside.md"),
+            fixture.root.join("Shared/note.md"),
+            PathBuf::from("Shared/bad\u{0}.md"),
+        ] {
+            let error = fixture.vault.read_note(&path).await.unwrap_err();
+            let outward: rmcp::ErrorData = error.into();
+            assert_eq!(outward.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn admitted_physical_keys_never_follow_replacement_links() {
+        let fixture = fixture(vec![directory("Shared", Role::Editor)], vec![]).await;
+        let root = fixture.vault.authenticated_root().unwrap();
+        let (logical, admitted) = root
+            .resolve_access_existing(Path::new("Shared/note.md"))
+            .unwrap();
+        fixture
+            .vault
+            .access_client()
+            .unwrap()
+            .check(Action::Update, &logical, &admitted.relative)
+            .unwrap();
+        std::fs::remove_file(fixture.root.join(&admitted.relative)).unwrap();
+        std::os::unix::fs::symlink("../Private/note.md", fixture.root.join(&admitted.relative))
+            .unwrap();
+        for error in [
+            root.write_file_exact(&admitted.relative, "blocked")
+                .unwrap_err(),
+            root.append_file_exact(&admitted.relative, "blocked")
+                .unwrap_err(),
+            root.create_file_exact(&admitted.relative, "blocked")
+                .unwrap_err(),
+            root.file_stat_exact(&admitted.relative).unwrap_err(),
+            root.validate_access_file_exact(&admitted.relative)
+                .unwrap_err(),
+            root.move_entry_exact(
+                &admitted.relative,
+                Path::new("Shared/moved.md"),
+                &admitted.relative,
+            )
+            .unwrap_err(),
+        ] {
+            assert!(matches!(
+                error,
+                VaultError::AccessDenied { visible: false, .. }
+            ));
+        }
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("Private/note.md")).unwrap(),
+            "private source"
+        );
+        assert!(!fixture.root.join("Shared/moved.md").exists());
+        // Deletion acts on the admitted namespace entry, never its new target.
+        root.delete_entry_exact(&admitted.relative).unwrap();
+        assert!(fixture.root.join("Private/note.md").exists());
+
+        std::fs::create_dir(fixture.root.join("Shared/New")).unwrap();
+        let (logical, future) = root
+            .resolve_access_for_write(Path::new("Shared/New/new.md"))
+            .unwrap();
+        fixture
+            .vault
+            .access_client()
+            .unwrap()
+            .check(Action::Create, &logical, &future.relative)
+            .unwrap();
+        std::fs::rename(
+            fixture.root.join("Shared/New"),
+            fixture.root.join("Shared/retained-parent"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("../Private", fixture.root.join("Shared/New")).unwrap();
+        assert!(matches!(
+            root.create_file_exact(&future.relative, "blocked"),
+            Err(VaultError::AccessDenied { visible: false, .. })
+        ));
+        assert!(!fixture.root.join("Private/new.md").exists());
+    }
+}

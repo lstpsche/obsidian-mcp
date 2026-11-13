@@ -1,4 +1,7 @@
-//! Optional audience policy for fixed-root private memory readers.
+//! Optional client access policies and fixed-root private memory readers.
+
+pub mod clients;
+pub mod store;
 
 use std::path::{Component, Path};
 

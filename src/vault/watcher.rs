@@ -78,6 +78,13 @@ pub(crate) fn new_change_debouncer(
 const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(500);
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
+fn protected_index(index: &RwLock<VaultIndex>) -> bool {
+    index
+        .read()
+        .map(|index| index.content_is_restricted())
+        .unwrap_or(true)
+}
+
 /// A native subscription that collects changes while the initial indexes are being built.
 pub(crate) struct PendingWatcher {
     vault_root: PathBuf,
@@ -135,6 +142,7 @@ impl PendingWatcher {
                 notify_debouncer_mini::DebouncedEventKind::Any,
             )
         });
+        let protected = protected_index(&index);
         #[cfg(has_embeddings)]
         let embedding_runtime = embedding_runtime
             .as_ref()
@@ -152,7 +160,13 @@ impl PendingWatcher {
                     TantivyIndex::publish,
                 );
             }
-            Err(error) => tracing::warn!(%error, "watch error"),
+            Err(error) => {
+                if protected {
+                    tracing::warn!("protected filesystem watch event failed");
+                } else {
+                    tracing::warn!(%error, "watch error");
+                }
+            }
         };
         if let Some(event) = initial {
             reconcile(Ok(vec![event]));
@@ -168,7 +182,11 @@ impl PendingWatcher {
             while let Some(result) = receiver.recv().await {
                 let reconcile = Arc::clone(&reconcile);
                 if let Err(error) = tokio::task::spawn_blocking(move || reconcile(result)).await {
-                    tracing::error!(%error, "watcher reconciliation task failed");
+                    if protected {
+                        tracing::error!("protected watcher reconciliation task failed");
+                    } else {
+                        tracing::error!(%error, "watcher reconciliation task failed");
+                    }
                 }
             }
         });
@@ -349,7 +367,16 @@ fn reconcile_events<'a>(
                         .publish_embedding_upserts(_committed, |path| runtime.submit_upsert(path));
                 }
             }
-            Err(error) => tracing::warn!(%error, "tantivy batch flush failed"),
+            Err(error) => {
+                if protected_index(index) {
+                    tracing::warn!(
+                        category = error.diagnostic_category(),
+                        "protected lexical batch publication failed"
+                    );
+                } else {
+                    tracing::warn!(%error, "tantivy batch flush failed");
+                }
+            }
         }
     }
     dirty
@@ -384,11 +411,19 @@ fn stage_event(
     exclude: &ExcludeSet,
     #[cfg(has_embeddings)] runtime: Option<&super::embedding_runtime::EmbeddingRuntimeWeak>,
 ) -> bool {
+    let protected = protected_index(index);
     let relative = match visible_relative_path(vault_root, absolute) {
         Ok(Some(relative)) => relative,
         Ok(None) => return false,
         Err(error) => {
-            tracing::warn!(%error, "invalid watcher path");
+            if protected {
+                tracing::warn!(
+                    category = error.diagnostic_category(),
+                    "invalid protected watcher path"
+                );
+            } else {
+                tracing::warn!(%error, "invalid watcher path");
+            }
             return false;
         }
     };
@@ -402,7 +437,14 @@ fn stage_event(
     let filesystem = match index.filesystem(vault_root) {
         Ok(filesystem) => filesystem,
         Err(error) => {
-            tracing::warn!(%error, "watcher vault unavailable");
+            if protected {
+                tracing::warn!(
+                    category = error.diagnostic_category(),
+                    "protected watcher source unavailable"
+                );
+            } else {
+                tracing::warn!(%error, "watcher vault unavailable");
+            }
             return false;
         }
     };
@@ -410,7 +452,14 @@ fn stage_event(
         Ok(paths) => paths,
         Err(error) => {
             // Still invalidate known descendants if an ancestor disappeared or became a link.
-            tracing::warn!(path = %absolute.display(), %error, "watcher reconciliation failed");
+            if protected {
+                tracing::warn!(
+                    category = error.diagnostic_category(),
+                    "protected watcher reconciliation failed"
+                );
+            } else {
+                tracing::warn!(path = %absolute.display(), %error, "watcher reconciliation failed");
+            }
             index
                 .tracked_paths()
                 .filter(|path| path.starts_with(&relative))
@@ -436,7 +485,14 @@ fn stage_event(
             Ok(changed) => dirty |= changed,
             Err(error) => {
                 dirty |= tantivy.is_some() && was_note;
-                tracing::warn!(path = %path.display(), %error, "watcher reindex failed");
+                if protected {
+                    tracing::warn!(
+                        category = error.diagnostic_category(),
+                        "protected watcher reindex failed"
+                    );
+                } else {
+                    tracing::warn!(path = %path.display(), %error, "watcher reindex failed");
+                }
             }
         }
         #[cfg(has_embeddings)]

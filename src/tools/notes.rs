@@ -313,7 +313,7 @@ pub async fn note_read_many(
     let mut batch = storage.read_batch().await?;
     if explicit_paths {
         for candidate in &candidates {
-            if vault.is_scoped() {
+            if vault.is_scoped() || vault.is_authenticated() {
                 vault.validate_path(&candidate.path).await?;
             } else {
                 batch.validate(&candidate.path).await?;
@@ -322,7 +322,7 @@ pub async fn note_read_many(
     }
 
     for candidate in candidates.iter().take(inspected_count) {
-        let prepared = if vault.is_scoped() {
+        let prepared = if vault.is_scoped() || vault.is_authenticated() {
             vault
                 .canonical_existing_relative_path(&candidate.path)
                 .await
@@ -462,7 +462,9 @@ fn record_file_error(
     skipped_count: &mut usize,
 ) -> Result<(), ErrorData> {
     let reason = match error {
-        VaultError::NoteNotFound(_) => NoteReadManySkipReason::NotFound,
+        VaultError::NoteNotFound(_) | VaultError::AccessDenied { .. } => {
+            NoteReadManySkipReason::NotFound
+        }
         VaultError::Io(_) => NoteReadManySkipReason::Unreadable,
         VaultError::Storage {
             kind: StorageErrorKind::InvalidSource,

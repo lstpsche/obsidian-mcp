@@ -302,7 +302,9 @@ pub async fn search_semantic(
         }
     }
     .map_err(|error| {
-        if vault.is_scoped() {
+        if vault.is_authenticated() {
+            authenticated_semantic_tool_error(vault, error)
+        } else if vault.is_scoped() {
             scoped_semantic_tool_error(error)
         } else {
             to_semantic_tool_error(error)
@@ -433,14 +435,19 @@ async fn search_semantic_local(
             .check_result_revision(&hit.path, &hit.entry.source_revision)
             .await?;
     }
-    let results = crate::vault::semantic_results::render_many_source(
-        &storage,
-        hits,
-        query,
-        include_content,
-        timeout,
-    )
-    .await?;
+    let results = if vault.is_authenticated() {
+        crate::vault::semantic_results::render_many_authorized(vault, hits, query, include_content)
+            .await?
+    } else {
+        crate::vault::semantic_results::render_many_source(
+            &storage,
+            hits,
+            query,
+            include_content,
+            timeout,
+        )
+        .await?
+    };
     // Source context acquisition may discover that the authority which admitted
     // these observations has changed. Ordinary outages can still return hits.
     vault.require_semantic_catalog()?;
@@ -505,6 +512,36 @@ fn scoped_semantic_tool_error(error: VaultError) -> rmcp::ErrorData {
         ErrorCode::INTERNAL_ERROR,
         "Semantic memory search is unavailable; inspect local service diagnostics.",
         None::<serde_json::Value>,
+    )
+}
+
+fn authenticated_semantic_tool_error(vault: &Vault, error: VaultError) -> rmcp::ErrorData {
+    if matches!(
+        error,
+        VaultError::EmbeddingInputTooLong { .. }
+            | VaultError::AccessDenied { .. }
+            | VaultError::Authorization(_)
+            | VaultError::SourceChanged { .. }
+    ) {
+        return error.into();
+    }
+    #[cfg(has_embeddings)]
+    if vault.embedding_status().is_some_and(|status| {
+        status.phase == crate::vault::embedding_runtime::EmbeddingPhase::Warming
+            && !status.queryable
+    }) {
+        return rmcp::ErrorData::new(
+            ErrorCode::INVALID_REQUEST,
+            "Semantic search is warming; retry shortly",
+            Some(serde_json::json!({"code": "semantic_warming"})),
+        );
+    }
+    #[cfg(not(has_embeddings))]
+    let _ = vault;
+    rmcp::ErrorData::new(
+        ErrorCode::INTERNAL_ERROR,
+        "Semantic search is unavailable; contact the vault owner",
+        Some(serde_json::json!({"code": "semantic_unavailable"})),
     )
 }
 
