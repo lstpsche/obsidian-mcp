@@ -367,7 +367,7 @@ impl Vault {
             let (requested, actual) = vault
                 .resolve_access_path(&root, &requested, false)
                 .map_err(|error| {
-                    if error.is_not_found() {
+                    if super::fs::is_missing_entry(&error) {
                         VaultError::DirectoryNotFound(requested.clone())
                     } else {
                         error
@@ -402,7 +402,14 @@ impl Vault {
                 client.current()?;
                 let directory_handle = match root.open_dir_exact(&directory) {
                     Ok(directory) => directory,
-                    Err(VaultError::AccessDenied { .. }) if directory != source_base => continue,
+                    Err(error)
+                        if directory != source_base && super::fs::skip_changed_entry(&error) =>
+                    {
+                        continue;
+                    }
+                    Err(error) if super::fs::is_missing_entry(&error) => {
+                        return Err(VaultError::DirectoryNotFound(requested.clone()));
+                    }
                     Err(error) => return Err(error),
                 };
                 let entries = super::fs::dir_entries(&directory_handle)?;
@@ -773,6 +780,36 @@ mod tests {
             .expect("all explicit paths must pass syntax validation");
             assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         }
+    }
+
+    #[tokio::test]
+    async fn a_readable_file_is_not_a_directory_for_listing_or_bulk_reads() {
+        use crate::tools::notes::{NoteReadManyParams, note_read_many};
+
+        let f = fixture(vec![directory("Shared", Role::Reader)], vec![]).await;
+        for path in ["Shared/note.md", "Shared/note.md/child"] {
+            assert!(matches!(
+                f.vault.list_files(Path::new(path), true, None).await,
+                Err(VaultError::DirectoryNotFound(requested)) if requested == Path::new(path)
+            ));
+            let error = note_read_many(
+                &f.vault,
+                NoteReadManyParams {
+                    dir: Some(path.into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .err()
+            .expect("a file cannot be read as a directory");
+            assert_eq!(error.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND);
+        }
+        assert!(matches!(
+            f.vault
+                .list_files(Path::new("Private/note.md"), true, None)
+                .await,
+            Err(VaultError::AccessDenied { visible: false, .. })
+        ));
     }
 
     #[cfg(unix)]
@@ -1309,6 +1346,41 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn an_open_source_root_blocks_native_replacement() {
+        let fixture = fixture(vec![directory("", Role::Editor)], vec![]).await;
+        let original = fixture.root.with_file_name("retained-original");
+        let error = std::fs::rename(&fixture.root, &original).unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32)
+        );
+        assert!(!original.exists());
+        let named = VaultRoot::open(&fixture.root).unwrap();
+        assert!(
+            fixture
+                .vault
+                .inner
+                .filesystem
+                .as_ref()
+                .unwrap()
+                .same_root(&named)
+                .unwrap()
+        );
+        let client = fixture.vault.access_client().unwrap().clone();
+        client.current().unwrap();
+        let selected = fixture.vault.with_access(client).unwrap();
+        assert_eq!(
+            selected
+                .read_note(Path::new("Shared/note.md"))
+                .await
+                .unwrap(),
+            "original"
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_rebound_client_cannot_reuse_an_old_root_at_the_same_path() {
         let fixture = fixture(vec![directory("", Role::Editor)], vec![]).await;

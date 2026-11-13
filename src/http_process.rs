@@ -1,12 +1,18 @@
 //! Ownership checks for the HTTP listener controlled by the local CLI.
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
+use std::net::SocketAddr;
+#[cfg(not(windows))]
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpStream};
 use std::path::Path;
 use std::time::Duration;
 
 pub(crate) fn bind_available_tcp(endpoint: SocketAddr) -> io::Result<tokio::net::TcpSocket> {
-    if endpoint.port() != 0 && endpoint_is_reachable(endpoint)? {
+    #[cfg(windows)]
+    let occupied = endpoint.port() != 0 && platform::has_overlapping_listener(endpoint)?;
+    #[cfg(not(windows))]
+    let occupied = endpoint.port() != 0 && endpoint_is_reachable(endpoint)?;
+    if occupied {
         return Err(io::Error::new(
             io::ErrorKind::AddrInUse,
             format!("{endpoint} already has a listener"),
@@ -23,6 +29,7 @@ pub(crate) fn bind_available_tcp(endpoint: SocketAddr) -> io::Result<tokio::net:
     Ok(socket)
 }
 
+#[cfg(not(windows))]
 fn endpoint_is_reachable(endpoint: SocketAddr) -> io::Result<bool> {
     let connect_ip = match endpoint.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -75,6 +82,12 @@ pub(crate) fn listener_pid(endpoint: SocketAddr) -> io::Result<Option<u32>> {
     }
 }
 
+fn endpoints_overlap(requested: SocketAddr, bound: SocketAddr) -> bool {
+    requested.is_ipv4() == bound.is_ipv4()
+        && requested.port() == bound.port()
+        && (requested == bound || requested.ip().is_unspecified() || bound.ip().is_unspecified())
+}
+
 fn collect_owner(
     pids: &mut Vec<u32>,
     requested: SocketAddr,
@@ -83,9 +96,7 @@ fn collect_owner(
 ) -> io::Result<()> {
     if bound == requested {
         pids.push(pid);
-    } else if requested.port() == bound.port()
-        && (requested.ip().is_unspecified() || bound.ip().is_unspecified())
-    {
+    } else if endpoints_overlap(requested, bound) {
         return Err(io::Error::other(format!(
             "{requested} overlaps the listener on {bound}; specify its exact bind address"
         )));
@@ -476,11 +487,21 @@ mod platform {
     };
 
     pub(super) fn platform_listener_pids(endpoint: SocketAddr) -> io::Result<Vec<u32>> {
-        let family = if endpoint.is_ipv4() {
-            AF_INET
-        } else {
-            AF_INET6
-        };
+        let mut pids = Vec::new();
+        for (address, pid) in tcp_listeners(endpoint.is_ipv4())? {
+            collect_owner(&mut pids, endpoint, address, pid)?;
+        }
+        Ok(pids)
+    }
+
+    pub(super) fn has_overlapping_listener(endpoint: SocketAddr) -> io::Result<bool> {
+        Ok(tcp_listeners(endpoint.is_ipv4())?
+            .into_iter()
+            .any(|(bound, _)| endpoints_overlap(endpoint, bound)))
+    }
+
+    fn tcp_listeners(ipv4: bool) -> io::Result<Vec<(SocketAddr, u32)>> {
+        let family = if ipv4 { AF_INET } else { AF_INET6 };
         let mut buffer: Vec<u32> = Vec::new();
         let mut size = 0;
         loop {
@@ -509,7 +530,7 @@ mod platform {
         let (&count, entries) = buffer
             .split_first()
             .ok_or_else(|| io::Error::other("empty TCP listener table"))?;
-        let entry_size = if endpoint.is_ipv4() {
+        let entry_size = if ipv4 {
             size_of::<MIB_TCPROW_OWNER_PID>()
         } else {
             size_of::<MIB_TCP6ROW_OWNER_PID>()
@@ -517,34 +538,31 @@ mod platform {
         if count as usize > size_of_val(entries) / entry_size {
             return Err(io::Error::other("truncated TCP listener table"));
         }
-        let mut pids = Vec::new();
+        let mut listeners = Vec::new();
         for raw in entries.chunks_exact(entry_size / 4).take(count as usize) {
             // SAFETY: rows consist of DWORDs and byte arrays with alignment four,
             // and each chunk has exactly the size of the selected row layout.
-            let (addr, pid) = match endpoint {
-                SocketAddr::V4(_) => {
-                    let row = unsafe { &*raw.as_ptr().cast::<MIB_TCPROW_OWNER_PID>() };
-                    let ip = Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes());
-                    (
-                        SocketAddr::new(ip.into(), u16::from_be(row.dwLocalPort as u16)),
-                        row.dwOwningPid,
-                    )
-                }
-                SocketAddr::V6(_) => {
-                    let row = unsafe { &*raw.as_ptr().cast::<MIB_TCP6ROW_OWNER_PID>() };
-                    let ip = Ipv6Addr::from(row.ucLocalAddr);
-                    let addr = SocketAddrV6::new(
-                        ip,
-                        u16::from_be(row.dwLocalPort as u16),
-                        0,
-                        u32::from_be(row.dwLocalScopeId),
-                    );
-                    (addr.into(), row.dwOwningPid)
-                }
+            let (addr, pid) = if ipv4 {
+                let row = unsafe { &*raw.as_ptr().cast::<MIB_TCPROW_OWNER_PID>() };
+                let ip = Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes());
+                (
+                    SocketAddr::new(ip.into(), u16::from_be(row.dwLocalPort as u16)),
+                    row.dwOwningPid,
+                )
+            } else {
+                let row = unsafe { &*raw.as_ptr().cast::<MIB_TCP6ROW_OWNER_PID>() };
+                let ip = Ipv6Addr::from(row.ucLocalAddr);
+                let addr = SocketAddrV6::new(
+                    ip,
+                    u16::from_be(row.dwLocalPort as u16),
+                    0,
+                    u32::from_be(row.dwLocalScopeId),
+                );
+                (addr.into(), row.dwOwningPid)
             };
-            collect_owner(&mut pids, endpoint, addr, pid)?;
+            listeners.push((addr, pid));
         }
-        Ok(pids)
+        Ok(listeners)
     }
 
     fn image_name(handle: HANDLE) -> io::Result<Vec<u16>> {
@@ -618,6 +636,33 @@ mod tests {
     const LISTENER_READY: &str = "test listener address: ";
 
     #[test]
+    fn endpoint_overlap_keeps_exact_owner_selection_separate_from_wildcards() {
+        for (requested, bound, overlap) in [
+            ("127.0.0.1:12345", "127.0.0.1:12345", true),
+            ("127.0.0.1:12345", "127.0.0.2:12345", false),
+            ("127.0.0.1:12345", "127.0.0.1:12346", false),
+            ("127.0.0.1:12345", "0.0.0.0:12345", true),
+            ("0.0.0.0:12345", "127.0.0.1:12345", true),
+            ("[::1]:12345", "[::]:12345", true),
+            ("[::]:12345", "[::1]:12345", true),
+            ("127.0.0.1:12345", "[::]:12345", false),
+        ] {
+            let requested = requested.parse().unwrap();
+            let bound = bound.parse().unwrap();
+            assert_eq!(endpoints_overlap(requested, bound), overlap);
+            let mut pids = Vec::new();
+            let selected = collect_owner(&mut pids, requested, bound, 42);
+            if requested == bound {
+                assert!(selected.is_ok());
+                assert_eq!(pids, [42]);
+            } else {
+                assert_eq!(selected.is_err(), overlap);
+                assert!(pids.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn checked_tcp_bind_accepts_a_free_endpoint_without_a_runtime() {
         for endpoint in ["127.0.0.1:0", "[::1]:0"] {
             let socket = bind_available_tcp(endpoint.parse().unwrap()).unwrap();
@@ -643,12 +688,20 @@ mod tests {
                 io::ErrorKind::AddrInUse
             );
             listener.set_nonblocking(true).unwrap();
-            let (mut probe, _) = listener.accept().unwrap();
-            probe.set_nonblocking(false).unwrap();
-            probe
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            assert_eq!(std::io::Read::read(&mut probe, &mut [0]).unwrap(), 0);
+            #[cfg(unix)]
+            {
+                let (mut probe, _) = listener.accept().unwrap();
+                probe.set_nonblocking(false).unwrap();
+                probe
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                assert_eq!(std::io::Read::read(&mut probe, &mut [0]).unwrap(), 0);
+            }
+            #[cfg(windows)]
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
         }
     }
 

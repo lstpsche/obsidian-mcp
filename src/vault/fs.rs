@@ -48,8 +48,17 @@ pub(super) fn is_missing_entry(error: &VaultError) -> bool {
 }
 
 /// Only for no-follow opens or stats of a previously validated native name.
-/// An invalid physical path here means a component became a symlink or reparse point.
+/// An invalid physical path means a component became a symlink or reparse point;
+/// restricted roots conceal that native failure as a hidden denial. Do not use
+/// this classifier for errors from client policy or credential checks.
 pub(super) fn skip_changed_entry(error: &VaultError) -> bool {
+    if matches!(error, VaultError::AccessDenied { visible: false, .. }) {
+        tracing::warn!(
+            error_category = error.diagnostic_category(),
+            "skipping a protected vault entry replaced during traversal"
+        );
+        return true;
+    }
     if matches!(error, VaultError::InvalidPath(_)) {
         tracing::warn!(%error, "skipping a vault entry replaced during traversal");
         return true;
@@ -1195,6 +1204,71 @@ mod confinement_tests {
         )
         .unwrap();
         assert_eq!(files, [Path::new("kept/note.md")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restricted_traversal_skips_a_directory_replaced_by_an_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = VaultRoot::open(temp.path()).unwrap().restricted_content();
+        root.create_file(Path::new("replaced/note.md"), "original")
+            .unwrap();
+        root.create_file(Path::new("kept/note.md"), "visible")
+            .unwrap();
+        std::fs::write(outside.path().join("note.md"), "external").unwrap();
+        let mut files = Vec::new();
+        root.visit_entries(
+            Path::new(""),
+            true,
+            |_| true,
+            || Ok(()),
+            |path, is_file| {
+                if path == Path::new("replaced") {
+                    std::fs::rename(
+                        temp.path().join(path),
+                        outside.path().join("retained-directory"),
+                    )?;
+                    std::os::unix::fs::symlink(outside.path(), temp.path().join(path))?;
+                } else if is_file {
+                    files.push(path.to_owned());
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(files, [Path::new("kept/note.md")]);
+        for error in [
+            root.open_dir_exact(Path::new("replaced")).unwrap_err(),
+            root.entry_metadata_exact(Path::new("replaced/note.md"))
+                .unwrap_err(),
+            root.open_exact(Path::new("replaced/note.md")).unwrap_err(),
+        ] {
+            assert!(matches!(
+                error,
+                VaultError::AccessDenied { visible: false, .. }
+            ));
+            assert!(skip_changed_entry(&error));
+        }
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("note.md")).unwrap(),
+            "external"
+        );
+    }
+
+    #[test]
+    fn native_changed_entry_classification_preserves_authorization_and_io_errors() {
+        for error in [
+            VaultError::Authorization("policy is unavailable".into()),
+            VaultError::AccessDenied {
+                path: PathBuf::from("note.md"),
+                visible: true,
+            },
+            VaultError::Io(io::Error::from(io::ErrorKind::PermissionDenied)),
+            VaultError::Io(io::Error::from(io::ErrorKind::Other)),
+        ] {
+            assert!(!skip_changed_entry(&error));
+        }
     }
 
     #[cfg(unix)]

@@ -2725,30 +2725,41 @@ mod tests {
     fn cold_index_skips_attachments_if_their_open_directory_becomes_a_link() {
         use crate::test_helpers::INDEX_DIRECTORY_VISITS;
         use std::cell::Cell;
-        let temp = TempDir::new().unwrap();
-        let outside = TempDir::new().unwrap();
-        let assets = temp.path().join("assets");
-        stdfs::create_dir(&assets).unwrap();
-        stdfs::write(assets.join("photo.bin"), b"inside").unwrap();
-        stdfs::write(outside.path().join("photo.bin"), b"outside content").unwrap();
-        stdfs::write(temp.path().join("kept.md"), "# Visible").unwrap();
-        let root = fs::VaultRoot::open(temp.path()).unwrap();
-        let visits = INDEX_DIRECTORY_VISITS.get();
-        let switched = Cell::new(false);
-        let check = || {
-            // With one subdirectory, the second directory visit owns its iterator.
-            if INDEX_DIRECTORY_VISITS.get() == visits + 2 && !switched.replace(true) {
-                stdfs::rename(&assets, temp.path().join(".moved"))?;
-                std::os::unix::fs::symlink(outside.path(), &assets)?;
-            }
-            Ok(())
-        };
-        let index =
-            VaultIndex::build_sync(root, Arc::new(ExcludeSet::default()), &check, |_, _| Ok(()))
-                .unwrap();
-        assert!(switched.get());
-        assert!(index.get_note(Path::new("kept.md")).is_some());
-        assert!(index.attachments.is_empty());
+        for restricted in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let outside = TempDir::new().unwrap();
+            let assets = temp.path().join("assets");
+            stdfs::create_dir(&assets).unwrap();
+            stdfs::write(assets.join("photo.bin"), b"inside").unwrap();
+            stdfs::write(outside.path().join("photo.bin"), b"outside content").unwrap();
+            stdfs::write(temp.path().join("kept.md"), "# Visible").unwrap();
+            let root = fs::VaultRoot::open(temp.path()).unwrap();
+            let root = if restricted {
+                root.restricted_content()
+            } else {
+                root
+            };
+            let visits = INDEX_DIRECTORY_VISITS.get();
+            let switched = Cell::new(false);
+            let check = || {
+                // With one subdirectory, the second directory visit owns its iterator.
+                if INDEX_DIRECTORY_VISITS.get() == visits + 2 && !switched.replace(true) {
+                    stdfs::rename(&assets, temp.path().join(".moved"))?;
+                    std::os::unix::fs::symlink(outside.path(), &assets)?;
+                }
+                Ok(())
+            };
+            let index = VaultIndex::build_sync(
+                root,
+                Arc::new(ExcludeSet::default()),
+                &check,
+                |_, _| Ok(()),
+            )
+            .unwrap();
+            assert!(switched.get());
+            assert!(index.get_note(Path::new("kept.md")).is_some());
+            assert!(index.attachments.is_empty());
+        }
     }
 
     fn setup_vault() -> TempDir {

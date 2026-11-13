@@ -593,9 +593,9 @@ fn remote_windows_helper_uses_explicit_shell_and_client_local_paths() {
             .arg(added["token_file"].as_str().unwrap())
             .args([
                 "--binary",
-                "C:\\Program Files\\Obsidian MCP\\obsidian-mcp.exe",
+                "C:\\Program Files\\Owner's MCP\\obsidian-mcp.exe",
                 "--client-token-file",
-                "C:\\Users\\Owner\\Private\\reader.token",
+                "C:\\Users\\Owner's Private\\reader.token",
                 "--out",
             ])
             .arg(&out)
@@ -608,9 +608,71 @@ fn remote_windows_helper_uses_explicit_shell_and_client_local_paths() {
         .as_str()
         .unwrap();
     assert!(helper.starts_with("powershell.exe -NoLogo -NoProfile -NonInteractive -Command"));
-    assert!(helper.contains("& 'C:\\Program Files\\Obsidian MCP\\obsidian-mcp.exe'"));
-    assert!(helper.contains("'C:\\Users\\Owner\\Private\\reader.token'"));
+    assert!(helper.contains("& 'C:\\Program Files\\Owner''s MCP\\obsidian-mcp.exe'"));
+    assert!(helper.contains("'C:\\Users\\Owner''s Private\\reader.token'"));
     assert!(!helper.contains(added["token_file"].as_str().unwrap()));
+}
+
+#[test]
+fn remote_posix_helper_uses_client_paths_and_posix_apostrophe_quoting_on_any_host() {
+    let fixture = Fixture::new();
+    fixture.initialize();
+    let added = fixture.add("reader", false);
+    let out = fixture.profile.parent().unwrap().join("posix-client.json");
+    let client_binary = "/opt/owner's tools/obsidian-mcp";
+    let client_token = "/home/owner's private/reader.token";
+    success(
+        fixture
+            .command()
+            .args([
+                "config",
+                "reader",
+                "--client",
+                "claude-code",
+                "--token-file",
+            ])
+            .arg(added["token_file"].as_str().unwrap())
+            .args([
+                "--binary",
+                client_binary,
+                "--client-token-file",
+                client_token,
+                "--out",
+            ])
+            .arg(&out)
+            .arg("--json")
+            .output()
+            .unwrap(),
+    );
+    let value: Value = serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
+    let helper = value["mcpServers"]["reader"]["headersHelper"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        helper,
+        r"'/opt/owner'\''s tools/obsidian-mcp' access headers --token-file '/home/owner'\''s private/reader.token'"
+    );
+    assert!(!helper.contains(added["token_file"].as_str().unwrap()));
+    #[cfg(unix)]
+    {
+        let parsed = Command::new("/bin/sh")
+            .env("NO_COLOR", "1")
+            .args(["-c", &format!("set -- {helper}; printf '%s\\n' \"$@\"")])
+            .output()
+            .unwrap();
+        assert!(parsed.status.success());
+        let words = String::from_utf8(parsed.stdout).unwrap();
+        assert_eq!(
+            words.lines().collect::<Vec<_>>(),
+            [
+                client_binary,
+                "access",
+                "headers",
+                "--token-file",
+                client_token
+            ]
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -692,6 +754,64 @@ fn ipv6_setup_keeps_the_generated_server_and_client_endpoint_consistent() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains(&format!("--host ::1 --port {port}")));
     assert!(!fixture.profile.parent().unwrap().exists());
+}
+
+#[test]
+fn localhost_setup_uses_the_selected_literal_for_client_launch_and_doctor() {
+    let listener = (11000u16..11100)
+        .find_map(
+            |port| match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
+                Ok(listener) => Some(listener),
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => None,
+                Err(error) => panic!("could not reserve localhost setup fixture port: {error}"),
+            },
+        )
+        .expect("a private localhost fixture port should be available");
+    let port = listener.local_addr().unwrap().port();
+    let fixture = Fixture::new();
+    let out = fixture
+        .profile
+        .parent()
+        .unwrap()
+        .join("localhost-client.json");
+    let mut process = command();
+    process
+        .arg("setup")
+        .arg(&fixture.vault)
+        .arg("--access-file")
+        .arg(&fixture.profile)
+        .args([
+            "--name",
+            "assistant",
+            "--directory",
+            "Shared",
+            "--client",
+            "claude-code",
+            "--url",
+            &format!("http://localhost:{port}/mcp"),
+            "--out",
+        ])
+        .arg(&out)
+        .arg("--json");
+    drop(listener);
+    let result = success(process.output().unwrap());
+    let backend = format!("http://127.0.0.1:{port}/mcp");
+    assert_eq!(result["url"], backend);
+    assert_eq!(result["backend_url"], backend);
+    assert!(
+        result["server_command"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("--host 127.0.0.1 --port {port}"))
+    );
+    assert!(
+        result["doctor_command"]
+            .as_str()
+            .unwrap()
+            .contains(&backend)
+    );
+    let snippet: Value = serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
+    assert_eq!(snippet["mcpServers"]["assistant"]["url"], backend);
 }
 
 #[test]
@@ -880,8 +1000,9 @@ fn preview_preserves_a_real_read_permission_failure() {
 }
 
 struct OccupiedDefaultBackend {
-    _serial: std::sync::MutexGuard<'static, ()>,
     listener: Option<std::net::TcpListener>,
+    // Close the listener before another fixture acquires the shared port.
+    _serial: std::sync::MutexGuard<'static, ()>,
 }
 
 fn wildcard_listener(endpoint: &str) -> std::io::Result<std::net::TcpListener> {
@@ -911,8 +1032,8 @@ fn occupy_default_backend() -> OccupiedDefaultBackend {
         Err(error) => panic!("could not qualify the default loopback port: {error}"),
     };
     OccupiedDefaultBackend {
-        _serial: serial,
         listener,
+        _serial: serial,
     }
 }
 
@@ -1043,6 +1164,7 @@ fn https_setup_preview_prints_its_selected_upstream_and_both_connection_checks()
 
 #[test]
 fn explicit_http_setup_does_not_reuse_an_occupied_listener() {
+    #[cfg(unix)]
     use std::io::Read;
 
     for address in ["127.0.0.1:0", "0.0.0.0:0", "[::]:0"] {
@@ -1075,12 +1197,21 @@ fn explicit_http_setup_does_not_reuse_an_occupied_listener() {
         assert!(String::from_utf8_lossy(&output.stderr).contains("already in use"));
         assert!(!fixture.profile.parent().unwrap().exists());
         assert_eq!(listener.local_addr().unwrap(), bound);
-        let (mut probe, _) = listener.accept().unwrap();
-        probe.set_nonblocking(false).unwrap();
-        probe
-            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-            .unwrap();
-        assert_eq!(probe.read(&mut [0]).unwrap(), 0);
+        listener.set_nonblocking(true).unwrap();
+        #[cfg(unix)]
+        {
+            let (mut probe, _) = listener.accept().unwrap();
+            probe.set_nonblocking(false).unwrap();
+            probe
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            assert_eq!(probe.read(&mut [0]).unwrap(), 0);
+        }
+        #[cfg(windows)]
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 }
 

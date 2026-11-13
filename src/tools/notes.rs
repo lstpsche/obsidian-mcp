@@ -313,7 +313,7 @@ pub async fn note_read_many(
     let mut batch = storage.read_batch().await?;
     if explicit_paths {
         for candidate in &candidates {
-            if vault.is_scoped() || vault.is_authenticated() {
+            if vault.is_scoped() {
                 vault.validate_path(&candidate.path).await?;
             } else {
                 batch.validate(&candidate.path).await?;
@@ -322,7 +322,7 @@ pub async fn note_read_many(
     }
 
     for candidate in candidates.iter().take(inspected_count) {
-        let prepared = if vault.is_scoped() || vault.is_authenticated() {
+        let prepared = if vault.is_scoped() {
             vault
                 .canonical_existing_relative_path(&candidate.path)
                 .await

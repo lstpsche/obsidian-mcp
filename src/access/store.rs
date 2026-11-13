@@ -470,7 +470,11 @@ impl AccessStore {
             (false, false) => fs2::FileExt::lock_shared(&file),
         };
         result.map_err(|error| {
-            if error.kind() == io::ErrorKind::WouldBlock {
+            let contended = error.kind() == io::ErrorKind::WouldBlock
+                || error
+                    .raw_os_error()
+                    .is_some_and(|code| fs2::lock_contended_error().raw_os_error() == Some(code));
+            if nonblocking && contended {
                 AccessError::Busy
             } else {
                 error.into()
@@ -551,6 +555,20 @@ impl AuthorizedClient {
     }
     pub fn source(&self) -> &SourceIdentity {
         &self.source
+    }
+
+    /// Compare retained authorization identities without reading current policy.
+    /// Equality does not authorize current access; acquire a fresh permit for it.
+    pub fn same_authorization(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.store.0, &other.store.0)
+            && self.client_id == other.client_id
+            && self.credential_id == other.credential_id
+            && bool::from(
+                self.credential_digest
+                    .as_bytes()
+                    .ct_eq(other.credential_digest.as_bytes()),
+            )
+            && self.policy_hash == other.policy_hash
     }
 
     pub fn current(&self) -> AccessResult<()> {
@@ -991,6 +1009,77 @@ mod tests {
             ),
             Err(AccessError::Denied { visible: false, .. })
         ));
+    }
+
+    #[test]
+    fn retained_authorization_equality_requires_the_same_store_and_does_not_grant_access() {
+        let fixture = Fixture::new();
+        let client = fixture.issue();
+        let cloned = client.clone();
+        let token = read_token_file(&fixture.token_path).unwrap();
+        let authenticated = fixture.store.authenticate(token.expose()).unwrap();
+        assert!(client.same_authorization(&cloned));
+        assert!(client.same_authorization(&authenticated));
+
+        let reopened = AccessStore::open(fixture.store.path()).unwrap();
+        let independently_opened = reopened.authenticate(token.expose()).unwrap();
+        assert!(!client.same_authorization(&independently_opened));
+
+        fixture
+            .store
+            .update(None, |policy| {
+                policy.clients.get_mut("writer").unwrap().credentials[0].revoked = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(client.same_authorization(&cloned));
+        assert!(client.current().is_err());
+    }
+
+    #[test]
+    fn retained_authorization_equality_distinguishes_replaced_digests_under_the_same_ids() {
+        let fixture = Fixture::new();
+        let original = fixture.issue();
+        let replacement = format!(
+            "{TOKEN_PREFIX}{}_{}",
+            original.credential_id(),
+            random_secret().unwrap()
+        );
+        fixture
+            .store
+            .update(None, |policy| {
+                policy.clients.get_mut("writer").unwrap().credentials[0].digest =
+                    token_digest(&replacement);
+                Ok(())
+            })
+            .unwrap();
+        let replaced = fixture.store.authenticate(&replacement).unwrap();
+        assert_eq!(original.client_id(), replaced.client_id());
+        assert_eq!(original.credential_id(), replaced.credential_id());
+        assert_eq!(original.policy_hash(), replaced.policy_hash());
+        assert!(!original.same_authorization(&replaced));
+        assert!(original.current().is_err());
+        replaced.current().unwrap();
+    }
+
+    #[test]
+    fn retained_authorization_equality_distinguishes_policy_changes_for_the_same_credential() {
+        let fixture = Fixture::new();
+        let original = fixture.issue();
+        fixture
+            .store
+            .update(None, |policy| {
+                policy.clients.get_mut("writer").unwrap().grants[0].role = Role::Reader;
+                Ok(())
+            })
+            .unwrap();
+        let token = read_token_file(&fixture.token_path).unwrap();
+        let changed = fixture.store.authenticate(token.expose()).unwrap();
+        assert_eq!(original.client_id(), changed.client_id());
+        assert_eq!(original.credential_id(), changed.credential_id());
+        assert!(!original.same_authorization(&changed));
+        assert!(original.current().is_err());
+        changed.current().unwrap();
     }
 
     #[test]

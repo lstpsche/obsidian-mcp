@@ -52,54 +52,82 @@ impl Authorizer {
             let mut interval = tokio::time::interval(RELEASE_RECHECK);
             loop {
                 interval.tick().await;
-                authorizer.retire_invalid_sessions().await;
+                if let Err(category) = authorizer.retire_invalid_sessions().await {
+                    tracing::error!(category, "client session retirement stopped");
+                    break;
+                }
             }
         }))
     }
 
-    async fn retire_invalid_sessions(&self) {
-        let bindings = match self.sessions.lock() {
-            Ok(sessions) => sessions
-                .iter()
-                .map(|(id, client)| (id.clone(), client.clone()))
-                .collect::<Vec<_>>(),
-            Err(_) => return,
-        };
+    async fn retire_invalid_sessions(&self) -> Result<(), &'static str> {
+        let bindings = self
+            .sessions
+            .lock()
+            .map_err(|_| "session_registry_poisoned")?
+            .iter()
+            .map(|(id, client)| (id.clone(), client.clone()))
+            .collect::<Vec<_>>();
         if bindings.is_empty() {
-            return;
+            return Ok(());
         }
         let mut live_bindings = Vec::with_capacity(bindings.len());
         for (id, client) in bindings {
-            if matches!(
-                self.manager.has_session(&Arc::from(id.clone())).await,
-                Ok(false)
-            ) {
-                if let Ok(mut sessions) = self.sessions.lock() {
-                    sessions.remove(&id);
-                }
+            if !self
+                .manager
+                .has_session(&Arc::from(id.clone()))
+                .await
+                .map_err(|_| "session_registry_inspection_failed")?
+            {
+                self.sessions
+                    .lock()
+                    .map_err(|_| "session_registry_poisoned")?
+                    .remove(&id);
             } else {
                 live_bindings.push((id, client));
             }
         }
         if live_bindings.is_empty() {
-            return;
+            return Ok(());
         }
         let invalid = tokio::task::spawn_blocking(move || {
-            live_bindings
-                .into_iter()
-                .filter_map(|(id, client)| match client.try_permit() {
-                    Ok(_) | Err(AccessError::Busy) => None,
-                    Err(_) => Some(id),
-                })
-                .collect::<Vec<_>>()
-        })
-        .await;
-        let Ok(invalid) = invalid else { return };
-        for id in invalid {
-            if let Ok(mut sessions) = self.sessions.lock() {
-                sessions.remove(&id);
+            let mut invalid = Vec::new();
+            for (client, ids) in group_bindings(live_bindings) {
+                match client.try_permit() {
+                    Ok(_) | Err(AccessError::Busy) => (),
+                    Err(_) => invalid.extend(ids),
+                }
             }
-            let _ = self.manager.close_session(&Arc::from(id)).await;
+            invalid
+        })
+        .await
+        .map_err(|error| {
+            if error.is_panic() {
+                "session_retirement_worker_panicked"
+            } else {
+                "session_retirement_worker_cancelled"
+            }
+        })?;
+        for id in invalid {
+            self.sessions
+                .lock()
+                .map_err(|_| "session_registry_poisoned")?
+                .remove(&id);
+            self.close_session(&id).await;
+        }
+        Ok(())
+    }
+
+    async fn close_session(&self, id: &str) {
+        if let Err(error) = self.manager.close_session(&Arc::from(id)).await {
+            use rmcp::transport::streamable_http_server::session::local::LocalSessionManagerError;
+            let category = match error {
+                LocalSessionManagerError::SessionNotFound(_) => "session_not_found",
+                LocalSessionManagerError::SessionError(_) => "session_worker_failed",
+                LocalSessionManagerError::InvalidEventId(_) => "session_event_invalid",
+                _ => "session_close_failed",
+            };
+            tracing::warn!(category, "MCP session cleanup failed");
         }
     }
 
@@ -112,10 +140,7 @@ impl Authorizer {
         let Some(bound) = bound else { return false };
         // An owner may replace a digest without changing its safe ID. The
         // retained credential must still be valid; the ID alone is no grant.
-        bound.current_async().await.is_ok()
-            && bound.client_id() == client.client_id()
-            && bound.credential_id() == client.credential_id()
-            && bound.policy_hash() == client.policy_hash()
+        bound.current_async().await.is_ok() && bound.same_authorization(client)
     }
 
     async fn bind_session(&self, id: &str, client: &AuthorizedClient, deleting: bool) -> bool {
@@ -135,6 +160,23 @@ impl Authorizer {
             false
         }
     }
+}
+
+fn group_bindings(
+    bindings: Vec<(String, AuthorizedClient)>,
+) -> Vec<(AuthorizedClient, Vec<String>)> {
+    let mut groups: Vec<(AuthorizedClient, Vec<String>)> = Vec::new();
+    for (id, client) in bindings {
+        if let Some((_, ids)) = groups
+            .iter_mut()
+            .find(|(bound, _)| bound.same_authorization(&client))
+        {
+            ids.push(id);
+        } else {
+            groups.push((client, vec![id]));
+        }
+    }
+    groups
 }
 
 pub async fn middleware(
@@ -176,7 +218,7 @@ pub async fn middleware(
         if let Some(id) = id {
             let accepted = authorizer.bind_session(&id, &client, deleting).await;
             if !accepted {
-                let _ = authorizer.manager.close_session(&Arc::from(id)).await;
+                authorizer.close_session(&id).await;
                 return rejection(StatusCode::SERVICE_UNAVAILABLE);
             }
         }
@@ -267,13 +309,12 @@ impl AuthorizedBody {
     }
 
     fn wake_after(&mut self, cx: &mut Context<'_>, duration: Duration) {
-        if self.wake.is_none() {
-            self.wake = Some(Box::pin(tokio::time::sleep(duration)));
-        }
-        if let Some(wake) = &mut self.wake
-            && std::future::Future::poll(wake.as_mut(), cx).is_ready()
-        {
-            self.wake = None;
+        let deadline = tokio::time::Instant::now() + duration;
+        let wake = self
+            .wake
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
+        wake.as_mut().reset(deadline);
+        if std::future::Future::poll(wake.as_mut(), cx).is_ready() {
             cx.waker().wake_by_ref();
         }
     }
@@ -422,7 +463,7 @@ mod tests {
         assert!(authorizer.bind_session(&id, &client, false).await);
         manager.close_session(&id).await.unwrap();
         drop(transport);
-        authorizer.retire_invalid_sessions().await;
+        authorizer.retire_invalid_sessions().await.unwrap();
         assert!(authorizer.sessions.lock().unwrap().is_empty());
 
         // An absent SDK session must not consume the binding limit, even when
@@ -434,9 +475,128 @@ mod tests {
                 .unwrap()
                 .insert(format!("expired-{index}"), client.clone());
         }
-        authorizer.retire_invalid_sessions().await;
+        authorizer.retire_invalid_sessions().await.unwrap();
         assert!(authorizer.sessions.lock().unwrap().is_empty());
         assert!(authorizer.bind_session("fresh", &client, false).await);
+    }
+
+    #[tokio::test]
+    async fn session_retirement_keeps_replacement_digests_separate() {
+        use sha2::{Digest, Sha256};
+
+        let (_temp, store, original) = credential();
+        let manager = Arc::new(LocalSessionManager::default());
+        let authorizer = Authorizer::new(store.clone(), manager.clone());
+        let (old_id, _old_transport) = manager.create_session().await.unwrap();
+        assert!(authorizer.bind_session(&old_id, &original, false).await);
+        let token = format!("omcp1_{}_{}", original.credential_id(), "a".repeat(64));
+        let mut hash = Sha256::new();
+        hash.update(b"obsidian-mcp/access-token/v1\0");
+        hash.update(token.as_bytes());
+        let digest = hash
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        store
+            .update(None, |policy| {
+                let credentials = &mut policy.clients.get_mut("reader").unwrap().credentials;
+                credentials[0].digest = digest;
+                Ok(())
+            })
+            .unwrap();
+        let current = store.authenticate(&token).unwrap();
+        assert_eq!(original.credential_id(), current.credential_id());
+        let groups = group_bindings(vec![
+            ("old-a".into(), original.clone()),
+            ("new-a".into(), current.clone()),
+            ("old-b".into(), original.clone()),
+            ("new-b".into(), current.clone()),
+        ]);
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().all(|(_, ids)| ids.len() == 2));
+        let (new_id, _new_transport) = manager.create_session().await.unwrap();
+        assert!(authorizer.bind_session(&new_id, &current, false).await);
+        authorizer.retire_invalid_sessions().await.unwrap();
+        assert!(!manager.has_session(&old_id).await.unwrap());
+        assert!(manager.has_session(&new_id).await.unwrap());
+        let sessions = authorizer.sessions.lock().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions.contains_key(new_id.as_ref()));
+    }
+
+    #[derive(Default)]
+    struct CountWake(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_recheck_does_not_immediately_schedule_a_second_validation() {
+        let (_temp, _store, client) = credential();
+        let mut body = AuthorizedBody::new(
+            Body::from_stream(futures_util::stream::pending::<Result<Bytes, io::Error>>()),
+            client,
+        );
+        let counter = Arc::new(CountWake::default());
+        let waker = std::task::Waker::from(Arc::clone(&counter));
+        let mut context = Context::from_waker(&waker);
+        assert!(Pin::new(&mut body).poll_frame(&mut context).is_pending());
+        let deadline = body.wake.as_ref().unwrap().deadline();
+        tokio::time::sleep_until(deadline + Duration::from_millis(20)).await;
+        counter.0.store(0, std::sync::atomic::Ordering::SeqCst);
+        assert!(Pin::new(&mut body).poll_frame(&mut context).is_pending());
+        assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ready_frame_does_not_wait_for_an_old_idle_timer_after_publication() {
+        let (_temp, store, client) = credential();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let stream =
+            futures_util::stream::once(async move { Ok::<_, io::Error>(receive.await.unwrap()) });
+        let mut body = AuthorizedBody::new(Body::from_stream(stream), client);
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        assert!(Pin::new(&mut body).poll_frame(&mut context).is_pending());
+        let writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(store.path().with_file_name("access.json.lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&writer).unwrap();
+        send.send(Bytes::from_static(b"current frame")).unwrap();
+        assert!(Pin::new(&mut body).poll_frame(&mut context).is_pending());
+        // Observe a separate task so the watchdog cannot poll the body into
+        // making progress when its own timer has not woken it.
+        let mut publication = tokio::spawn(async move { frame(&mut body).await });
+        let (published, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_millis(180), &mut publication),
+            async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                drop(writer);
+            }
+        );
+        if published.is_err() {
+            publication.abort();
+            let _ = publication.await;
+        }
+        assert_eq!(
+            published
+                .expect("publication retry was delayed by the idle recheck")
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .into_data()
+                .unwrap(),
+            "current frame"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

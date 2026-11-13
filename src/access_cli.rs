@@ -1470,7 +1470,7 @@ fn windows_path(path: &Path) -> bool {
 }
 
 fn absolute_client_path(path: &Path) -> bool {
-    path.is_absolute() || windows_path(path)
+    windows_path(path) || path.to_string_lossy().starts_with('/')
 }
 
 fn helper_command(binary: &Path, token: &Path) -> Result<String, String> {
@@ -1509,8 +1509,8 @@ fn helper_command(binary: &Path, token: &Path) -> Result<String, String> {
         }
         Ok(format!(
             "{} access headers --token-file {}",
-            quote(binary),
-            quote(token)
+            quote_posix(binary),
+            quote_posix(token)
         ))
     }
 }
@@ -1535,7 +1535,7 @@ impl SetupEndpoint {
 }
 
 fn setup_endpoint(args: &Arguments) -> Result<SetupEndpoint, String> {
-    let mut public_url = validated_url(args.text("url")?.unwrap_or(DEFAULT_URL))?;
+    let public_url = validated_url(args.text("url")?.unwrap_or(DEFAULT_URL))?;
     let direct = public_url.scheme() == "http";
     if direct && public_url.path() != "/mcp" {
         return Err("Direct HTTP setup uses the server's /mcp path. Use /mcp here; 'access config --url' can select a separately configured proxy path.".into());
@@ -1569,11 +1569,6 @@ fn setup_endpoint(args: &Arguments) -> Result<SetupEndpoint, String> {
         }
         selected.ok_or("No free setup backend port was found; free a loopback port in 37842–37942, or set up a local HTTP endpoint first.")?
     };
-    if direct {
-        public_url
-            .set_port(Some(port))
-            .map_err(|_| "could not select the setup port")?;
-    }
     let authority = if host == "::1" {
         format!("[::1]:{port}")
     } else {
@@ -1582,7 +1577,11 @@ fn setup_endpoint(args: &Arguments) -> Result<SetupEndpoint, String> {
     let backend_url = reqwest::Url::parse(&format!("http://{authority}/mcp"))
         .map_err(|_| "could not construct the setup backend endpoint")?;
     Ok(SetupEndpoint {
-        public_url,
+        public_url: if direct {
+            backend_url.clone()
+        } else {
+            public_url
+        },
         backend_url,
     })
 }
@@ -1812,6 +1811,10 @@ fn selector(directory: &Option<String>, file: &Option<String>) -> String {
     }
 }
 
+fn quote_posix(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn quote(value: &str) -> String {
     #[cfg(windows)]
     {
@@ -1819,7 +1822,7 @@ fn quote(value: &str) -> String {
     }
     #[cfg(not(windows))]
     {
-        format!("'{}'", value.replace('\'', "'\\''"))
+        quote_posix(value)
     }
 }
 
