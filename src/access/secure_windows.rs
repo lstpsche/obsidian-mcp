@@ -1,0 +1,538 @@
+//! Native Windows ownership and DACL validation for private access state.
+
+use std::ffi::c_void;
+use std::fs::File;
+use std::io;
+use std::mem::{offset_of, size_of};
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
+use std::ptr;
+
+use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE, LocalFree};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    ConvertStringSidToSidW, GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
+};
+use windows_sys::Win32::Security::{
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+    CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
+    GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetTokenInformation, INHERIT_ONLY_ACE,
+    IsWellKnownSid, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+    TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid, WinCreatorOwnerSid,
+    WinLocalSystemSid,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, GetFileInformationByHandle, READ_CONTROL, ReOpenFile,
+    WRITE_DAC, WRITE_OWNER,
+};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+use super::super::{AccessError, AccessResult};
+
+const ALLOWED_ACE: u8 = 0;
+const DENIED_ACE: u8 = 1;
+const GENERIC_WRITE: u32 = 0x4000_0000;
+const GENERIC_ALL: u32 = 0x1000_0000;
+// Windows Resource Protection owns system ancestors through this exact service.
+// https://learn.microsoft.com/en-us/archive/msdn-magazine/2008/november/access-control-understanding-windows-file-and-registry-permissions
+const TRUSTED_INSTALLER_SID: &str =
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
+struct LocalAllocation(PSECURITY_DESCRIPTOR);
+impl Drop for LocalAllocation {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { LocalFree(self.0) };
+        }
+    }
+}
+
+struct TokenHandle(windows_sys::Win32::Foundation::HANDLE);
+impl Drop for TokenHandle {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+fn user_token() -> AccessResult<Vec<usize>> {
+    let mut token = ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let token = TokenHandle(token);
+    let mut bytes = 0;
+    unsafe { GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut bytes) };
+    if bytes == 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let mut buffer = vec![0usize; (bytes as usize).div_ceil(size_of::<usize>())];
+    if unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            bytes,
+            &mut bytes,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(buffer)
+}
+
+fn user_sid(buffer: &[usize]) -> PSID {
+    // The aligned allocation is filled by GetTokenInformation with TOKEN_USER.
+    unsafe { (*(buffer.as_ptr().cast::<TOKEN_USER>())).User.Sid }
+}
+
+fn trusted(sid: PSID, owner: PSID) -> bool {
+    unsafe {
+        EqualSid(sid, owner) != 0
+            || IsWellKnownSid(sid, WinLocalSystemSid) != 0
+            || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
+    }
+}
+
+fn trusted_installer_sid() -> AccessResult<LocalAllocation> {
+    let text: Vec<u16> = TRUSTED_INSTALLER_SID
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let mut sid = ptr::null_mut();
+    if unsafe { ConvertStringSidToSidW(text.as_ptr(), &mut sid) } == 0 {
+        return Err(native_error(
+            "parse_system_owner",
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(LocalAllocation(sid))
+}
+
+fn trusted_for_scope(sid: PSID, user: PSID, installer: PSID, private: bool) -> bool {
+    trusted(sid, user) || (!private && unsafe { EqualSid(sid, installer) } != 0)
+}
+
+fn owner_category(sid: PSID, user: PSID) -> &'static str {
+    if sid.is_null() {
+        "missing"
+    } else if unsafe { EqualSid(sid, user) } != 0 {
+        "service_user"
+    } else if unsafe { IsWellKnownSid(sid, WinLocalSystemSid) } != 0 {
+        "system"
+    } else if unsafe { IsWellKnownSid(sid, WinBuiltinAdministratorsSid) } != 0 {
+        "administrators"
+    } else {
+        "unrecognized"
+    }
+}
+
+fn native_error(stage: &'static str, error: io::Error) -> AccessError {
+    io::Error::new(
+        error.kind(),
+        format!("Windows access state {stage}: {error}"),
+    )
+    .into()
+}
+
+fn sid_string(sid: PSID) -> AccessResult<String> {
+    let mut sid_text = ptr::null_mut();
+    if unsafe { ConvertSidToStringSidW(sid, &mut sid_text) } == 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let mut length = 0;
+    unsafe {
+        while *sid_text.add(length) != 0 {
+            length += 1;
+        }
+    }
+    let sid = String::from_utf16(unsafe { std::slice::from_raw_parts(sid_text, length) })
+        .map_err(|_| AccessError::Configuration("invalid owner SID".into()));
+    unsafe { LocalFree(sid_text.cast()) };
+    sid
+}
+
+pub(super) fn protect(file: &File, directory: bool) -> AccessResult<()> {
+    let user = user_token()?;
+    let sid = sid_string(user_sid(&user))?;
+    let inheritance = if directory { "OICI" } else { "" };
+    let descriptor = format!(
+        "D:P(A;{inheritance};FA;;;SY)(A;{inheritance};FA;;;BA)(A;{inheritance};FA;;;{sid})"
+    );
+    let descriptor: Vec<u16> = descriptor.encode_utf16().chain(Some(0)).collect();
+    let mut security = ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            descriptor.as_ptr(),
+            1,
+            &mut security,
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error().into());
+    }
+    let security = LocalAllocation(security);
+    let mut present = 0;
+    let mut defaulted = 0;
+    let mut acl = ptr::null_mut();
+    if unsafe { GetSecurityDescriptorDacl(security.0, &mut present, &mut acl, &mut defaulted) } == 0
+        || present == 0
+        || acl.is_null()
+    {
+        return Err(io::Error::last_os_error().into());
+    }
+    // Called only for newly created empty access-state objects. Set the owner
+    // explicitly: a token's default owner need not be its TokenUser SID.
+    let access = READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES;
+    let handle = if directory {
+        crate::vault::fs::reopen_directory(file, access)
+            .map_err(|error| native_error("reopen_directory_for_protection", error))?
+    } else {
+        // ReOpenFile supports regular files, but rejects directory handles.
+        let handle = unsafe {
+            ReOpenFile(
+                file.as_raw_handle().cast(),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(native_error(
+                "reopen_file_for_protection",
+                io::Error::last_os_error(),
+            ));
+        }
+        unsafe { File::from_raw_handle(handle.cast()) }
+    };
+    let result = unsafe {
+        SetSecurityInfo(
+            handle.as_raw_handle().cast(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            user_sid(&user),
+            ptr::null_mut(),
+            acl,
+            ptr::null(),
+        )
+    };
+    if result != 0 {
+        return Err(native_error(
+            "set_owner_and_dacl",
+            io::Error::from_raw_os_error(result as i32),
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate(file: &File, private: bool, directory: bool) -> AccessResult<()> {
+    validate_acl(file, private, directory, false)
+}
+
+pub(super) fn validate_creation_parent(file: &File) -> AccessResult<()> {
+    validate_acl(file, false, true, true)
+}
+
+fn validate_acl(file: &File, private: bool, directory: bool, creating: bool) -> AccessResult<()> {
+    let info = information(file)?;
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || (!directory && info.nNumberOfLinks != 1)
+    {
+        return Err(AccessError::Configuration(
+            "access state cannot use reparse points or hard links".into(),
+        ));
+    }
+    let user = user_token()?;
+    let user_sid = user_sid(&user);
+    let mut owner = ptr::null_mut();
+    let mut acl: *mut ACL = ptr::null_mut();
+    let mut descriptor = ptr::null_mut();
+    let result = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle().cast(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            ptr::null_mut(),
+            &mut acl,
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if result != 0 {
+        return Err(native_error(
+            "read_owner_and_dacl",
+            io::Error::from_raw_os_error(result as i32),
+        ));
+    }
+    let descriptor = LocalAllocation(descriptor);
+    validate_descriptor(descriptor.0, owner, acl, user_sid, private, creating)
+}
+
+fn validate_descriptor(
+    descriptor: PSECURITY_DESCRIPTOR,
+    owner: PSID,
+    acl: *mut ACL,
+    user_sid: PSID,
+    private: bool,
+    creating: bool,
+) -> AccessResult<()> {
+    let installer = trusted_installer_sid()?;
+    if owner.is_null()
+        || acl.is_null()
+        || !trusted_for_scope(owner, user_sid, installer.0, private)
+        || (private && unsafe { EqualSid(owner, user_sid) } == 0)
+    {
+        let scope = if private { "private" } else { "ancestor" };
+        let category = owner_category(owner, user_sid);
+        let dacl = if acl.is_null() { "missing" } else { "present" };
+        let message = format!(
+            "Windows access state ownership rejected (scope={scope}, owner={category}, dacl={dacl})"
+        );
+        // Native test fixtures expose exact account identity only in their
+        // captured failure, so an unfamiliar system owner can be investigated.
+        #[cfg(test)]
+        let message = if owner.is_null() {
+            message
+        } else {
+            format!(
+                "{message}; test owner_sid={:?}, token_user_sid={:?}",
+                sid_string(owner),
+                sid_string(user_sid)
+            )
+        };
+        return Err(AccessError::Configuration(message));
+    }
+    let mut control = 0;
+    let mut revision = 0;
+    if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    if private && control & SE_DACL_PROTECTED == 0 {
+        return Err(AccessError::Configuration(
+            "access state requires a protected DACL".into(),
+        ));
+    }
+    let mut size = ACL_SIZE_INFORMATION::default();
+    if unsafe {
+        GetAclInformation(
+            acl,
+            (&mut size as *mut ACL_SIZE_INFORMATION).cast(),
+            size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error().into());
+    }
+    // Ancestors may permit new children (for example C:\), but cannot let
+    // another principal replace an existing child or change its authority.
+    let write_mask = GENERIC_ALL
+        | GENERIC_WRITE
+        | WRITE_DAC
+        | WRITE_OWNER
+        | DELETE
+        | FILE_WRITE_ATTRIBUTES
+        | FILE_DELETE_CHILD;
+    for index in 0..size.AceCount {
+        let mut raw: *mut c_void = ptr::null_mut();
+        if unsafe { GetAce(acl, index, &mut raw) } == 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let header = unsafe { &*raw.cast::<ACE_HEADER>() };
+        if header.AceType == DENIED_ACE {
+            continue;
+        }
+        if header.AceType != ALLOWED_ACE {
+            return Err(AccessError::Configuration(
+                "unsupported access-state DACL entry".into(),
+            ));
+        }
+        if usize::from(header.AceSize) < size_of::<ACCESS_ALLOWED_ACE>() {
+            return Err(AccessError::Configuration(
+                "invalid access-state DACL entry".into(),
+            ));
+        }
+        let ace = unsafe { &*raw.cast::<ACCESS_ALLOWED_ACE>() };
+        let sid = unsafe {
+            raw.cast::<u8>()
+                .add(offset_of!(ACCESS_ALLOWED_ACE, SidStart))
+                .cast::<c_void>()
+        };
+        let flags = u32::from(header.AceFlags);
+        let inherit_only = flags & INHERIT_ONLY_ACE != 0;
+        let inheritable = flags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) != 0;
+        // CREATOR OWNER is resolved to our newly created child's owner. It is
+        // trusted only as an inherit-only placeholder, never as a group grant.
+        let inherited_owner =
+            inherit_only && inheritable && unsafe { IsWellKnownSid(sid, WinCreatorOwnerSid) } != 0;
+        if ace.Mask != 0
+            && !trusted_for_scope(sid, user_sid, installer.0, private)
+            && !inherited_owner
+            && (private
+                || (creating && inheritable)
+                || (!inherit_only && ace.Mask & write_mask != 0))
+        {
+            return Err(AccessError::Configuration("access state grants another account access; use a private owner-controlled directory".into()));
+        }
+    }
+    Ok(())
+}
+
+fn information(file: &File) -> AccessResult<BY_HANDLE_FILE_INFORMATION> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) } == 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(info)
+}
+
+pub(super) fn object_identity(file: &File) -> AccessResult<String> {
+    let info = information(file)?;
+    Ok(format!(
+        "windows:{}:{}:{}",
+        info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::process::Command;
+    use windows_sys::Win32::Security::GetSecurityDescriptorOwner;
+
+    fn check_descriptor(
+        owner: &str,
+        extra_grants: &str,
+        private: bool,
+        creating: bool,
+    ) -> AccessResult<()> {
+        let user = user_token()?;
+        let user_sid = user_sid(&user);
+        let user_text = sid_string(user_sid)?;
+        let text = format!("O:{owner}D:P(A;;FA;;;{user_text}){extra_grants}");
+        let text: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+        let mut descriptor = ptr::null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                text.as_ptr(),
+                1,
+                &mut descriptor,
+                ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+        let descriptor = LocalAllocation(descriptor);
+        let mut owner = ptr::null_mut();
+        let mut acl = ptr::null_mut();
+        let mut defaulted = 0;
+        let mut present = 0;
+        if unsafe { GetSecurityDescriptorOwner(descriptor.0, &mut owner, &mut defaulted) } == 0
+            || unsafe {
+                GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut acl, &mut defaulted)
+            } == 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+        validate_descriptor(descriptor.0, owner, acl, user_sid, private, creating)
+    }
+
+    #[test]
+    fn windows_trusted_installer_is_limited_to_ancestor_ownership_and_grants() {
+        let user = user_token().unwrap();
+        let user = sid_string(user_sid(&user)).unwrap();
+        let installer_grant = format!("(A;OICI;FA;;;{TRUSTED_INSTALLER_SID})");
+        assert!(check_descriptor(TRUSTED_INSTALLER_SID, &installer_grant, false, false).is_ok());
+        assert!(check_descriptor(TRUSTED_INSTALLER_SID, "", true, false).is_err());
+        assert!(check_descriptor(&user, &installer_grant, true, false).is_err());
+        assert!(check_descriptor(&user, &installer_grant, false, true).is_ok());
+        // An ordinary broad grant remains unsafe even below a trusted system owner.
+        assert!(check_descriptor(TRUSTED_INSTALLER_SID, "(A;;FA;;;WD)", false, false).is_err());
+    }
+
+    #[test]
+    fn windows_other_service_sids_cannot_own_or_mutate_access_ancestors() {
+        let user = user_token().unwrap();
+        let user = sid_string(user_sid(&user)).unwrap();
+        let other = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478465";
+        assert!(check_descriptor(other, "", false, false).is_err());
+        assert!(check_descriptor(&user, &format!("(A;;FA;;;{other})"), false, false).is_err());
+        assert!(check_descriptor(&user, &format!("(A;OICIIO;FA;;;{other})"), false, true).is_err());
+    }
+
+    fn directory_handle(path: &Path) -> File {
+        cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority())
+            .unwrap()
+            .into_std_file()
+    }
+
+    fn grant_untrusted_inheritance(path: &Path) {
+        let output = Command::new("icacls.exe")
+            .arg(path)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)(IO)(F)"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "icacls failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn windows_protection_sets_user_ownership_without_changing_object_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = directory_handle(temporary.path());
+        let identity = object_identity(&directory).unwrap();
+        protect(&directory, true).unwrap();
+        validate(&directory, true, true).unwrap();
+        assert_eq!(object_identity(&directory).unwrap(), identity);
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(temporary.path().join("credential"))
+            .unwrap();
+        let identity = object_identity(&file).unwrap();
+        protect(&file, false).unwrap();
+        validate(&file, true, false).unwrap();
+        assert_eq!(object_identity(&file).unwrap(), identity);
+    }
+
+    #[test]
+    fn windows_acl_rejects_inherit_only_untrusted_grants_on_private_parent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = directory_handle(temporary.path());
+        protect(&directory, true).unwrap();
+        grant_untrusted_inheritance(temporary.path());
+        assert!(validate(&directory, true, true).is_err());
+        // It does not authorize this existing ancestor, but must prevent new
+        // children from inheriting a transient broadly accessible handle.
+        validate(&directory, false, true).unwrap();
+        assert!(validate_creation_parent(&directory).is_err());
+    }
+
+    #[test]
+    fn windows_acl_unsafe_inheritance_prevents_file_and_directory_creation() {
+        use super::super::super::{create_protected_directory, write_protected_file};
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = directory_handle(temporary.path());
+        protect(&directory, true).unwrap();
+        grant_untrusted_inheritance(temporary.path());
+        let token = temporary.path().join("token");
+        assert!(write_protected_file(&token, b"synthetic-secret").is_err());
+        assert!(!token.exists());
+        let child = temporary.path().join("private");
+        assert!(create_protected_directory(&child).is_err());
+        assert!(!child.exists());
+    }
+}

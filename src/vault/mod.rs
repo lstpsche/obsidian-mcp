@@ -3,6 +3,10 @@
 //! Knows nothing about MCP; provides the data model and I/O primitives
 //! that tool handlers delegate to.
 
+mod access_source;
+#[cfg(has_embeddings)]
+mod authenticated_semantic;
+pub(crate) mod authorized_index;
 mod data;
 pub mod exclude;
 pub mod frontmatter;
@@ -42,6 +46,7 @@ use futures_util::{FutureExt, StreamExt, stream};
 use notify_debouncer_mini::Debouncer;
 
 use crate::access::ReadScope;
+use crate::access::store::AuthorizedClient;
 use crate::config::Config;
 use crate::error::{VaultError, VaultResult};
 use crate::models::{
@@ -210,6 +215,10 @@ struct VaultInner {
     /// Wrapped in `Mutex` to guarantee `Sync` (`Debouncer` contains a `mpsc::Sender`
     /// which is `Send` but not `Sync`).
     _watcher: Mutex<Option<Debouncer<ChangeWatcher>>>,
+    authenticated_config: Option<Config>,
+    authorized_indices: authorized_index::AuthorizedProjectionRegistry,
+    #[cfg(has_embeddings)]
+    authenticated_semantics: OnceLock<Arc<authenticated_semantic::AuthenticatedSemanticRegistry>>,
 }
 
 /// High-level facade over the vault filesystem, index, and watcher.
@@ -222,6 +231,8 @@ pub struct Vault {
     inner: Arc<VaultInner>,
     background: Arc<Background>,
     read_scope: Option<Arc<ReadScope>>,
+    access: Option<AuthorizedClient>,
+    projection: Option<Arc<authorized_index::AuthorizedProjection>>,
 }
 
 enum IndexRead<'a> {
@@ -375,13 +386,13 @@ pub(crate) struct NoteListMetadata {
 impl Vault {
     /// Open a vault: validate the path, build the index, and optionally start the watcher.
     pub async fn open(config: &Config) -> VaultResult<Self> {
-        Self::open_inner(config, None, true).await
+        Self::open_inner(config, None, true, None).await
     }
 
     /// Open a vault with a dormant local embedding coordinator.
     /// Mutations remain queued until `activate_embeddings` selects local ownership.
     pub async fn open_deferred_embeddings(config: &Config) -> VaultResult<Self> {
-        Self::open_inner(config, None, false).await
+        Self::open_inner(config, None, false, None).await
     }
 
     #[cfg(all(test, has_embeddings))]
@@ -389,18 +400,24 @@ impl Vault {
         config: &Config,
         embedding_loader: Option<EmbeddingLoaderFuture>,
     ) -> VaultResult<Self> {
-        Self::open_inner(config, embedding_loader, true).await
+        Self::open_inner(config, embedding_loader, true, None).await
     }
 
     async fn open_inner(
         config: &Config,
         _embedding_loader: Option<EmbeddingLoaderFuture>,
         _embeddings_active: bool,
+        authenticated_config: Option<Config>,
     ) -> VaultResult<Self> {
         if let Some(location) = config.sftp_location()? {
             return Self::open_remote(config, location).await;
         }
         let filesystem = fs::VaultRoot::open(&config.vault_path)?;
+        let filesystem = if authenticated_config.is_some() {
+            filesystem.restricted_content()
+        } else {
+            filesystem
+        };
         let root = filesystem.path().to_path_buf();
         let (data, exclude) = data::initialize(
             &filesystem,
@@ -504,9 +521,15 @@ impl Vault {
                 #[cfg(has_embeddings)]
                 embeddings_requested: config.embeddings,
                 _watcher: Mutex::new(watcher_handle),
+                authenticated_config,
+                authorized_indices: Default::default(),
+                #[cfg(has_embeddings)]
+                authenticated_semantics: OnceLock::new(),
             }),
             background: Arc::new(Background::default()),
             read_scope: None,
+            access: None,
+            projection: None,
         };
         *vault
             .background
@@ -542,7 +565,7 @@ impl Vault {
         F: FnOnce(Self) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = VaultResult<T>> + Send + 'static,
     {
-        self.check_mutation_scope()?;
+        self.check_mutation_scope().await?;
         let admission = Arc::clone(&self.background.admission).acquire_owned();
         let permit = match deadline {
             Some(deadline) => tokio::time::timeout_at(deadline, admission)
@@ -589,6 +612,15 @@ impl Vault {
             .map_err(|error| VaultError::Other(format!("mutation task failed: {error}")))?
     }
     fn committed_error(&self, path: &Path, error: VaultError) -> VaultError {
+        if self.is_authenticated() {
+            return VaultError::storage(
+                "index",
+                path.to_string_lossy(),
+                crate::error::StorageErrorKind::ProjectionFailure,
+                format!("source write committed but authorized index publication failed: {error}"),
+            )
+            .with_mutation_outcome(crate::error::MutationOutcome::Committed);
+        }
         if !self.is_remote() {
             return error;
         }
@@ -691,6 +723,10 @@ impl Vault {
     }
     pub async fn storage(&self) -> VaultResult<Storage> {
         if let Some(source) = self.inner.source.get() {
+            if self.is_authenticated() {
+                self.check_access_current_async().await?;
+                return Ok(Storage::Local(self.authenticated_root()?));
+            }
             return Ok(source.clone());
         }
         let deadline =
@@ -730,9 +766,13 @@ impl Vault {
         }
     }
     pub async fn is_file(&self, path: &Path) -> VaultResult<bool> {
+        if self.is_authenticated() {
+            return self.access_is_file(path).await;
+        }
         self.storage().await?.is_file(path).await
     }
     fn require_catalog(&self) -> VaultResult<()> {
+        self.refresh_authorized_projection()?;
         if let Some(status) = self.source_status()
             && status.availability == "unavailable"
         {
@@ -754,8 +794,34 @@ impl Vault {
         Ok(())
     }
 
+    /// Run a complete synchronous catalog operation away from async workers
+    /// when refreshing the selected authorized corpus can block on source I/O.
+    pub(crate) async fn catalog_work<T, F>(&self, work: F) -> VaultResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Vault) -> VaultResult<T> + Send + 'static,
+    {
+        let vault = self.clone();
+        if self.is_authenticated() {
+            source_work(move || work(vault)).await
+        } else {
+            work(vault)
+        }
+    }
+
+    async fn require_catalog_async(&self) -> VaultResult<()> {
+        self.catalog_work(|vault| vault.require_catalog()).await
+    }
+
+    #[cfg(has_embeddings)]
+    pub(crate) async fn require_semantic_catalog_async(&self) -> VaultResult<()> {
+        self.catalog_work(|vault| vault.require_semantic_catalog())
+            .await
+    }
+
     #[cfg(has_embeddings)]
     pub(crate) fn require_semantic_catalog(&self) -> VaultResult<()> {
+        self.refresh_authorized_projection()?;
         // A completed catalog can rank retained evidence during a connection
         // outage; context reads still report their own source errors. An uncertain
         // mutation withdraws catalog readiness until a complete repair scan.
@@ -860,9 +926,15 @@ impl Vault {
                 #[cfg(has_embeddings)]
                 embeddings_requested: config.embeddings,
                 _watcher: Mutex::new(None),
+                authenticated_config: None,
+                authorized_indices: Default::default(),
+                #[cfg(has_embeddings)]
+                authenticated_semantics: OnceLock::new(),
             }),
             background: Arc::new(Background::default()),
             read_scope: None,
+            access: None,
+            projection: None,
         };
         *source
             .background
@@ -885,6 +957,8 @@ impl Vault {
                     inner,
                     background: Arc::new(Background::default()),
                     read_scope: None,
+                    access: None,
+                    projection: None,
                 };
                 if notified || service.inner.reconcile_needed.load(Ordering::Acquire) {
                     recovering |= service.begin_reconciliation(notified);
@@ -1457,7 +1531,7 @@ impl Vault {
         } else {
             template_path.to_owned()
         };
-        let content = self.storage().await?.read_file(&path).await?;
+        let content = self.read_note(&path).await?;
         let date = *date;
         let title = title.to_owned();
         source_work(move || periodic::expand_template_string(&content, &date, &title)).await
@@ -1467,6 +1541,29 @@ impl Vault {
         config: &crate::models::PeriodicNoteConfig,
         limit: usize,
     ) -> VaultResult<Vec<PathBuf>> {
+        if self.is_authenticated() {
+            let folder = Path::new(config.folder.as_deref().unwrap_or(""));
+            let actual = match self.access_canonical_existing(folder).await {
+                Ok(actual) => actual,
+                Err(error) if error.is_not_found() => return Ok(Vec::new()),
+                Err(error) => return Err(error),
+            };
+            let files = match self.access_list_files(folder, true, None, true).await {
+                Ok(files) => files,
+                Err(error) if error.is_not_found() => return Ok(Vec::new()),
+                Err(error) => return Err(error),
+            };
+            let configured_paths = files
+                .into_iter()
+                .map(|file| {
+                    let suffix = file
+                        .strip_prefix(&actual)
+                        .map_err(|_| VaultError::OutsideVault(file.clone()))?;
+                    path::logical_join(folder, suffix)
+                })
+                .collect::<VaultResult<Vec<_>>>()?;
+            return periodic::filter_recent_paths(config, configured_paths, limit);
+        }
         let source = self.storage().await?;
         if let Some(root) = source.local_root() {
             let root = root.clone();
@@ -1547,6 +1644,11 @@ impl Vault {
 
     /// Retain the same source/index with an immutable, read-only audience policy.
     pub fn with_read_scope(&self, scope: ReadScope) -> VaultResult<Self> {
+        if self.is_authenticated() {
+            return Err(VaultError::Authorization(
+                "authorization backends cannot be combined".into(),
+            ));
+        }
         scope.validate()?;
         if self.is_remote() {
             return Err(VaultError::Other(
@@ -1557,11 +1659,13 @@ impl Vault {
             inner: Arc::clone(&self.inner),
             background: Arc::clone(&self.background),
             read_scope: Some(Arc::new(scope)),
+            access: self.access.clone(),
+            projection: self.projection.clone(),
         })
     }
 
     pub fn is_scoped(&self) -> bool {
-        self.read_scope.is_some()
+        self.read_scope.is_some() || self.is_authenticated()
     }
 
     pub(crate) async fn check_result_revision(
@@ -1569,7 +1673,10 @@ impl Vault {
         path: &Path,
         revision: &str,
     ) -> VaultResult<()> {
-        if self.is_scoped() {
+        if self.is_authenticated() {
+            return self.check_access_result(path).await;
+        }
+        if self.read_scope.is_some() {
             self.read_source_snapshot(path)
                 .await?
                 .check_revision(path, Some(revision))?;
@@ -1585,6 +1692,9 @@ impl Vault {
     }
 
     fn read_scoped_native(&self, path: &Path, max_bytes: Option<usize>) -> VaultResult<String> {
+        if self.is_authenticated() {
+            return self.read_access_native(path, max_bytes);
+        }
         self.check_scope_path(path)?;
         let filesystem = self.inner.filesystem.as_ref().ok_or_else(|| {
             VaultError::Other("private memory scopes require a local vault".into())
@@ -1663,8 +1773,18 @@ impl Vault {
     }
 
     /// Access the Tantivy BM25 index (if enabled via `Config::tantivy`).
+    fn selected_tantivy(&self) -> Option<&Arc<TantivyIndex>> {
+        if let Some(projection) = &self.projection {
+            projection.tantivy.as_ref()
+        } else if self.is_authenticated() {
+            None
+        } else {
+            self.inner.tantivy.as_ref()
+        }
+    }
+
     pub fn tantivy(&self) -> Option<&TantivyIndex> {
-        self.inner.tantivy.as_deref()
+        self.selected_tantivy().map(Arc::as_ref)
     }
 
     // ── fs delegation ──────────────────────────────────────────────────
@@ -1675,6 +1795,9 @@ impl Vault {
         recursive: bool,
         glob: Option<&str>,
     ) -> VaultResult<Vec<PathBuf>> {
+        if self.is_authenticated() {
+            return self.access_list_files(dir, recursive, glob, false).await;
+        }
         let files = self
             .storage()
             .await?
@@ -1709,6 +1832,9 @@ impl Vault {
         recursive: bool,
         glob: Option<&str>,
     ) -> VaultResult<Vec<PathBuf>> {
+        if self.is_authenticated() {
+            return self.access_list_files(dir, recursive, glob, true).await;
+        }
         let files = self
             .storage()
             .await?
@@ -1753,6 +1879,9 @@ impl Vault {
     }
 
     pub async fn file_stat(&self, path: &Path) -> VaultResult<FileStat> {
+        if self.is_authenticated() {
+            return self.access_file_stat(path).await;
+        }
         self.check_read_scope(path).await?;
         self.storage().await?.file_stat(path).await
     }
@@ -1775,11 +1904,7 @@ impl Vault {
         let expected = expected_revision.to_owned();
         self.run_mutation(move |vault| async move {
             let content = validate_source(content).await?;
-            let actual = vault
-                .storage()
-                .await?
-                .write_file_if_revision(&path, &content, &expected)
-                .await?;
+            let actual = vault.replace_source(&path, &content, &expected).await?;
             vault
                 .reindex(&actual)
                 .await
@@ -1790,7 +1915,7 @@ impl Vault {
 
     async fn write_note_inner(&self, path: &Path, content: &str) -> VaultResult<()> {
         let content = validate_source(content.to_owned()).await?;
-        let actual_path = self.storage().await?.write_file(path, &content).await?;
+        let actual_path = self.write_source(path, &content).await?;
         self.reindex(&actual_path)
             .await
             .map_err(|error| self.committed_error(&actual_path, error))?;
@@ -1808,7 +1933,7 @@ impl Vault {
 
     async fn append_note_inner(&self, path: &Path, content: &str) -> VaultResult<()> {
         let storage = self.storage().await?;
-        let existing = match storage.read_file(path).await {
+        let existing = match self.read_note(path).await {
             Ok(existing) => Some(existing),
             Err(VaultError::NoteNotFound(_)) => None,
             Err(error) => return Err(error),
@@ -1821,7 +1946,9 @@ impl Vault {
             Ok((combined, expected))
         })
         .await?;
-        let actual_path = if let Some(root) = storage.local_root() {
+        let actual_path = if self.is_authenticated() {
+            self.append_source(path, content).await?
+        } else if let Some(root) = storage.local_root() {
             let root = root.clone();
             let path = path.to_owned();
             let content = content.to_owned();
@@ -1880,11 +2007,7 @@ impl Vault {
             Ok(content)
         })
         .await?;
-        let actual_path = self
-            .storage()
-            .await?
-            .create_file(path, &full_content)
-            .await?;
+        let actual_path = self.create_source(path, &full_content).await?;
         self.reindex(&actual_path)
             .await
             .map_err(|error| self.committed_error(&actual_path, error))?;
@@ -1902,7 +2025,7 @@ impl Vault {
     }
 
     async fn prepend_note_inner(&self, path: &Path, content: &str) -> VaultResult<()> {
-        let existing = self.storage().await?.read_file(path).await?;
+        let existing = self.read_note(path).await?;
         let content = content.to_owned();
         let (new_content, expected) = source_work(move || {
             let expected = source::source_revision(&existing);
@@ -1920,11 +2043,7 @@ impl Vault {
             Ok((new_content, expected))
         })
         .await?;
-        let actual_path = self
-            .storage()
-            .await?
-            .write_file_if_revision(path, &new_content, &expected)
-            .await?;
+        let actual_path = self.replace_source(path, &new_content, &expected).await?;
         self.reindex(&actual_path)
             .await
             .map_err(|error| self.committed_error(&actual_path, error))?;
@@ -1938,7 +2057,7 @@ impl Vault {
     }
 
     async fn delete_note_inner(&self, path: &Path) -> VaultResult<()> {
-        let actual_path = self.storage().await?.delete_file(path).await?;
+        let actual_path = self.delete_source(path).await?;
         self.reindex(&actual_path)
             .await
             .map_err(|error| self.committed_error(&actual_path, error))
@@ -1952,7 +2071,7 @@ impl Vault {
     }
 
     async fn move_note_inner(&self, from: &Path, to: &Path) -> VaultResult<PathBuf> {
-        let move_result = self.storage().await?.move_file(from, to).await?;
+        let move_result = self.move_source(from, to).await?;
         let old_result = self.reindex(&move_result.from).await;
         let new_result = self.reindex(&move_result.to).await;
         old_result
@@ -1971,7 +2090,7 @@ impl Vault {
     }
 
     async fn patch_note_inner(&self, path: &Path, request: &PatchRequest) -> VaultResult<()> {
-        let content = self.storage().await?.read_file(path).await?;
+        let content = self.read_note(path).await?;
         let request = request.clone();
         let source_path = path.to_owned();
         let (patched, expected) = source_work(move || {
@@ -1981,11 +2100,7 @@ impl Vault {
             Ok((patched, expected))
         })
         .await?;
-        let actual_path = self
-            .storage()
-            .await?
-            .write_file_if_revision(path, &patched, &expected)
-            .await?;
+        let actual_path = self.replace_source(path, &patched, &expected).await?;
         self.reindex(&actual_path)
             .await
             .map_err(|error| self.committed_error(&actual_path, error))?;
@@ -2019,7 +2134,7 @@ impl Vault {
         key: &str,
         value: serde_json::Value,
     ) -> VaultResult<()> {
-        let content = self.storage().await?.read_file(path).await?;
+        let content = self.read_note(path).await?;
         let key = key.to_owned();
         let (updated, expected) = source_work(move || {
             let expected = source::source_revision(&content);
@@ -2028,11 +2143,7 @@ impl Vault {
             Ok((updated, expected))
         })
         .await?;
-        let actual_path = self
-            .storage()
-            .await?
-            .write_file_if_revision(path, &updated, &expected)
-            .await?;
+        let actual_path = self.replace_source(path, &updated, &expected).await?;
         self.reindex(&actual_path)
             .await
             .map_err(|error| self.committed_error(&actual_path, error))?;
@@ -2049,7 +2160,7 @@ impl Vault {
     }
 
     async fn remove_frontmatter_field_inner(&self, path: &Path, key: &str) -> VaultResult<()> {
-        let content = self.storage().await?.read_file(path).await?;
+        let content = self.read_note(path).await?;
         let key = key.to_owned();
         let (updated, expected) = source_work(move || {
             let expected = source::source_revision(&content);
@@ -2058,11 +2169,7 @@ impl Vault {
             Ok((updated, expected))
         })
         .await?;
-        let actual_path = self
-            .storage()
-            .await?
-            .write_file_if_revision(path, &updated, &expected)
-            .await?;
+        let actual_path = self.replace_source(path, &updated, &expected).await?;
         self.reindex(&actual_path)
             .await
             .map_err(|error| self.committed_error(&actual_path, error))?;
@@ -2080,7 +2187,7 @@ impl Vault {
     }
 
     pub async fn get_note_metadata(&self, path: &Path) -> VaultResult<NoteMetadata> {
-        self.require_catalog()?;
+        self.require_catalog_async().await?;
         let actual_path = self.canonical_existing_relative_path(path).await?;
         self.read_index()
             .get_note(&actual_path)
@@ -2122,7 +2229,7 @@ impl Vault {
         query: &str,
         context_len: usize,
     ) -> VaultResult<Vec<SearchResult>> {
-        let max_results = if self.inner.tantivy.is_some() {
+        let max_results = if self.selected_tantivy().is_some() {
             200
         } else {
             usize::MAX
@@ -2138,8 +2245,22 @@ impl Vault {
         fuzzy: bool,
         fields: Option<&[SearchField]>,
     ) -> VaultResult<Vec<SearchResult>> {
-        self.require_catalog()?;
-        if let Some(tv) = &self.inner.tantivy {
+        self.search_with_reconciliation(|| {
+            self.search_text_once(query, context_len, max_results, fuzzy, fields)
+        })
+        .await
+    }
+
+    async fn search_text_once(
+        &self,
+        query: &str,
+        context_len: usize,
+        max_results: usize,
+        fuzzy: bool,
+        fields: Option<&[SearchField]>,
+    ) -> VaultResult<Vec<SearchResult>> {
+        self.require_catalog_async().await?;
+        if let Some(tv) = self.selected_tantivy() {
             return self
                 .tantivy_search_with_context(tv, query, context_len, max_results, fuzzy, fields)
                 .await;
@@ -2191,7 +2312,17 @@ impl Vault {
         context_len: usize,
         limit: Option<usize>,
     ) -> VaultResult<Vec<SearchResult>> {
-        self.require_catalog()?;
+        self.search_with_reconciliation(|| self.scan_regex_once(pattern, context_len, limit))
+            .await
+    }
+
+    async fn scan_regex_once(
+        &self,
+        pattern: &str,
+        context_len: usize,
+        limit: Option<usize>,
+    ) -> VaultResult<Vec<SearchResult>> {
+        self.require_catalog_async().await?;
         if pattern.len() > 1000 {
             return Err(VaultError::InvalidRegex {
                 pattern: pattern.into(),
@@ -2264,10 +2395,15 @@ impl Vault {
         if query.is_empty() || top_k == 0 {
             return Ok(Vec::new());
         }
-        let runtime = self.inner.embedding_runtime.get().ok_or_else(|| {
+        let runtime = self.selected_embedding_runtime(true)?.ok_or_else(|| {
             VaultError::Embedding("embeddings not enabled (OBSIDIAN_EMBEDDINGS=false)".into())
         })?;
         let snapshot = runtime.query_snapshot()?;
+        let snapshot = if self.is_authenticated() {
+            snapshot.with_authorization(self.authenticated_query_authorization()?)
+        } else {
+            snapshot
+        };
         let current_paths = self
             .read_index()
             .notes()
@@ -2279,6 +2415,29 @@ impl Vault {
         if entries.is_empty() {
             snapshot.validate_query(query)?;
             self.require_semantic_catalog()?;
+            if self.is_authenticated() && !current_paths.is_empty() {
+                let status = runtime.status();
+                if status.last_error.is_some()
+                    || status.phase == embedding_runtime::EmbeddingPhase::Degraded
+                {
+                    return Err(VaultError::storage(
+                        "search",
+                        "",
+                        crate::error::StorageErrorKind::Unavailable,
+                        "authorized semantic corpus is unavailable",
+                    ));
+                }
+                if status.phase == embedding_runtime::EmbeddingPhase::Warming
+                    && status.pending_notes > 0
+                {
+                    return Err(VaultError::storage(
+                        "search",
+                        "",
+                        crate::error::StorageErrorKind::Warming,
+                        "authorized semantic corpus is warming",
+                    ));
+                }
+            }
             return Ok(Vec::new());
         }
         let query_vector = snapshot.embed_query(query)?;
@@ -2287,7 +2446,19 @@ impl Vault {
         Ok(ranked)
     }
 
-    /// Returns `true` if embeddings are available for semantic search.
+    #[cfg(has_embeddings)]
+    fn selected_embedding_runtime(
+        &self,
+        activate: bool,
+    ) -> VaultResult<Option<embedding_runtime::EmbeddingRuntime>> {
+        if self.is_authenticated() {
+            self.authenticated_semantic_runtime(activate)
+        } else {
+            Ok(self.inner.embedding_runtime.get().cloned())
+        }
+    }
+
+    /// Returns whether the local embedding runtime is queryable.
     #[cfg(has_embeddings)]
     pub fn has_embeddings(&self) -> bool {
         self.inner
@@ -2298,11 +2469,17 @@ impl Vault {
 
     #[cfg(has_embeddings)]
     pub(crate) fn embeddings_configured(&self) -> bool {
+        if let Some(config) = &self.inner.authenticated_config {
+            return config.embeddings;
+        }
         self.inner.embedding_runtime.get().is_some()
     }
 
     #[cfg(has_embeddings)]
     pub(crate) fn embeddings_requested(&self) -> bool {
+        if let Some(config) = &self.inner.authenticated_config {
+            return config.embeddings;
+        }
         self.inner.embeddings_requested
     }
 
@@ -2321,13 +2498,34 @@ impl Vault {
         }
     }
 
-    /// Current background embedding lifecycle status, when embeddings are enabled.
+    /// Current lifecycle status of this vault's local embedding runtime.
     #[cfg(has_embeddings)]
     pub fn embedding_status(&self) -> Option<embedding_runtime::EmbeddingRuntimeStatus> {
         self.inner
             .embedding_runtime
             .get()
             .map(embedding_runtime::EmbeddingRuntime::status)
+    }
+
+    /// Inspect the selected authenticated corpus without activating inference.
+    #[cfg(has_embeddings)]
+    pub(crate) fn authenticated_embedding_status(
+        &self,
+    ) -> VaultResult<Option<embedding_runtime::EmbeddingRuntimeStatus>> {
+        let status = self.authenticated_semantic_runtime(false)?.map(|runtime| {
+            let mut status = runtime.status();
+            if self
+                .projection
+                .as_ref()
+                .is_some_and(|view| !view.is_ready())
+            {
+                status.queryable = false;
+                status.phase = embedding_runtime::EmbeddingPhase::Degraded;
+                status.last_error = Some("authorized corpus is unavailable".into());
+            }
+            status
+        });
+        Ok(status)
     }
 
     /// Hybrid search: BM25 prefetch via Tantivy, then re-rank by combining
@@ -2365,19 +2563,47 @@ impl Vault {
             return Ok(Vec::new());
         }
 
-        let tv = self.inner.tantivy.as_ref().ok_or_else(|| {
+        let tv = self.selected_tantivy().ok_or_else(|| {
             VaultError::Other("hybrid search requires Tantivy (set OBSIDIAN_TANTIVY=true)".into())
         })?;
-        let runtime = self.inner.embedding_runtime.get().ok_or_else(|| {
+        let runtime = self.selected_embedding_runtime(true)?.ok_or_else(|| {
             VaultError::Embedding("embeddings not enabled (OBSIDIAN_EMBEDDINGS=false)".into())
         })?;
         let snapshot = runtime.query_snapshot()?;
+        let snapshot = if self.is_authenticated() {
+            snapshot.with_authorization(self.authenticated_query_authorization()?)
+        } else {
+            snapshot
+        };
         snapshot.validate_query(query)?;
         let current_paths = self.read_index().notes().keys().cloned().collect();
         let mut entries = snapshot.capture_entries(&current_paths);
         self.filter_scoped_semantic_entries(&mut entries);
         if entries.is_empty() {
             self.require_semantic_catalog()?;
+            if self.is_authenticated() && !current_paths.is_empty() {
+                let status = runtime.status();
+                if status.last_error.is_some()
+                    || status.phase == embedding_runtime::EmbeddingPhase::Degraded
+                {
+                    return Err(VaultError::storage(
+                        "search",
+                        "",
+                        crate::error::StorageErrorKind::Unavailable,
+                        "authorized semantic corpus is unavailable",
+                    ));
+                }
+                if status.phase == embedding_runtime::EmbeddingPhase::Warming
+                    && status.pending_notes > 0
+                {
+                    return Err(VaultError::storage(
+                        "search",
+                        "",
+                        crate::error::StorageErrorKind::Warming,
+                        "authorized semantic corpus is warming",
+                    ));
+                }
+            }
             return Ok(Vec::new());
         }
         let allowed = semantic_results::paths(&entries);
@@ -2459,7 +2685,7 @@ impl Vault {
     }
 
     pub async fn backlinks(&self, path: &Path) -> VaultResult<Vec<NoteMetadata>> {
-        self.require_catalog()?;
+        self.require_catalog_async().await?;
         let actual_path = self.canonical_existing_relative_path(path).await?;
         Ok(self
             .read_index()
@@ -2470,7 +2696,7 @@ impl Vault {
     }
 
     pub async fn outgoing_links(&self, path: &Path) -> VaultResult<Vec<WikiLink>> {
-        self.require_catalog()?;
+        self.require_catalog_async().await?;
         let actual_path = self.canonical_existing_relative_path(path).await?;
         Ok(self
             .read_index()
@@ -2508,13 +2734,25 @@ impl Vault {
         &self,
         path: &Path,
     ) -> VaultResult<PathBuf> {
+        if self.is_authenticated() {
+            return self.access_canonical_existing(path).await;
+        }
         let actual = self.storage().await?.resolve_existing(path).await?.relative;
         self.check_read_scope(&actual).await?;
         Ok(actual)
     }
 
     /// Validate that a relative path doesn't escape the vault root.
+    /// Authenticated views validate caller syntax here; source operations check
+    /// authority and physical containment without observing hidden paths first.
     pub async fn validate_path(&self, path: &Path) -> VaultResult<()> {
+        if self.is_authenticated() {
+            let normalized = path::normalize_relative(path)?;
+            path::VaultPath::parse(normalized.to_str().ok_or_else(|| {
+                VaultError::InvalidPath("vault-relative paths must be UTF-8".into())
+            })?)?;
+            return Ok(());
+        }
         self.storage().await?.resolve_for_write(path).await?;
         Ok(())
     }
@@ -2575,7 +2813,7 @@ impl Vault {
         };
 
         let content = validate_source(content).await?;
-        let actual_path = self.storage().await?.create_file(&path, &content).await?;
+        let actual_path = self.create_source(&path, &content).await?;
         self.reindex(&actual_path)
             .await
             .map_err(|error| self.committed_error(&actual_path, error))?;
@@ -2610,12 +2848,13 @@ impl Vault {
         fuzzy: bool,
         fields: Option<&[SearchField]>,
     ) -> VaultResult<Vec<SearchResult>> {
-        self.require_catalog()?;
+        self.require_catalog_async().await?;
         let tv = Arc::clone(tv);
         let search_query = query.to_owned();
         let fields = fields.map(<[SearchField]>::to_vec);
         let vault = self.clone();
-        let hits = source_work(move || {
+        let (hits, revisions) = source_work(move || {
+            let index = vault.is_authenticated().then(|| vault.read_index());
             let allowed = vault.read_scope.as_ref().map(|_| {
                 vault
                     .read_index()
@@ -2624,7 +2863,7 @@ impl Vault {
                     .cloned()
                     .collect::<HashSet<_>>()
             });
-            if fuzzy || fields.is_some() {
+            let hits = if fuzzy || fields.is_some() {
                 tv.search_with_options_for_paths(
                     &search_query,
                     max_results,
@@ -2634,7 +2873,20 @@ impl Vault {
                 )
             } else {
                 tv.search_for_paths(&search_query, max_results, allowed.as_ref())
-            }
+            }?;
+            let revisions = match index {
+                Some(index) => hits
+                    .iter()
+                    .map(|(path, _)| {
+                        index
+                            .source_revision(path)
+                            .map(|revision| (path.as_os_str().to_owned(), revision.to_owned()))
+                            .ok_or_else(|| VaultError::NoteNotFound(path.clone()))
+                    })
+                    .collect::<VaultResult<HashMap<_, _>>>()?,
+                None => HashMap::new(),
+            };
+            Ok((hits, revisions))
         })
         .await?;
 
@@ -2646,7 +2898,14 @@ impl Vault {
             return source_work(move || {
                 hits.into_iter()
                     .map(|(path, score)| {
-                        let content = vault.read_scoped_native(&path, None)?;
+                        let content = if vault.is_authenticated() {
+                            let revision = revisions
+                                .get(path.as_os_str())
+                                .ok_or_else(|| VaultError::NoteNotFound(path.clone()))?;
+                            vault.read_access_revision_native(&path, revision)?
+                        } else {
+                            vault.read_scoped_native(&path, None)?
+                        };
                         let matches = word_re.as_ref().map_or_else(Vec::new, |regex| {
                             match_source_content(&content, regex, context_len)
                         });
@@ -2696,8 +2955,16 @@ impl Vault {
                 let mut results = Vec::new();
                 let mut matched = 0usize;
                 for path in paths {
-                    let Ok(content) = vault.read_scoped_native(&path, None) else {
-                        continue;
+                    let content = match if vault.is_authenticated() {
+                        vault.read_access_indexed_native(&path)
+                    } else {
+                        vault.read_scoped_native(&path, None)
+                    } {
+                        Ok(content) => content,
+                        Err(_) if vault.read_scope.is_some() => {
+                            continue;
+                        }
+                        Err(error) => return Err(error),
                     };
                     let matches = match_source_content(&content, &regex, context_len);
                     matched += usize::from(!matches.is_empty());
@@ -2800,8 +3067,9 @@ impl Vault {
         Ok(results)
     }
 
-    fn check_mutation_scope(&self) -> VaultResult<()> {
-        if self.is_scoped() {
+    async fn check_mutation_scope(&self) -> VaultResult<()> {
+        self.check_access_current_async().await?;
+        if self.read_scope.is_some() {
             return Err(VaultError::Other(
                 "private memory scope is read-only".into(),
             ));
@@ -2810,11 +3078,21 @@ impl Vault {
     }
 
     async fn lock_mutations(&self) -> VaultResult<tokio::sync::MutexGuard<'_, ()>> {
-        self.check_mutation_scope()?;
-        Ok(self.inner.mutations.lock().await)
+        self.check_mutation_scope().await?;
+        let lock = self.inner.mutations.lock().await;
+        self.check_mutation_scope().await?;
+        Ok(lock)
     }
 
     fn read_index(&self) -> IndexRead<'_> {
+        if let Some(projection) = &self.projection {
+            return IndexRead::Shared(
+                projection
+                    .index
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner()),
+            );
+        }
         let index = self.inner.index.read().unwrap_or_else(|e| e.into_inner());
         if let Some(scope) = &self.read_scope {
             let contents = index
@@ -2835,7 +3113,7 @@ impl Vault {
 
     #[cfg(has_embeddings)]
     fn filter_scoped_semantic_entries(&self, entries: &mut semantic_results::CapturedEntries) {
-        if self.is_scoped() {
+        if self.read_scope.is_some() {
             entries.retain(|path, entry| {
                 self.check_scoped_revision_native(Path::new(path), &entry.source_revision)
                     .is_ok()
@@ -2886,6 +3164,14 @@ impl Vault {
     }
 
     fn reindex_local(&self, path: &Path) -> VaultResult<()> {
+        self.reindex_source_local(path)?;
+        self.refresh_authorized_projection()?;
+        #[cfg(has_embeddings)]
+        self.notify_authenticated_semantics();
+        Ok(())
+    }
+
+    fn reindex_source_local(&self, path: &Path) -> VaultResult<()> {
         let filesystem = self
             .inner
             .filesystem
@@ -3576,6 +3862,38 @@ mod tests {
                 assert_eq!(matched.match_start, start);
                 assert_eq!(matched.match_end, start + "needle".len());
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_regex_scans_skip_vanished_candidates_without_watching() {
+        for ranked in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("a.md"), "needle vanished").unwrap();
+            std::fs::write(directory.path().join("z.md"), "needle retained").unwrap();
+            let mut config = test_config(directory.path());
+            config.watch = false;
+            config.tantivy = ranked;
+            let vault = Vault::open(&config).await.unwrap();
+            assert!(!vault.is_scoped());
+            std::fs::remove_file(directory.path().join("a.md")).unwrap();
+
+            for hits in [
+                vault.search_regex("needle", 40).await.unwrap(),
+                vault
+                    .search_regex_with_limit("needle", 40, 1)
+                    .await
+                    .unwrap(),
+            ] {
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].path, Path::new("z.md"));
+            }
+            if !ranked {
+                let hits = vault.search_text("needle", 40).await.unwrap();
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].path, Path::new("z.md"));
+            }
+            assert!(vault.read_index().get_note(Path::new("a.md")).is_some());
         }
     }
 
@@ -4891,7 +5209,7 @@ mod tests {
             loader_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(loader_model as Arc<dyn embeddings::Embedder>)
         });
-        let vault = Vault::open_inner(&config, Some(loader), false)
+        let vault = Vault::open_inner(&config, Some(loader), false, None)
             .await
             .unwrap();
         let submitter = vault.inner.embedding_runtime.get().unwrap().downgrade();

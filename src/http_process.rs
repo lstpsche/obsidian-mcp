@@ -2,10 +2,49 @@
 
 use std::io;
 use std::net::SocketAddr;
-#[cfg(unix)]
+#[cfg(not(windows))]
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpStream};
 use std::path::Path;
 use std::time::Duration;
+
+pub(crate) fn bind_available_tcp(endpoint: SocketAddr) -> io::Result<tokio::net::TcpSocket> {
+    #[cfg(windows)]
+    let occupied = endpoint.port() != 0 && platform::has_overlapping_listener(endpoint)?;
+    #[cfg(not(windows))]
+    let occupied = endpoint.port() != 0 && endpoint_is_reachable(endpoint)?;
+    if occupied {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("{endpoint} already has a listener"),
+        ));
+    }
+    let socket = if endpoint.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    // Retain Mio's platform policy so closed connections do not block a restart.
+    socket.set_reuseaddr(cfg!(unix))?;
+    socket.bind(endpoint)?;
+    Ok(socket)
+}
+
+#[cfg(not(windows))]
+fn endpoint_is_reachable(endpoint: SocketAddr) -> io::Result<bool> {
+    let connect_ip = match endpoint.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    match TcpStream::connect_timeout(
+        &SocketAddr::new(connect_ip, endpoint.port()),
+        Duration::from_millis(200),
+    ) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => Ok(false),
+        Err(error) => Err(error),
+    }
+}
 
 pub(crate) fn listener_pid(endpoint: SocketAddr) -> io::Result<Option<u32>> {
     if endpoint.port() == 0 {
@@ -14,21 +53,7 @@ pub(crate) fn listener_pid(endpoint: SocketAddr) -> io::Result<Option<u32>> {
     // Unix lsof can hide another user's listener. Windows supplies the
     // system-wide owner table directly, including an empty endpoint.
     #[cfg(unix)]
-    let reachable = {
-        let connect_ip = match endpoint.ip() {
-            IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
-            IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
-            ip => ip,
-        };
-        match TcpStream::connect_timeout(
-            &SocketAddr::new(connect_ip, endpoint.port()),
-            Duration::from_millis(200),
-        ) {
-            Ok(_) => true,
-            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => false,
-            Err(error) => return Err(error),
-        }
-    };
+    let reachable = endpoint_is_reachable(endpoint)?;
     #[cfg(unix)]
     if !reachable && !endpoint.ip().is_unspecified() {
         return Ok(None);
@@ -57,6 +82,12 @@ pub(crate) fn listener_pid(endpoint: SocketAddr) -> io::Result<Option<u32>> {
     }
 }
 
+fn endpoints_overlap(requested: SocketAddr, bound: SocketAddr) -> bool {
+    requested.is_ipv4() == bound.is_ipv4()
+        && requested.port() == bound.port()
+        && (requested == bound || requested.ip().is_unspecified() || bound.ip().is_unspecified())
+}
+
 fn collect_owner(
     pids: &mut Vec<u32>,
     requested: SocketAddr,
@@ -65,9 +96,7 @@ fn collect_owner(
 ) -> io::Result<()> {
     if bound == requested {
         pids.push(pid);
-    } else if requested.port() == bound.port()
-        && (requested.ip().is_unspecified() || bound.ip().is_unspecified())
-    {
+    } else if endpoints_overlap(requested, bound) {
         return Err(io::Error::other(format!(
             "{requested} overlaps the listener on {bound}; specify its exact bind address"
         )));
@@ -138,8 +167,23 @@ pub(crate) fn stop(endpoint: SocketAddr, _expected: &Path) -> io::Result<bool> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[derive(Debug, thiserror::Error)]
+#[error("listener inspection {operation}: {source}")]
+struct ListenerInspectionError {
+    operation: &'static str,
+    source: io::Error,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn inspect_listener(endpoint: SocketAddr, operation: &'static str) -> io::Result<Option<u32>> {
+    listener_pid(endpoint).map_err(|source| {
+        io::Error::new(source.kind(), ListenerInspectionError { operation, source })
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub(crate) fn stop(endpoint: SocketAddr, expected_executable: &Path) -> io::Result<bool> {
-    let Some(pid) = listener_pid(endpoint)? else {
+    let Some(pid) = inspect_listener(endpoint, "before stopping")? else {
         // Darwin may hide other users' kernel socket records. An exclusive bind
         // can confirm this empty wildcard before any child has been spawned.
         // Never take this port while waiting for the actual child to bind.
@@ -174,7 +218,7 @@ fn stop_instance(
     expected_executable: &Path,
 ) -> io::Result<()> {
     process.verify_executable(expected_executable)?;
-    if listener_pid(endpoint)? != Some(pid) {
+    if inspect_listener(endpoint, "before termination")? != Some(pid) {
         return Err(io::Error::other(format!(
             "listener on {endpoint} changed during inspection"
         )));
@@ -183,7 +227,9 @@ fn stop_instance(
     if !process.wait(Duration::from_secs(5))? {
         // The same instance may still be draining requests after closing its listener.
         // If a supervisor replaced it, leave the replacement to its owner.
-        if listener_pid(endpoint)?.is_some_and(|current| current != pid) {
+        if inspect_listener(endpoint, "before forced termination")?
+            .is_some_and(|current| current != pid)
+        {
             return Err(io::Error::other(format!(
                 "another process now owns {endpoint}"
             )));
@@ -196,7 +242,7 @@ fn stop_instance(
             )));
         }
     }
-    if let Some(owner) = listener_pid(endpoint)? {
+    if let Some(owner) = inspect_listener(endpoint, "after process exit")? {
         return Err(io::Error::other(format!(
             "HTTP server process {pid} exited but process {owner} now owns {endpoint}"
         )));
@@ -458,11 +504,21 @@ mod platform {
     };
 
     pub(super) fn platform_listener_pids(endpoint: SocketAddr) -> io::Result<Vec<u32>> {
-        let family = if endpoint.is_ipv4() {
-            AF_INET
-        } else {
-            AF_INET6
-        };
+        let mut pids = Vec::new();
+        for (address, pid) in tcp_listeners(endpoint.is_ipv4())? {
+            collect_owner(&mut pids, endpoint, address, pid)?;
+        }
+        Ok(pids)
+    }
+
+    pub(super) fn has_overlapping_listener(endpoint: SocketAddr) -> io::Result<bool> {
+        Ok(tcp_listeners(endpoint.is_ipv4())?
+            .into_iter()
+            .any(|(bound, _)| endpoints_overlap(endpoint, bound)))
+    }
+
+    fn tcp_listeners(ipv4: bool) -> io::Result<Vec<(SocketAddr, u32)>> {
+        let family = if ipv4 { AF_INET } else { AF_INET6 };
         let mut buffer: Vec<u32> = Vec::new();
         let mut size = 0;
         loop {
@@ -491,7 +547,7 @@ mod platform {
         let (&count, entries) = buffer
             .split_first()
             .ok_or_else(|| io::Error::other("empty TCP listener table"))?;
-        let entry_size = if endpoint.is_ipv4() {
+        let entry_size = if ipv4 {
             size_of::<MIB_TCPROW_OWNER_PID>()
         } else {
             size_of::<MIB_TCP6ROW_OWNER_PID>()
@@ -499,34 +555,31 @@ mod platform {
         if count as usize > size_of_val(entries) / entry_size {
             return Err(io::Error::other("truncated TCP listener table"));
         }
-        let mut pids = Vec::new();
+        let mut listeners = Vec::new();
         for raw in entries.chunks_exact(entry_size / 4).take(count as usize) {
             // SAFETY: rows consist of DWORDs and byte arrays with alignment four,
             // and each chunk has exactly the size of the selected row layout.
-            let (addr, pid) = match endpoint {
-                SocketAddr::V4(_) => {
-                    let row = unsafe { &*raw.as_ptr().cast::<MIB_TCPROW_OWNER_PID>() };
-                    let ip = Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes());
-                    (
-                        SocketAddr::new(ip.into(), u16::from_be(row.dwLocalPort as u16)),
-                        row.dwOwningPid,
-                    )
-                }
-                SocketAddr::V6(_) => {
-                    let row = unsafe { &*raw.as_ptr().cast::<MIB_TCP6ROW_OWNER_PID>() };
-                    let ip = Ipv6Addr::from(row.ucLocalAddr);
-                    let addr = SocketAddrV6::new(
-                        ip,
-                        u16::from_be(row.dwLocalPort as u16),
-                        0,
-                        u32::from_be(row.dwLocalScopeId),
-                    );
-                    (addr.into(), row.dwOwningPid)
-                }
+            let (addr, pid) = if ipv4 {
+                let row = unsafe { &*raw.as_ptr().cast::<MIB_TCPROW_OWNER_PID>() };
+                let ip = Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes());
+                (
+                    SocketAddr::new(ip.into(), u16::from_be(row.dwLocalPort as u16)),
+                    row.dwOwningPid,
+                )
+            } else {
+                let row = unsafe { &*raw.as_ptr().cast::<MIB_TCP6ROW_OWNER_PID>() };
+                let ip = Ipv6Addr::from(row.ucLocalAddr);
+                let addr = SocketAddrV6::new(
+                    ip,
+                    u16::from_be(row.dwLocalPort as u16),
+                    0,
+                    u32::from_be(row.dwLocalScopeId),
+                );
+                (addr.into(), row.dwOwningPid)
             };
-            collect_owner(&mut pids, endpoint, addr, pid)?;
+            listeners.push((addr, pid));
         }
-        Ok(pids)
+        Ok(listeners)
     }
 
     fn image_name(handle: HANDLE) -> io::Result<Vec<u16>> {
@@ -594,10 +647,107 @@ mod platform {
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
     use std::process::{Child, Command, Stdio};
 
     const LISTENER_READY: &str = "test listener address: ";
+
+    #[test]
+    fn endpoint_overlap_keeps_exact_owner_selection_separate_from_wildcards() {
+        for (requested, bound, overlap) in [
+            ("127.0.0.1:12345", "127.0.0.1:12345", true),
+            ("127.0.0.1:12345", "127.0.0.2:12345", false),
+            ("127.0.0.1:12345", "127.0.0.1:12346", false),
+            ("127.0.0.1:12345", "0.0.0.0:12345", true),
+            ("0.0.0.0:12345", "127.0.0.1:12345", true),
+            ("[::1]:12345", "[::]:12345", true),
+            ("[::]:12345", "[::1]:12345", true),
+            ("127.0.0.1:12345", "[::]:12345", false),
+        ] {
+            let requested = requested.parse().unwrap();
+            let bound = bound.parse().unwrap();
+            assert_eq!(endpoints_overlap(requested, bound), overlap);
+            let mut pids = Vec::new();
+            let selected = collect_owner(&mut pids, requested, bound, 42);
+            if requested == bound {
+                assert!(selected.is_ok());
+                assert_eq!(pids, [42]);
+            } else {
+                assert_eq!(selected.is_err(), overlap);
+                assert!(pids.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn checked_tcp_bind_accepts_a_free_endpoint_without_a_runtime() {
+        for endpoint in ["127.0.0.1:0", "[::1]:0"] {
+            let socket = bind_available_tcp(endpoint.parse().unwrap()).unwrap();
+            let bound = socket.local_addr().unwrap();
+            assert_ne!(bound.port(), 0);
+        }
+    }
+
+    #[test]
+    fn checked_tcp_bind_rejects_a_live_wildcard_listener_without_sending_bytes() {
+        for endpoint in ["0.0.0.0:0", "[::]:0"] {
+            let listener = TcpListener::bind(endpoint).unwrap();
+            let bound = listener.local_addr().unwrap();
+            let loopback = if bound.is_ipv4() {
+                IpAddr::V4(Ipv4Addr::LOCALHOST)
+            } else {
+                IpAddr::V6(Ipv6Addr::LOCALHOST)
+            };
+            assert_eq!(
+                bind_available_tcp(SocketAddr::new(loopback, bound.port()))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::AddrInUse
+            );
+            listener.set_nonblocking(true).unwrap();
+            #[cfg(unix)]
+            {
+                let (mut probe, _) = listener.accept().unwrap();
+                probe.set_nonblocking(false).unwrap();
+                probe
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                assert_eq!(std::io::Read::read(&mut probe, &mut [0]).unwrap(), 0);
+            }
+            #[cfg(windows)]
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn checked_tcp_bind_allows_immediate_restart_after_server_active_close() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for endpoint in ["127.0.0.1:0", "[::1]:0"] {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let listener = bind_available_tcp(endpoint.parse().unwrap())
+                    .unwrap()
+                    .listen(128)
+                    .unwrap();
+                let bound = listener.local_addr().unwrap();
+                let mut client = tokio::net::TcpStream::connect(bound).await.unwrap();
+                let (mut server, _) = listener.accept().await.unwrap();
+                server.shutdown().await.unwrap();
+                assert_eq!(client.read_to_end(&mut Vec::new()).await.unwrap(), 0);
+                drop(client);
+                assert_eq!(server.read_to_end(&mut Vec::new()).await.unwrap(), 0);
+                drop(server);
+                drop(listener);
+                let restarted = bind_available_tcp(bound).unwrap().listen(128).unwrap();
+                assert_eq!(restarted.local_addr().unwrap(), bound);
+            })
+            .await
+            .expect("controlled active-close restart timed out");
+        }
+    }
 
     #[test]
     fn process_listener_fixture() {

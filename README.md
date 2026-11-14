@@ -32,6 +32,20 @@ obsidian-mcp sftp://vault-server/home/alice/notes
 
 Add to your MCP client config (Cursor, Claude Desktop, etc.). Local vaults expose 19 tools before filtering. Remote vaults expose the same operations except `open_in_obsidian`, which requires a local Obsidian vault. See [remote vault setup and behavior](docs/remote-vaults.md).
 
+## Optional authenticated clients
+
+To give assistants different permissions on one local vault, run:
+
+```sh
+obsidian-mcp access setup /path/to/your/vault
+```
+
+Setup guides you through reader/editor access and shared folders, then creates a protected token and client configuration snippet. Follow its printed server, reconnect and connection-check commands. It generates Codex and Claude Code header-helper configuration formats. The Codex CLI 0.166.0 local app-server integration supports the generated helper; verify other installed clients separately.
+
+Authentication is enabled only by an explicit `--access-file PATH` or `OBSIDIAN_ACCESS_FILE` setting. Existing unauthenticated HTTP, stdio, daemon and SFTP configurations keep their behavior when these settings are absent. Creating a profile does not change a running server or client configuration.
+
+See [authenticated clients](docs/access-control.md) for permissions, remote connections, restricted stdio, credential rotation and recovery.
+
 ## What It Can Do
 
 | Category | Capabilities |
@@ -679,6 +693,8 @@ For `note_patch` heading targets, bare heading text such as `"Log"` is canonical
 
 Control which tools are exposed via the `OBSIDIAN_TOOLS` environment variable or the `X-Obsidian-Tools` HTTP header. The header can only further restrict the server-wide tool set; disabled tools are hidden from listings and cannot be called.
 
+Tool filtering is separate from [authenticated client permissions](docs/access-control.md). A client role cannot restore a globally disabled tool, and tool visibility cannot grant access to a denied path or write action. Existing profile definitions remain unchanged.
+
 For legacy HTTP sessions, send the header with `initialize`; that filter lasts for the session. With protocol `2026-07-28`, send it on every request that needs the restriction. Stateless requests do not retain a previous request's filter. A missing header uses the server-wide tool set; invalid profile names or invalid header encoding return HTTP 400.
 
 | Value | Effect |
@@ -742,6 +758,8 @@ clients retain all supported ownership modes.
 | `OBSIDIAN_LOG_LEVEL` | No | `info` | `trace`, `debug`, `info`, `warn`, `error` |
 | `OBSIDIAN_TANTIVY` | No | `true` | BM25 full-text index |
 | `OBSIDIAN_TOOLS` | No | `full` | Tool filtering: profile name, comma-separated allow-list, or `!`-prefixed deny-list |
+| `OBSIDIAN_ACCESS_FILE` | No | Unset | Explicitly enable authenticated clients with a protected external policy. Equivalent to `--access-file PATH`; absent preserves ordinary access |
+| `OBSIDIAN_ACCESS_TOKEN_FILE` | For restricted stdio | Unset | Protected client credential file, equivalent to `--access-token-file PATH`. Requires an access profile; invalid for HTTP servers |
 | `OBSIDIAN_MCP_DATA` | No | Source-dependent | Local machine-data root. Local vaults default to `{vault}/.obsidian-mcp`; external local-vault data uses `vaults-v2/<vault_key>/`. SFTP data uses a separate `sources-v1/<source-id>/` namespace and never writes caches into the remote folder |
 | `OBSIDIAN_SFTP_TIMEOUT_SECS` | No | `30` | SFTP source-operation deadline, including queueing and eligible recovery; integer from 1 to 86400 |
 | `OBSIDIAN_SFTP_POLL_INTERVAL_SECS` | No | `300` | Metadata/tree polling interval while watching is enabled; integer from 1 to 86400 |
@@ -759,7 +777,7 @@ clients retain all supported ownership modes.
 | `OBSIDIAN_EMBEDDING_BATCH_SIZE` | No | `32` | Maximum notes processed per background reconciliation batch; positive integer, for either embedding backend |
 | `OBSIDIAN_EMBEDDING_CA_CERT` | No | — | Path to PEM CA certificate for API TLS |
 | `OBSIDIAN_EMBEDDING_TLS_VERIFY` | No | `true` | Set to `false` to skip TLS verification |
-| `OBSIDIAN_SEMANTIC_MODE` | No | `auto` | Semantic backend mode: `auto`, `daemon`, `local`. SFTP sources use the MCP-local runtime for `auto`/`local`; explicit `daemon` is unsupported when embeddings are enabled |
+| `OBSIDIAN_SEMANTIC_MODE` | No | `auto` | Semantic backend mode: `auto`, `daemon`, `local`. SFTP uses the MCP-local runtime for `auto`/`local`. Authenticated local vaults select `local` when unspecified and reject explicit other modes. This selects ownership, not the embedding provider |
 | `OBSIDIAN_SEMANTIC_HOME` | No | OS data-dir default | Shared semantic runtime home for daemon bin/model/cache state |
 | `OBSIDIAN_SEMANTIC_DAEMON_PATH` | No | unset | Override daemon binary path used by bootstrap |
 | `OBSIDIAN_SEMANTIC_DAEMON_DOWNLOAD_URL` | No | `https://github.com/lstpsche/obsidian-mcp/releases/download/v<version>/obsidian-semanticd-<version>-<target>.<ext>` | Override daemon download URL when binary is missing |

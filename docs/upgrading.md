@@ -75,6 +75,16 @@ The daemon remains on API v2 and adds `semantic_source_evidence_v1` to health ca
 
 Rust library callers that used `load_ignore_patterns` can open the vault with `Vault::open(&config).await?` and read its merged rules with `vault.exclude().patterns()`. Remove calls to `migrate_legacy_cache_to_daemon_store` and matches on `LegacyCacheMigration`. The scoped daemon creates its checkpoint from the notes its active attachment permits. Legacy checkpoint files stay available for manual recovery.
 
+## Optional authenticated clients
+
+Installing a version with client authorization does not enable it. Existing HTTP, stdio, daemon, SFTP and tool-filter configurations preserve ordinary behavior when `--access-file` and `OBSIDIAN_ACCESS_FILE` are absent. Profiles are not discovered or activated automatically.
+
+To adopt it, run `obsidian-mcp access setup /path/to/vault` and follow the generated launch and client-configuration instructions. Profile/token creation does not change a running service. Keep the authenticated `--access-file` argument or setting in the service's existing configuration source, and preserve it on later restarts. Restricted stdio also needs its protected token-file setting.
+
+The updater does not convert a service to authenticated access, distribute credentials or rewrite MCP client configuration. Verify the intended client separately after reconnecting. Authenticated local vaults use MCP-owned semantic coordination; unsupported external-daemon, SFTP and simultaneous-authorizer combinations fail explicitly. Embedding enablement and provider settings remain separate.
+
+See [authenticated clients](access-control.md) for setup, permissions, supported combinations, rotation and recovery. Rebinding after a deliberate vault restore/relocation requires an explicit owner command and server restart; upgrading does not silently rebind a profile.
+
 ## Manual smoke test for maintainers
 
 Use a temporary Cargo root, vault, semantic home, service definition, and non-default port—never a personal production service.

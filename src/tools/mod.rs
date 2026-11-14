@@ -11,7 +11,7 @@ pub mod utility;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -20,6 +20,7 @@ use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{CallToolResult, ErrorData, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 
+use crate::access::store::AuthorizedClient;
 use crate::client::semantic_daemon::{DaemonConnectPolicy, SemanticDaemonClient, VaultAttachment};
 use crate::config::SemanticMode;
 use crate::daemon::bootstrap::PendingBootstrap;
@@ -146,7 +147,7 @@ impl RuntimeAttachments {
         local_selected: &AtomicBool,
         expired: Option<&str>,
     ) -> VaultResult<Arc<VaultAttachment>> {
-        if vault.is_remote() {
+        if vault.is_remote() || vault.is_authenticated() {
             return Err(VaultError::InvalidPath(
                 "SFTP vaults cannot attach to the local semantic daemon".into(),
             ));
@@ -347,6 +348,8 @@ pub struct ObsidianMcp {
     semantic_runtime: SemanticRuntime,
     pub tool_router: ToolRouter<Self>,
 }
+
+static INVOCATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[tool_router]
 impl ObsidianMcp {
@@ -656,6 +659,126 @@ impl ObsidianMcp {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for ObsidianMcp {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
+        let Some(client) = self.request_client(&context)? else {
+            return self
+                .tool_router
+                .call(rmcp::handler::server::tool::ToolCallContext::new(
+                    self, request, context,
+                ))
+                .await;
+        };
+        let tool = crate::config::ALL_TOOL_NAMES
+            .iter()
+            .copied()
+            .find(|name| *name == request.name.as_ref())
+            .unwrap_or("unknown");
+        let action = invocation_action(tool, request.arguments.as_ref());
+        let result = async {
+            let router = self.authorized_router(&client, &context).await?;
+            let vault = self.vault.clone();
+            let request_client = client.clone();
+            let vault = tokio::task::spawn_blocking(move || vault.with_access(request_client))
+                .await
+                .map_err(|_| {
+                    ErrorData::internal_error("Authorized view initialization failed", None)
+                })?
+                .map_err(ErrorData::from)?;
+            let server = Self {
+                vault,
+                hybrid_alpha: self.hybrid_alpha,
+                semantic_runtime: self.semantic_runtime.clone(),
+                tool_router: router,
+            };
+            server
+                .tool_router
+                .call(rmcp::handler::server::tool::ToolCallContext::new(
+                    &server, request, context,
+                ))
+                .await
+        }
+        .await;
+        let outcome = result
+            .as_ref()
+            .err()
+            .and_then(|error| error.data.as_ref())
+            .and_then(|data| data.get("outcome"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|outcome| {
+                matches!(
+                    *outcome,
+                    "not_dispatched" | "not_committed" | "committed" | "unknown"
+                )
+            })
+            .unwrap_or_else(|| {
+                if result.is_ok() {
+                    "completed"
+                } else {
+                    "failed"
+                }
+            });
+        // This audit describes the invocation independently of whether a
+        // later revocation allows its acknowledgement to reach the caller.
+        // All fields are server-defined IDs or finite labels, never source text.
+        tracing::info!(
+            operation_id = INVOCATION_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+            client_id = client.client_id(),
+            credential_id = client.credential_id(),
+            policy = client.policy_hash(),
+            tool,
+            action,
+            outcome,
+            "authenticated invocation finished"
+        );
+        // Results can outlive source/provider waits. HTTP additionally checks at
+        // actual outbound frame publication; stdio checks here before handoff.
+        let _permit = client
+            .permit_async()
+            .await
+            .map_err(|error| ErrorData::from(VaultError::from(error)))?;
+        result.map_err(authenticated_error)
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, ErrorData> {
+        let client = self.request_client(&context)?;
+        let router = match &client {
+            Some(client) => self.authorized_router(client, &context).await?,
+            None => self.tool_router.clone(),
+        };
+        let modern = context
+            .protocol_version()
+            .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        let _permit = match &client {
+            Some(client) => Some(
+                client
+                    .permit_async()
+                    .await
+                    .map_err(|error| ErrorData::from(VaultError::from(error)))?,
+            ),
+            None => None,
+        };
+        Ok(rmcp::model::ListToolsResult {
+            result_type: Some(rmcp::model::ResultType::COMPLETE),
+            tools: router.list_all(),
+            meta: None,
+            next_cursor: None,
+            ttl_ms: modern.then_some(0),
+            cache_scope: modern.then_some(if client.is_some() {
+                rmcp::model::CacheScope::Private
+            } else {
+                rmcp::model::CacheScope::Public
+            }),
+        })
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
@@ -667,6 +790,133 @@ impl ServerHandler for ObsidianMcp {
                  and navigate your Obsidian notes via direct filesystem access.",
             )
     }
+}
+
+fn invocation_action(
+    tool: &str,
+    arguments: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> &'static str {
+    match tool {
+        "frontmatter" => match arguments
+            .and_then(|args| args.get("action"))
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(action) if action.eq_ignore_ascii_case("get") => "read",
+            Some(action)
+                if action.eq_ignore_ascii_case("set") || action.eq_ignore_ascii_case("remove") =>
+            {
+                "update"
+            }
+            _ => "invalid",
+        },
+        "periodic" => match arguments
+            .and_then(|args| args.get("action"))
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(action)
+                if action.eq_ignore_ascii_case("get") || action.eq_ignore_ascii_case("list") =>
+            {
+                "read"
+            }
+            Some(action) if action.eq_ignore_ascii_case("create") => "create",
+            _ => "invalid",
+        },
+        "note_create" => "create",
+        "note_write" => "write",
+        "note_insert" => "insert",
+        "note_patch" => "update",
+        "note_delete" => "delete",
+        "note_move" => "move",
+        "unknown" => "invalid",
+        _ => "read",
+    }
+}
+
+impl ObsidianMcp {
+    fn request_client(
+        &self,
+        context: &rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<Option<AuthorizedClient>, ErrorData> {
+        if !self.vault.is_authenticated() {
+            return Ok(None);
+        }
+        let client = match context.extensions.get::<axum::http::request::Parts>() {
+            Some(parts) => parts.extensions.get::<AuthorizedClient>(),
+            None => self.vault.access_client(),
+        };
+        client.cloned().map(Some).ok_or_else(|| {
+            ErrorData::internal_error("Authenticated request context is unavailable", None)
+        })
+    }
+
+    async fn authorized_router(
+        &self,
+        client: &AuthorizedClient,
+        context: &rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ToolRouter<Self>, ErrorData> {
+        let permit = client
+            .permit_async()
+            .await
+            .map_err(|error| ErrorData::from(VaultError::from(error)))?;
+        let policy = permit.policy();
+        let mut router = self.tool_router.clone();
+        router.disable_route("open_in_obsidian");
+        if !policy.has_write_access() {
+            for name in [
+                "note_create",
+                "note_write",
+                "note_insert",
+                "note_patch",
+                "note_delete",
+                "note_move",
+            ] {
+                router.disable_route(name);
+            }
+        }
+        if let Some(parts) = context.extensions.get::<axum::http::request::Parts>()
+            && let Some(filter) = parts.headers.get("X-Obsidian-Tools")
+        {
+            let filter = filter
+                .to_str()
+                .map_err(|_| ErrorData::invalid_params("Invalid X-Obsidian-Tools header", None))?;
+            for name in crate::config::ToolFilter::parse_authenticated(filter)
+                .map_err(|_| ErrorData::invalid_params("Invalid X-Obsidian-Tools filter", None))?
+                .disabled_tools()
+            {
+                router.disable_route(name);
+            }
+        }
+        Ok(router)
+    }
+}
+
+fn authenticated_error(mut error: ErrorData) -> ErrorData {
+    if error.code == rmcp::model::ErrorCode::RESOURCE_NOT_FOUND {
+        error.message = "Resource not found".into();
+        error.data = None;
+    } else if error.code == rmcp::model::ErrorCode::INTERNAL_ERROR {
+        if error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|code| {
+                matches!(code, "authorization_unavailable" | "semantic_unavailable")
+            })
+        {
+            return error;
+        }
+        // Provider, storage and parser diagnostics can contain machine paths or
+        // source bytes. Keep only the outcome needed to reconcile a mutation.
+        let outcome = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("outcome"))
+            .cloned();
+        error.message = "Vault operation failed; contact the vault owner".into();
+        error.data = outcome.map(|outcome| serde_json::json!({"outcome": outcome}));
+    }
+    error
 }
 
 #[cfg(test)]
@@ -1028,6 +1278,86 @@ mod tests {
         let server = ObsidianMcp::new(vault, 0.25, test_runtime(), disabled);
         let response = request_raw(server, "tools/list", serde_json::json!({})).await;
         assert_eq!(response["result"]["tools"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn restricted_stdio_conceals_authorized_view_initialization_errors() {
+        use crate::access::clients::{ClientPolicy, Grant, Role};
+        use crate::access::store::{AccessStore, read_token_file};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let vault_path = root.join("vault");
+        std::fs::create_dir_all(vault_path.join("Shared")).unwrap();
+        let unrelated = "Shared/unrelated.md";
+        let changed = "Shared/aaa-private-stage-marker.md";
+        std::fs::write(vault_path.join(unrelated), "Unrelated readable source").unwrap();
+        std::fs::write(vault_path.join(changed), "Original source").unwrap();
+
+        let data = root.join("private/data");
+        let store =
+            AccessStore::initialize(&root.join("private/access.json"), &vault_path, &data).unwrap();
+        store
+            .update(None, |policy| {
+                for (name, directory, role) in [
+                    ("owner", "", Role::Editor),
+                    ("reader", "Shared", Role::Reader),
+                ] {
+                    policy.clients.insert(
+                        name.into(),
+                        ClientPolicy {
+                            grants: vec![Grant::directory("content", directory, role)],
+                            ..Default::default()
+                        },
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+        let mut clients = Vec::new();
+        for name in ["owner", "reader"] {
+            let token_path = root.join(format!("private/{name}.token"));
+            store.issue_token(name, &token_path, None).unwrap();
+            clients.push(
+                store
+                    .authenticate(read_token_file(&token_path).unwrap().expose())
+                    .unwrap(),
+            );
+        }
+        let mut config = test_config(&vault_path);
+        config.mcp_data_dir = Some(data);
+        let source = Vault::open_authenticated(&config).await.unwrap();
+        let owner = source.with_access(clients.remove(0)).unwrap();
+        let reader = source.with_access(clients.remove(0)).unwrap();
+
+        // A different readable corpus advances the shared source observation
+        // without refreshing this reader's retained projection. The next source
+        // edit makes reader initialization reconcile a malformed document.
+        owner
+            .write_note(std::path::Path::new(changed), "New indexed source")
+            .await
+            .unwrap();
+        std::fs::write(
+            vault_path.join(changed),
+            "---\nprivate-stage-content-marker: [\n---\nMalformed source",
+        )
+        .unwrap();
+
+        let server = ObsidianMcp::new(reader, 0.25, test_runtime(), HashSet::new());
+        let response =
+            call_tool_raw(server, "note_read", serde_json::json!({"path": unrelated})).await;
+        assert_eq!(response["error"]["code"], -32603, "{response}");
+        assert_eq!(
+            response["error"]["message"], "Vault operation failed; contact the vault owner",
+            "{response}"
+        );
+        assert!(
+            response["error"]["data"].get("path").is_none(),
+            "{response}"
+        );
+        for marker in ["aaa-private-stage-marker", "private-stage-content-marker"] {
+            assert!(!response.to_string().contains(marker), "{response}");
+        }
     }
 
     #[tokio::test]

@@ -1,0 +1,1697 @@
+//! Owner administration and explicit connection checks through the shipped binary.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+use obsidian_mcp::access::store::{AccessStore, read_token_file};
+use serde_json::Value;
+
+fn binary() -> PathBuf {
+    std::env::var_os("OBSIDIAN_TEST_MCP_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_obsidian-mcp")))
+}
+
+fn command() -> Command {
+    command_at(&binary())
+}
+
+fn command_at(executable: &Path) -> Command {
+    let mut command = Command::new(executable);
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("OBSIDIAN_") || name.starts_with("OPENAI_") {
+            command.env_remove(key);
+        }
+    }
+    command.env("NO_COLOR", "1").arg("access");
+    command
+}
+
+fn success(output: Output) -> Value {
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("JSON command should return JSON")
+}
+
+struct Fixture {
+    _directory: tempfile::TempDir,
+    vault: PathBuf,
+    profile: PathBuf,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = directory.path().join("vault");
+        std::fs::create_dir_all(vault.join("Shared")).unwrap();
+        std::fs::create_dir_all(vault.join("Private")).unwrap();
+        std::fs::write(vault.join("Shared/note.md"), "shared fixture").unwrap();
+        std::fs::write(vault.join("Private/secret.md"), "private fixture").unwrap();
+        let profile = directory.path().join("access/access.json");
+        Self {
+            _directory: directory,
+            vault,
+            profile,
+        }
+    }
+
+    fn initialize(&self) -> Value {
+        success(
+            command()
+                .arg("init")
+                .arg(&self.vault)
+                .arg("--access-file")
+                .arg(&self.profile)
+                .arg("--json")
+                .output()
+                .unwrap(),
+        )
+    }
+
+    fn command(&self) -> Command {
+        let mut command = command();
+        command.arg("--access-file").arg(&self.profile);
+        command
+    }
+
+    fn add(&self, name: &str, editor: bool) -> Value {
+        let mut command = self.command();
+        command
+            .args(["client", "add", name, "--directory", "Shared/"])
+            .args(["--role", if editor { "editor" } else { "reader" }])
+            .arg("--json");
+        success(command.output().unwrap())
+    }
+
+    fn check(&self, client: &str, action: &str, path: &str) -> Value {
+        success(
+            self.command()
+                .args([
+                    "check", client, "--action", action, "--path", path, "--json",
+                ])
+                .output()
+                .unwrap(),
+        )
+    }
+}
+
+#[test]
+fn help_does_not_require_a_vault_or_valid_profile() {
+    let output = command()
+        .arg("--help")
+        .env("OBSIDIAN_ACCESS_FILE", "/missing/unsafe/profile")
+        .env("OBSIDIAN_EMBEDDINGS", "true")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(help.contains("access setup VAULT"));
+    assert!(help.contains("Creating a profile does not change existing servers"));
+    assert!(help.contains("headers --token-file PATH"));
+}
+
+#[test]
+fn initialization_creates_external_state_without_touching_the_source() {
+    let fixture = Fixture::new();
+    let result = fixture.initialize();
+    assert!(fixture.profile.exists());
+    assert_eq!(result["revision"], 1);
+    assert!(!fixture.vault.join(".obsidian-mcp").exists());
+    assert!(!fixture.vault.join(".obsidian").exists());
+    assert_eq!(std::fs::read_dir(&fixture.vault).unwrap().count(), 2);
+    let second = fixture
+        .command()
+        .arg("init")
+        .arg(&fixture.vault)
+        .output()
+        .unwrap();
+    assert!(!second.status.success());
+    assert!(String::from_utf8_lossy(&second.stderr).contains("access client add NAME"));
+    assert_eq!(
+        AccessStore::open(&fixture.profile)
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .policy
+            .revision,
+        1
+    );
+}
+
+#[test]
+fn initialization_dry_run_creates_no_profile_or_machine_data() {
+    let fixture = Fixture::new();
+    let output = success(
+        command()
+            .arg("init")
+            .arg(&fixture.vault)
+            .arg("--access-file")
+            .arg(&fixture.profile)
+            .args(["--dry-run", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(output["dry_run"], true);
+    assert!(!fixture.profile.parent().unwrap().exists());
+    assert!(!fixture.vault.join(".obsidian-mcp").exists());
+}
+
+#[test]
+fn rebind_preview_and_apply_reject_state_inside_the_proposed_vault() {
+    for state in ["profile", "data"] {
+        let fixture = Fixture::new();
+        let proposed = fixture._directory.path().join("proposed-vault");
+        std::fs::create_dir(&proposed).unwrap();
+        let profile = if state == "profile" {
+            proposed.join("private/access.json")
+        } else {
+            fixture.profile.clone()
+        };
+        let data = if state == "data" {
+            proposed.join("derived")
+        } else {
+            fixture._directory.path().join("private-data")
+        };
+        success(
+            command()
+                .arg("init")
+                .arg(&fixture.vault)
+                .arg("--access-file")
+                .arg(&profile)
+                .arg("--data-dir")
+                .arg(&data)
+                .arg("--json")
+                .output()
+                .unwrap(),
+        );
+        let before = std::fs::read(&profile).unwrap();
+        for dry_run in [true, false] {
+            let mut rebind = command();
+            rebind
+                .arg("rebind")
+                .arg("--access-file")
+                .arg(&profile)
+                .arg("--vault")
+                .arg(&proposed);
+            if dry_run {
+                rebind.arg("--dry-run");
+            }
+            let output = rebind.output().unwrap();
+            assert!(!output.status.success(), "{state}, dry_run={dry_run}");
+            assert!(String::from_utf8_lossy(&output.stderr).contains("outside the vault"));
+            assert_eq!(std::fs::read(&profile).unwrap(), before);
+        }
+    }
+}
+
+#[test]
+fn rebind_preview_preserves_state_and_apply_recovers_a_moved_vault() {
+    let fixture = Fixture::new();
+    fixture.initialize();
+    let before = std::fs::read(&fixture.profile).unwrap();
+    let revision = AccessStore::open(&fixture.profile)
+        .unwrap()
+        .snapshot()
+        .unwrap()
+        .policy
+        .revision;
+    let relocated = fixture._directory.path().join("relocated-vault");
+    std::fs::rename(&fixture.vault, &relocated).unwrap();
+    let preview = fixture
+        .command()
+        .arg("rebind")
+        .arg("--vault")
+        .arg(&relocated)
+        .arg("--dry-run")
+        .output()
+        .unwrap();
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let text = String::from_utf8(preview.stdout).unwrap();
+    assert!(text.starts_with("Would update vault binding."));
+    assert!(text.contains("Dry run complete; no files were changed."));
+    assert!(!text.contains("Restart"));
+    assert_eq!(std::fs::read(&fixture.profile).unwrap(), before);
+    let preview = success(
+        fixture
+            .command()
+            .arg("rebind")
+            .arg("--vault")
+            .arg(&relocated)
+            .args(["--dry-run", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(preview["dry_run"], true);
+    assert_eq!(preview["revision"], revision);
+    assert_eq!(std::fs::read(&fixture.profile).unwrap(), before);
+    let applied = fixture
+        .command()
+        .arg("rebind")
+        .arg("--vault")
+        .arg(&relocated)
+        .output()
+        .unwrap();
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let text = String::from_utf8(applied.stdout).unwrap();
+    assert!(text.starts_with("Updated vault binding."));
+    assert!(text.contains("Restart the authenticated server"));
+    let store = AccessStore::open(&fixture.profile).unwrap();
+    store.validate_source(&relocated).unwrap();
+    let current = store.snapshot().unwrap().policy;
+    assert_eq!(current.revision, revision + 1);
+    assert_eq!(
+        current.source.canonical_path,
+        relocated.canonicalize().unwrap()
+    );
+}
+
+#[test]
+fn reader_default_and_explicit_denial_are_enforced_by_owner_checks() {
+    let fixture = Fixture::new();
+    fixture.initialize();
+    fixture.add("reader", false);
+    assert_eq!(
+        fixture.check("reader", "read", "Shared/note.md")["decision"]["allowed"],
+        true
+    );
+    assert_eq!(
+        fixture.check("reader", "update", "Shared/note.md")["decision"]["allowed"],
+        false
+    );
+    assert_eq!(
+        fixture.check("reader", "read", "Private/secret.md")["decision"]["allowed"],
+        false
+    );
+    success(
+        fixture
+            .command()
+            .args([
+                "grant",
+                "reader",
+                "--directory",
+                "",
+                "--role",
+                "editor",
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+    let denied = success(
+        fixture
+            .command()
+            .args(["deny", "reader", "--directory", "Private/", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert!(denied["revision"].as_u64().unwrap() > 1);
+    let check = fixture.check("reader", "read", "Private/secret.md");
+    assert_eq!(check["decision"]["allowed"], false);
+    assert_eq!(check["decision"]["reason"], "denied");
+    assert!(check["decision"]["rule_id"].as_str().is_some());
+}
+
+#[test]
+fn dry_run_and_revision_conflict_do_not_publish_permissions_or_tokens() {
+    let fixture = Fixture::new();
+    fixture.initialize();
+    fixture.add("reader", false);
+    let before = std::fs::read(&fixture.profile).unwrap();
+    let token = fixture.profile.parent().unwrap().join("not-created.token");
+    success(
+        fixture
+            .command()
+            .args([
+                "client",
+                "add",
+                "preview",
+                "--directory",
+                "",
+                "--role",
+                "editor",
+                "--dry-run",
+                "--json",
+                "--token-out",
+            ])
+            .arg(&token)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(std::fs::read(&fixture.profile).unwrap(), before);
+    assert!(!token.exists());
+    let conflict = fixture
+        .command()
+        .args([
+            "grant",
+            "reader",
+            "--directory",
+            "",
+            "--role",
+            "editor",
+            "--expected-revision",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(!conflict.status.success());
+    assert!(String::from_utf8_lossy(&conflict.stderr).contains("revision conflict"));
+    assert_eq!(std::fs::read(&fixture.profile).unwrap(), before);
+}
+
+#[test]
+fn credentials_overlap_until_exact_revocation_without_secret_output() {
+    let fixture = Fixture::new();
+    fixture.initialize();
+    let first = fixture.add("editor", true);
+    let first_path = Path::new(first["token_file"].as_str().unwrap());
+    let first_token = read_token_file(first_path).unwrap();
+    let second = success(
+        fixture
+            .command()
+            .args(["token", "create", "editor", "--json"])
+            .output()
+            .unwrap(),
+    );
+    let second_token = read_token_file(Path::new(second["token_file"].as_str().unwrap())).unwrap();
+    let store = AccessStore::open(&fixture.profile).unwrap();
+    assert!(store.authenticate(first_token.expose()).is_ok());
+    assert!(store.authenticate(second_token.expose()).is_ok());
+    let list = fixture
+        .command()
+        .args(["client", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    let displayed = String::from_utf8(list.stdout).unwrap();
+    assert!(!displayed.contains(first_token.expose()));
+    assert!(!displayed.contains(second_token.expose()));
+    assert!(!displayed.contains("digest"));
+    assert!(
+        !std::fs::read_to_string(&fixture.profile)
+            .unwrap()
+            .contains(first_token.expose())
+    );
+    success(
+        fixture
+            .command()
+            .args([
+                "token",
+                "revoke",
+                "editor",
+                first["credential_id"].as_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert!(store.authenticate(first_token.expose()).is_err());
+    assert!(store.authenticate(second_token.expose()).is_ok());
+}
+
+#[test]
+fn helper_is_the_explicit_secret_output_and_needs_no_owner_profile() {
+    let fixture = Fixture::new();
+    fixture.initialize();
+    let added = fixture.add("reader", false);
+    let token_path = Path::new(added["token_file"].as_str().unwrap());
+    let token = read_token_file(token_path).unwrap();
+    let result = success(
+        command()
+            .args(["headers", "--token-file"])
+            .arg(token_path)
+            .env("OBSIDIAN_ACCESS_FILE", "/missing/profile")
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(result.as_object().unwrap().len(), 1);
+    assert_eq!(
+        result["Authorization"],
+        format!("Bearer {}", token.expose())
+    );
+}
+
+#[test]
+fn generated_configuration_contains_file_helper_not_plaintext_and_never_overwrites() {
+    let fixture = Fixture::new();
+    fixture.initialize();
+    let added = fixture.add("reader", false);
+    let token_path = Path::new(added["token_file"].as_str().unwrap());
+    let token = read_token_file(token_path).unwrap();
+    let out = fixture.profile.parent().unwrap().join("client.json");
+    let result = success(
+        fixture
+            .command()
+            .args([
+                "config",
+                "reader",
+                "--client",
+                "claude-code",
+                "--token-file",
+            ])
+            .arg(token_path)
+            .arg("--out")
+            .arg(&out)
+            .arg("--json")
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(result["adapter"], "claude-code");
+    let bytes = std::fs::read(&out).unwrap();
+    let configuration: Value = serde_json::from_slice(&bytes).unwrap();
+    let helper = configuration["mcpServers"]["reader"]["headersHelper"]
+        .as_str()
+        .unwrap();
+    assert!(helper.contains("access headers --token-file"));
+    assert!(!String::from_utf8_lossy(&bytes).contains(token.expose()));
+    let repeat = fixture
+        .command()
+        .args([
+            "config",
+            "reader",
+            "--client",
+            "claude-code",
+            "--token-file",
+        ])
+        .arg(token_path)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(!repeat.status.success());
+    assert_eq!(std::fs::read(&out).unwrap(), bytes);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&out).unwrap().permissions().mode() & 0o077,
+            0
+        );
+    }
+}
+
+#[test]
+fn setup_generates_explicit_optional_launch_and_client_configuration() {
+    let _listener = occupy_default_backend();
+    let fixture = Fixture::new();
+    let out = fixture.profile.parent().unwrap().join("assistant.toml");
+    let result = success(
+        command()
+            .arg("setup")
+            .arg(&fixture.vault)
+            .arg("--access-file")
+            .arg(&fixture.profile)
+            .args([
+                "--name",
+                "assistant",
+                "--directory",
+                "Shared",
+                "--client",
+                "codex",
+                "--out",
+            ])
+            .arg(&out)
+            .arg("--json")
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(result["client_id"], "assistant");
+    assert_eq!(result["transport"], "http");
+    let backend = reqwest::Url::parse(result["backend_url"].as_str().unwrap()).unwrap();
+    assert_ne!(backend.port(), Some(37842));
+    assert!(out.exists());
+    assert!(!fixture.vault.join(".obsidian-mcp").exists());
+    let config = std::fs::read_to_string(&out).unwrap();
+    assert!(config.contains("http_headers_helper"));
+    let check = fixture.check("assistant", "update", "Shared/note.md");
+    assert_eq!(check["decision"]["allowed"], false);
+}
+
+#[test]
+fn stdio_configuration_selects_the_profile_and_protected_token_explicitly() {
+    let fixture = Fixture::new();
+    fixture.initialize();
+    let added = fixture.add("reader", false);
+    let out = fixture.profile.parent().unwrap().join("stdio.json");
+    success(
+        fixture
+            .command()
+            .args([
+                "config",
+                "reader",
+                "--client",
+                "claude-code",
+                "--transport",
+                "stdio",
+                "--token-file",
+            ])
+            .arg(added["token_file"].as_str().unwrap())
+            .arg("--out")
+            .arg(&out)
+            .arg("--json")
+            .output()
+            .unwrap(),
+    );
+    let config: Value = serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
+    let arguments = config["mcpServers"]["reader"]["args"].as_array().unwrap();
+    assert!(arguments.contains(&Value::String("--access-file".into())));
+    assert!(arguments.contains(&Value::String("--access-token-file".into())));
+    assert!(config["mcpServers"]["reader"]["headersHelper"].is_null());
+}
+
+#[test]
+fn unsupported_or_misplaced_options_fail_before_changing_policy() {
+    let fixture = Fixture::new();
+    fixture.initialize();
+    fixture.add("reader", false);
+    let before = std::fs::read(&fixture.profile).unwrap();
+    let output = fixture
+        .command()
+        .args([
+            "token",
+            "revoke",
+            "reader",
+            "does-not-exist",
+            "--directory",
+            "Shared",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not valid"));
+    assert_eq!(std::fs::read(&fixture.profile).unwrap(), before);
+}
+
+#[path = "common/http_listening.rs"]
+mod http_listening;
+
+#[tokio::test]
+async fn doctor_checks_authenticated_mcp_and_explicit_disposable_writes() {
+    use std::process::Stdio;
+
+    let fixture = Fixture::new();
+    fixture.initialize();
+    let added = fixture.add("editor", true);
+    let token_file = Path::new(added["token_file"].as_str().unwrap());
+    let mut server = http_listening::isolated_command(binary())
+        .arg(&fixture.vault)
+        .args([
+            "--http",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--access-file",
+        ])
+        .arg(&fixture.profile)
+        .env("OBSIDIAN_EMBEDDINGS", "false")
+        .env("OBSIDIAN_WATCH", "false")
+        .env("OBSIDIAN_LOG_LEVEL", "info")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let address = http_listening::ready(&mut server).await.unwrap();
+    let output = http_listening::isolated_command(binary())
+        .args(["access", "doctor", "--access-file"])
+        .arg(&fixture.profile)
+        .arg("--token-file")
+        .arg(token_file)
+        .args([
+            "--url",
+            &format!("http://{address}/mcp"),
+            "--path",
+            "Shared/note.md",
+            "--write-check",
+            "Shared/disposable-check.md",
+            "--json",
+        ])
+        .output()
+        .await
+        .unwrap();
+    server.kill().await.unwrap();
+    server.wait().await.unwrap();
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("shared fixture"));
+    let result = success(output);
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["real_client_verified"], false);
+    assert!(!fixture.vault.join("Shared/disposable-check.md").exists());
+    assert!(
+        result["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check == "explicit disposable create/read/delete passed")
+    );
+}
+
+#[test]
+fn dry_run_rejects_unsafe_state_and_configuration_stays_outside_the_vault() {
+    let fixture = Fixture::new();
+    let unsafe_profile = fixture.vault.join("Shared/access.json");
+    let output = command()
+        .arg("init")
+        .arg(&fixture.vault)
+        .arg("--access-file")
+        .arg(&unsafe_profile)
+        .arg("--dry-run")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!unsafe_profile.exists());
+    fixture.initialize();
+    let added = fixture.add("reader", false);
+    let unsafe_config = fixture.vault.join("Shared/client.json");
+    let output = fixture
+        .command()
+        .args(["config", "reader", "--token-file"])
+        .arg(added["token_file"].as_str().unwrap())
+        .arg("--out")
+        .arg(&unsafe_config)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!unsafe_config.exists());
+}
+
+#[test]
+fn remote_windows_helper_uses_explicit_shell_and_client_local_paths() {
+    let fixture = Fixture::new();
+    fixture.initialize();
+    let added = fixture.add("reader", false);
+    let out = fixture
+        .profile
+        .parent()
+        .unwrap()
+        .join("windows-client.json");
+    success(
+        fixture
+            .command()
+            .args([
+                "config",
+                "reader",
+                "--client",
+                "claude-code",
+                "--token-file",
+            ])
+            .arg(added["token_file"].as_str().unwrap())
+            .args([
+                "--binary",
+                "C:\\Program Files\\Owner's MCP\\obsidian-mcp.exe",
+                "--client-token-file",
+                "C:\\Users\\Owner's Private\\reader.token",
+                "--out",
+            ])
+            .arg(&out)
+            .arg("--json")
+            .output()
+            .unwrap(),
+    );
+    let value: Value = serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
+    let helper = value["mcpServers"]["reader"]["headersHelper"]
+        .as_str()
+        .unwrap();
+    assert!(helper.starts_with("powershell.exe -NoLogo -NoProfile -NonInteractive -Command"));
+    assert!(helper.contains("& 'C:\\Program Files\\Owner''s MCP\\obsidian-mcp.exe'"));
+    assert!(helper.contains("'C:\\Users\\Owner''s Private\\reader.token'"));
+    assert!(!helper.contains(added["token_file"].as_str().unwrap()));
+}
+
+#[test]
+fn remote_posix_helper_uses_client_paths_and_posix_apostrophe_quoting_on_any_host() {
+    let fixture = Fixture::new();
+    fixture.initialize();
+    let added = fixture.add("reader", false);
+    let out = fixture.profile.parent().unwrap().join("posix-client.json");
+    let client_binary = "/opt/owner's tools/obsidian-mcp";
+    let client_token = "/home/owner's private/reader.token";
+    success(
+        fixture
+            .command()
+            .args([
+                "config",
+                "reader",
+                "--client",
+                "claude-code",
+                "--token-file",
+            ])
+            .arg(added["token_file"].as_str().unwrap())
+            .args([
+                "--binary",
+                client_binary,
+                "--client-token-file",
+                client_token,
+                "--out",
+            ])
+            .arg(&out)
+            .arg("--json")
+            .output()
+            .unwrap(),
+    );
+    let value: Value = serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
+    let helper = value["mcpServers"]["reader"]["headersHelper"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        helper,
+        r"'/opt/owner'\''s tools/obsidian-mcp' access headers --token-file '/home/owner'\''s private/reader.token'"
+    );
+    assert!(!helper.contains(added["token_file"].as_str().unwrap()));
+    #[cfg(unix)]
+    {
+        let parsed = Command::new("/bin/sh")
+            .env("NO_COLOR", "1")
+            .args(["-c", &format!("set -- {helper}; printf '%s\\n' \"$@\"")])
+            .output()
+            .unwrap();
+        assert!(parsed.status.success());
+        let words = String::from_utf8(parsed.stdout).unwrap();
+        assert_eq!(
+            words.lines().collect::<Vec<_>>(),
+            [
+                client_binary,
+                "access",
+                "headers",
+                "--token-file",
+                client_token
+            ]
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn owner_check_does_not_approve_an_allowed_alias_to_a_denied_target() {
+    let fixture = Fixture::new();
+    std::os::unix::fs::symlink(
+        "../Private/secret.md",
+        fixture.vault.join("Shared/alias.md"),
+    )
+    .unwrap();
+    fixture.initialize();
+    fixture.add("reader", false);
+    let decision = fixture.check("reader", "read", "Shared/alias.md");
+    assert_eq!(decision["decision"]["allowed"], false);
+    assert_eq!(decision["resolved_path"], "Private/secret.md");
+}
+
+#[test]
+fn setup_rejects_an_ephemeral_client_url_before_creating_state() {
+    let fixture = Fixture::new();
+    let output = command()
+        .arg("setup")
+        .arg(&fixture.vault)
+        .arg("--access-file")
+        .arg(&fixture.profile)
+        .args([
+            "--name",
+            "assistant",
+            "--directory",
+            "Shared",
+            "--url",
+            "http://127.0.0.1:0/mcp",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("fixed nonzero port"));
+    assert!(!fixture.profile.parent().unwrap().exists());
+}
+
+#[test]
+fn ipv6_setup_keeps_the_generated_server_and_client_endpoint_consistent() {
+    let fixture = Fixture::new();
+    // A released :0 port can be reused by parallel outgoing connections before
+    // setup probes it. Keep this fixture below automatic client-port ranges.
+    let listener = (10000u16..10100)
+        .find_map(
+            |port| match std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)) {
+                Ok(listener) => Some(listener),
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => None,
+                Err(error) => panic!("could not reserve IPv6 setup fixture port: {error}"),
+            },
+        )
+        .expect("a private IPv6 fixture port should be available");
+    let port = listener.local_addr().unwrap().port();
+    let mut process = command();
+    process
+        .arg("setup")
+        .arg(&fixture.vault)
+        .arg("--access-file")
+        .arg(&fixture.profile)
+        .args([
+            "--name",
+            "assistant",
+            "--directory",
+            "Shared",
+            "--url",
+            &format!("http://[::1]:{port}/mcp"),
+            "--dry-run",
+        ]);
+    drop(listener);
+    let output = process.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains(&format!("--host ::1 --port {port}")));
+    assert!(!fixture.profile.parent().unwrap().exists());
+}
+
+#[test]
+fn localhost_setup_uses_the_selected_literal_for_client_launch_and_doctor() {
+    let listener = (11000u16..11100)
+        .find_map(
+            |port| match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
+                Ok(listener) => Some(listener),
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => None,
+                Err(error) => panic!("could not reserve localhost setup fixture port: {error}"),
+            },
+        )
+        .expect("a private localhost fixture port should be available");
+    let port = listener.local_addr().unwrap().port();
+    let fixture = Fixture::new();
+    let out = fixture
+        .profile
+        .parent()
+        .unwrap()
+        .join("localhost-client.json");
+    let mut process = command();
+    process
+        .arg("setup")
+        .arg(&fixture.vault)
+        .arg("--access-file")
+        .arg(&fixture.profile)
+        .args([
+            "--name",
+            "assistant",
+            "--directory",
+            "Shared",
+            "--client",
+            "claude-code",
+            "--url",
+            &format!("http://localhost:{port}/mcp"),
+            "--out",
+        ])
+        .arg(&out)
+        .arg("--json");
+    drop(listener);
+    let result = success(process.output().unwrap());
+    let backend = format!("http://127.0.0.1:{port}/mcp");
+    assert_eq!(result["url"], backend);
+    assert_eq!(result["backend_url"], backend);
+    assert!(
+        result["server_command"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("--host 127.0.0.1 --port {port}"))
+    );
+    assert!(
+        result["doctor_command"]
+            .as_str()
+            .unwrap()
+            .contains(&backend)
+    );
+    let snippet: Value = serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
+    assert_eq!(snippet["mcpServers"]["assistant"]["url"], backend);
+}
+
+#[test]
+fn malformed_policy_diagnostics_do_not_echo_pasted_values_or_field_names() {
+    const CANARY: &str = "omcp1_synthetic_secret_must_never_be_logged";
+    let fixture = Fixture::new();
+    fixture.initialize();
+    fixture.add("reader", false);
+    let original: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.profile).unwrap()).unwrap();
+    for variant in 0..3 {
+        let mut policy = original.clone();
+        match variant {
+            0 => policy["clients"]["reader"]["grants"][0]["role"] = Value::String(CANARY.into()),
+            1 => policy["clients"]["reader"]["enabled"] = Value::String(CANARY.into()),
+            _ => policy[CANARY] = Value::Bool(true),
+        }
+        std::fs::write(&fixture.profile, serde_json::to_vec(&policy).unwrap()).unwrap();
+        let output = fixture.command().arg("validate").output().unwrap();
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(CANARY));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(CANARY));
+    }
+}
+
+#[test]
+fn stdio_setup_preview_uses_client_started_process_instructions() {
+    let fixture = Fixture::new();
+    let output = command()
+        .arg("setup")
+        .arg(&fixture.vault)
+        .arg("--access-file")
+        .arg(&fixture.profile)
+        .args([
+            "--name",
+            "assistant",
+            "--directory",
+            "Shared",
+            "--transport",
+            "stdio",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("Would create"));
+    assert!(text.contains("The client starts the restricted server process."));
+    assert!(!text.contains("--http"));
+    assert!(!text.contains("http://"));
+    assert!(!fixture.profile.parent().unwrap().exists());
+}
+
+fn preview_paths(fixture: &Fixture, client: &str, provider: &str) -> Vec<String> {
+    let result = success(
+        fixture
+            .command()
+            .args(["preview", client, "--json"])
+            .env("OBSIDIAN_EMBEDDINGS", "true")
+            .env("OBSIDIAN_EMBEDDING_PROVIDER", "api")
+            .env("OBSIDIAN_EMBEDDING_API_BASE", provider)
+            .env("OBSIDIAN_EMBEDDING_API_MODEL", "text-embedding-3-small")
+            .env("OBSIDIAN_EMBEDDING_API_KEY", "synthetic-provider-key")
+            .output()
+            .unwrap(),
+    );
+    result["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn preview_lists_regular_files_for_directory_whole_vault_and_exact_file_grants() {
+    let fixture = Fixture::new();
+    std::fs::create_dir_all(fixture.vault.join("Shared/nested/empty")).unwrap();
+    std::fs::write(fixture.vault.join("Shared/nested/other.md"), "another note").unwrap();
+    std::fs::write(fixture.vault.join("Shared/attachment.bin"), b"attachment").unwrap();
+    std::fs::write(fixture.vault.join("root.md"), "root note").unwrap();
+    fixture.initialize();
+    fixture.add("shared", false);
+    success(
+        fixture
+            .command()
+            .args([
+                "client",
+                "add",
+                "whole",
+                "--directory",
+                "",
+                "--deny-directory",
+                "Private",
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+    success(
+        fixture
+            .command()
+            .args([
+                "client",
+                "add",
+                "exact",
+                "--file",
+                "Shared/note.md",
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+    let provider = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    provider.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/v1", provider.local_addr().unwrap());
+    let shared = vec![
+        "Shared/attachment.bin",
+        "Shared/nested/other.md",
+        "Shared/note.md",
+    ];
+    assert_eq!(preview_paths(&fixture, "shared", &url), shared);
+    let mut whole = shared.clone();
+    whole.push("root.md");
+    assert_eq!(preview_paths(&fixture, "whole", &url), whole);
+    assert_eq!(preview_paths(&fixture, "exact", &url), ["Shared/note.md"]);
+    assert!(!fixture.vault.join(".obsidian-mcp").exists());
+    assert_eq!(
+        provider.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn preview_omits_unsafe_aliases_and_hardlinks_without_losing_permitted_files() {
+    let fixture = Fixture::new();
+    let external = fixture._directory.path().join("outside.md");
+    std::fs::write(&external, "outside source").unwrap();
+    std::fs::create_dir_all(fixture.vault.join("Shared/nested")).unwrap();
+    std::os::unix::fs::symlink("note.md", fixture.vault.join("Shared/allowed.md")).unwrap();
+    std::os::unix::fs::symlink(
+        "../Private/secret.md",
+        fixture.vault.join("Shared/denied.md"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("missing.md", fixture.vault.join("Shared/dangling.md")).unwrap();
+    std::os::unix::fs::symlink(&external, fixture.vault.join("Shared/outside.md")).unwrap();
+    std::os::unix::fs::symlink("nested", fixture.vault.join("Shared/directory-alias")).unwrap();
+    std::fs::hard_link(&external, fixture.vault.join("Shared/hardlink.md")).unwrap();
+    fixture.initialize();
+    fixture.add("reader", false);
+    let paths = preview_paths(&fixture, "reader", "http://127.0.0.1:1/v1");
+    assert_eq!(paths, ["Shared/allowed.md", "Shared/note.md"]);
+    assert!(!fixture.vault.join(".obsidian-mcp").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn preview_preserves_a_real_read_permission_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize();
+    fixture.add("reader", false);
+    let note = fixture.vault.join("Shared/note.md");
+    std::fs::set_permissions(&note, std::fs::Permissions::from_mode(0o0)).unwrap();
+    let output = fixture
+        .command()
+        .args(["preview", "reader", "--json"])
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&note, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .to_ascii_lowercase()
+            .contains("permission denied")
+    );
+}
+
+struct OccupiedDefaultBackend {
+    _listener: Option<std::net::TcpListener>,
+    // Close the listener before another fixture acquires the shared port.
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+fn wildcard_listener(endpoint: &str) -> std::io::Result<std::net::TcpListener> {
+    // Strict wildcard fixtures must not attach beside an existing specific address.
+    fixture_listener(endpoint, false)
+}
+
+fn fixture_listener(endpoint: &str, reuse_addr: bool) -> std::io::Result<std::net::TcpListener> {
+    let endpoint: std::net::SocketAddr = endpoint.parse().unwrap();
+    let socket = if endpoint.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    socket.set_reuseaddr(reuse_addr)?;
+    socket.bind(endpoint)?;
+    socket.set_reuseaddr(cfg!(unix))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()?;
+    let _entered = runtime.enter();
+    socket.listen(128)?.into_std()
+}
+
+fn occupy_default_backend() -> OccupiedDefaultBackend {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let serial = SERIAL.lock().unwrap();
+    let listener =
+        occupied_backend_listener(37842).expect("could not qualify the default loopback port");
+    OccupiedDefaultBackend {
+        _listener: listener,
+        _serial: serial,
+    }
+}
+
+fn occupied_backend_listener(port: u16) -> std::io::Result<Option<std::net::TcpListener>> {
+    if loopback_backend_has_listener(port)? {
+        return Ok(None);
+    }
+    // Closed connections can prevent a strict bind without any live listener.
+    // Match normal platform reuse only after read-only listener qualification.
+    fixture_listener(&format!("127.0.0.1:{port}"), cfg!(unix)).map(Some)
+}
+
+#[cfg(unix)]
+fn loopback_backend_has_listener(port: u16) -> std::io::Result<bool> {
+    #[cfg(target_os = "macos")]
+    let lsof = "/usr/sbin/lsof";
+    #[cfg(not(target_os = "macos"))]
+    let lsof = "lsof";
+    let output = Command::new(lsof)
+        .args([
+            "-nP",
+            "-a",
+            &format!("-i4TCP:{port}"),
+            "-sTCP:LISTEN",
+            "-Fn",
+        ])
+        .output()?;
+    if !output.status.success() && !(output.status.code() == Some(1) && output.stderr.is_empty()) {
+        return Err(std::io::Error::other(format!(
+            "cannot inspect fixture listeners: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    for line in std::str::from_utf8(&output.stdout)
+        .map_err(std::io::Error::other)?
+        .lines()
+    {
+        let Some(name) = line.strip_prefix('n') else {
+            continue;
+        };
+        if name == format!("*:{port}") {
+            return Ok(true);
+        }
+        let bound: std::net::SocketAddr = name.parse().map_err(std::io::Error::other)?;
+        let ip = match bound.ip() {
+            std::net::IpAddr::V4(ip) => Some(ip),
+            std::net::IpAddr::V6(ip) => ip.to_ipv4_mapped(),
+        };
+        if bound.port() == port
+            && ip.is_some_and(|ip| ip.is_unspecified() || ip == std::net::Ipv4Addr::LOCALHOST)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(windows)]
+fn loopback_backend_has_listener(port: u16) -> std::io::Result<bool> {
+    use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
+    };
+    use windows_sys::Win32::Networking::WinSock::AF_INET;
+
+    let mut buffer: Vec<u32> = Vec::new();
+    let mut size = 0;
+    loop {
+        let data = if buffer.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            buffer.as_mut_ptr().cast()
+        };
+        // SAFETY: the API receives a DWORD-aligned buffer of the advertised size.
+        match unsafe {
+            GetExtendedTcpTable(
+                data,
+                &mut size,
+                0,
+                AF_INET.into(),
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            )
+        } {
+            ERROR_INSUFFICIENT_BUFFER => buffer.resize((size as usize).div_ceil(4), 0),
+            NO_ERROR => break,
+            code => return Err(std::io::Error::from_raw_os_error(code as i32)),
+        }
+    }
+    let (&count, entries) = buffer
+        .split_first()
+        .ok_or_else(|| std::io::Error::other("empty fixture TCP listener table"))?;
+    let row_words = std::mem::size_of::<MIB_TCPROW_OWNER_PID>() / 4;
+    if count as usize > entries.len() / row_words {
+        return Err(std::io::Error::other(
+            "truncated fixture TCP listener table",
+        ));
+    }
+    Ok(entries
+        .chunks_exact(row_words)
+        .take(count as usize)
+        .any(|raw| {
+            // SAFETY: each row is exactly the native DWORD-aligned row size.
+            let row = unsafe { &*raw.as_ptr().cast::<MIB_TCPROW_OWNER_PID>() };
+            let ip = std::net::Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes());
+            u16::from_be(row.dwLocalPort as u16) == port
+                && (ip.is_unspecified() || ip == std::net::Ipv4Addr::LOCALHOST)
+        }))
+}
+
+#[cfg(unix)]
+#[test]
+fn backend_fixture_owns_a_listener_after_controlled_active_close() {
+    use std::io::Read;
+    use std::net::{Shutdown, TcpStream};
+
+    let listener = wildcard_listener("127.0.0.1:0").unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let mut client = TcpStream::connect(endpoint).unwrap();
+    let (mut server, _) = listener.accept().unwrap();
+    server.set_nonblocking(false).unwrap();
+    for connection in [&server, &client] {
+        connection
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+    }
+    server.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(client.read(&mut [0]).unwrap(), 0);
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(server.read(&mut [0]).unwrap(), 0);
+    drop(server);
+    drop(client);
+    drop(listener);
+    assert_eq!(
+        wildcard_listener(&format!("0.0.0.0:{}", endpoint.port()))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+    let occupied = occupied_backend_listener(endpoint.port())
+        .unwrap()
+        .expect("closed connections are not a live occupied backend");
+    assert_eq!(occupied.local_addr().unwrap().port(), endpoint.port());
+}
+
+#[test]
+fn backend_fixture_verifies_live_listeners_without_connecting() {
+    for endpoint in ["127.0.0.1:0", "0.0.0.0:0"] {
+        let listener = wildcard_listener(endpoint).unwrap();
+        let bound = listener.local_addr().unwrap();
+        assert!(occupied_backend_listener(bound.port()).unwrap().is_none());
+        assert_eq!(listener.local_addr().unwrap(), bound);
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+}
+
+#[test]
+fn initialization_prints_a_launch_that_selects_its_port_when_started() {
+    let _listener = occupy_default_backend();
+    let fixture = Fixture::new();
+    let output = command()
+        .arg("init")
+        .arg(&fixture.vault)
+        .arg("--access-file")
+        .arg(&fixture.profile)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    let launch = text
+        .lines()
+        .find(|line| line.contains(" --http --host "))
+        .unwrap();
+    assert!(launch.contains("--host 127.0.0.1 --port 0"));
+    assert!(text.contains("http://<printed-address>/mcp"));
+    let snapshot = AccessStore::open(&fixture.profile)
+        .unwrap()
+        .snapshot()
+        .unwrap();
+    assert!(snapshot.policy.clients.is_empty());
+    assert!(!fixture.vault.join(".obsidian-mcp").exists());
+}
+
+#[test]
+fn initialization_keeps_endpoint_options_in_guided_setup() {
+    let fixture = Fixture::new();
+    let output = command()
+        .arg("init")
+        .arg(&fixture.vault)
+        .arg("--access-file")
+        .arg(&fixture.profile)
+        .args(["--url", "http://127.0.0.1:37843/mcp"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not valid"));
+    assert!(!fixture.profile.parent().unwrap().exists());
+}
+
+#[test]
+fn https_setup_preserves_public_route_and_selects_a_separate_free_backend() {
+    let _listener = occupy_default_backend();
+    let fixture = Fixture::new();
+    let out = fixture.profile.parent().unwrap().join("https-client.json");
+    let public = "https://notes.example.test/assistant/mcp";
+    let result = success(
+        command()
+            .arg("setup")
+            .arg(&fixture.vault)
+            .arg("--access-file")
+            .arg(&fixture.profile)
+            .args([
+                "--name",
+                "assistant",
+                "--directory",
+                "Shared",
+                "--client",
+                "claude-code",
+                "--url",
+                public,
+                "--out",
+            ])
+            .arg(&out)
+            .arg("--json")
+            .output()
+            .unwrap(),
+    );
+    let backend = reqwest::Url::parse(result["backend_url"].as_str().unwrap()).unwrap();
+    let port = backend.port().unwrap();
+    assert_ne!(port, 37842);
+    assert_eq!(backend.scheme(), "http");
+    assert_eq!(backend.host_str(), Some("127.0.0.1"));
+    assert_eq!(backend.path(), "/mcp");
+    assert_eq!(result["url"], public);
+    assert_eq!(result["proxy_upstream"], backend.as_str());
+    assert_eq!(result["proxy_host_header"], format!("127.0.0.1:{port}"));
+    assert!(
+        result["server_command"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("--host 127.0.0.1 --port {port}"))
+    );
+    assert!(
+        result["doctor_command"]
+            .as_str()
+            .unwrap()
+            .contains(backend.as_str())
+    );
+    assert!(
+        result["public_doctor_command"]
+            .as_str()
+            .unwrap()
+            .contains(public)
+    );
+    let configuration: Value = serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
+    assert_eq!(configuration["mcpServers"]["assistant"]["url"], public);
+}
+
+#[test]
+fn https_setup_preview_prints_its_selected_upstream_and_both_connection_checks() {
+    let _listener = occupy_default_backend();
+    let fixture = Fixture::new();
+    let public = "https://notes.example.test/assistant/mcp";
+    let output = command()
+        .arg("setup")
+        .arg(&fixture.vault)
+        .arg("--access-file")
+        .arg(&fixture.profile)
+        .args([
+            "--name",
+            "assistant",
+            "--directory",
+            "Shared",
+            "--url",
+            public,
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    let launch = text
+        .lines()
+        .find(|line| line.contains(" --http --host "))
+        .unwrap();
+    let port = launch
+        .split_once("--port ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .next()
+        .unwrap();
+    assert_ne!(port, "37842");
+    let backend = format!("http://127.0.0.1:{port}/mcp");
+    assert!(text.contains(&format!(
+        "Route your HTTPS proxy's {public} endpoint to {backend}"
+    )));
+    assert!(text.contains(&format!("forward Host as 127.0.0.1:{port}")));
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("Check the backend:") && line.contains(&backend))
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.contains("check its public endpoint:") && line.contains(public))
+    );
+    assert!(!fixture.profile.parent().unwrap().exists());
+}
+
+#[test]
+fn explicit_http_setup_does_not_reuse_an_occupied_listener() {
+    #[cfg(unix)]
+    use std::io::Read;
+
+    for address in ["127.0.0.1:0", "0.0.0.0:0", "[::]:0"] {
+        let listener = wildcard_listener(address).unwrap();
+        let bound = listener.local_addr().unwrap();
+        let host = if bound.is_ipv4() {
+            "127.0.0.1"
+        } else {
+            "[::1]"
+        };
+        let endpoint = format!("http://{host}:{}/mcp", bound.port());
+        let fixture = Fixture::new();
+        let output = command()
+            .arg("setup")
+            .arg(&fixture.vault)
+            .arg("--access-file")
+            .arg(&fixture.profile)
+            .args([
+                "--name",
+                "assistant",
+                "--directory",
+                "Shared",
+                "--url",
+                &endpoint,
+                "--dry-run",
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{endpoint}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("already in use"));
+        assert!(!fixture.profile.parent().unwrap().exists());
+        assert_eq!(listener.local_addr().unwrap(), bound);
+        listener.set_nonblocking(true).unwrap();
+        #[cfg(unix)]
+        {
+            let (mut probe, _) = listener.accept().unwrap();
+            probe.set_nonblocking(false).unwrap();
+            probe
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            assert_eq!(probe.read(&mut [0]).unwrap(), 0);
+        }
+        #[cfg(windows)]
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+}
+
+#[tokio::test]
+async fn authenticated_startup_does_not_attach_beside_an_ordinary_wildcard_listener() {
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    let fixture = Fixture::new();
+    fixture.initialize();
+    for wildcard in ["0.0.0.0", "::"] {
+        let mut ordinary = http_listening::isolated_command(binary())
+            .arg(&fixture.vault)
+            .args(["--http", "--host", wildcard, "--port", "0"])
+            .env("OBSIDIAN_EMBEDDINGS", "false")
+            .env("OBSIDIAN_WATCH", "false")
+            .env("OBSIDIAN_LOG_LEVEL", "info")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let address = http_listening::ready(&mut ordinary).await.unwrap();
+        let host = if address.is_ipv4() {
+            "127.0.0.1"
+        } else {
+            "::1"
+        };
+        let mut authenticated = http_listening::isolated_command(binary());
+        authenticated
+            .arg(&fixture.vault)
+            .args(["--http", "--host", host, "--port"])
+            .arg(address.port().to_string())
+            .arg("--access-file")
+            .arg(&fixture.profile)
+            .env("OBSIDIAN_EMBEDDINGS", "false")
+            .env("OBSIDIAN_WATCH", "false")
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(10), authenticated.output())
+            .await
+            .expect("authenticated server attached beside the ordinary listener")
+            .unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+        assert!(error.contains("addrinuse"), "{error}");
+        assert!(ordinary.try_wait().unwrap().is_none());
+        let authority = if address.is_ipv4() {
+            format!("127.0.0.1:{}", address.port())
+        } else {
+            format!("[::1]:{}", address.port())
+        };
+        let health = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{authority}/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::OK);
+        ordinary.kill().await.unwrap();
+        ordinary.wait().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn authenticated_server_restarts_immediately_after_closing_a_connection() {
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let fixture = Fixture::new();
+    fixture.initialize();
+    let launch = |host: &str, port: u16| {
+        let mut command = http_listening::isolated_command(binary());
+        command
+            .arg(&fixture.vault)
+            .args(["--http", "--host", host, "--port"])
+            .arg(port.to_string())
+            .arg("--access-file")
+            .arg(&fixture.profile)
+            .env("OBSIDIAN_EMBEDDINGS", "false")
+            .env("OBSIDIAN_WATCH", "false")
+            .env("OBSIDIAN_LOG_LEVEL", "info")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        command
+    };
+    for host in ["127.0.0.1", "::1"] {
+        let mut server = launch(host, 0).spawn().unwrap();
+        let address = http_listening::ready(&mut server).await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(
+                format!("GET /health HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+            .await
+            .expect("server did not close the HTTP connection")
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        client.shutdown().await.unwrap();
+        drop(client);
+        server.kill().await.unwrap();
+        server.wait().await.unwrap();
+        let mut restarted = launch(host, address.port()).spawn().unwrap();
+        assert_eq!(
+            http_listening::ready(&mut restarted).await.unwrap(),
+            address
+        );
+        restarted.kill().await.unwrap();
+        restarted.wait().await.unwrap();
+    }
+}
+
+#[test]
+fn direct_http_setup_rejects_a_path_that_the_server_does_not_serve() {
+    let fixture = Fixture::new();
+    let output = command()
+        .arg("setup")
+        .arg(&fixture.vault)
+        .arg("--access-file")
+        .arg(&fixture.profile)
+        .args([
+            "--name",
+            "assistant",
+            "--directory",
+            "Shared",
+            "--url",
+            "http://127.0.0.1:37842/not-mcp",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("server's /mcp path"));
+    assert!(!fixture.profile.parent().unwrap().exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn printed_windows_launch_invokes_an_executable_path_with_spaces() {
+    let fixture = Fixture::new();
+    let directory = fixture._directory.path().join("binary with spaces");
+    std::fs::create_dir(&directory).unwrap();
+    let executable = directory.join(format!("obsidian-mcp{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(binary(), &executable).unwrap();
+    let output = command_at(&executable)
+        .arg("init")
+        .arg(&fixture.vault)
+        .arg("--access-file")
+        .arg(&fixture.profile)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    let launch = text
+        .lines()
+        .find(|line| line.contains(" --http --host "))
+        .unwrap();
+    assert!(launch.contains("binary with spaces"));
+    assert!(launch.starts_with("& '"), "{launch}");
+}

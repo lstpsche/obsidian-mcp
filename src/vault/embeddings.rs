@@ -76,6 +76,60 @@ impl EmbeddingSpaceIdentity {
     }
 }
 
+/// A fresh authorization boundary for retained semantic work. The returned
+/// permit protects only the synchronous admission or publication that follows.
+#[derive(Clone)]
+pub(crate) struct EmbeddingAuthorization {
+    acquire: Arc<EmbeddingAdmission>,
+}
+
+type EmbeddingAdmission = dyn Fn(Option<&Path>) -> VaultResult<Box<dyn Send>> + Send + Sync;
+
+impl EmbeddingAuthorization {
+    pub(crate) fn new(
+        acquire: impl Fn(Option<&Path>) -> VaultResult<Box<dyn Send>> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            acquire: Arc::new(acquire),
+        }
+    }
+
+    pub(crate) fn acquire(&self, path: Option<&Path>) -> VaultResult<Box<dyn Send>> {
+        (self.acquire)(path)
+    }
+
+    pub(crate) fn for_paths(&self, paths: Vec<PathBuf>) -> Self {
+        let authority = self.clone();
+        let mut seen = HashSet::new();
+        let paths = paths
+            .into_iter()
+            .filter(|path| seen.insert(path.clone()))
+            .collect::<Vec<_>>();
+        Self::new(move |_| {
+            // Independent store locks must never nest: a waiting policy writer
+            // can otherwise sit between two shared acquisitions. Each path check
+            // binds the same immutable read policy; only the final fresh permit
+            // spans the synchronous dispatch/publication point.
+            for path in &paths {
+                drop(authority.acquire(Some(path))?);
+            }
+            authority.acquire(None)
+        })
+    }
+}
+
+fn document_admission(
+    owner_live: Option<&AtomicBool>,
+    authorization: Option<&EmbeddingAuthorization>,
+) -> VaultResult<Option<Box<dyn Send>>> {
+    check_document_owner(owner_live)?;
+    let permit = authorization
+        .map(|authority| authority.acquire(None))
+        .transpose()?;
+    check_document_owner(owner_live)?;
+    Ok(permit)
+}
+
 fn check_document_owner(owner_live: Option<&AtomicBool>) -> VaultResult<()> {
     if owner_live.is_some_and(|live| !live.load(AtomicOrdering::Acquire)) {
         return Err(VaultError::Embedding("embedding scope retired".into()));
@@ -104,8 +158,13 @@ pub(crate) trait Embedder: Send + Sync {
         &self,
         texts: &[&str],
         owner_live: &Arc<AtomicBool>,
+        authorization: Option<&EmbeddingAuthorization>,
+        source_paths: &[PathBuf],
     ) -> (usize, VaultResult<Vec<Vec<f32>>>) {
-        if let Err(error) = check_document_owner(Some(owner_live)) {
+        // Check corpus eligibility before planning, then bind path admission to
+        // the exact request prefix. A later unavailable note must not reject or
+        // inherit the failure of an earlier, independently dispatched request.
+        if let Err(error) = document_admission(Some(owner_live), authorization) {
             return (1, Err(error));
         }
         let count = match self.plan_batch(texts) {
@@ -120,16 +179,44 @@ pub(crate) trait Embedder: Send + Sync {
             }
             Err(error) => return (1, Err(error)),
         };
-        (count, self.dispatch_documents(&texts[..count], owner_live))
+        let authorization = match authorization {
+            Some(authority) if source_paths.len() == texts.len() => {
+                Some(authority.for_paths(source_paths[..count].to_vec()))
+            }
+            Some(_) => {
+                return (
+                    count,
+                    Err(VaultError::Embedding(
+                        "embedding request source paths do not match its inputs".into(),
+                    )),
+                );
+            }
+            None => None,
+        };
+        (
+            count,
+            self.dispatch_documents(&texts[..count], owner_live, authorization.as_ref()),
+        )
     }
 
     fn dispatch_documents(
         &self,
         texts: &[&str],
         owner_live: &Arc<AtomicBool>,
+        authorization: Option<&EmbeddingAuthorization>,
     ) -> VaultResult<Vec<Vec<f32>>> {
-        check_document_owner(Some(owner_live))?;
+        // Admission is a point, not a lease over slow inference or provider I/O.
+        drop(document_admission(Some(owner_live), authorization)?);
         self.embed_batch(texts)
+    }
+
+    fn embed_authorized_query(
+        &self,
+        query: &str,
+        authorization: Option<&EmbeddingAuthorization>,
+    ) -> VaultResult<Vec<f32>> {
+        drop(document_admission(None, authorization)?);
+        self.embed_query(query)
     }
 
     fn embed_query(&self, query: &str) -> VaultResult<Vec<f32>> {
@@ -1214,6 +1301,7 @@ enum EmbeddingBackend {
 struct ApiEmbeddingRequest {
     texts: Vec<String>,
     owner_live: Option<Arc<AtomicBool>>,
+    authorization: Option<EmbeddingAuthorization>,
     retry_deadline: Option<std::time::Instant>,
     response: std::sync::mpsc::Sender<VaultResult<Vec<Vec<f32>>>>,
 }
@@ -1268,8 +1356,11 @@ impl ApiEmbeddingClient {
                             model.as_str(),
                             api_key.as_str(),
                             &texts,
-                            request.retry_deadline,
-                            request.owner_live.as_ref(),
+                            ApiRequestPolicy {
+                                retry_deadline: request.retry_deadline,
+                                owner_live: request.owner_live.as_ref(),
+                                authorization: request.authorization.as_ref(),
+                            },
                         );
                         let _ = request.response.send(result);
                     }
@@ -1296,11 +1387,7 @@ impl ApiEmbeddingClient {
 
     #[cfg(test)]
     fn embed_batch(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>> {
-        self.request(texts, false, None)
-    }
-
-    fn embed_with_retry(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>> {
-        self.request(texts, true, None)
+        self.request(texts, false, None, None)
     }
 
     fn request(
@@ -1308,6 +1395,7 @@ impl ApiEmbeddingClient {
         texts: &[&str],
         retry_transient: bool,
         owner_live: Option<&Arc<AtomicBool>>,
+        authorization: Option<&EmbeddingAuthorization>,
     ) -> VaultResult<Vec<Vec<f32>>> {
         let sender = self
             .sender
@@ -1318,6 +1406,7 @@ impl ApiEmbeddingClient {
         let mut request = ApiEmbeddingRequest {
             texts: texts.iter().map(|text| (*text).to_string()).collect(),
             owner_live: owner_live.cloned(),
+            authorization: authorization.cloned(),
             retry_deadline,
             response,
         };
@@ -1390,9 +1479,18 @@ impl EmbeddingModel {
     /// `provider` selects the backend explicitly; `None` infers from compiled
     /// features (local preferred when both are available).
     pub async fn load(model_name: &str, provider: Option<EmbeddingProvider>) -> VaultResult<Self> {
+        Self::load_authorized(model_name, provider, None).await
+    }
+
+    pub(crate) async fn load_authorized(
+        model_name: &str,
+        provider: Option<EmbeddingProvider>,
+        authorization: Option<EmbeddingAuthorization>,
+    ) -> VaultResult<Self> {
+        drop(document_admission(None, authorization.as_ref())?);
         match resolve_provider(provider) {
             EmbeddingProvider::Local => Self::load_local(model_name).await,
-            EmbeddingProvider::Api => Self::load_api(model_name).await,
+            EmbeddingProvider::Api => Self::load_api(model_name, authorization).await,
         }
     }
 
@@ -1429,7 +1527,7 @@ impl EmbeddingModel {
             self.request_overhead,
             |text| self.counter.count(text),
         )?;
-        self.dispatch_validated(texts, _retry_transient, None)
+        self.dispatch_validated(texts, _retry_transient, None, None)
     }
 
     fn dispatch_validated(
@@ -1437,6 +1535,7 @@ impl EmbeddingModel {
         texts: &[&str],
         _retry_transient: bool,
         owner_live: Option<&Arc<AtomicBool>>,
+        authorization: Option<&EmbeddingAuthorization>,
     ) -> VaultResult<Vec<Vec<f32>>> {
         let vectors = match &self.backend {
             #[cfg(feature = "embeddings")]
@@ -1444,7 +1543,10 @@ impl EmbeddingModel {
                 let mut model = inner
                     .lock()
                     .map_err(|e| VaultError::Embedding(format!("model lock poisoned: {e}")))?;
-                check_document_owner(owner_live.map(Arc::as_ref))?;
+                drop(document_admission(
+                    owner_live.map(Arc::as_ref),
+                    authorization,
+                )?);
                 model
                     .embed(texts, Some(LOCAL_MAX_REQUEST_INPUTS))
                     .map_err(|error| VaultError::EmbeddingRequest {
@@ -1454,7 +1556,9 @@ impl EmbeddingModel {
                     })?
             }
             #[cfg(feature = "embeddings-api")]
-            EmbeddingBackend::Api(client) => client.request(texts, _retry_transient, owner_live)?,
+            EmbeddingBackend::Api(client) => {
+                client.request(texts, _retry_transient, owner_live, authorization)?
+            }
         };
         validate_embedding_batch(vectors, texts.len(), self.dim)
     }
@@ -1519,7 +1623,10 @@ impl EmbeddingModel {
     // ── API backend (OpenAI-compatible) ────────────────────────────────
 
     #[cfg(feature = "embeddings-api")]
-    async fn load_api(model_name: &str) -> VaultResult<Self> {
+    async fn load_api(
+        model_name: &str,
+        authorization: Option<EmbeddingAuthorization>,
+    ) -> VaultResult<Self> {
         let model_name = model_name.to_owned();
         let timeout =
             crate::config::embedding_api_timeout_from_env().map_err(VaultError::Embedding)?;
@@ -1558,6 +1665,7 @@ impl EmbeddingModel {
                 model,
                 contract,
                 parse_usize_env("OBSIDIAN_EMBEDDING_DIM"),
+                authorization.as_ref(),
             )
         })
         .await
@@ -1571,6 +1679,7 @@ impl EmbeddingModel {
         model: String,
         contract: embedding_input::ApiInputContract,
         configured_dimension: Option<usize>,
+        authorization: Option<&EmbeddingAuthorization>,
     ) -> VaultResult<Self> {
         let request_overhead = serde_json::to_vec(
             &serde_json::json!({"model":model,"input":[],"encoding_format":"float"}),
@@ -1599,7 +1708,7 @@ impl EmbeddingModel {
             }
             None => {
                 tracing::info!("probing embedding API for dimension…");
-                probe_api_dimension(&api_client)?
+                probe_api_dimension(&api_client, authorization)?
             }
         };
         let identity = EmbeddingSpaceIdentity::api(model.clone(), &base_url, dim, &contract.policy);
@@ -1629,7 +1738,10 @@ impl EmbeddingModel {
     }
 
     #[cfg(not(feature = "embeddings-api"))]
-    async fn load_api(_model_name: &str) -> VaultResult<Self> {
+    async fn load_api(
+        _model_name: &str,
+        _authorization: Option<EmbeddingAuthorization>,
+    ) -> VaultResult<Self> {
         Err(VaultError::Embedding(
             "API embedding backend not compiled (needs --features embeddings-api)".into(),
         ))
@@ -1675,8 +1787,27 @@ impl Embedder for EmbeddingModel {
         &self,
         texts: &[&str],
         owner_live: &Arc<AtomicBool>,
+        authorization: Option<&EmbeddingAuthorization>,
     ) -> VaultResult<Vec<Vec<f32>>> {
-        self.dispatch_validated(texts, false, Some(owner_live))
+        self.dispatch_validated(texts, false, Some(owner_live), authorization)
+    }
+
+    fn embed_authorized_query(
+        &self,
+        query: &str,
+        authorization: Option<&EmbeddingAuthorization>,
+    ) -> VaultResult<Vec<f32>> {
+        embedding_input::validate_batch(
+            &[query],
+            &self.input_policy,
+            self.request_limits,
+            self.request_overhead,
+            |text| self.counter.count(text),
+        )?;
+        let mut vectors = self.dispatch_validated(&[query], true, None, authorization)?;
+        vectors
+            .pop()
+            .ok_or_else(|| VaultError::Embedding("embedding query returned no vector".into()))
     }
 
     fn embed_query(&self, query: &str) -> VaultResult<Vec<f32>> {
@@ -1801,8 +1932,11 @@ fn build_api_client(timeout: std::time::Duration) -> Result<reqwest::blocking::C
 }
 
 #[cfg(feature = "embeddings-api")]
-fn probe_api_dimension(client: &ApiEmbeddingClient) -> Result<usize, VaultError> {
-    let vecs = client.embed_with_retry(&["dim"])?;
+fn probe_api_dimension(
+    client: &ApiEmbeddingClient,
+    authorization: Option<&EmbeddingAuthorization>,
+) -> Result<usize, VaultError> {
+    let vecs = client.request(&["dim"], true, None, authorization)?;
     let first = vecs
         .first()
         .ok_or_else(|| VaultError::Embedding("dimension probe returned empty result".into()))?;
@@ -1822,7 +1956,14 @@ fn embed_batch_api(
     api_key: &str,
     texts: &[&str],
 ) -> Result<Vec<Vec<f32>>, VaultError> {
-    embed_batch_api_with_policy(client, base_url, model, api_key, texts, None, None)
+    embed_batch_api_with_policy(
+        client,
+        base_url,
+        model,
+        api_key,
+        texts,
+        ApiRequestPolicy::default(),
+    )
 }
 
 // A blocking HTTP client can queue work internally after our provider worker
@@ -1830,15 +1971,18 @@ fn embed_batch_api(
 #[cfg(feature = "embeddings-api")]
 struct ScopedRequestBody {
     bytes: std::io::Cursor<Vec<u8>>,
-    live: Arc<AtomicBool>,
+    live: Option<Arc<AtomicBool>>,
+    authorization: Option<EmbeddingAuthorization>,
 }
 
 #[cfg(feature = "embeddings-api")]
 impl Read for ScopedRequestBody {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.bytes.position() == 0 && !self.live.load(AtomicOrdering::Acquire) {
-            return Err(std::io::Error::other("embedding scope retired"));
+        if self.bytes.position() != 0 {
+            return self.bytes.read(buf);
         }
+        let _permit = document_admission(self.live.as_deref(), self.authorization.as_ref())
+            .map_err(std::io::Error::other)?;
         self.bytes.read(buf)
     }
 }
@@ -1853,16 +1997,31 @@ fn api_retry_timeout() -> VaultError {
 }
 
 #[cfg(feature = "embeddings-api")]
+#[derive(Default)]
+struct ApiRequestPolicy<'a> {
+    retry_deadline: Option<std::time::Instant>,
+    owner_live: Option<&'a Arc<AtomicBool>>,
+    authorization: Option<&'a EmbeddingAuthorization>,
+}
+
+#[cfg(feature = "embeddings-api")]
 fn embed_batch_api_with_policy(
     client: &reqwest::blocking::Client,
     base_url: &str,
     model: &str,
     api_key: &str,
     texts: &[&str],
-    retry_deadline: Option<std::time::Instant>,
-    owner_live: Option<&Arc<AtomicBool>>,
+    policy: ApiRequestPolicy<'_>,
 ) -> Result<Vec<Vec<f32>>, VaultError> {
-    check_document_owner(owner_live.map(Arc::as_ref))?;
+    let ApiRequestPolicy {
+        retry_deadline,
+        owner_live,
+        authorization,
+    } = policy;
+    drop(document_admission(
+        owner_live.map(Arc::as_ref),
+        authorization,
+    )?);
     let url = format!("{}/embeddings", base_url.trim_end_matches('/'));
     let body = serde_json::json!({
         "model": model,
@@ -1875,14 +2034,15 @@ fn embed_batch_api_with_policy(
         let mut request = client
             .post(&url)
             .header("Authorization", format!("Bearer {api_key}"));
-        request = if let Some(live) = owner_live {
+        request = if owner_live.is_some() || authorization.is_some() {
             let bytes = serde_json::to_vec(&body).map_err(|err| {
                 VaultError::Embedding(format!("cannot encode embedding request: {err}"))
             })?;
             let size = bytes.len() as u64;
             let input = ScopedRequestBody {
                 bytes: std::io::Cursor::new(bytes),
-                live: Arc::clone(live),
+                live: owner_live.cloned(),
+                authorization: authorization.cloned(),
             };
             request
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -1897,7 +2057,10 @@ fn embed_batch_api_with_policy(
             }
             request = request.timeout(remaining);
         }
-        check_document_owner(owner_live.map(Arc::as_ref))?;
+        drop(document_admission(
+            owner_live.map(Arc::as_ref),
+            authorization,
+        )?);
         attempts += 1;
         let (mut message, retryable, retry_after) = match request.send() {
             Ok(response) => {
@@ -2123,10 +2286,34 @@ impl CacheFile {
             .transpose()
     }
 
+    pub(crate) fn diagnostic_id(&self) -> String {
+        let mut hash = Sha256::new();
+        hash.update(b"obsidian-mcp/semantic-diagnostic/v1\0");
+        hash.update(self.relative.as_os_str().as_encoded_bytes());
+        crate::config::digest_hex(hash)
+    }
+
+    pub(crate) fn remove(&self) -> VaultResult<()> {
+        match self.root.delete_file(&self.relative) {
+            Ok(_) => Ok(()),
+            Err(error) if error.is_not_found() => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) fn publish(
         &self,
         bytes: &[u8],
         owner: Option<(&AtomicBool, &std::sync::Mutex<()>)>,
+    ) -> VaultResult<bool> {
+        self.publish_authorized(bytes, owner, None)
+    }
+
+    pub(crate) fn publish_authorized(
+        &self,
+        bytes: &[u8],
+        owner: Option<(&AtomicBool, &std::sync::Mutex<()>)>,
+        authorization: Option<&EmbeddingAuthorization>,
     ) -> VaultResult<bool> {
         if bytes.len() as u64 > MAX_CACHE_BYTES {
             return Err(cache_error("embedding cache is too large to persist"));
@@ -2147,9 +2334,13 @@ impl CacheFile {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err.into()),
         }
-        let temp = CheckpointTemp::write_in(&dir, bytes)?;
-        // Retirement only waits for the atomic replacement. Preparing and syncing
-        // a large checkpoint cannot stall withdrawal of a connection's rights.
+        let temp =
+            CheckpointTemp::write_in(&dir, bytes, authorization.map(|_| self.diagnostic_id()))?;
+        // Policy publication only waits for the atomic replacement. Preparing
+        // and syncing a large checkpoint cannot stall authorization withdrawal.
+        let _authorization = authorization
+            .map(|authority| authority.acquire(None))
+            .transpose()?;
         let _commit = owner.map(|(_, gate)| gate.lock().unwrap_or_else(|error| error.into_inner()));
         if !active() {
             return Ok(false);
@@ -2164,10 +2355,15 @@ struct CheckpointTemp<'a> {
     dir: &'a cap_std::fs::Dir,
     name: String,
     cleanup: bool,
+    diagnostic_corpus: Option<String>,
 }
 
 impl<'a> CheckpointTemp<'a> {
-    fn write_in(dir: &'a cap_std::fs::Dir, bytes: &[u8]) -> VaultResult<Self> {
+    fn write_in(
+        dir: &'a cap_std::fs::Dir,
+        bytes: &[u8],
+        diagnostic_corpus: Option<String>,
+    ) -> VaultResult<Self> {
         let mut id = [0u8; 16];
         getrandom::fill(&mut id)
             .map_err(|err| cache_error(format!("cannot name temporary checkpoint: {err}")))?;
@@ -2184,6 +2380,7 @@ impl<'a> CheckpointTemp<'a> {
             dir,
             name,
             cleanup: true,
+            diagnostic_corpus,
         };
         file.write_all(bytes)?;
         file.flush()?;
@@ -2204,7 +2401,15 @@ impl Drop for CheckpointTemp<'_> {
             && let Err(err) = super::fs::remove_temp_file(self.dir, self.name.as_ref())
             && err.kind() != std::io::ErrorKind::NotFound
         {
-            tracing::warn!(error = %err, "failed to remove temporary checkpoint");
+            if let Some(corpus) = self.diagnostic_corpus.as_deref() {
+                tracing::warn!(
+                    corpus,
+                    error_category = "cache_io",
+                    "failed to remove temporary checkpoint"
+                );
+            } else {
+                tracing::warn!(error = %err, "failed to remove temporary checkpoint");
+            }
         }
     }
 }
@@ -2214,6 +2419,43 @@ impl Drop for CheckpointTemp<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_authorization_never_nests_independent_release_permits() {
+        struct Permit(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Permit {
+            fn drop(&mut self) {
+                assert_eq!(self.0.fetch_sub(1, AtomicOrdering::SeqCst), 1);
+            }
+        }
+        let held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&held);
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_calls = Arc::clone(&calls);
+        let authority = EmbeddingAuthorization::new(move |path| {
+            // A queued exclusive policy writer can prevent another independent
+            // shared lock from joining this permit, so nesting is forbidden.
+            assert_eq!(observed.fetch_add(1, AtomicOrdering::SeqCst), 0);
+            observed_calls
+                .lock()
+                .unwrap()
+                .push(path.map(Path::to_owned));
+            Ok(Box::new(Permit(Arc::clone(&observed))))
+        });
+        let batch = authority.for_paths(vec![PathBuf::from("one.md"), PathBuf::from("two.md")]);
+        let permit = batch.acquire(None).unwrap();
+        assert_eq!(held.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                Some(PathBuf::from("one.md")),
+                Some(PathBuf::from("two.md")),
+                None,
+            ]
+        );
+        drop(permit);
+        assert_eq!(held.load(AtomicOrdering::SeqCst), 0);
+    }
 
     // ── cosine_similarity ──────────────────────────────────────────
 
@@ -3464,6 +3706,7 @@ mod tests {
                 "test-model".into(),
                 contract,
                 dimension,
+                None,
             )
         }
 
@@ -3581,6 +3824,8 @@ mod tests {
                 &model,
                 &["document body"],
                 &Arc::new(AtomicBool::new(true)),
+                None,
+                &[],
             );
             assert_eq!(count, 1);
             let error = result.unwrap_err();
@@ -3616,6 +3861,8 @@ mod tests {
                     &model,
                     &["document body"],
                     &Arc::new(AtomicBool::new(true)),
+                    None,
+                    &[],
                 );
                 assert_eq!(count, 1);
                 let error = result.unwrap_err();
@@ -3640,6 +3887,8 @@ mod tests {
                 &model,
                 &["document body"],
                 &Arc::new(AtomicBool::new(true)),
+                None,
+                &[],
             );
             assert_eq!(count, 1);
             let error = result.unwrap_err();
@@ -3659,8 +3908,13 @@ mod tests {
             let (base, server) = api_fixture(vec![(200, "0", body)]);
             let model =
                 api_fixture_model(&base, Some(2), std::time::Duration::from_secs(2)).unwrap();
-            let (count, result) =
-                Embedder::embed_next_batch(&model, &["body"; 33], &Arc::new(AtomicBool::new(true)));
+            let (count, result) = Embedder::embed_next_batch(
+                &model,
+                &["body"; 33],
+                &Arc::new(AtomicBool::new(true)),
+                None,
+                &[],
+            );
             assert_eq!(count, 32);
             assert_eq!(result.unwrap(), vec![vec![1.0, 0.0]; 32]);
             assert_eq!(
@@ -3673,6 +3927,8 @@ mod tests {
                 &model,
                 &[oversized.as_str()],
                 &Arc::new(AtomicBool::new(true)),
+                None,
+                &[],
             );
             assert_eq!(count, 1);
             assert!(matches!(
@@ -4003,6 +4259,7 @@ mod tests {
                     .send(ApiEmbeddingRequest {
                         texts: vec!["in flight".into()],
                         owner_live: None,
+                        authorization: None,
                         retry_deadline: None,
                         response,
                     })
@@ -4016,11 +4273,31 @@ mod tests {
                 .try_send(ApiEmbeddingRequest {
                     texts: vec!["private queued document".into()],
                     owner_live: Some(Arc::clone(&live)),
+                    authorization: None,
                     retry_deadline: None,
                     response,
                 })
                 .expect("request must be waiting behind the held workers");
+            let authorized = Arc::new(AtomicBool::new(true));
+            let check = Arc::clone(&authorized);
+            let authority = EmbeddingAuthorization::new(move |_| {
+                if !check.load(AtomicOrdering::Acquire) {
+                    return Err(VaultError::Embedding("authorization withdrawn".into()));
+                }
+                Ok(Box::new(()))
+            });
+            let (fresh_response, fresh_outcome) = mpsc::channel();
+            sender
+                .try_send(ApiEmbeddingRequest {
+                    texts: vec!["private queued authorization".into()],
+                    owner_live: Some(Arc::new(AtomicBool::new(true))),
+                    authorization: Some(authority.clone()),
+                    retry_deadline: None,
+                    response: fresh_response,
+                })
+                .expect("fresh authorization request must wait in the queue");
             live.store(false, AtomicOrdering::Release);
+            authorized.store(false, AtomicOrdering::Release);
             release.send(()).unwrap();
             for response in in_flight {
                 assert_eq!(
@@ -4036,6 +4313,14 @@ mod tests {
                     .to_string()
                     .contains("scope retired")
             );
+            assert!(
+                fresh_outcome
+                    .recv_timeout(deadline)
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("authorization withdrawn")
+            );
             let listener = fixture.join().unwrap();
             listener.set_nonblocking(true).unwrap();
             assert_eq!(
@@ -4047,9 +4332,17 @@ mod tests {
             // transport to take its body. Its first byte has the same boundary.
             let mut body = ScopedRequestBody {
                 bytes: std::io::Cursor::new(b"private".to_vec()),
-                live,
+                live: Some(live),
+                authorization: None,
             };
             let mut received = Vec::new();
+            assert!(body.read_to_end(&mut received).is_err());
+            assert!(received.is_empty());
+            let mut body = ScopedRequestBody {
+                bytes: std::io::Cursor::new(b"private".to_vec()),
+                live: Some(Arc::new(AtomicBool::new(true))),
+                authorization: Some(authority),
+            };
             assert!(body.read_to_end(&mut received).is_err());
             assert!(received.is_empty());
         }
@@ -4125,7 +4418,7 @@ mod tests {
                 Duration::from_millis(50),
             )
             .unwrap();
-            let error = probe_api_dimension(&short_client).unwrap_err();
+            let error = probe_api_dimension(&short_client, None).unwrap_err();
             assert!(error.to_string().contains("request timed out"));
 
             let patient_client = ApiEmbeddingClient::start(

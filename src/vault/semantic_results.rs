@@ -167,6 +167,53 @@ async fn render_source(
     .map_err(|error| VaultError::Other(format!("semantic source rendering task failed: {error}")))
 }
 
+/// Render authenticated context through the same source boundary as explicit
+/// note reads. Raw storage batches must not bypass physical-path or hard-link
+/// admission, and authorization errors must not become readable hit metadata.
+pub(crate) async fn render_many_authorized(
+    vault: &super::Vault,
+    hits: Vec<RankedNote>,
+    query: &str,
+    include_content: bool,
+) -> VaultResult<Vec<SemanticNoteResult>> {
+    use futures_util::TryStreamExt;
+
+    futures_util::stream::iter(hits.into_iter().map(|hit| async move {
+        let snapshot = vault.read_source_snapshot(&hit.path).await;
+        match snapshot {
+            Err(error @ (VaultError::AccessDenied { .. } | VaultError::Authorization(_))) => {
+                Err(error)
+            }
+            snapshot => {
+                let query = query.to_owned();
+                tokio::task::spawn_blocking(move || {
+                    let mut result = render_snapshot(snapshot, hit, &query, include_content);
+                    if let Some(error) = &mut result.context_error {
+                        error.message = match error.code.as_str() {
+                            "source_changed" => {
+                                "The note changed after this semantic observation was indexed."
+                            }
+                            "source_unavailable" => {
+                                "The note is unavailable at its indexed revision."
+                            }
+                            _ => "The indexed source context requires reconciliation.",
+                        }
+                        .to_owned();
+                    }
+                    result
+                })
+                .await
+                .map_err(|error| {
+                    VaultError::Other(format!("semantic source rendering task failed: {error}"))
+                })
+            }
+        }
+    }))
+    .buffered(CONCURRENT_SOURCE_READS)
+    .try_collect()
+    .await
+}
+
 const CONCURRENT_SOURCE_READS: usize = 4;
 const CONTEXT_DEADLINE_ERROR: &str = "semantic source context deadline exceeded";
 

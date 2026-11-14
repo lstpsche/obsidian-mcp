@@ -1,3 +1,6 @@
+mod access_cli;
+mod access_http;
+mod access_startup;
 mod http_process;
 mod memory_http;
 
@@ -8,6 +11,7 @@ use std::sync::Arc;
 
 use rmcp::ServiceExt;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
 
 use obsidian_mcp::client::semantic_daemon::{DaemonConnectPolicy, SemanticDaemonClient};
 use obsidian_mcp::config::{
@@ -37,8 +41,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(code);
     }
 
-    let cli = parse_cli_args(std::env::args_os().skip(1))?;
-    let config = Config::load(&cli)?;
+    let (args, access_options) = access_startup::AccessOptions::parse(std::env::args_os().skip(1))?;
+    let cli = parse_cli_args(args.into_iter())?;
+    let mut config = Config::load(&cli)?;
     let private_memory = std::env::var_os("OBSIDIAN_MEMORY_AUTHORIZER_URL").is_some()
         || std::env::var_os("OBSIDIAN_MEMORY_KEY_FILE").is_some();
     if private_memory && matches!(config.transport, Transport::Stdio) {
@@ -48,15 +53,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("private memory authorization requires a local vault source".into());
     }
     let mut semantic_runtime_config = SemanticRuntimeConfig::load_from_env();
+    let access = access_options.configure(&mut config, &mut semantic_runtime_config)?;
     if private_memory && semantic_runtime_config.mode != SemanticMode::Local {
         return Err("private memory authorization requires OBSIDIAN_SEMANTIC_MODE=local".into());
     }
     select_source_semantic_mode(&config, &mut semantic_runtime_config)?;
+    let memory_authorizer = memory_http::Authorizer::from_env()?;
+    if memory_authorizer.is_some() && !config.http_host.is_loopback() {
+        return Err("private memory HTTP reader must bind to loopback".into());
+    }
 
-    tracing_subscriber::fmt()
+    let subscriber = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(&config.log_level))
         .with_writer(std::io::stderr)
-        .init();
+        .finish();
+    if access.is_some() {
+        // Transport dependencies trace complete protocol messages and headers.
+        // Even an explicit trace filter must not log delegated note contents.
+        subscriber
+            .with(tracing_subscriber::filter::filter_fn(|metadata| {
+                let target = metadata.target();
+                // RMCP also logs complete notifications at INFO, including
+                // caller-provided cancellation reasons. Our boundaries report
+                // finite protocol/operation diagnostics instead.
+                if target == "rmcp" || target.starts_with("rmcp::") {
+                    return false;
+                }
+                target.starts_with("obsidian_mcp") || *metadata.level() <= tracing::Level::INFO
+            }))
+            .init();
+    } else {
+        subscriber.init();
+    }
 
     tracing::info!(
         vault = %config.vault_path.display(),
@@ -71,7 +99,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "semantic runtime configured"
     );
 
-    let vault = if semantic_runtime.uses_local_backend() {
+    let vault = if access.is_some() {
+        Vault::open_authenticated(&config).await?
+    } else if semantic_runtime.uses_local_backend() {
         Vault::open(&config).await?
     } else {
         Vault::open_deferred_embeddings(&config).await?
@@ -80,6 +110,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match config.transport {
         Transport::Stdio => {
+            let vault = match access.as_ref().and_then(|access| access.client.clone()) {
+                Some(client) => {
+                    tokio::task::spawn_blocking(move || vault.with_access(client)).await??
+                }
+                None => vault,
+            };
             let server =
                 ObsidianMcp::new(vault, config.hybrid_alpha, semantic_runtime, disabled_tools)
                     .serve(rmcp::transport::io::stdio())
@@ -93,6 +129,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 semantic_runtime,
                 disabled_tools,
                 &config,
+                access.map(|access| access.store),
+                memory_authorizer,
             )
             .await?;
         }
@@ -107,6 +145,8 @@ async fn serve_http(
     semantic_runtime: SemanticRuntime,
     server_disabled: HashSet<String>,
     config: &Config,
+    access_store: Option<obsidian_mcp::access::store::AccessStore>,
+    memory_authorizer: Option<memory_http::Authorizer>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use axum::{Router, middleware, routing::get};
     use rmcp::transport::StreamableHttpServerConfig;
@@ -117,13 +157,14 @@ async fn serve_http(
     let mut mcp_config = StreamableHttpServerConfig::default();
     mcp_config.legacy_session_mode = true;
     mcp_config.json_response = true;
-
-    let memory_authorizer = memory_http::Authorizer::from_env()?;
-    let memory_required = memory_authorizer.is_some();
-    if memory_required && !config.http_host.is_loopback() {
-        return Err("private memory HTTP reader must bind to loopback".into());
+    if access_store.is_some() {
+        mcp_config = mcp_config.enforce_origin_validation();
     }
+
+    let memory_required = memory_authorizer.is_some();
     let health_vault = vault.clone();
+    let access_required = access_store.is_some();
+    let sessions = Arc::new(LocalSessionManager::default());
     let mcp_service: StreamableHttpService<ObsidianMcp, LocalSessionManager> =
         StreamableHttpService::new(
             move || {
@@ -162,7 +203,7 @@ async fn serve_http(
                     disabled,
                 ))
             },
-            Arc::new(LocalSessionManager::default()),
+            Arc::clone(&sessions),
             mcp_config,
         );
 
@@ -177,16 +218,46 @@ async fn serve_http(
     } else {
         mcp_router
     };
+    let authorizer = access_store.map(|store| access_http::Authorizer::new(store, sessions));
+    let _session_reaper = authorizer
+        .as_ref()
+        .map(access_http::Authorizer::start_reaper);
+    let mcp_router = if let Some(authorizer) = authorizer {
+        mcp_router.layer(middleware::from_fn_with_state(
+            authorizer,
+            access_http::middleware,
+        ))
+    } else {
+        mcp_router
+    };
 
     let app = Router::new()
         .route(
             "/health",
-            get(move || health_handler(health_vault.clone(), memory_required)),
+            get(move || {
+                let vault = health_vault.clone();
+                async move {
+                    if access_required {
+                        axum::Json(serde_json::json!({
+                            "status": "ok",
+                            "server": env!("CARGO_PKG_NAME"),
+                            "version": env!("CARGO_PKG_VERSION"),
+                            "authorization_required": true,
+                        }))
+                    } else {
+                        health_handler(vault, memory_required).await
+                    }
+                }
+            }),
         )
         .merge(mcp_router);
 
     let addr = std::net::SocketAddr::new(config.http_host, config.http_port);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = if access_required {
+        http_process::bind_available_tcp(addr)?.listen(128)?
+    } else {
+        tokio::net::TcpListener::bind(addr).await?
+    };
     let addr = listener.local_addr()?;
     tracing::info!(%addr, "HTTP MCP server listening");
 
@@ -203,15 +274,36 @@ async fn tool_filter_middleware(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
+    let authenticated = request
+        .extensions()
+        .get::<obsidian_mcp::access::store::AuthorizedClient>()
+        .is_some();
     let disabled = match request.headers().get("X-Obsidian-Tools") {
         Some(header) => {
             let filter = header
                 .to_str()
                 .map_err(|error| format!("Invalid X-Obsidian-Tools encoding: {error}"))
-                .and_then(ToolFilter::parse);
+                .and_then(|raw| {
+                    if authenticated {
+                        ToolFilter::parse_authenticated(raw)
+                    } else {
+                        ToolFilter::parse(raw)
+                    }
+                });
             match filter {
                 Ok(filter) => filter.disabled_tools(),
                 Err(error) => {
+                    if authenticated {
+                        tracing::warn!(
+                            category = "invalid_tools_filter",
+                            "rejected client tool filter"
+                        );
+                        return (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            "Invalid X-Obsidian-Tools filter",
+                        )
+                            .into_response();
+                    }
                     tracing::warn!(%error, "rejected invalid X-Obsidian-Tools header");
                     return (axum::http::StatusCode::BAD_REQUEST, error).into_response();
                 }
@@ -479,6 +571,7 @@ async fn handle_cli_flags() -> Option<i32> {
             Some(0)
         }
         "upgrade" => Some(run_upgrade_command().await),
+        "access" => Some(access_cli::run(std::env::args_os().skip(2).collect()).await),
         #[cfg(windows)]
         "__apply-upgrade" => Some(run_windows_upgrade_helper().await),
         "serve" | "stop" | "restart" => {
@@ -516,7 +609,8 @@ fn print_help() {
              {name} serve [OPTIONS] [VAULT_PATH]    Start HTTP server in background\n    \
              {name} stop [--host ADDR] [--port PORT]              Stop a running HTTP server\n    \
              {name} restart [OPTIONS] [VAULT_PATH]  Restart HTTP server (stop + serve)\n    \
-             {name} upgrade [--dry-run]             Safely upgrade Cargo-installed binaries\n\
+             {name} upgrade [--dry-run]             Safely upgrade Cargo-installed binaries\n    \
+             {name} access setup VAULT_PATH         Set up optional authenticated clients\n\
          \n\
          The 'serve' and 'restart' commands daemonize and log to a platform-specific file:\n    \
              macOS:   ~/Library/Logs/obsidian-mcp.log\n    \
@@ -532,7 +626,9 @@ fn print_help() {
              -v, --version        Print version\n    \
              --http               Use Streamable HTTP transport instead of stdio\n    \
              --port <PORT>        HTTP listen port                  [default: 37842]\n    \
-             --host <ADDR>        HTTP bind address                 [default: 127.0.0.1]\n\
+             --host <ADDR>        HTTP bind address                 [default: 127.0.0.1]\n    \
+             --access-file <PATH> Explicitly enable authenticated client access\n    \
+             --access-token-file <PATH> Protected credential for restricted stdio\n\
          \n\
          ENVIRONMENT VARIABLES:\n    \
              OBSIDIAN_VAULT_PATH     Vault root (required if not passed as argument)\n    \
@@ -555,6 +651,8 @@ fn print_help() {
              OBSIDIAN_EMBEDDING_DIM  Override embedding dimension   [default: probed from API]\n    \
              OBSIDIAN_EMBEDDING_CA_CERT   PEM CA cert path for API TLS\n    \
              OBSIDIAN_EMBEDDING_TLS_VERIFY  Verify API TLS certs    [default: true]\n    \
+             OBSIDIAN_ACCESS_FILE    Protected policy; unset preserves ordinary access\n    \
+             OBSIDIAN_ACCESS_TOKEN_FILE  Protected credential for restricted stdio\n    \
              OBSIDIAN_TOOLS          Tool filter: profile (full/core/read/minimal),\n    \
                                      comma-separated allow-list, or !-prefixed deny-list\n    \
              OBSIDIAN_MCP_DATA       Local directory for machine data\n    \
@@ -741,7 +839,8 @@ async fn run_windows_upgrade_helper() -> i32 {
 
 /// Resolve the HTTP bind endpoint without requiring a vault path.
 fn resolve_endpoint_from_args() -> Result<std::net::SocketAddr, Box<dyn std::error::Error>> {
-    let cli = parse_cli_args(std::env::args_os().skip(2))?;
+    let (args, _) = access_startup::AccessOptions::parse(std::env::args_os().skip(2))?;
+    let cli = parse_cli_args(args.into_iter())?;
     obsidian_mcp::config::resolve_http_endpoint(&cli).map_err(Into::into)
 }
 

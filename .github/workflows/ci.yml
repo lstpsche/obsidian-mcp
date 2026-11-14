@@ -135,8 +135,8 @@ jobs:
             exit 1
           fi
 
-      - name: API library, chunking, daemon, SFTP and MCP contracts
-        run: cargo test --locked --no-default-features --features embeddings-api --lib --test automatic_chunking_tests --test semantic_daemon_api_tests --test integration_tests --test mcp_transport_tests --test sftp_mcp_tests
+      - name: API library, client access, chunking, daemon, SFTP and MCP contracts
+        run: cargo test --locked --no-default-features --features embeddings-api --lib --test access_cli_tests --test access_control_tests --test memory_scope_tests --test automatic_chunking_tests --test semantic_daemon_api_tests --test integration_tests --test mcp_transport_tests --test sftp_mcp_tests
 
       - name: Native SSH authentication and host-key checks
         env:
@@ -210,7 +210,7 @@ jobs:
       - name: Daemon integration tests
         run: cargo test --features embeddings --test daemon_integration_tests
 
-      - name: Local embedding chunking and retrieval
+      - name: Local embeddings and client access
         env:
           OBSIDIAN_EMBEDDING_PROVIDER: local
-        run: cargo test --locked --features embeddings --test automatic_chunking_tests
+        run: cargo test --locked --features embeddings --test access_cli_tests --test access_control_tests --test memory_scope_tests --test automatic_chunking_tests

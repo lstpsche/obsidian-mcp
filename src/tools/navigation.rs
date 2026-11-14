@@ -121,10 +121,15 @@ async fn vault_list_flat(
         .collect();
 
     let entries = if params.include_metadata.unwrap_or(false) {
-        // Indexed metadata must not look absent while the first catalog is unknown.
-        vault.vault_stats()?;
-        let metadata =
-            vault.get_indexed_note_metadata_batch(paths.iter().map(|path| Path::new(*path)));
+        let indexed_paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+        let metadata = vault
+            .catalog_work(move |vault| {
+                // Indexed metadata must not look absent while the catalog is unknown.
+                vault.vault_stats()?;
+                Ok(vault
+                    .get_indexed_note_metadata_batch(indexed_paths.iter().map(PathBuf::as_path)))
+            })
+            .await?;
         let entries = paths
             .into_iter()
             .zip(metadata)

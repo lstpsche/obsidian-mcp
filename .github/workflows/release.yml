@@ -6,11 +6,21 @@ on:
   pull_request:
     paths:
       - ".github/workflows/release.yml"
+      - "tests/access_cli_tests.rs"
+      - "tests/access_control_tests.rs"
       - "tests/semantic_daemon_api_tests.rs"
       - "tests/sftp_mcp_tests.rs"
       - "tests/sftp_integration_tests.rs"
       - "tests/common/**"
       - "src/config/source.rs"
+      - "src/access.rs"
+      - "src/access/**"
+      - "src/access_cli.rs"
+      - "src/access_http.rs"
+      - "src/access_startup.rs"
+      - "src/vault/access_source.rs"
+      - "src/vault/authenticated_semantic.rs"
+      - "src/vault/authorized_index.rs"
       - "src/vault/storage/**"
 
 permissions:
@@ -114,7 +124,7 @@ jobs:
             tar -xzf obsidian-semanticd-"${ARCHIVE_REF#v}"-${{ matrix.target }}.tar.gz -C daemon-smoke
             tar -xzf obsidian-mcp-"${ARCHIVE_REF#v}"-${{ matrix.target }}.tar.gz -C daemon-smoke
           fi
-          OBSIDIAN_TEST_DAEMON_BINARY="$PWD/daemon-smoke/obsidian-semanticd$daemon_suffix" OBSIDIAN_TEST_MCP_BINARY="$PWD/daemon-smoke/obsidian-mcp$daemon_suffix" cargo test --locked --release --features "${{ matrix.features }}" --target ${{ matrix.target }} --test semantic_daemon_api_tests --test sftp_mcp_tests
+          OBSIDIAN_TEST_DAEMON_BINARY="$PWD/daemon-smoke/obsidian-semanticd$daemon_suffix" OBSIDIAN_TEST_MCP_BINARY="$PWD/daemon-smoke/obsidian-mcp$daemon_suffix" cargo test --locked --release --features "${{ matrix.features }}" --target ${{ matrix.target }} --test access_cli_tests --test access_control_tests --test semantic_daemon_api_tests --test sftp_mcp_tests
 
       - name: Verify native SSH authentication against archive
         shell: bash

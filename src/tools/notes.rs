@@ -462,7 +462,9 @@ fn record_file_error(
     skipped_count: &mut usize,
 ) -> Result<(), ErrorData> {
     let reason = match error {
-        VaultError::NoteNotFound(_) => NoteReadManySkipReason::NotFound,
+        VaultError::NoteNotFound(_) | VaultError::AccessDenied { .. } => {
+            NoteReadManySkipReason::NotFound
+        }
         VaultError::Io(_) => NoteReadManySkipReason::Unreadable,
         VaultError::Storage {
             kind: StorageErrorKind::InvalidSource,

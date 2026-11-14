@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, BoostQuery, Occur, QueryParser, TermQuery};
@@ -175,6 +175,37 @@ impl TantivyIndex {
             }
         }
         builder.finish()
+    }
+
+    /// Replace a complete admitted corpus without reopening source paths. Used
+    /// for first publication and recovery after a failed derived-state update.
+    pub(crate) fn replace_all_documents(
+        &self,
+        notes: &HashMap<OsString, NoteMetadata>,
+        contents: &HashMap<OsString, Arc<str>>,
+    ) -> VaultResult<()> {
+        if notes.keys().any(|path| !contents.contains_key(path)) {
+            return Err(VaultError::Other(
+                "lexical corpus is missing source content".into(),
+            ));
+        }
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|e| VaultError::Other(format!("tantivy writer lock poisoned: {e}")))?;
+        writer.delete_all_documents()?;
+        let mut paths = notes.keys().collect::<Vec<_>>();
+        paths.sort_unstable();
+        for path in paths {
+            writer.add_document(build_document(
+                &self.ts,
+                Path::new(path),
+                &notes[path],
+                &contents[path],
+            ))?;
+        }
+        drop(writer);
+        self.flush()
     }
 
     /// Re-index a single file after create or modify (commits immediately).
