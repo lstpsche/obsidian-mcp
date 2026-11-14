@@ -517,10 +517,6 @@ impl AuthenticatedSemanticRegistry {
                 sweep: Mutex::new(CacheSweep::default()),
             });
         }
-        if let Some(cleanup) = self.cleanup.get() {
-            cleanup.request_sweep();
-        }
-        self.cleanup_obsolete_caches();
         let relative = profile_directory
             .join(cache_key(vault, client))
             .join("embeddings.bin");
@@ -585,6 +581,12 @@ impl AuthenticatedSemanticRegistry {
             .map_err(|_| authorization_error("semantic runtime was initialized twice"))?;
         entries.insert(key, Arc::clone(&entry));
         drop(entries);
+        // Directory and policy I/O can wait independently of registration,
+        // retirement and passive status lookups for every readable policy.
+        if let Some(cleanup) = self.cleanup.get() {
+            cleanup.request_sweep();
+        }
+        self.cleanup_obsolete_caches();
         entry.reconcile(true)?;
         self.notify.notify_one();
         Ok(Some(runtime))
@@ -838,6 +840,13 @@ mod tests {
     async fn reader_fixture(
         embeddings: bool,
     ) -> (tempfile::TempDir, AccessStore, Vault, AuthorizedClient) {
+        reader_fixture_with_lexical(embeddings, false).await
+    }
+
+    async fn reader_fixture_with_lexical(
+        embeddings: bool,
+        tantivy: bool,
+    ) -> (tempfile::TempDir, AccessStore, Vault, AuthorizedClient) {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("vault");
         std::fs::create_dir(&root).unwrap();
@@ -869,6 +878,7 @@ mod tests {
         let mut config = crate::test_helpers::test_config(&root);
         config.mcp_data_dir = Some(data);
         config.embeddings = embeddings;
+        config.tantivy = tantivy;
         let vault = Vault::open_authenticated(&config)
             .await
             .unwrap()
@@ -912,6 +922,123 @@ mod tests {
         assert!(
             result.is_err(),
             "registry failure must not become absent semantic status"
+        );
+    }
+
+    #[tokio::test]
+    async fn activation_cache_sweep_does_not_hold_the_semantic_registry_lock() {
+        let (_directory, store, vault, client) = reader_fixture(true).await;
+        let registry = install_registry(&vault, Arc::new(CapturingEmbedder::new()));
+        let exclusions = vault.exclude().scope_id(vault.root());
+        let directory =
+            PathBuf::from("embeddings/access-v1").join(profile_cache_key(&store, &exclusions));
+        let obsolete = "a".repeat(64);
+        assert_ne!(obsolete, cache_key(&vault, &client));
+        let root = VaultRoot::open(vault.resolved_mcp_data().unwrap()).unwrap();
+        let checkpoint = directory.join(&obsolete).join("embeddings.bin");
+        root.create_file(&checkpoint, "obsolete checkpoint marker")
+            .unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let cursor = std::iter::once_with(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            Ok((OsString::from(obsolete), true))
+        });
+        assert!(
+            registry
+                .cleanup
+                .set(CacheCleanup {
+                    root: root.clone(),
+                    directory,
+                    store,
+                    source: client.source().clone(),
+                    exclusions,
+                    diagnostic_id: "held-cache-sweep".into(),
+                    sweep: Mutex::new(CacheSweep {
+                        cursor: Some(Box::new(cursor)),
+                        requested: false,
+                    }),
+                })
+                .is_ok()
+        );
+        let activation_registry = Arc::clone(&registry);
+        let activation_vault = vault.clone();
+        let activation = tokio::task::spawn_blocking(move || {
+            activation_registry.runtime(&activation_vault, true)
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let registry_available = registry.entries.try_lock().is_ok();
+        release_tx.send(()).unwrap();
+        let runtime = activation.await.unwrap().unwrap();
+        assert!(runtime.is_some());
+        assert!(
+            registry_available,
+            "cache I/O must not hold semantic registration or passive lookup behind the map lock"
+        );
+        assert!(
+            root.read_file(&checkpoint).is_err(),
+            "first activation must finish its bounded obsolete-checkpoint sweep"
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_projection_publication_keeps_semantic_admission_available() {
+        let (_directory, _store, vault, client) = reader_fixture_with_lexical(true, true).await;
+        let path = Path::new("one.md");
+        std::fs::write(vault.root().join(path), "# One\noriginalmarker").unwrap();
+        vault.reindex(path).await.unwrap();
+        let registry = install_registry(&vault, Arc::new(CapturingEmbedder::new()));
+        let runtime = registry.runtime(&vault, true).unwrap().unwrap();
+        wait_for_runtime(&runtime, |status| status.phase == EmbeddingPhase::Ready).await;
+        let entry = registry.entries.lock().unwrap()[client.read_policy_key()].clone();
+        let projection = Arc::clone(&entry.projection);
+        let index_guard = projection.index.read().unwrap();
+        std::fs::write(vault.root().join(path), "# One\nincrementalmarker").unwrap();
+        vault.reindex_source_local(path).unwrap();
+        let source = Arc::clone(&vault.inner);
+        let policy = client.policy().clone();
+        let root = vault.authenticated_root().unwrap();
+        let worker = std::thread::spawn(move || {
+            source
+                .authorized_indices
+                .project(&source.index, &policy, true, |path| {
+                    root.read_exact_bounded(path, source::MAX_SOURCE_BYTES)
+                })
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let published_lexical = loop {
+            if projection
+                .tantivy
+                .as_ref()
+                .unwrap()
+                .search("incrementalmarker", 5)
+                .unwrap()
+                .iter()
+                .any(|(hit, _)| hit == path)
+            {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        // Tantivy has committed the update, but the metadata write remains
+        // blocked. Existing readable-corpus authority must still admit work.
+        let admitted = entry.admit(None).is_ok();
+        drop(index_guard);
+        worker.join().unwrap().unwrap();
+        assert!(
+            published_lexical,
+            "fixture must reach incremental publication"
+        );
+        assert!(
+            admitted,
+            "successful incremental publication must not withdraw semantic admission"
         );
     }
 
@@ -1026,6 +1153,167 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn warm_semantic_queries_reconcile_a_newly_ineligible_exact_source() {
+        let variants: &[bool] = if cfg!(unix) { &[false, true] } else { &[false] };
+        for denied_alias in variants {
+            let (directory, store, vault, _) = reader_fixture(true).await;
+            store
+                .update(None, |policy| {
+                    policy.clients.get_mut("reader").unwrap().denies =
+                        vec![crate::access::clients::Deny::directory(
+                            "private", "Private/",
+                        )];
+                    Ok(())
+                })
+                .unwrap();
+            let token = crate::access::store::read_token_file(
+                &directory.path().join("private/reader.token"),
+            )
+            .unwrap();
+            let vault = vault
+                .with_access(store.authenticate(token.as_str()).unwrap())
+                .unwrap();
+            let unsafe_path = Path::new("a-unsafe.md");
+            let safe_path = Path::new("b-allowed.md");
+            std::fs::write(
+                vault.root().join(unsafe_path),
+                "# Before\nformerly readable source",
+            )
+            .unwrap();
+            std::fs::write(
+                vault.root().join(safe_path),
+                "# Allowed\nremaining readable source",
+            )
+            .unwrap();
+            vault.reindex(unsafe_path).await.unwrap();
+            vault.reindex(safe_path).await.unwrap();
+            let model = Arc::new(CapturingEmbedder::new());
+            let registry = install_registry(&vault, Arc::clone(&model));
+            let owner = registry.runtime(&vault, true).unwrap().unwrap();
+            wait_for_runtime(&owner, |status| status.phase == EmbeddingPhase::Ready).await;
+            let runtime = crate::tools::SemanticRuntime {
+                mode: crate::config::SemanticMode::Local,
+                daemon_client: None,
+                pending_daemon_bootstrap: None,
+                daemon_unavailable_reason: None,
+                prefetch_count: 50,
+                attachments: Arc::default(),
+                local_fallback_active: Arc::default(),
+                daemon_health_pending: Arc::default(),
+            };
+            let query = "semantic eligibility probe";
+            let search = || {
+                crate::tools::search::search_semantic(
+                    &vault,
+                    crate::tools::search::SearchSemanticParams {
+                        query: query.into(),
+                        top_k: Some(10),
+                        include_content: Some(true),
+                        ..Default::default()
+                    },
+                    0.25,
+                    &runtime,
+                )
+            };
+            let initial = search().await.unwrap();
+            assert_eq!(
+                initial.structured_content.unwrap()["results"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+            let before = vault.inner.index.read().unwrap().generation();
+            let calls = || {
+                model
+                    .inputs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|input| input.as_str() == query)
+                    .count()
+            };
+            let before_calls = calls();
+            if *denied_alias {
+                #[cfg(unix)]
+                {
+                    std::fs::create_dir(vault.root().join("Private")).unwrap();
+                    std::fs::write(
+                        vault.root().join("Private/hidden.md"),
+                        "private replacement marker",
+                    )
+                    .unwrap();
+                    std::fs::remove_file(vault.root().join(unsafe_path)).unwrap();
+                    std::os::unix::fs::symlink("Private/hidden.md", vault.root().join(unsafe_path))
+                        .unwrap();
+                }
+            } else {
+                std::fs::hard_link(
+                    vault.root().join(unsafe_path),
+                    directory.path().join("shadow.md"),
+                )
+                .unwrap();
+            }
+            let revision = source::source_revision("# Before\nformerly readable source");
+            let page = crate::tools::notes::note_read(
+                &vault,
+                crate::tools::notes::NoteReadParams {
+                    path: "a-unsafe.md".into(),
+                    expected_revision: Some(revision.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+            let headings = crate::tools::metadata::note_inspect(
+                &vault,
+                crate::tools::metadata::NoteInspectParams {
+                    path: "a-unsafe.md".into(),
+                    fields: Some(vec!["headings".into()]),
+                    expected_revision: Some(revision),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+            for denied in [page, headings] {
+                assert_eq!(denied.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND);
+                assert!(denied.data.is_none());
+            }
+            assert_eq!(vault.inner.index.read().unwrap().generation(), before);
+            assert!(vault.read_index().get_note(unsafe_path).is_some());
+            let first = search().await;
+            let second = search().await;
+            assert_eq!(
+                calls() - before_calls,
+                2,
+                "each explicit query performs one inference without an automatic replay"
+            );
+            let code = first
+                .as_ref()
+                .err()
+                .and_then(|error| error.data.as_ref())
+                .and_then(|data| data["code"].as_str());
+            assert_eq!(
+                code,
+                Some("semantic_warming"),
+                "first={first:?}; second={second:?}; generation before={before}, after={}",
+                vault.inner.index.read().unwrap().generation()
+            );
+            let second = second.unwrap();
+            let results = &second.structured_content.as_ref().unwrap()["results"];
+            assert_eq!(results.as_array().unwrap().len(), 1);
+            assert_eq!(results[0]["path"], "b-allowed.md");
+            assert!(
+                !serde_json::to_string(&second)
+                    .unwrap()
+                    .contains("private replacement marker")
+            );
+            assert!(vault.inner.index.read().unwrap().generation() > before);
+        }
     }
 
     #[tokio::test]

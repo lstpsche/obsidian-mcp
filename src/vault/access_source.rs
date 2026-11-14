@@ -172,17 +172,103 @@ impl Vault {
         // Reconcile that exact admitted key in the shared owner, then require
         // one complete current projection. Further races and other errors remain
         // visible; no previous or partial catalog is returned as a substitute.
-        client.check(Action::Read, &path, &path)?;
-        self.reindex_source_local(&path)?;
-        client.current()?;
-        #[cfg(has_embeddings)]
-        self.notify_authenticated_semantics();
+        self.reconcile_access_source(&path)?;
         self.inner.authorized_indices.project(
             &self.inner.index,
             client.policy(),
             config.tantivy,
             |path| self.read_access_native(path, None),
         )
+    }
+
+    fn reconcile_access_source(&self, path: &Path) -> VaultResult<()> {
+        let client = self.require_access()?;
+        client.check(Action::Read, path, path)?;
+        self.reindex_source_local(path)?;
+        client.current()?;
+        #[cfg(has_embeddings)]
+        self.notify_authenticated_semantics();
+        Ok(())
+    }
+
+    pub(crate) async fn search_with_reconciliation<T, F, Fut>(
+        &self,
+        mut search: F,
+    ) -> VaultResult<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = VaultResult<T>>,
+    {
+        let result = search().await;
+        if !self.is_authenticated() {
+            return result;
+        }
+        let path = match &result {
+            Err(VaultError::SourceChanged { path, .. })
+            | Err(VaultError::NoteNotFound(path))
+            | Err(VaultError::DirectoryNotFound(path))
+            | Err(VaultError::AccessDenied {
+                path,
+                visible: false,
+            }) => path.clone(),
+            _ => return result,
+        };
+        let vault = self.clone();
+        source_work(move || {
+            vault.reconcile_access_source(&path)?;
+            vault.refresh_authorized_projection()
+        })
+        .await?;
+        // Ranking and limits must use the complete repaired corpus. In
+        // particular, dropping a failed BM25 hit would retain its statistics.
+        search().await
+    }
+
+    pub(crate) fn read_access_indexed_native(&self, path: &Path) -> VaultResult<String> {
+        let expected = {
+            let index = self.read_index();
+            match index.source_revision(path) {
+                Some(revision) => revision.to_owned(),
+                None if index.get_note(path).is_none() => {
+                    return Err(VaultError::NoteNotFound(path.to_owned()));
+                }
+                None => {
+                    return Err(VaultError::Other(
+                        "authorized source revision requires reconciliation".into(),
+                    ));
+                }
+            }
+        };
+        self.read_access_revision_native(path, &expected)
+    }
+
+    pub(crate) fn read_access_revision_native(
+        &self,
+        path: &Path,
+        expected: &str,
+    ) -> VaultResult<String> {
+        let client = self.require_access()?;
+        client.check(Action::Read, path, path)?;
+        let content = self
+            .authenticated_root()?
+            .read_observed(path)
+            .map_err(|error| {
+                if super::fs::is_missing_entry(&error) {
+                    VaultError::NoteNotFound(path.to_owned())
+                } else {
+                    error
+                }
+            })?;
+        client.check(Action::Read, path, path)?;
+        let current = source::source_revision(&content);
+        if current != expected {
+            return Err(VaultError::SourceChanged {
+                path: path.to_owned(),
+                expected_revision: expected.to_owned(),
+                current_revision: current,
+            });
+        }
+        Ok(content)
     }
 
     pub(crate) fn refresh_authorized_projection(&self) -> VaultResult<()> {
@@ -263,8 +349,10 @@ impl Vault {
         Ok(content)
     }
 
-    /// Scored evidence may retain an unavailable source, but never a source
-    /// which resolves to a resource outside the current client's authority.
+    /// Admit only paths from server-ranked semantic evidence. Raw caller paths
+    /// use normal source reads, whose hidden-denial behavior is independent of
+    /// index history. Scored evidence may retain an unavailable source, but never
+    /// a resource outside the current client's authority.
     pub(crate) async fn check_access_result(&self, path: &Path) -> VaultResult<()> {
         let vault = self.clone();
         let path = path.to_owned();
@@ -272,19 +360,40 @@ impl Vault {
             let client = vault.require_access()?;
             client.check(Action::Read, &path, &path)?;
             let root = vault.authenticated_root()?;
-            match root.resolve_existing(&path) {
-                Ok(actual) => {
-                    client.check(Action::Read, &path, &actual.relative)?;
-                    if let Err(error @ VaultError::AccessDenied { .. }) =
-                        root.validate_access_file_exact(&actual.relative)
-                    {
-                        return Err(error);
+            let physical = (|| -> VaultResult<()> {
+                match root.resolve_existing(&path) {
+                    Ok(actual) => {
+                        client.check(Action::Read, &path, &actual.relative)?;
+                        if let Err(error @ VaultError::AccessDenied { .. }) =
+                            root.validate_access_file_exact(&actual.relative)
+                        {
+                            return Err(error);
+                        }
                     }
+                    Err(VaultError::Io(_)) => (),
+                    Err(error) if error.is_not_found() => (),
+                    Err(error) => return Err(error),
                 }
-                Err(VaultError::Io(_)) => (),
-                Err(error) if error.is_not_found() => (),
-                Err(error) => return Err(error),
+                Ok(())
+            })();
+            if matches!(
+                physical,
+                Err(VaultError::AccessDenied { visible: false, .. })
+            ) && vault.read_index().get_note(&path).is_some()
+            {
+                // The logical grant is current, but the exact ranked source is
+                // no longer eligible. Repair that observation and require fresh
+                // ranking; never replay provider inference inside this query.
+                vault.reconcile_access_source(&path)?;
+                vault.refresh_authorized_projection()?;
+                return Err(VaultError::storage(
+                    "search",
+                    "",
+                    crate::error::StorageErrorKind::Warming,
+                    "authorized semantic source was reconciled; submit a fresh query",
+                ));
             }
+            physical?;
             // Missing/unreadable/changed source is represented by the semantic
             // renderer's revision-bound context_error rather than mixed bytes.
             client.current()?;
@@ -690,6 +799,10 @@ mod tests {
     }
 
     async fn fixture(grants: Vec<Grant>, denies: Vec<Deny>) -> Fixture {
+        fixture_with_tantivy(grants, denies, false).await
+    }
+
+    async fn fixture_with_tantivy(grants: Vec<Grant>, denies: Vec<Deny>, tantivy: bool) -> Fixture {
         let temporary = tempfile::tempdir().unwrap();
         let parent = temporary.path().canonicalize().unwrap();
         let root = parent.join("vault");
@@ -726,6 +839,7 @@ mod tests {
         let client = store.authenticate(token.trim()).unwrap();
         let mut config = crate::test_helpers::test_config(&root);
         config.mcp_data_dir = Some(data);
+        config.tantivy = tantivy;
         let vault = Vault::open_authenticated(&config)
             .await
             .unwrap()
@@ -1166,6 +1280,266 @@ mod tests {
             ["indexed"]
         );
         assert!(!f.vault.projection.as_ref().unwrap().is_ready());
+    }
+
+    async fn lexical_tool_query(
+        vault: &Vault,
+        tantivy: bool,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        use crate::tools::search::{
+            SearchRegexParams, SearchTextParams, search_regex, search_text,
+        };
+        if tantivy {
+            search_text(
+                vault,
+                SearchTextParams {
+                    query: "quokka".into(),
+                    context_length: Some(0),
+                    max_results: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+        } else {
+            search_regex(
+                vault,
+                SearchRegexParams {
+                    pattern: "quokka".into(),
+                    context_length: Some(20),
+                    max_results: Some(1),
+                },
+            )
+            .await
+        }
+    }
+
+    async fn lexical_query_reconciles_external_change(tantivy: bool, change: &str) {
+        let f = fixture_with_tantivy(
+            vec![directory("Shared", Role::Editor)],
+            vec![deny_private()],
+            tantivy,
+        )
+        .await;
+        f.vault
+            .write_note(Path::new("Shared/note.md"), "quokka quokka quokka")
+            .await
+            .unwrap();
+        f.vault
+            .create_note(
+                Path::new("Shared/z.md"),
+                "quokka retained source with enough additional words to keep its term frequency lower than the other matching note",
+                None,
+            )
+            .await
+            .unwrap();
+        let generation = f.vault.inner.index.read().unwrap().generation();
+        match change {
+            "deleted" => std::fs::remove_file(f.root.join("Shared/note.md")).unwrap(),
+            "hardlink" => {
+                std::fs::hard_link(
+                    f.root.join("Shared/note.md"),
+                    f.root.join("Private/linked.md"),
+                )
+                .unwrap();
+            }
+            "alias" => {
+                #[cfg(unix)]
+                {
+                    std::fs::remove_file(f.root.join("Shared/note.md")).unwrap();
+                    std::os::unix::fs::symlink("../Private/note.md", f.root.join("Shared/note.md"))
+                        .unwrap();
+                }
+                #[cfg(not(unix))]
+                unreachable!("native alias fixture requires Unix");
+            }
+            "edited" => {
+                std::fs::write(f.root.join("Shared/note.md"), "replacement source").unwrap()
+            }
+            _ => unreachable!("unknown source change"),
+        }
+        let selected = f
+            .vault
+            .with_access(f.vault.access_client().unwrap().clone())
+            .unwrap();
+        assert_eq!(f.vault.inner.index.read().unwrap().generation(), generation);
+        let result = lexical_tool_query(&selected, tantivy)
+            .await
+            .expect("the complete query must reconcile its stale candidate");
+        let results = &result.structured_content.as_ref().unwrap()["results"];
+        assert_eq!(results.as_array().unwrap().len(), 1);
+        assert_eq!(results[0]["path"], "Shared/z.md");
+        assert!(f.vault.inner.index.read().unwrap().generation() > generation);
+        assert_eq!(
+            selected.vault_stats().unwrap().total_notes,
+            if change == "edited" { 2 } else { 1 }
+        );
+
+        let fresh = Vault::open_authenticated(f.vault.inner.authenticated_config.as_ref().unwrap())
+            .await
+            .unwrap()
+            .with_access(f.vault.access_client().unwrap().clone())
+            .unwrap();
+        let fresh_result = lexical_tool_query(&fresh, tantivy).await.unwrap();
+        assert_eq!(result.structured_content, fresh_result.structured_content);
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("Private/note.md")).unwrap(),
+            "private source"
+        );
+    }
+
+    #[tokio::test]
+    async fn bm25_query_repairs_a_deleted_candidate_before_ranking_again() {
+        lexical_query_reconciles_external_change(true, "deleted").await;
+    }
+
+    #[tokio::test]
+    async fn bm25_query_repairs_a_multilink_candidate_before_ranking_again() {
+        lexical_query_reconciles_external_change(true, "hardlink").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bm25_query_repairs_a_denied_alias_before_ranking_again() {
+        lexical_query_reconciles_external_change(true, "alias").await;
+    }
+
+    #[tokio::test]
+    async fn bm25_query_repairs_changed_source_before_ranking_again() {
+        lexical_query_reconciles_external_change(true, "edited").await;
+    }
+
+    #[tokio::test]
+    async fn regex_query_repairs_a_deleted_candidate_before_searching_again() {
+        lexical_query_reconciles_external_change(false, "deleted").await;
+    }
+
+    #[tokio::test]
+    async fn regex_query_repairs_a_multilink_candidate_before_searching_again() {
+        lexical_query_reconciles_external_change(false, "hardlink").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn regex_query_repairs_a_denied_alias_before_searching_again() {
+        lexical_query_reconciles_external_change(false, "alias").await;
+    }
+
+    #[tokio::test]
+    async fn regex_query_repairs_changed_source_before_searching_again() {
+        lexical_query_reconciles_external_change(false, "edited").await;
+    }
+
+    #[tokio::test]
+    async fn lexical_queries_preserve_source_io_and_current_authorization_failures() {
+        for tantivy in [false, true] {
+            let f = fixture_with_tantivy(vec![directory("Shared", Role::Editor)], vec![], tantivy)
+                .await;
+            f.vault
+                .write_note(Path::new("Shared/note.md"), "quokka")
+                .await
+                .unwrap();
+            let generation = f.vault.inner.index.read().unwrap().generation();
+            std::fs::write(f.root.join("Shared/note.md"), [0xff]).unwrap();
+            let error = lexical_tool_query(&f.vault, tantivy).await.unwrap_err();
+            assert_eq!(error.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+            assert_eq!(f.vault.inner.index.read().unwrap().generation(), generation);
+            assert!(
+                f.vault
+                    .inner
+                    .index
+                    .read()
+                    .unwrap()
+                    .get_note(Path::new("Shared/note.md"))
+                    .is_some()
+            );
+            f.store
+                .update(None, |policy| {
+                    policy.clients.get_mut("client").unwrap().enabled = false;
+                    Ok(())
+                })
+                .unwrap();
+            let error = lexical_tool_query(&f.vault, tantivy).await.unwrap_err();
+            assert_eq!(
+                error.data.as_ref().unwrap()["code"],
+                "authorization_unavailable"
+            );
+            assert_eq!(f.vault.inner.index.read().unwrap().generation(), generation);
+        }
+    }
+
+    #[tokio::test]
+    async fn lexical_source_reads_keep_the_captured_ranking_revision() {
+        let f = fixture(vec![directory("Shared", Role::Editor)], vec![]).await;
+        let path = Path::new("Shared/note.md");
+        let scored_revision = f
+            .vault
+            .read_index()
+            .source_revision(path)
+            .unwrap()
+            .to_owned();
+        f.vault
+            .write_note(path, "replacement source")
+            .await
+            .unwrap();
+        assert!(matches!(
+            f.vault.read_access_revision_native(path, &scored_revision),
+            Err(VaultError::SourceChanged { expected_revision, .. }) if expected_revision == scored_revision
+        ));
+        assert_eq!(
+            f.vault.read_access_indexed_native(path).unwrap(),
+            "replacement source"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_query_repair_is_bounded_and_does_not_return_partial_hits() {
+        for tantivy in [false, true] {
+            let f = fixture_with_tantivy(vec![directory("Shared", Role::Editor)], vec![], tantivy)
+                .await;
+            f.vault
+                .write_note(Path::new("Shared/note.md"), "quokka")
+                .await
+                .unwrap();
+            f.vault
+                .create_note(Path::new("Shared/other.md"), "quokka quokka", None)
+                .await
+                .unwrap();
+            f.vault
+                .create_note(
+                    Path::new("Shared/z.md"),
+                    "quokka with several other words",
+                    None,
+                )
+                .await
+                .unwrap();
+            for name in ["note.md", "other.md"] {
+                std::fs::hard_link(
+                    f.root.join("Shared").join(name),
+                    f.root.join("Private").join(format!("linked-{name}")),
+                )
+                .unwrap();
+            }
+            let error = lexical_tool_query(&f.vault, tantivy).await.unwrap_err();
+            assert_eq!(error.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND);
+            let still_indexed = ["Shared/note.md", "Shared/other.md"]
+                .iter()
+                .filter(|path| {
+                    f.vault
+                        .inner
+                        .index
+                        .read()
+                        .unwrap()
+                        .get_note(Path::new(path))
+                        .is_some()
+                })
+                .count();
+            assert_eq!(still_indexed, 1);
+            let result = lexical_tool_query(&f.vault, tantivy).await.unwrap();
+            let results = &result.structured_content.as_ref().unwrap()["results"];
+            assert_eq!(results.as_array().unwrap().len(), 1);
+            assert_eq!(results[0]["path"], "Shared/z.md");
+            assert_eq!(f.vault.vault_stats().unwrap().total_notes, 1);
+        }
     }
 
     #[cfg(unix)]

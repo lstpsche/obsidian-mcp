@@ -198,7 +198,7 @@ impl AuthorizedProjectionRegistry {
             }),
         };
 
-        let was_ready = projection.ready.swap(false, Ordering::AcqRel);
+        let was_ready = projection.is_ready();
         if let Some(tantivy) = &projection.tantivy {
             if !was_ready {
                 tantivy.replace_all_documents(&snapshot.notes, &contents)?;
@@ -585,6 +585,100 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn incremental_refresh_keeps_the_published_corpus_ready() {
+        let source = source();
+        observe(&source, "Shared/note.md", "originalword");
+        let registry = Arc::new(AuthorizedProjectionRegistry::default());
+        let policy = policy("reader");
+        let projection = registry
+            .project(&source, &policy, true, |_| Ok("originalword".into()))
+            .unwrap();
+        let entry = registry
+            .entries
+            .lock()
+            .unwrap()
+            .get(&policy.read_policy_hash())
+            .cloned()
+            .unwrap();
+        let publishing = entry.publication.lock().unwrap();
+        observe(&source, "Shared/note.md", "replacementword");
+        let worker_registry = Arc::clone(&registry);
+        let worker_source = Arc::clone(&source);
+        let worker = std::thread::spawn(move || {
+            worker_registry.project(&worker_source, &policy, true, |_| {
+                Ok("replacementword".into())
+            })
+        });
+        let lexical = projection.tantivy.as_ref().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let lexical_published = loop {
+            if !lexical.search("replacementword", 1).unwrap().is_empty() {
+                break true;
+            }
+            if worker.is_finished() || std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let ready_during_refresh = projection.is_ready();
+        drop(publishing);
+        let refreshed = worker.join().unwrap().unwrap();
+        assert!(lexical_published, "refresh must reach held publication");
+        assert!(ready_during_refresh, "a routine refresh is not withdrawal");
+        assert!(Arc::ptr_eq(&projection, &refreshed));
+        assert!(refreshed.is_ready());
+    }
+
+    #[test]
+    fn publication_failure_invalidates_and_rebuilds_the_complete_lexical_corpus() {
+        let source = source();
+        observe(&source, "Shared/note.md", "originalword");
+        let registry = AuthorizedProjectionRegistry::default();
+        let policy = policy("reader");
+        let projection = registry
+            .project(&source, &policy, true, |_| Ok("originalword".into()))
+            .unwrap();
+        let poisoned = Arc::clone(&projection);
+        assert!(
+            std::thread::spawn(move || {
+                let _index = poisoned.index.write().unwrap();
+                panic!("synthetic metadata publication failure");
+            })
+            .join()
+            .is_err()
+        );
+        observe(&source, "Shared/note.md", "replacementword");
+        let error = registry
+            .project(&source, &policy, true, |_| Ok("replacementword".into()))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("authorized index lock poisoned"));
+        assert!(!projection.is_ready());
+        let lexical = projection.tantivy.as_ref().unwrap();
+        assert_eq!(lexical.search("replacementword", 1).unwrap().len(), 1);
+        let metadata = source
+            .read()
+            .unwrap()
+            .get_note(Path::new("Shared/note.md"))
+            .unwrap()
+            .clone();
+        lexical
+            .replace_document(Path::new("Shared/untracked.md"), &metadata, "untrackedword")
+            .unwrap();
+        lexical.flush().unwrap();
+        assert_eq!(lexical.search("untrackedword", 1).unwrap().len(), 1);
+        projection.index.clear_poison();
+        let recovered = registry
+            .project(&source, &policy, true, |_| Ok("replacementword".into()))
+            .unwrap();
+        assert!(Arc::ptr_eq(&projection, &recovered));
+        assert!(recovered.is_ready());
+        assert!(lexical.search("untrackedword", 1).unwrap().is_empty());
+        assert!(lexical.search("originalword", 1).unwrap().is_empty());
+        assert_eq!(lexical.search("replacementword", 1).unwrap().len(), 1);
     }
 
     #[test]

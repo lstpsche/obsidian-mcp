@@ -2245,6 +2245,20 @@ impl Vault {
         fuzzy: bool,
         fields: Option<&[SearchField]>,
     ) -> VaultResult<Vec<SearchResult>> {
+        self.search_with_reconciliation(|| {
+            self.search_text_once(query, context_len, max_results, fuzzy, fields)
+        })
+        .await
+    }
+
+    async fn search_text_once(
+        &self,
+        query: &str,
+        context_len: usize,
+        max_results: usize,
+        fuzzy: bool,
+        fields: Option<&[SearchField]>,
+    ) -> VaultResult<Vec<SearchResult>> {
         self.require_catalog_async().await?;
         if let Some(tv) = self.selected_tantivy() {
             return self
@@ -2293,6 +2307,16 @@ impl Vault {
         self.scan_regex(pattern, context_len, None).await
     }
     async fn scan_regex(
+        &self,
+        pattern: &str,
+        context_len: usize,
+        limit: Option<usize>,
+    ) -> VaultResult<Vec<SearchResult>> {
+        self.search_with_reconciliation(|| self.scan_regex_once(pattern, context_len, limit))
+            .await
+    }
+
+    async fn scan_regex_once(
         &self,
         pattern: &str,
         context_len: usize,
@@ -2829,7 +2853,8 @@ impl Vault {
         let search_query = query.to_owned();
         let fields = fields.map(<[SearchField]>::to_vec);
         let vault = self.clone();
-        let hits = source_work(move || {
+        let (hits, revisions) = source_work(move || {
+            let index = vault.is_authenticated().then(|| vault.read_index());
             let allowed = vault.read_scope.as_ref().map(|_| {
                 vault
                     .read_index()
@@ -2838,7 +2863,7 @@ impl Vault {
                     .cloned()
                     .collect::<HashSet<_>>()
             });
-            if fuzzy || fields.is_some() {
+            let hits = if fuzzy || fields.is_some() {
                 tv.search_with_options_for_paths(
                     &search_query,
                     max_results,
@@ -2848,7 +2873,20 @@ impl Vault {
                 )
             } else {
                 tv.search_for_paths(&search_query, max_results, allowed.as_ref())
-            }
+            }?;
+            let revisions = match index {
+                Some(index) => hits
+                    .iter()
+                    .map(|(path, _)| {
+                        index
+                            .source_revision(path)
+                            .map(|revision| (path.as_os_str().to_owned(), revision.to_owned()))
+                            .ok_or_else(|| VaultError::NoteNotFound(path.clone()))
+                    })
+                    .collect::<VaultResult<HashMap<_, _>>>()?,
+                None => HashMap::new(),
+            };
+            Ok((hits, revisions))
         })
         .await?;
 
@@ -2860,7 +2898,14 @@ impl Vault {
             return source_work(move || {
                 hits.into_iter()
                     .map(|(path, score)| {
-                        let content = vault.read_scoped_native(&path, None)?;
+                        let content = if vault.is_authenticated() {
+                            let revision = revisions
+                                .get(path.as_os_str())
+                                .ok_or_else(|| VaultError::NoteNotFound(path.clone()))?;
+                            vault.read_access_revision_native(&path, revision)?
+                        } else {
+                            vault.read_scoped_native(&path, None)?
+                        };
                         let matches = word_re.as_ref().map_or_else(Vec::new, |regex| {
                             match_source_content(&content, regex, context_len)
                         });
@@ -2910,9 +2955,13 @@ impl Vault {
                 let mut results = Vec::new();
                 let mut matched = 0usize;
                 for path in paths {
-                    let content = match vault.read_scoped_native(&path, None) {
+                    let content = match if vault.is_authenticated() {
+                        vault.read_access_indexed_native(&path)
+                    } else {
+                        vault.read_scoped_native(&path, None)
+                    } {
                         Ok(content) => content,
-                        Err(error) if vault.read_scope.is_some() || error.is_not_found() => {
+                        Err(_) if vault.read_scope.is_some() => {
                             continue;
                         }
                         Err(error) => return Err(error),
@@ -3813,6 +3862,38 @@ mod tests {
                 assert_eq!(matched.match_start, start);
                 assert_eq!(matched.match_end, start + "needle".len());
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_regex_scans_skip_vanished_candidates_without_watching() {
+        for ranked in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("a.md"), "needle vanished").unwrap();
+            std::fs::write(directory.path().join("z.md"), "needle retained").unwrap();
+            let mut config = test_config(directory.path());
+            config.watch = false;
+            config.tantivy = ranked;
+            let vault = Vault::open(&config).await.unwrap();
+            assert!(!vault.is_scoped());
+            std::fs::remove_file(directory.path().join("a.md")).unwrap();
+
+            for hits in [
+                vault.search_regex("needle", 40).await.unwrap(),
+                vault
+                    .search_regex_with_limit("needle", 40, 1)
+                    .await
+                    .unwrap(),
+            ] {
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].path, Path::new("z.md"));
+            }
+            if !ranked {
+                let hits = vault.search_text("needle", 40).await.unwrap();
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].path, Path::new("z.md"));
+            }
+            assert!(vault.read_index().get_note(Path::new("a.md")).is_some());
         }
     }
 

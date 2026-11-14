@@ -349,6 +349,12 @@ impl VaultIndex {
         self.generation
     }
 
+    pub(crate) fn source_revision(&self, path: &Path) -> Option<&str> {
+        self.source_revisions
+            .get(path.as_os_str())
+            .map(String::as_str)
+    }
+
     /// Copy only exact note revisions for semantic change detection. Metadata,
     /// attachments and link structures remain in the retained projection.
     #[cfg(has_embeddings)]

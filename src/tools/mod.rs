@@ -678,25 +678,30 @@ impl ServerHandler for ObsidianMcp {
             .find(|name| *name == request.name.as_ref())
             .unwrap_or("unknown");
         let action = invocation_action(tool, request.arguments.as_ref());
-        let router = self.authorized_router(&client, &context).await?;
-        let vault = self.vault.clone();
-        let request_client = client.clone();
-        let vault = tokio::task::spawn_blocking(move || vault.with_access(request_client))
-            .await
-            .map_err(|_| ErrorData::internal_error("Authorized view initialization failed", None))?
-            .map_err(ErrorData::from)?;
-        let server = Self {
-            vault,
-            hybrid_alpha: self.hybrid_alpha,
-            semantic_runtime: self.semantic_runtime.clone(),
-            tool_router: router,
-        };
-        let result = server
-            .tool_router
-            .call(rmcp::handler::server::tool::ToolCallContext::new(
-                &server, request, context,
-            ))
-            .await;
+        let result = async {
+            let router = self.authorized_router(&client, &context).await?;
+            let vault = self.vault.clone();
+            let request_client = client.clone();
+            let vault = tokio::task::spawn_blocking(move || vault.with_access(request_client))
+                .await
+                .map_err(|_| {
+                    ErrorData::internal_error("Authorized view initialization failed", None)
+                })?
+                .map_err(ErrorData::from)?;
+            let server = Self {
+                vault,
+                hybrid_alpha: self.hybrid_alpha,
+                semantic_runtime: self.semantic_runtime.clone(),
+                tool_router: router,
+            };
+            server
+                .tool_router
+                .call(rmcp::handler::server::tool::ToolCallContext::new(
+                    &server, request, context,
+                ))
+                .await
+        }
+        .await;
         let outcome = result
             .as_ref()
             .err()
@@ -716,7 +721,7 @@ impl ServerHandler for ObsidianMcp {
                     "failed"
                 }
             });
-        // This audit describes completed source work independently of whether a
+        // This audit describes the invocation independently of whether a
         // later revocation allows its acknowledgement to reach the caller.
         // All fields are server-defined IDs or finite labels, never source text.
         tracing::info!(
@@ -1273,6 +1278,86 @@ mod tests {
         let server = ObsidianMcp::new(vault, 0.25, test_runtime(), disabled);
         let response = request_raw(server, "tools/list", serde_json::json!({})).await;
         assert_eq!(response["result"]["tools"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn restricted_stdio_conceals_authorized_view_initialization_errors() {
+        use crate::access::clients::{ClientPolicy, Grant, Role};
+        use crate::access::store::{AccessStore, read_token_file};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let vault_path = root.join("vault");
+        std::fs::create_dir_all(vault_path.join("Shared")).unwrap();
+        let unrelated = "Shared/unrelated.md";
+        let changed = "Shared/aaa-private-stage-marker.md";
+        std::fs::write(vault_path.join(unrelated), "Unrelated readable source").unwrap();
+        std::fs::write(vault_path.join(changed), "Original source").unwrap();
+
+        let data = root.join("private/data");
+        let store =
+            AccessStore::initialize(&root.join("private/access.json"), &vault_path, &data).unwrap();
+        store
+            .update(None, |policy| {
+                for (name, directory, role) in [
+                    ("owner", "", Role::Editor),
+                    ("reader", "Shared", Role::Reader),
+                ] {
+                    policy.clients.insert(
+                        name.into(),
+                        ClientPolicy {
+                            grants: vec![Grant::directory("content", directory, role)],
+                            ..Default::default()
+                        },
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+        let mut clients = Vec::new();
+        for name in ["owner", "reader"] {
+            let token_path = root.join(format!("private/{name}.token"));
+            store.issue_token(name, &token_path, None).unwrap();
+            clients.push(
+                store
+                    .authenticate(read_token_file(&token_path).unwrap().expose())
+                    .unwrap(),
+            );
+        }
+        let mut config = test_config(&vault_path);
+        config.mcp_data_dir = Some(data);
+        let source = Vault::open_authenticated(&config).await.unwrap();
+        let owner = source.with_access(clients.remove(0)).unwrap();
+        let reader = source.with_access(clients.remove(0)).unwrap();
+
+        // A different readable corpus advances the shared source observation
+        // without refreshing this reader's retained projection. The next source
+        // edit makes reader initialization reconcile a malformed document.
+        owner
+            .write_note(std::path::Path::new(changed), "New indexed source")
+            .await
+            .unwrap();
+        std::fs::write(
+            vault_path.join(changed),
+            "---\nprivate-stage-content-marker: [\n---\nMalformed source",
+        )
+        .unwrap();
+
+        let server = ObsidianMcp::new(reader, 0.25, test_runtime(), HashSet::new());
+        let response =
+            call_tool_raw(server, "note_read", serde_json::json!({"path": unrelated})).await;
+        assert_eq!(response["error"]["code"], -32603, "{response}");
+        assert_eq!(
+            response["error"]["message"], "Vault operation failed; contact the vault owner",
+            "{response}"
+        );
+        assert!(
+            response["error"]["data"].get("path").is_none(),
+            "{response}"
+        );
+        for marker in ["aaa-private-stage-marker", "private-stage-content-marker"] {
+            assert!(!response.to_string().contains(marker), "{response}");
+        }
     }
 
     #[tokio::test]
