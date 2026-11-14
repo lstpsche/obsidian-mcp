@@ -1123,14 +1123,18 @@ struct OccupiedDefaultBackend {
 }
 
 fn wildcard_listener(endpoint: &str) -> std::io::Result<std::net::TcpListener> {
+    // Strict wildcard fixtures must not attach beside an existing specific address.
+    fixture_listener(endpoint, false)
+}
+
+fn fixture_listener(endpoint: &str, reuse_addr: bool) -> std::io::Result<std::net::TcpListener> {
     let endpoint: std::net::SocketAddr = endpoint.parse().unwrap();
     let socket = if endpoint.is_ipv4() {
         tokio::net::TcpSocket::new_v4()?
     } else {
         tokio::net::TcpSocket::new_v6()?
     };
-    // Do not attach the fixture beside a listener owned by another process.
-    socket.set_reuseaddr(false)?;
+    socket.set_reuseaddr(reuse_addr)?;
     socket.bind(endpoint)?;
     socket.set_reuseaddr(cfg!(unix))?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1143,14 +1147,168 @@ fn wildcard_listener(endpoint: &str) -> std::io::Result<std::net::TcpListener> {
 fn occupy_default_backend() -> OccupiedDefaultBackend {
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let serial = SERIAL.lock().unwrap();
-    let listener = match wildcard_listener("0.0.0.0:37842") {
-        Ok(listener) => Some(listener),
-        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => None,
-        Err(error) => panic!("could not qualify the default loopback port: {error}"),
-    };
+    let listener =
+        occupied_backend_listener(37842).expect("could not qualify the default loopback port");
     OccupiedDefaultBackend {
         _listener: listener,
         _serial: serial,
+    }
+}
+
+fn occupied_backend_listener(port: u16) -> std::io::Result<Option<std::net::TcpListener>> {
+    if loopback_backend_has_listener(port)? {
+        return Ok(None);
+    }
+    // Closed connections can prevent a strict bind without any live listener.
+    // Match normal platform reuse only after read-only listener qualification.
+    fixture_listener(&format!("127.0.0.1:{port}"), cfg!(unix)).map(Some)
+}
+
+#[cfg(unix)]
+fn loopback_backend_has_listener(port: u16) -> std::io::Result<bool> {
+    #[cfg(target_os = "macos")]
+    let lsof = "/usr/sbin/lsof";
+    #[cfg(not(target_os = "macos"))]
+    let lsof = "lsof";
+    let output = Command::new(lsof)
+        .args([
+            "-nP",
+            "-a",
+            &format!("-i4TCP:{port}"),
+            "-sTCP:LISTEN",
+            "-Fn",
+        ])
+        .output()?;
+    if !output.status.success() && !(output.status.code() == Some(1) && output.stderr.is_empty()) {
+        return Err(std::io::Error::other(format!(
+            "cannot inspect fixture listeners: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    for line in std::str::from_utf8(&output.stdout)
+        .map_err(std::io::Error::other)?
+        .lines()
+    {
+        let Some(name) = line.strip_prefix('n') else {
+            continue;
+        };
+        if name == format!("*:{port}") {
+            return Ok(true);
+        }
+        let bound: std::net::SocketAddr = name.parse().map_err(std::io::Error::other)?;
+        let ip = match bound.ip() {
+            std::net::IpAddr::V4(ip) => Some(ip),
+            std::net::IpAddr::V6(ip) => ip.to_ipv4_mapped(),
+        };
+        if bound.port() == port
+            && ip.is_some_and(|ip| ip.is_unspecified() || ip == std::net::Ipv4Addr::LOCALHOST)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(windows)]
+fn loopback_backend_has_listener(port: u16) -> std::io::Result<bool> {
+    use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
+    };
+    use windows_sys::Win32::Networking::WinSock::AF_INET;
+
+    let mut buffer: Vec<u32> = Vec::new();
+    let mut size = 0;
+    loop {
+        let data = if buffer.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            buffer.as_mut_ptr().cast()
+        };
+        // SAFETY: the API receives a DWORD-aligned buffer of the advertised size.
+        match unsafe {
+            GetExtendedTcpTable(
+                data,
+                &mut size,
+                0,
+                AF_INET.into(),
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            )
+        } {
+            ERROR_INSUFFICIENT_BUFFER => buffer.resize((size as usize).div_ceil(4), 0),
+            NO_ERROR => break,
+            code => return Err(std::io::Error::from_raw_os_error(code as i32)),
+        }
+    }
+    let (&count, entries) = buffer
+        .split_first()
+        .ok_or_else(|| std::io::Error::other("empty fixture TCP listener table"))?;
+    let row_words = std::mem::size_of::<MIB_TCPROW_OWNER_PID>() / 4;
+    if count as usize > entries.len() / row_words {
+        return Err(std::io::Error::other(
+            "truncated fixture TCP listener table",
+        ));
+    }
+    Ok(entries
+        .chunks_exact(row_words)
+        .take(count as usize)
+        .any(|raw| {
+            // SAFETY: each row is exactly the native DWORD-aligned row size.
+            let row = unsafe { &*raw.as_ptr().cast::<MIB_TCPROW_OWNER_PID>() };
+            let ip = std::net::Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes());
+            u16::from_be(row.dwLocalPort as u16) == port
+                && (ip.is_unspecified() || ip == std::net::Ipv4Addr::LOCALHOST)
+        }))
+}
+
+#[cfg(unix)]
+#[test]
+fn backend_fixture_owns_a_listener_after_controlled_active_close() {
+    use std::io::Read;
+    use std::net::{Shutdown, TcpStream};
+
+    let listener = wildcard_listener("127.0.0.1:0").unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let mut client = TcpStream::connect(endpoint).unwrap();
+    let (mut server, _) = listener.accept().unwrap();
+    server.set_nonblocking(false).unwrap();
+    for connection in [&server, &client] {
+        connection
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+    }
+    server.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(client.read(&mut [0]).unwrap(), 0);
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(server.read(&mut [0]).unwrap(), 0);
+    drop(server);
+    drop(client);
+    drop(listener);
+    assert_eq!(
+        wildcard_listener(&format!("0.0.0.0:{}", endpoint.port()))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+    let occupied = occupied_backend_listener(endpoint.port())
+        .unwrap()
+        .expect("closed connections are not a live occupied backend");
+    assert_eq!(occupied.local_addr().unwrap().port(), endpoint.port());
+}
+
+#[test]
+fn backend_fixture_verifies_live_listeners_without_connecting() {
+    for endpoint in ["127.0.0.1:0", "0.0.0.0:0"] {
+        let listener = wildcard_listener(endpoint).unwrap();
+        let bound = listener.local_addr().unwrap();
+        assert!(occupied_backend_listener(bound.port()).unwrap().is_none());
+        assert_eq!(listener.local_addr().unwrap(), bound);
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 }
 
