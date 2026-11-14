@@ -317,7 +317,7 @@ pub async fn search_semantic(
         Ok(results) => results,
         Err(error) => {
             return Err(if vault.is_authenticated() {
-                authenticated_semantic_tool_error(vault, error).await
+                authenticated_semantic_tool_error(error)
             } else if vault.is_scoped() {
                 scoped_semantic_tool_error(error)
             } else {
@@ -534,7 +534,7 @@ fn scoped_semantic_tool_error(error: VaultError) -> rmcp::ErrorData {
     )
 }
 
-async fn authenticated_semantic_tool_error(vault: &Vault, error: VaultError) -> rmcp::ErrorData {
+pub(crate) fn authenticated_semantic_tool_error(error: VaultError) -> rmcp::ErrorData {
     if matches!(
         error,
         VaultError::EmbeddingInputTooLong { .. }
@@ -544,29 +544,19 @@ async fn authenticated_semantic_tool_error(vault: &Vault, error: VaultError) -> 
     ) {
         return error.into();
     }
-    #[cfg(has_embeddings)]
-    match vault
-        .catalog_work(|vault| Ok(vault.embedding_status()))
-        .await
-    {
-        Ok(Some(status))
-            if status.phase == crate::vault::embedding_runtime::EmbeddingPhase::Warming
-                && !status.queryable =>
-        {
-            return rmcp::ErrorData::new(
-                ErrorCode::INVALID_REQUEST,
-                "Semantic search is warming; retry shortly",
-                Some(serde_json::json!({"code": "semantic_warming"})),
-            );
+    if matches!(
+        error,
+        VaultError::Storage {
+            kind: crate::error::StorageErrorKind::Warming,
+            ..
         }
-        Err(error) => tracing::warn!(
-            error_category = error.diagnostic_category(),
-            "authenticated semantic status worker failed"
-        ),
-        _ => {}
+    ) {
+        return rmcp::ErrorData::new(
+            ErrorCode::INVALID_REQUEST,
+            "Semantic search is warming; retry shortly",
+            Some(serde_json::json!({"code": "semantic_warming"})),
+        );
     }
-    #[cfg(not(has_embeddings))]
-    let _ = vault;
     rmcp::ErrorData::new(
         ErrorCode::INTERNAL_ERROR,
         "Semantic search is unavailable; contact the vault owner",
@@ -596,69 +586,23 @@ mod tests {
     #[cfg(unix)]
     use tokio::io::{AsyncWriteExt, BufReader};
 
-    #[cfg(has_embeddings)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn authenticated_semantic_error_status_does_not_block_on_a_policy_writer() {
-        use crate::access::clients::{ClientPolicy, Grant, Role};
-        use crate::access::store::AccessStore;
-        use std::time::{Duration, Instant};
-
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("vault");
-        std::fs::create_dir(&root).unwrap();
-        let data = directory.path().join("private/data");
-        let store =
-            AccessStore::initialize(&directory.path().join("private/access.json"), &root, &data)
-                .unwrap();
-        store
-            .update(None, |policy| {
-                policy.clients.insert(
-                    "reader".into(),
-                    ClientPolicy {
-                        grants: vec![Grant {
-                            id: "root-read".into(),
-                            directory: Some(String::new()),
-                            file: None,
-                            role: Role::Reader,
-                        }],
-                        ..Default::default()
-                    },
-                );
-                Ok(())
-            })
-            .unwrap();
-        let token_path = directory.path().join("private/reader.token");
-        store.issue_token("reader", &token_path, None).unwrap();
-        let token = crate::access::store::read_token_file(&token_path).unwrap();
-        let mut config = test_config(&root);
-        config.mcp_data_dir = Some(data);
-        let vault = Vault::open_authenticated(&config)
-            .await
-            .unwrap()
-            .with_access(store.authenticate(token.as_str()).unwrap())
-            .unwrap();
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let writer = std::thread::spawn(move || {
-            store.update(None, |_| {
-                entered_tx.send(()).unwrap();
-                // A blocked executor must fail this test within a fixed bound.
-                let _ = release_rx.recv_timeout(Duration::from_secs(2));
-                Ok(())
-            })
+    #[test]
+    fn authenticated_semantic_errors_use_the_captured_failure_without_a_live_status_lookup() {
+        let warming = authenticated_semantic_tool_error(VaultError::storage(
+            "search",
+            "",
+            crate::error::StorageErrorKind::Warming,
+            "authorized semantic corpus is warming",
+        ));
+        assert_eq!(warming.data.unwrap()["code"], "semantic_warming");
+        let provider = authenticated_semantic_tool_error(VaultError::EmbeddingRequest {
+            message: "synthetic-provider-private-detail".into(),
+            retryable: true,
+            retry_after: None,
         });
-        entered_rx.await.unwrap();
-        let started = Instant::now();
-        let (error, ()) = tokio::join!(
-            authenticated_semantic_tool_error(&vault, VaultError::Embedding("unavailable".into())),
-            async move {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                let _ = release_tx.send(());
-            }
-        );
-        writer.join().unwrap().unwrap();
-        assert!(started.elapsed() < Duration::from_secs(1));
-        assert_eq!(error.data.unwrap()["code"], "semantic_unavailable");
+        let text = serde_json::to_string(&provider).unwrap();
+        assert_eq!(provider.data.unwrap()["code"], "semantic_unavailable");
+        assert!(!text.contains("synthetic-provider-private-detail"));
     }
 
     #[test]

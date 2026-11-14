@@ -268,14 +268,14 @@ fn initialize(args: &Arguments) -> Result<Output, String> {
             )],
         ));
     }
-    let endpoint = setup_endpoint(args)?;
     let store =
         AccessStore::initialize(&profile, &vault, &data).map_err(|error| error.to_string())?;
     let snapshot = store.snapshot().map_err(|error| error.to_string())?;
-    let launch = launch_command(
+    let launch = http_launch_command(
         &profile,
         &snapshot.policy.source.canonical_path,
-        endpoint.backend_url.as_str(),
+        "127.0.0.1",
+        0,
     )?;
     Ok(Output::new(
         json!({"access_file":profile,"data_dir":data,"revision":snapshot.policy.revision}),
@@ -283,6 +283,7 @@ fn initialize(args: &Arguments) -> Result<Output, String> {
             format!("Created access profile {}.", profile.display()),
             "Add a client with 'access client add NAME --directory PATH --role reader|editor' and the --access-file path above.".into(),
             launch,
+            "Port 0 chooses a free port when the server starts. Use http://<printed-address>/mcp in your client configuration.".into(),
         ],
     ))
 }
@@ -736,8 +737,15 @@ fn rebind(args: &Arguments) -> Result<Output, String> {
         policy.source = source;
         Ok(())
     })?;
-    let mut output = changed_output(args, snapshot, "Updated vault binding.".into());
-    output.lines.push("Restart the authenticated server to open the new binding. Existing servers cannot inherit it.".into());
+    let message = if args.flag("dry-run") {
+        "Would update vault binding."
+    } else {
+        "Updated vault binding."
+    };
+    let mut output = changed_output(args, snapshot, message.into());
+    if !args.flag("dry-run") {
+        output.lines.push("Restart the authenticated server to open the new binding. Existing servers cannot inherit it.".into());
+    }
     Ok(output)
 }
 
@@ -1651,7 +1659,9 @@ fn change_policy(
     let expected = snapshot.policy.revision;
     let mut prepared = snapshot.policy;
     change(&mut prepared)?;
-    prepared.validate().map_err(|error| error.to_string())?;
+    store
+        .validate_policy_update(&prepared)
+        .map_err(|error| error.to_string())?;
     if args.flag("dry-run") {
         return Ok(prepared);
     }
@@ -1877,8 +1887,17 @@ fn launch_command(profile: &Path, vault: &Path, url: &str) -> Result<String, Str
     let port = url
         .port_or_known_default()
         .ok_or("backend endpoint has no port")?;
-    let binary = std::env::current_exe().map_err(|error| error.to_string())?;
     let host = local_setup_host(&url);
+    http_launch_command(profile, vault, host, port)
+}
+
+fn http_launch_command(
+    profile: &Path,
+    vault: &Path,
+    host: &str,
+    port: u16,
+) -> Result<String, String> {
+    let binary = std::env::current_exe().map_err(|error| error.to_string())?;
     Ok(format!(
         "{} --http --host {host} --port {port} --access-file {} {}",
         executable_invocation(&binary),

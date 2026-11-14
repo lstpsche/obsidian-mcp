@@ -223,6 +223,14 @@ impl AccessStore {
         Ok(())
     }
 
+    /// Validate the policy and state locations shared by preview and publication.
+    /// The old source need not be available during an intentional rebind.
+    pub fn validate_policy_update(&self, policy: &AccessPolicy) -> AccessResult<()> {
+        policy.validate()?;
+        ensure_external(self.0.directory.path(), &policy.source)?;
+        ensure_external(&policy.data_dir, &policy.source)
+    }
+
     /// Publish one complete policy under the stable lock. A changed revision is
     /// detected before invoking the caller's transformation.
     pub fn update(
@@ -240,9 +248,7 @@ impl AccessStore {
             .ok_or_else(|| AccessError::Configuration("access policy revision exhausted".into()))?;
         change(&mut policy)?;
         policy.revision = revision;
-        policy.validate()?;
-        ensure_external(self.0.directory.path(), &policy.source)?;
-        ensure_external(&policy.data_dir, &policy.source)?;
+        self.validate_policy_update(&policy)?;
         let bytes = encode_policy(&policy)?;
         self.0.directory.publish(&self.0.name, &bytes)?;
         Ok(PolicySnapshot {
@@ -1539,6 +1545,70 @@ mod tests {
         reopened.validate_source(&fixture.vault).unwrap();
         let token = read_token_file(&fixture.token_path).unwrap();
         assert!(reopened.authenticate(token.expose()).is_ok());
+    }
+
+    #[test]
+    fn policy_update_preview_and_apply_reject_state_inside_the_new_source() {
+        for contained in ["profile", "data"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let vault = temporary.path().join("original-vault");
+            let new_vault = temporary.path().join("new-vault");
+            std::fs::create_dir(&vault).unwrap();
+            std::fs::create_dir(&new_vault).unwrap();
+            let profile = if contained == "profile" {
+                new_vault.join("private/access.json")
+            } else {
+                temporary.path().join("private/access.json")
+            };
+            let data = if contained == "data" {
+                new_vault.join("private-data")
+            } else {
+                temporary.path().join("private-data")
+            };
+            let store = AccessStore::initialize(&profile, &vault, &data).unwrap();
+            let before = std::fs::read(&profile).unwrap();
+            let mut proposed = store.snapshot().unwrap().policy;
+            proposed.source = SourceIdentity::capture(&new_vault).unwrap();
+            proposed.validate().unwrap();
+
+            let preview = store.validate_policy_update(&proposed).unwrap_err();
+            let apply = store
+                .update(None, |policy| {
+                    *policy = proposed;
+                    Ok(())
+                })
+                .unwrap_err();
+            assert!(matches!(preview, AccessError::Configuration(_)));
+            assert_eq!(preview.to_string(), apply.to_string(), "{contained}");
+            assert_eq!(std::fs::read(&profile).unwrap(), before, "{contained}");
+        }
+    }
+
+    #[test]
+    fn policy_update_preview_and_apply_rebind_when_the_old_source_is_missing() {
+        let fixture = Fixture::new();
+        let client = fixture.issue();
+        let moved = fixture.vault.with_file_name("moved-vault");
+        std::fs::rename(&fixture.vault, &moved).unwrap();
+        assert!(!fixture.vault.exists());
+        assert!(client.current().is_err());
+        let before = std::fs::read(fixture.store.path()).unwrap();
+        let mut proposed = fixture.store.snapshot().unwrap().policy;
+        proposed.source = SourceIdentity::capture(&moved).unwrap();
+        fixture.store.validate_policy_update(&proposed).unwrap();
+        assert_eq!(std::fs::read(fixture.store.path()).unwrap(), before);
+        fixture
+            .store
+            .update(None, |policy| {
+                *policy = proposed;
+                Ok(())
+            })
+            .unwrap();
+
+        let reopened = AccessStore::open(fixture.store.path()).unwrap();
+        reopened.validate_source(&moved).unwrap();
+        let token = read_token_file(&fixture.token_path).unwrap();
+        reopened.authenticate(token.expose()).unwrap();
     }
 
     #[test]

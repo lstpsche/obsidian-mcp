@@ -8,7 +8,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::daemon::protocol::{self, SemanticPhase, SemanticStatus};
-use crate::error::VaultError;
+use crate::error::{VaultError, VaultResult};
 use crate::models::VaultStats;
 use crate::vault::Vault;
 
@@ -114,22 +114,29 @@ pub struct EmbeddingInfo {
     pub error: Option<String>,
 }
 
-async fn embedding_info(vault: &Vault, runtime: &SemanticRuntime) -> EmbeddingInfo {
-    if vault.is_remote() || runtime.uses_local_backend() {
+async fn embedding_info(vault: &Vault, runtime: &SemanticRuntime) -> VaultResult<EmbeddingInfo> {
+    if vault.is_authenticated() || vault.is_remote() || runtime.uses_local_backend() {
         #[cfg(has_embeddings)]
         {
             let status = match vault
-                .catalog_work(|vault| Ok(vault.embedding_status()))
+                .catalog_work(|vault| {
+                    if vault.is_authenticated() {
+                        vault.authenticated_embedding_status()
+                    } else {
+                        Ok(vault.embedding_status())
+                    }
+                })
                 .await
             {
                 Ok(status) => status,
+                Err(error) if vault.is_authenticated() => return Err(error),
                 Err(error) => {
-                    return EmbeddingInfo {
+                    return Ok(EmbeddingInfo {
                         source: EmbeddingSource::Local,
                         availability: EmbeddingAvailability::Unavailable,
                         status: None,
                         error: Some(error.to_string()),
-                    };
+                    });
                 }
             };
             let status = status.map(|status| EmbeddingSnapshot {
@@ -148,7 +155,7 @@ async fn embedding_info(vault: &Vault, runtime: &SemanticRuntime) -> EmbeddingIn
                 pending_notes: status.pending_notes,
                 last_error: status.last_error,
             });
-            return EmbeddingInfo {
+            return Ok(EmbeddingInfo {
                 source: EmbeddingSource::Local,
                 availability: if status.is_some() {
                     EmbeddingAvailability::Available
@@ -160,19 +167,19 @@ async fn embedding_info(vault: &Vault, runtime: &SemanticRuntime) -> EmbeddingIn
                 error: (status.is_none() && vault.embeddings_requested())
                     .then(|| "semantic source initialization is incomplete".to_owned()),
                 status,
-            };
+            });
         }
         #[cfg(not(has_embeddings))]
-        return EmbeddingInfo {
+        return Ok(EmbeddingInfo {
             source: EmbeddingSource::Local,
             availability: EmbeddingAvailability::Unsupported,
             status: None,
             error: Some("this binary was compiled without a local embedding backend".into()),
-        };
+        });
     }
 
     let Some(client) = runtime.resolved_daemon_client() else {
-        return EmbeddingInfo {
+        return Ok(EmbeddingInfo {
             source: EmbeddingSource::Daemon,
             availability: EmbeddingAvailability::Unavailable,
             status: None,
@@ -182,7 +189,7 @@ async fn embedding_info(vault: &Vault, runtime: &SemanticRuntime) -> EmbeddingIn
                     .clone()
                     .unwrap_or_else(|| "semantic daemon client is not initialized".into()),
             ),
-        };
+        });
     };
     let status = async {
         runtime.ensure_daemon_health().await?;
@@ -194,7 +201,7 @@ async fn embedding_info(vault: &Vault, runtime: &SemanticRuntime) -> EmbeddingIn
             .await
     }
     .await;
-    match status {
+    Ok(match status {
         Ok(status) => EmbeddingInfo {
             source: EmbeddingSource::Daemon,
             availability: EmbeddingAvailability::Available,
@@ -220,7 +227,7 @@ async fn embedding_info(vault: &Vault, runtime: &SemanticRuntime) -> EmbeddingIn
             status: None,
             error: Some(error.to_string()),
         },
-    }
+    })
 }
 
 /// Return aggregate vault statistics.
@@ -230,16 +237,12 @@ pub async fn vault_info(
     _params: VaultInfoParams,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     let stats = vault.catalog_work(|vault| vault.vault_stats()).await;
-    let source = vault.source_status();
     let vault_name = crate::vault::path::logical_file_name(vault.root())
         .unwrap_or_default()
         .to_owned();
-    let vault_path = vault.source_location();
-    let mcp_data_dir = vault
-        .resolved_mcp_data()
-        .and_then(|path| (Some(path) != vault.mcp_home()).then(|| path.display().to_string()));
-    let mut embeddings = embedding_info(vault, runtime).await;
     if vault.is_authenticated() {
+        let stats = stats?;
+        let mut embeddings = embedding_info(vault, runtime).await?;
         if let Some(status) = &mut embeddings.status
             && status.last_error.is_some()
         {
@@ -251,11 +254,17 @@ pub async fn vault_info(
                 Some("Semantic service is unavailable; contact the vault owner".into());
         }
         return super::output::json(&VaultInfoOutput::Authenticated(AuthenticatedVaultInfo {
-            stats: stats?,
+            stats,
             vault_name,
             embeddings,
         }));
     }
+    let source = vault.source_status();
+    let vault_path = vault.source_location();
+    let mcp_data_dir = vault
+        .resolved_mcp_data()
+        .and_then(|path| (Some(path) != vault.mcp_home()).then(|| path.display().to_string()));
+    let mut embeddings = embedding_info(vault, runtime).await?;
     if vault.is_scoped() {
         embeddings.status = None;
         if embeddings.error.is_some() {

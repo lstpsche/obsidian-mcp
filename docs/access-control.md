@@ -35,6 +35,8 @@ The default profile is under the user's application configuration directory, in 
 
 Use `access init /path/to/vault` to create only a profile. An existing profile is managed with `client add`, `grant`, `deny` and the other commands below; setup does not overwrite it.
 
+The optional HTTP launch command printed by `init` uses `--port 0`, so the server selects a free port when started. Use `http://<printed-address>/mcp` in your client configuration, replacing `<printed-address>` with the actual address it prints. Guided `setup` selects the port in advance and uses it in both its launch command and client configuration.
+
 ## Client configuration
 
 The generated HTTP configuration uses the client's native header helper. The helper reads a protected token file, so the client does not depend on an environment variable exported in a terminal. The token itself is absent from the snippet.

@@ -1611,14 +1611,6 @@ impl Vault {
 
     /// Activate local embeddings once without replacing the watcher submission handle.
     pub fn activate_embeddings(&self) -> bool {
-        #[cfg(has_embeddings)]
-        if self.is_authenticated() {
-            return self
-                .authenticated_semantic_runtime(true)
-                .ok()
-                .flatten()
-                .is_some();
-        }
         if self.is_remote() && !self.catalog_ready() {
             return false;
         }
@@ -1637,14 +1629,6 @@ impl Vault {
 
     /// Whether the local coordinator has been activated, independently of readiness.
     pub fn embeddings_active(&self) -> bool {
-        #[cfg(has_embeddings)]
-        if self.is_authenticated() {
-            return self
-                .authenticated_semantic_runtime(false)
-                .ok()
-                .flatten()
-                .is_some_and(|runtime| runtime.is_active());
-        }
         #[cfg(has_embeddings)]
         {
             self.inner
@@ -2407,27 +2391,28 @@ impl Vault {
         if entries.is_empty() {
             snapshot.validate_query(query)?;
             self.require_semantic_catalog()?;
-            if self.is_authenticated()
-                && !current_paths.is_empty()
-                && runtime.status().pending_notes > 0
-            {
-                return Err(VaultError::storage(
-                    "search",
-                    "",
-                    crate::error::StorageErrorKind::Warming,
-                    "authorized semantic corpus is warming",
-                ));
-            }
-            if self.is_authenticated()
-                && !current_paths.is_empty()
-                && runtime.status().last_error.is_some()
-            {
-                return Err(VaultError::storage(
-                    "search",
-                    "",
-                    crate::error::StorageErrorKind::Unavailable,
-                    "authorized semantic corpus is unavailable",
-                ));
+            if self.is_authenticated() && !current_paths.is_empty() {
+                let status = runtime.status();
+                if status.last_error.is_some()
+                    || status.phase == embedding_runtime::EmbeddingPhase::Degraded
+                {
+                    return Err(VaultError::storage(
+                        "search",
+                        "",
+                        crate::error::StorageErrorKind::Unavailable,
+                        "authorized semantic corpus is unavailable",
+                    ));
+                }
+                if status.phase == embedding_runtime::EmbeddingPhase::Warming
+                    && status.pending_notes > 0
+                {
+                    return Err(VaultError::storage(
+                        "search",
+                        "",
+                        crate::error::StorageErrorKind::Warming,
+                        "authorized semantic corpus is warming",
+                    ));
+                }
             }
             return Ok(Vec::new());
         }
@@ -2449,16 +2434,9 @@ impl Vault {
         }
     }
 
-    /// Returns `true` if embeddings are available for semantic search.
+    /// Returns whether the local embedding runtime is queryable.
     #[cfg(has_embeddings)]
     pub fn has_embeddings(&self) -> bool {
-        if self.is_authenticated() {
-            return self
-                .authenticated_semantic_runtime(false)
-                .ok()
-                .flatten()
-                .is_some_and(|runtime| runtime.status().queryable);
-        }
         self.inner
             .embedding_runtime
             .get()
@@ -2483,9 +2461,6 @@ impl Vault {
 
     /// Returns the error message from a failed embedding model load, if any.
     pub fn embedding_load_error(&self) -> Option<&str> {
-        if self.is_authenticated() {
-            return None;
-        }
         #[cfg(has_embeddings)]
         {
             self.inner
@@ -2499,32 +2474,34 @@ impl Vault {
         }
     }
 
-    /// Current background embedding lifecycle status, when embeddings are enabled.
+    /// Current lifecycle status of this vault's local embedding runtime.
     #[cfg(has_embeddings)]
     pub fn embedding_status(&self) -> Option<embedding_runtime::EmbeddingRuntimeStatus> {
-        if self.is_authenticated() {
-            return self
-                .authenticated_semantic_runtime(false)
-                .ok()
-                .flatten()
-                .map(|runtime| {
-                    let mut status = runtime.status();
-                    if self
-                        .projection
-                        .as_ref()
-                        .is_some_and(|view| !view.is_ready())
-                    {
-                        status.queryable = false;
-                        status.phase = embedding_runtime::EmbeddingPhase::Degraded;
-                        status.last_error = Some("authorized corpus is unavailable".into());
-                    }
-                    status
-                });
-        }
         self.inner
             .embedding_runtime
             .get()
             .map(embedding_runtime::EmbeddingRuntime::status)
+    }
+
+    /// Inspect the selected authenticated corpus without activating inference.
+    #[cfg(has_embeddings)]
+    pub(crate) fn authenticated_embedding_status(
+        &self,
+    ) -> VaultResult<Option<embedding_runtime::EmbeddingRuntimeStatus>> {
+        let status = self.authenticated_semantic_runtime(false)?.map(|runtime| {
+            let mut status = runtime.status();
+            if self
+                .projection
+                .as_ref()
+                .is_some_and(|view| !view.is_ready())
+            {
+                status.queryable = false;
+                status.phase = embedding_runtime::EmbeddingPhase::Degraded;
+                status.last_error = Some("authorized corpus is unavailable".into());
+            }
+            status
+        });
+        Ok(status)
     }
 
     /// Hybrid search: BM25 prefetch via Tantivy, then re-rank by combining
@@ -2580,27 +2557,28 @@ impl Vault {
         self.filter_scoped_semantic_entries(&mut entries);
         if entries.is_empty() {
             self.require_semantic_catalog()?;
-            if self.is_authenticated()
-                && !current_paths.is_empty()
-                && runtime.status().pending_notes > 0
-            {
-                return Err(VaultError::storage(
-                    "search",
-                    "",
-                    crate::error::StorageErrorKind::Warming,
-                    "authorized semantic corpus is warming",
-                ));
-            }
-            if self.is_authenticated()
-                && !current_paths.is_empty()
-                && runtime.status().last_error.is_some()
-            {
-                return Err(VaultError::storage(
-                    "search",
-                    "",
-                    crate::error::StorageErrorKind::Unavailable,
-                    "authorized semantic corpus is unavailable",
-                ));
+            if self.is_authenticated() && !current_paths.is_empty() {
+                let status = runtime.status();
+                if status.last_error.is_some()
+                    || status.phase == embedding_runtime::EmbeddingPhase::Degraded
+                {
+                    return Err(VaultError::storage(
+                        "search",
+                        "",
+                        crate::error::StorageErrorKind::Unavailable,
+                        "authorized semantic corpus is unavailable",
+                    ));
+                }
+                if status.phase == embedding_runtime::EmbeddingPhase::Warming
+                    && status.pending_notes > 0
+                {
+                    return Err(VaultError::storage(
+                        "search",
+                        "",
+                        crate::error::StorageErrorKind::Warming,
+                        "authorized semantic corpus is warming",
+                    ));
+                }
             }
             return Ok(Vec::new());
         }

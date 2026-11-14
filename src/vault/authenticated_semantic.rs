@@ -449,12 +449,20 @@ impl AuthenticatedSemanticRegistry {
             .lock()
             .map_err(|_| authorization_error("semantic registry lock is unavailable"))?;
         if let Some(entry) = entries.get(&key)
+            && !activate
+            && !Arc::ptr_eq(&entry.projection, &projection)
+        {
+            // An immutable caller view can outlive projection replacement.
+            // Passive inspection cannot change the newer owner's lifecycle.
+            return Ok(None);
+        }
+        if let Some(entry) = entries.get(&key)
+            && activate
             && (!Arc::ptr_eq(&entry.projection, &projection)
-                || (activate
-                    && entry
-                        .runtime
-                        .get()
-                        .is_some_and(|runtime| runtime.first_load_error().is_some())))
+                || entry
+                    .runtime
+                    .get()
+                    .is_some_and(|runtime| runtime.first_load_error().is_some()))
         {
             // A restored profile or repaired loader gets a new service owner on
             // explicit activation, never a stale grant or an automatic retry loop.
@@ -705,10 +713,131 @@ fn authorization_error(message: &str) -> VaultError {
 
 #[cfg(test)]
 mod tests {
+    use super::super::embedding_input::{EmbeddingInputPolicy, EmbeddingRequestLimits};
+    use super::super::embedding_runtime::{EmbeddingPhase, EmbeddingRuntimeStatus};
+    use super::super::embeddings::{EmbeddingBackendKind, EmbeddingSpaceIdentity};
     use super::*;
     use crate::access::clients::{ClientPolicy, Grant, Role};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    async fn reader_fixture() -> (tempfile::TempDir, AccessStore, Vault, AuthorizedClient) {
+    type DispatchGate = (
+        tokio::sync::oneshot::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    );
+
+    struct CapturingEmbedder {
+        identity: EmbeddingSpaceIdentity,
+        policy: EmbeddingInputPolicy,
+        inputs: Mutex<Vec<String>>,
+        gate: Mutex<Option<DispatchGate>>,
+        fail: AtomicBool,
+    }
+
+    impl CapturingEmbedder {
+        fn new() -> Self {
+            Self {
+                identity: EmbeddingSpaceIdentity {
+                    backend: EmbeddingBackendKind::Local,
+                    model: "authorized-fixture".into(),
+                    endpoint_fingerprint: None,
+                    dimension: 3,
+                    input_version: super::super::embeddings::EMBEDDING_INPUT_VERSION,
+                    tokenizer_fingerprint: [0; 32],
+                    max_input_tokens: 512,
+                    chunking_version: super::super::embedding_input::CHUNKING_VERSION,
+                },
+                policy: EmbeddingInputPolicy {
+                    max_input_tokens: 512,
+                    tokenizer_fingerprint: [0; 32],
+                },
+                inputs: Mutex::new(Vec::new()),
+                gate: Mutex::new(None),
+                fail: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl Embedder for CapturingEmbedder {
+        fn dimension(&self) -> usize {
+            self.identity.dimension
+        }
+        fn space_identity(&self) -> &EmbeddingSpaceIdentity {
+            &self.identity
+        }
+        fn input_policy(&self) -> &EmbeddingInputPolicy {
+            &self.policy
+        }
+        fn count_tokens(&self, text: &str) -> VaultResult<usize> {
+            Ok(text.chars().count())
+        }
+        fn request_limits(&self) -> EmbeddingRequestLimits {
+            EmbeddingRequestLimits {
+                max_inputs: 32,
+                max_total_tokens: 16_384,
+                max_request_bytes: 16 * 1024 * 1024,
+            }
+        }
+        fn embed_batch(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>> {
+            self.inputs
+                .lock()
+                .unwrap()
+                .extend(texts.iter().map(|text| (*text).to_owned()));
+            if let Some((started, release)) = self.gate.lock().unwrap().take() {
+                started.send(()).unwrap();
+                release.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            if self.fail.load(Ordering::Acquire) {
+                return Err(VaultError::EmbeddingRequest {
+                    message: "synthetic document provider failure".into(),
+                    retryable: true,
+                    retry_after: None,
+                });
+            }
+            Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect())
+        }
+    }
+
+    fn install_registry(
+        vault: &Vault,
+        model: Arc<CapturingEmbedder>,
+    ) -> Arc<AuthenticatedSemanticRegistry> {
+        let registry = Arc::new(AuthenticatedSemanticRegistry {
+            entries: Mutex::new(HashMap::new()),
+            model: Arc::new(OnceCell::new()),
+            notify: Arc::new(Notify::new()),
+            worker: Mutex::new(None),
+            cleanup: OnceLock::new(),
+        });
+        assert!(registry.model.set(model as Arc<dyn Embedder>).is_ok());
+        assert!(
+            vault
+                .inner
+                .authenticated_semantics
+                .set(Arc::clone(&registry))
+                .is_ok()
+        );
+        registry
+    }
+
+    async fn wait_for_runtime(
+        runtime: &EmbeddingRuntime,
+        predicate: impl Fn(&EmbeddingRuntimeStatus) -> bool,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if predicate(&runtime.status()) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("runtime status timed out: {:?}", runtime.status()));
+    }
+
+    async fn reader_fixture(
+        embeddings: bool,
+    ) -> (tempfile::TempDir, AccessStore, Vault, AuthorizedClient) {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("vault");
         std::fs::create_dir(&root).unwrap();
@@ -739,6 +868,7 @@ mod tests {
         let client = store.authenticate(token.as_str()).unwrap();
         let mut config = crate::test_helpers::test_config(&root);
         config.mcp_data_dir = Some(data);
+        config.embeddings = embeddings;
         let vault = Vault::open_authenticated(&config)
             .await
             .unwrap()
@@ -748,8 +878,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_vault_info_propagates_semantic_registry_failure() {
+        let (_directory, _store, vault, _client) = reader_fixture(true).await;
+        let registry = AuthenticatedSemanticRegistry::new();
+        assert!(
+            vault
+                .inner
+                .authenticated_semantics
+                .set(Arc::clone(&registry))
+                .is_ok()
+        );
+        let poison = std::thread::spawn(move || {
+            let _entries = registry.entries.lock().unwrap();
+            panic!("synthetic semantic registry failure");
+        });
+        assert!(poison.join().is_err());
+        let runtime = crate::tools::SemanticRuntime {
+            mode: crate::config::SemanticMode::Local,
+            daemon_client: None,
+            pending_daemon_bootstrap: None,
+            daemon_unavailable_reason: None,
+            prefetch_count: 50,
+            attachments: Arc::default(),
+            local_fallback_active: Arc::default(),
+            daemon_health_pending: Arc::default(),
+        };
+        let result = crate::tools::utility::vault_info(
+            &vault,
+            &runtime,
+            crate::tools::utility::VaultInfoParams {},
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "registry failure must not become absent semantic status"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_passive_projection_cannot_retire_a_new_owner_or_stop_ingestion() {
+        let (_directory, _store, stale, client) = reader_fixture(true).await;
+        let path = Path::new("one.md");
+        std::fs::write(stale.root().join(path), "# One\nbefore replacement").unwrap();
+        stale.reindex(path).await.unwrap();
+        let model = Arc::new(CapturingEmbedder::new());
+        let registry = install_registry(&stale, Arc::clone(&model));
+        assert!(stale.authenticated_embedding_status().unwrap().is_none());
+        assert!(registry.entries.lock().unwrap().is_empty());
+        let old_runtime = registry.runtime(&stale, true).unwrap().unwrap();
+        wait_for_runtime(&old_runtime, |status| status.phase == EmbeddingPhase::Ready).await;
+
+        // Projection withdrawal/recreation retains the old immutable view while
+        // another valid view explicitly activates the new service-owned corpus.
+        stale
+            .inner
+            .authorized_indices
+            .retire(client.read_policy_key())
+            .unwrap();
+        let fresh = stale.with_access(client.clone()).unwrap();
+        assert!(!Arc::ptr_eq(
+            stale.projection.as_ref().unwrap(),
+            fresh.projection.as_ref().unwrap()
+        ));
+        let current = registry.runtime(&fresh, true).unwrap().unwrap();
+        wait_for_runtime(&current, |status| status.phase == EmbeddingPhase::Ready).await;
+        assert!(stale.authenticated_embedding_status().unwrap().is_none());
+
+        std::fs::write(
+            fresh.root().join(path),
+            "# One\nafter-passive-status-marker",
+        )
+        .unwrap();
+        fresh.reindex(path).await.unwrap();
+        registry.reconcile();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if model
+                    .inputs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|input| input.contains("after-passive-status-marker"))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("passive stale status must preserve the current owner's later document dispatch");
+        assert!(current.is_active());
+        assert!(
+            registry
+                .entries
+                .lock()
+                .unwrap()
+                .contains_key(client.read_policy_key())
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_current_corpus_distinguishes_pending_work_from_provider_failure() {
+        let (_directory, _store, vault, _client) = reader_fixture(true).await;
+        let old = Path::new("old.md");
+        let new = Path::new("new.md");
+        std::fs::write(vault.root().join(old), "# Old\nprevious source").unwrap();
+        vault.reindex(old).await.unwrap();
+        let model = Arc::new(CapturingEmbedder::new());
+        let registry = install_registry(&vault, Arc::clone(&model));
+        let runtime = registry.runtime(&vault, true).unwrap().unwrap();
+        wait_for_runtime(&runtime, |status| status.phase == EmbeddingPhase::Ready).await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *model.gate.lock().unwrap() = Some((started_tx, release_rx));
+        std::fs::remove_file(vault.root().join(old)).unwrap();
+        std::fs::write(vault.root().join(new), "# New\nreplacement source").unwrap();
+        vault.reindex(old).await.unwrap();
+        vault.reindex(new).await.unwrap();
+        registry.reconcile();
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            runtime.query_snapshot().is_ok(),
+            "retained snapshot stays queryable"
+        );
+        let warming = vault.search_semantic_ranked("replacement source", 5);
+        model.fail.store(true, Ordering::Release);
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            warming,
+            Err(VaultError::Storage {
+                kind: crate::error::StorageErrorKind::Warming,
+                ..
+            })
+        ));
+        wait_for_runtime(&runtime, |status| {
+            status.phase == EmbeddingPhase::Degraded && status.pending_notes > 0
+        })
+        .await;
+        let unavailable = vault.search_semantic_ranked("replacement source", 5);
+        assert!(matches!(
+            unavailable,
+            Err(VaultError::Storage {
+                kind: crate::error::StorageErrorKind::Unavailable,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn idle_reconciliation_skips_projection_snapshots_but_checks_live_authority() {
-        let (_directory, store, vault, client) = reader_fixture().await;
+        let (_directory, store, vault, client) = reader_fixture(false).await;
         let projection = Arc::clone(vault.projection.as_ref().unwrap());
         let generation = vault.inner.index.read().unwrap().generation();
         let entry = Arc::new(SemanticEntry {
@@ -795,7 +1076,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_retirement_cannot_remove_a_replacement_or_revalidated_owner() {
-        let (_directory, store, vault, client) = reader_fixture().await;
+        let (_directory, store, vault, client) = reader_fixture(false).await;
         let make_entry = || {
             Arc::new(SemanticEntry {
                 source: Arc::downgrade(&vault.inner),

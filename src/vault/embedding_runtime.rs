@@ -723,6 +723,17 @@ impl EmbeddingRuntime {
             });
         }
         let status = status_for_current_paths(&state, &paths);
+        if self.control.shared.authorization.is_some()
+            && status.phase == EmbeddingPhase::Warming
+            && !status.queryable
+        {
+            return Err(VaultError::storage(
+                "search",
+                "",
+                crate::error::StorageErrorKind::Warming,
+                "authorized semantic corpus is warming",
+            ));
+        }
         Err(VaultError::Embedding(not_ready_message(&status)))
     }
 
@@ -2523,6 +2534,40 @@ mod tests {
         assert_eq!(runtime.status().indexed_notes, 0);
         assert!(!runtime.status().queryable);
         assert!(!cache_path.exists());
+    }
+
+    #[tokio::test]
+    async fn authenticated_warming_error_survives_the_transition_to_ready() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("one.md"), "# One\nsource body").unwrap();
+        let root = super::super::fs::VaultRoot::open(directory.path()).unwrap();
+        let cache = CacheFile::new(root.clone(), PathBuf::from(".cache/embeddings.bin"));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let runtime = EmbeddingRuntime::spawn_with_authorized_source(
+            Storage::Local(root),
+            test_index(directory.path()).await,
+            cache,
+            TEST_BATCH_SIZE,
+            true,
+            EmbeddingAuthorization::new(|_| Ok(Box::new(()))),
+            async move {
+                release_rx.await.unwrap();
+                Ok(Arc::new(FakeEmbedder::new()) as Arc<dyn Embedder>)
+            },
+        );
+        let captured = runtime.query_snapshot().err().expect("loader is held");
+        release_tx.send(()).unwrap();
+        wait_for_status(&runtime, |status| status.phase == EmbeddingPhase::Ready).await;
+        assert!(runtime.query_snapshot().is_ok());
+        assert!(matches!(
+            &captured,
+            VaultError::Storage {
+                kind: crate::error::StorageErrorKind::Warming,
+                ..
+            }
+        ));
+        let response = crate::tools::search::authenticated_semantic_tool_error(captured);
+        assert_eq!(response.data.unwrap()["code"], "semantic_warming");
     }
 
     #[tokio::test]

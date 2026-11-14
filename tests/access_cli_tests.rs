@@ -162,6 +162,123 @@ fn initialization_dry_run_creates_no_profile_or_machine_data() {
 }
 
 #[test]
+fn rebind_preview_and_apply_reject_state_inside_the_proposed_vault() {
+    for state in ["profile", "data"] {
+        let fixture = Fixture::new();
+        let proposed = fixture._directory.path().join("proposed-vault");
+        std::fs::create_dir(&proposed).unwrap();
+        let profile = if state == "profile" {
+            proposed.join("private/access.json")
+        } else {
+            fixture.profile.clone()
+        };
+        let data = if state == "data" {
+            proposed.join("derived")
+        } else {
+            fixture._directory.path().join("private-data")
+        };
+        success(
+            command()
+                .arg("init")
+                .arg(&fixture.vault)
+                .arg("--access-file")
+                .arg(&profile)
+                .arg("--data-dir")
+                .arg(&data)
+                .arg("--json")
+                .output()
+                .unwrap(),
+        );
+        let before = std::fs::read(&profile).unwrap();
+        for dry_run in [true, false] {
+            let mut rebind = command();
+            rebind
+                .arg("rebind")
+                .arg("--access-file")
+                .arg(&profile)
+                .arg("--vault")
+                .arg(&proposed);
+            if dry_run {
+                rebind.arg("--dry-run");
+            }
+            let output = rebind.output().unwrap();
+            assert!(!output.status.success(), "{state}, dry_run={dry_run}");
+            assert!(String::from_utf8_lossy(&output.stderr).contains("outside the vault"));
+            assert_eq!(std::fs::read(&profile).unwrap(), before);
+        }
+    }
+}
+
+#[test]
+fn rebind_preview_preserves_state_and_apply_recovers_a_moved_vault() {
+    let fixture = Fixture::new();
+    fixture.initialize();
+    let before = std::fs::read(&fixture.profile).unwrap();
+    let revision = AccessStore::open(&fixture.profile)
+        .unwrap()
+        .snapshot()
+        .unwrap()
+        .policy
+        .revision;
+    let relocated = fixture._directory.path().join("relocated-vault");
+    std::fs::rename(&fixture.vault, &relocated).unwrap();
+    let preview = fixture
+        .command()
+        .arg("rebind")
+        .arg("--vault")
+        .arg(&relocated)
+        .arg("--dry-run")
+        .output()
+        .unwrap();
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let text = String::from_utf8(preview.stdout).unwrap();
+    assert!(text.starts_with("Would update vault binding."));
+    assert!(text.contains("Dry run complete; no files were changed."));
+    assert!(!text.contains("Restart"));
+    assert_eq!(std::fs::read(&fixture.profile).unwrap(), before);
+    let preview = success(
+        fixture
+            .command()
+            .arg("rebind")
+            .arg("--vault")
+            .arg(&relocated)
+            .args(["--dry-run", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(preview["dry_run"], true);
+    assert_eq!(preview["revision"], revision);
+    assert_eq!(std::fs::read(&fixture.profile).unwrap(), before);
+    let applied = fixture
+        .command()
+        .arg("rebind")
+        .arg("--vault")
+        .arg(&relocated)
+        .output()
+        .unwrap();
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let text = String::from_utf8(applied.stdout).unwrap();
+    assert!(text.starts_with("Updated vault binding."));
+    assert!(text.contains("Restart the authenticated server"));
+    let store = AccessStore::open(&fixture.profile).unwrap();
+    store.validate_source(&relocated).unwrap();
+    let current = store.snapshot().unwrap().policy;
+    assert_eq!(current.revision, revision + 1);
+    assert_eq!(
+        current.source.canonical_path,
+        relocated.canonicalize().unwrap()
+    );
+}
+
+#[test]
 fn reader_default_and_explicit_denial_are_enforced_by_owner_checks() {
     let fixture = Fixture::new();
     fixture.initialize();
@@ -1038,7 +1155,7 @@ fn occupy_default_backend() -> OccupiedDefaultBackend {
 }
 
 #[test]
-fn initialization_prints_a_free_endpoint_without_starting_a_server() {
+fn initialization_prints_a_launch_that_selects_its_port_when_started() {
     let _listener = occupy_default_backend();
     let fixture = Fixture::new();
     let output = command()
@@ -1058,19 +1175,8 @@ fn initialization_prints_a_free_endpoint_without_starting_a_server() {
         .lines()
         .find(|line| line.contains(" --http --host "))
         .unwrap();
-    let port: u16 = launch
-        .split_once("--port ")
-        .unwrap()
-        .1
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert!((37843..=37942).contains(&port));
-    assert!(launch.contains(&format!("--host 127.0.0.1 --port {port}")));
-    let endpoint = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let _selected = std::net::TcpListener::bind(endpoint).unwrap();
+    assert!(launch.contains("--host 127.0.0.1 --port 0"));
+    assert!(text.contains("http://<printed-address>/mcp"));
     let snapshot = AccessStore::open(&fixture.profile)
         .unwrap()
         .snapshot()
