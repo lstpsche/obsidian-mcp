@@ -9,7 +9,7 @@ keywords = ["mcp", "obsidian", "vault", "ai"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
-rmcp = { version = "3.5.1", features = ["server", "transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "3.9.0", features = ["server", "transport-io", "transport-streamable-http-server"] }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -28,6 +28,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 unicode-normalization = "0.1.25"
+# Persisted deny guards require the same engines and compiled Unicode tables.
+icu_casemap = "=2.3.0"
+icu_casemap_data = "=2.3.0"
+icu_normalizer = "=2.3.0"
+icu_normalizer_data = "=2.3.0"
+icu_properties = "=2.3.0"
+icu_properties_data = "=2.3.0"
 tantivy = "0.26"
 fastembed = { version = "6.0.3", optional = true }
 tokenizers = { version = "=0.23.2", optional = true, default-features = false, features = ["fancy-regex"] }
@@ -41,6 +48,8 @@ flate2 = "1"
 tar = ">=0.4.45, <0.5"
 zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 zeroize = "1"
+subtle = "2.6"
+http-body = "1"
 tempfile = { version = "3", optional = true }
 openssh-sftp-client-lowlevel = "0.7.4"
 bytes = "1"
@@ -59,6 +68,7 @@ features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_Networking_WinSock",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Threading",

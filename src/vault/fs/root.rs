@@ -14,7 +14,7 @@ use super::dir_entries;
 use crate::error::{VaultError, VaultResult};
 
 #[derive(Clone, Debug)]
-pub struct VaultRoot(Arc<RootDirectory>);
+pub struct VaultRoot(Arc<RootDirectory>, bool);
 
 #[derive(Debug)]
 struct RootDirectory {
@@ -54,7 +54,57 @@ impl VaultRoot {
                 path
             }
         };
-        Ok(Self(Arc::new(RootDirectory { dir, path })))
+        Ok(Self(Arc::new(RootDirectory { dir, path }), false))
+    }
+
+    /// Restrict content operations without changing the retained directory owner.
+    pub(crate) fn restricted_content(&self) -> Self {
+        Self(Arc::clone(&self.0), true)
+    }
+
+    /// Validate a delegated content file without reading its bytes.
+    pub fn validate_access_file(&self, path: &Path) -> VaultResult<()> {
+        self.restricted_content().open_file(path).map(|_| ())
+    }
+
+    /// Validate a physical source key already selected by authorization.
+    pub(crate) fn validate_access_file_exact(&self, path: &Path) -> VaultResult<()> {
+        self.restricted_content().open_exact(path).map(|_| ())
+    }
+
+    /// Physical aliases outside a delegated namespace are hidden resources.
+    /// Preserve the original native diagnostics for unrestricted owners.
+    pub(super) fn content_result<T>(
+        &self,
+        requested: &Path,
+        result: VaultResult<T>,
+    ) -> VaultResult<T> {
+        result.map_err(|error| {
+            if self.content_is_restricted()
+                && matches!(
+                    error,
+                    VaultError::OutsideVault(_) | VaultError::InvalidPath(_)
+                )
+            {
+                VaultError::AccessDenied {
+                    path: requested.to_owned(),
+                    visible: false,
+                }
+            } else {
+                error
+            }
+        })
+    }
+
+    pub(crate) fn content_is_restricted(&self) -> bool {
+        self.1
+    }
+
+    pub(crate) fn check_content_file(&self, file: &File, path: &Path) -> VaultResult<()> {
+        if self.1 {
+            require_single_link(file, path)?;
+        }
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -73,35 +123,77 @@ impl VaultRoot {
     }
 
     pub fn resolve_existing(&self, relative: &Path) -> VaultResult<ResolvedPath> {
-        self.resolve(relative, false, true)
+        if self.content_is_restricted() {
+            path::normalize_relative(relative)?;
+        }
+        self.content_result(relative, self.resolve(relative, false, true))
     }
 
     pub fn resolve_for_write(&self, relative: &Path) -> VaultResult<ResolvedPath> {
-        self.resolve(relative, true, true)
+        if self.content_is_restricted() {
+            path::normalize_relative(relative)?;
+        }
+        self.content_result(relative, self.resolve(relative, true, true))
     }
 
-    /// Resolve user aliases to physical vault keys. This translates names only.
-    /// Every consuming operation opens each physical component without following
-    /// links, so replacing a discovered name cannot redirect the operation.
+    /// Recover native entry spellings without substituting symlink targets into
+    /// the logical key used for path grants.
+    pub(crate) fn resolve_access_existing(
+        &self,
+        relative: &Path,
+    ) -> VaultResult<(PathBuf, ResolvedPath)> {
+        if self.content_is_restricted() {
+            path::normalize_relative(relative)?;
+        }
+        self.content_result(relative, self.resolve_keys(relative, false, true))
+    }
+
+    pub(crate) fn resolve_access_for_write(
+        &self,
+        relative: &Path,
+    ) -> VaultResult<(PathBuf, ResolvedPath)> {
+        if self.content_is_restricted() {
+            path::normalize_relative(relative)?;
+        }
+        self.content_result(relative, self.resolve_keys(relative, true, true))
+    }
+
     fn resolve(
         &self,
         relative: &Path,
         allow_missing: bool,
         follow_leaf: bool,
     ) -> VaultResult<ResolvedPath> {
+        self.resolve_keys(relative, allow_missing, follow_leaf)
+            .map(|(_, resolved)| resolved)
+    }
+
+    /// Resolve user aliases to physical vault keys. This translates names only.
+    /// Every consuming operation opens each physical component without following
+    /// links, so replacing a discovered name cannot redirect the operation.
+    fn resolve_keys(
+        &self,
+        relative: &Path,
+        allow_missing: bool,
+        follow_leaf: bool,
+    ) -> VaultResult<(PathBuf, ResolvedPath)> {
         let normalized = path::normalize_relative(relative)?;
         let mut parts = normalized.iter().peekable();
         let mut physical = PathBuf::new();
+        let mut logical = PathBuf::new();
         let mut directory = self.0.dir.try_clone()?;
         while let Some(requested) = parts.next() {
             let Some((name, metadata)) = lookup_component(&directory, requested)? else {
                 if !allow_missing {
                     return Err(VaultError::NoteNotFound(relative.to_owned()));
                 }
+                logical.push(requested);
+                logical.extend(parts.clone());
                 physical.push(requested);
                 physical.extend(parts);
                 break;
             };
+            logical.push(&name);
             let last = parts.peek().is_none();
             if is_link(&metadata) && (!last || follow_leaf) {
                 // Absolute in-vault symlinks are supported. Native canonicalization
@@ -126,10 +218,13 @@ impl VaultRoot {
             }
         }
         let relative = path::portable_native(&physical)?;
-        Ok(ResolvedPath {
-            absolute: self.path().join(&relative),
-            relative,
-        })
+        Ok((
+            path::portable_native(&logical)?,
+            ResolvedPath {
+                absolute: self.path().join(&relative),
+                relative,
+            },
+        ))
     }
 
     /// Validate an existing link target. Unlink can also operate on a broken leaf.
@@ -154,7 +249,10 @@ impl VaultRoot {
     /// Open a physical directory obtained from a confined walk. Intermediate
     /// directories and the leaf must each be a directory entry, never a symlink.
     pub fn open_dir_exact(&self, relative: &Path) -> VaultResult<Dir> {
-        self.physical_dir(relative, false)
+        if self.content_is_restricted() {
+            path::portable_native(relative)?;
+        }
+        self.content_result(relative, self.physical_dir(relative, false))
     }
 
     fn physical_dir(&self, relative: &Path, create: bool) -> VaultResult<Dir> {
@@ -188,23 +286,36 @@ impl VaultRoot {
     /// No-follow metadata of an exact entry. Symlink leaves are identifiable
     /// for watcher/index classification. An intermediate link is an error.
     pub fn entry_metadata_exact(&self, relative: &Path) -> VaultResult<Metadata> {
-        if relative.as_os_str().is_empty() {
-            return Ok(self.0.dir.dir_metadata()?);
+        if self.content_is_restricted() {
+            path::portable_native(relative)?;
         }
-        let (parent, name) = self.parent(relative, false)?;
-        parent
-            .symlink_metadata(name)
-            .map_err(super::map_not_found(relative))
+        let result = (|| {
+            if relative.as_os_str().is_empty() {
+                return Ok(self.0.dir.dir_metadata()?);
+            }
+            let (parent, name) = self.parent(relative, false)?;
+            parent
+                .symlink_metadata(name)
+                .map_err(super::map_not_found(relative))
+        })();
+        self.content_result(relative, result)
     }
 
     pub fn open_exact(&self, relative: &Path) -> VaultResult<File> {
-        let (parent, name) = self.parent(relative, false)?;
-        let mut options = OpenOptions::new();
-        options.read(true);
-        let file = open_regular(&parent, name, relative, options)?;
-        #[cfg(test)]
-        crate::test_helpers::count_io(&crate::test_helpers::EXACT_FILE_OPENS);
-        Ok(file)
+        if self.content_is_restricted() {
+            path::portable_native(relative)?;
+        }
+        let result = (|| {
+            let (parent, name) = self.parent(relative, false)?;
+            let mut options = OpenOptions::new();
+            options.read(true);
+            let file = open_regular(&parent, name, relative, options)?;
+            self.check_content_file(&file, relative)?;
+            #[cfg(test)]
+            crate::test_helpers::count_io(&crate::test_helpers::EXACT_FILE_OPENS);
+            Ok(file)
+        })();
+        self.content_result(relative, result)
     }
 
     /// Verify that a cached key still names this opened file with the same
@@ -269,12 +380,19 @@ impl VaultRoot {
         Ok((self.physical_dir(parent, create)?, name))
     }
 
-    pub(super) fn resolve_entry(
+    pub(crate) fn resolve_entry(
         &self,
         relative: &Path,
         allow_missing: bool,
     ) -> VaultResult<PathBuf> {
-        Ok(self.resolve(relative, allow_missing, false)?.relative)
+        if self.content_is_restricted() {
+            path::normalize_relative(relative)?;
+        }
+        self.content_result(
+            relative,
+            self.resolve(relative, allow_missing, false)
+                .map(|resolved| resolved.relative),
+        )
     }
 }
 
@@ -506,4 +624,34 @@ fn disk_entry(dir: &Dir, name: OsString) -> VaultResult<(OsString, Metadata)> {
         .symlink_metadata(&name)
         .map_err(super::map_not_found(Path::new(&name)))?;
     Ok((name, metadata))
+}
+
+/// A writable inode may also be reachable through a denied or external name.
+fn require_single_link(file: &File, path: &Path) -> VaultResult<()> {
+    #[cfg(unix)]
+    let links = { std::os::unix::fs::MetadataExt::nlink(&file.metadata()?) };
+    #[cfg(windows)]
+    let links = {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        u64::from(information.nNumberOfLinks)
+    };
+    #[cfg(not(any(unix, windows)))]
+    return Err(VaultError::InvalidPath(
+        "authenticated content requires native file identity".into(),
+    ));
+    #[cfg(any(unix, windows))]
+    if links != 1 {
+        return Err(VaultError::AccessDenied {
+            path: path.to_owned(),
+            visible: false,
+        });
+    }
+    Ok(())
 }

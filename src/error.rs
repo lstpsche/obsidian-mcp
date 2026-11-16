@@ -32,6 +32,12 @@ pub enum MutationOutcome {
 
 #[derive(Debug, thiserror::Error)]
 pub enum VaultError {
+    #[error("Access denied for {path}")]
+    AccessDenied { path: PathBuf, visible: bool },
+
+    #[error("Authorization failed: {0}")]
+    Authorization(String),
+
     #[error("Storage {operation} failed for {path}: {message} (outcome: {outcome:?})")]
     Storage {
         operation: String,
@@ -156,7 +162,55 @@ pub enum VaultError {
 
 pub type VaultResult<T> = Result<T, VaultError>;
 
+impl From<crate::access::store::AccessError> for VaultError {
+    fn from(error: crate::access::store::AccessError) -> Self {
+        match error {
+            crate::access::store::AccessError::Denied { path, visible } => {
+                Self::AccessDenied { path, visible }
+            }
+            other => Self::Authorization(other.to_string()),
+        }
+    }
+}
+
 impl VaultError {
+    /// Finite operator diagnostics for delegated work. Provider/parser messages
+    /// may echo source bytes, so authenticated logs must not format those values.
+    pub(crate) fn diagnostic_category(&self) -> &'static str {
+        match self {
+            Self::AccessDenied { .. } => "permission_denied",
+            Self::Authorization(_) => "authorization_unavailable",
+            Self::Storage { .. } => "storage_error",
+            Self::NoteNotFound(_) | Self::DirectoryNotFound(_) => "not_found",
+            Self::InvalidPath(_) | Self::OutsideVault(_) => "invalid_path",
+            Self::SourceChanged { .. } => "source_changed",
+            Self::Io(_) => "io_error",
+            Self::FrontmatterParse { .. } | Self::InvalidFrontmatter { .. } => {
+                "invalid_frontmatter"
+            }
+            Self::EmbeddingRequest { .. } => "provider_error",
+            Self::EmbeddingCacheIncompatible(_) => "cache_incompatible",
+            Self::EmbeddingConfiguration(_) => "embedding_configuration",
+            Self::Embedding(_) => "embedding_error",
+            Self::SemanticResourceLimit { .. } => "resource_limit",
+            Self::EmbeddingInputTooLong { .. } => "input_too_long",
+            Self::Tantivy(_) => "lexical_index_error",
+            Self::Watcher(_) => "watcher_error",
+            Self::DaemonIpc(_)
+            | Self::DaemonProtocol(_)
+            | Self::DaemonUnavailable(_)
+            | Self::DaemonRpc { .. }
+            | Self::DaemonTimeout { .. }
+            | Self::DaemonBootstrap(_) => "daemon_error",
+            Self::InvalidSourceRange(_)
+            | Self::AlreadyExists(_)
+            | Self::PatchTargetNotFound { .. }
+            | Self::InvalidDateFormat { .. }
+            | Self::InvalidRegex { .. } => "invalid_operation",
+            Self::Other(_) => "internal_error",
+        }
+    }
+
     pub fn storage(
         operation: impl Into<String>,
         path: impl Into<String>,
@@ -199,7 +253,32 @@ impl VaultError {
 
 impl From<VaultError> for rmcp::ErrorData {
     fn from(err: VaultError) -> Self {
+        if let VaultError::Authorization(_) = &err {
+            return Self::new(
+                ErrorCode::INTERNAL_ERROR,
+                "Authorization is unavailable; contact the vault owner",
+                Some(serde_json::json!({"code": "authorization_unavailable"})),
+            );
+        }
+        if let VaultError::AccessDenied { path, visible } = &err {
+            return if *visible {
+                Self::new(
+                    ErrorCode::INVALID_REQUEST,
+                    "Permission denied",
+                    Some(serde_json::json!({"code": "permission_denied", "path": path})),
+                )
+            } else {
+                Self::new(
+                    ErrorCode::RESOURCE_NOT_FOUND,
+                    "Resource not found",
+                    None::<serde_json::Value>,
+                )
+            };
+        }
         let code = match &err {
+            VaultError::AccessDenied { .. } | VaultError::Authorization(_) => {
+                ErrorCode::INTERNAL_ERROR
+            }
             VaultError::Storage { kind, .. } => match kind {
                 StorageErrorKind::Warming
                 | StorageErrorKind::Conflict

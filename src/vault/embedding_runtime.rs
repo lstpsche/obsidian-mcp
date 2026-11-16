@@ -19,6 +19,7 @@ use crate::error::{VaultError, VaultResult};
 #[cfg(test)]
 use super::embedding_chunks::prepare_note;
 use super::embedding_chunks::{PreparedNote, prepare_note_with_budget};
+pub(crate) use super::embeddings::EmbeddingAuthorization;
 #[cfg(test)]
 use super::embeddings::prepared_text_hash;
 use super::embeddings::{
@@ -123,6 +124,8 @@ struct RuntimeShared {
     live: Arc<AtomicBool>,
     lifecycle_gate: Arc<Mutex<()>>,
     first_load_error: OnceLock<String>,
+    authorization: Option<EmbeddingAuthorization>,
+    diagnostic_corpus: Option<String>,
 }
 
 impl RuntimeShared {
@@ -266,6 +269,7 @@ impl StagedNote {
 pub(crate) struct EmbeddingQuerySnapshot {
     model: Arc<dyn Embedder>,
     store: Arc<RwLock<EmbeddingStore>>,
+    authorization: Option<EmbeddingAuthorization>,
 }
 
 impl EmbeddingQuerySnapshot {
@@ -288,8 +292,22 @@ impl EmbeddingQuerySnapshot {
         Ok(())
     }
 
+    pub(crate) fn with_authorization(mut self, authorization: EmbeddingAuthorization) -> Self {
+        self.authorization = Some(match self.authorization.take() {
+            Some(corpus) => EmbeddingAuthorization::new(move |path| {
+                // Preserve corpus readiness/ownership as well as the narrower
+                // requesting credential, without nesting independent store locks.
+                drop(corpus.acquire(path)?);
+                authorization.acquire(path)
+            }),
+            None => authorization,
+        });
+        self
+    }
+
     pub(crate) fn embed_query(&self, query: &str) -> VaultResult<Vec<f32>> {
-        self.model.embed_query(query)
+        self.model
+            .embed_authorized_query(query, self.authorization.as_ref())
     }
 
     #[cfg(test)]
@@ -379,6 +397,52 @@ impl EmbeddingRuntime {
     where
         F: Future<Output = VaultResult<Arc<dyn Embedder>>> + Send + 'static,
     {
+        Self::spawn_with_optional_authorization(
+            source,
+            index,
+            cache,
+            batch_size,
+            initially_active,
+            None,
+            loader,
+        )
+    }
+
+    pub(crate) fn spawn_with_authorized_source<F>(
+        source: Storage,
+        index: Arc<RwLock<VaultIndex>>,
+        cache: CacheFile,
+        batch_size: usize,
+        initially_active: bool,
+        authorization: EmbeddingAuthorization,
+        loader: F,
+    ) -> Self
+    where
+        F: Future<Output = VaultResult<Arc<dyn Embedder>>> + Send + 'static,
+    {
+        Self::spawn_with_optional_authorization(
+            source,
+            index,
+            cache,
+            batch_size,
+            initially_active,
+            Some(authorization),
+            loader,
+        )
+    }
+
+    fn spawn_with_optional_authorization<F>(
+        source: Storage,
+        index: Arc<RwLock<VaultIndex>>,
+        cache: CacheFile,
+        batch_size: usize,
+        initially_active: bool,
+        authorization: Option<EmbeddingAuthorization>,
+        loader: F,
+    ) -> Self
+    where
+        F: Future<Output = VaultResult<Arc<dyn Embedder>>> + Send + 'static,
+    {
         #[cfg(test)]
         tests::initialize_test_logging();
         debug_assert!(batch_size > 0);
@@ -405,6 +469,7 @@ impl EmbeddingRuntime {
             );
         }
         update_pending_status(&mut state);
+        let diagnostic_corpus = authorization.as_ref().map(|_| cache.diagnostic_id());
         let shared = Arc::new(RuntimeShared {
             source,
             index,
@@ -416,13 +481,18 @@ impl EmbeddingRuntime {
             live: Arc::new(AtomicBool::new(true)),
             lifecycle_gate: Arc::new(Mutex::new(())),
             first_load_error: OnceLock::new(),
+            authorization,
+            diagnostic_corpus,
         });
         let worker_shared = Arc::clone(&shared);
-        let span = tracing::info_span!(
-            "embedding_runtime",
-            source = if shared.source.is_remote() { "sftp" } else { "local" },
-            vault = %shared.source.path().display(),
-        );
+        let span = match shared.diagnostic_corpus.as_deref() {
+            Some(corpus) => tracing::info_span!("embedding_runtime", source = "local", corpus),
+            None => tracing::info_span!(
+                "embedding_runtime",
+                source = if shared.source.is_remote() { "sftp" } else { "local" },
+                vault = %shared.source.path().display(),
+            ),
+        };
         let worker = tokio::spawn(
             async move {
                 let coordinator = run_coordinator(Arc::clone(&worker_shared), loader);
@@ -548,7 +618,15 @@ impl EmbeddingRuntime {
             Ok(path) if !path.as_os_str().is_empty() => path,
             Ok(_) => return,
             Err(error) => {
-                tracing::warn!(path = %path.display(), error = %error, "ignoring invalid embedding intent path");
+                if let Some(corpus) = self.control.shared.diagnostic_corpus.as_deref() {
+                    tracing::warn!(
+                        corpus,
+                        error_category = error.diagnostic_category(),
+                        "ignoring invalid embedding intent path"
+                    );
+                } else {
+                    tracing::warn!(path = %path.display(), error = %error, "ignoring invalid embedding intent path");
+                }
                 return;
             }
         };
@@ -623,6 +701,7 @@ impl EmbeddingRuntime {
                 return Ok(EmbeddingQuerySnapshot {
                     model: Arc::clone(model),
                     store: Arc::clone(store),
+                    authorization: self.control.shared.authorization.clone(),
                 });
             }
         }
@@ -640,9 +719,21 @@ impl EmbeddingRuntime {
             return Ok(EmbeddingQuerySnapshot {
                 model: Arc::clone(model),
                 store: Arc::clone(store),
+                authorization: self.control.shared.authorization.clone(),
             });
         }
         let status = status_for_current_paths(&state, &paths);
+        if self.control.shared.authorization.is_some()
+            && status.phase == EmbeddingPhase::Warming
+            && !status.queryable
+        {
+            return Err(VaultError::storage(
+                "search",
+                "",
+                crate::error::StorageErrorKind::Warming,
+                "authorized semantic corpus is warming",
+            ));
+        }
         Err(VaultError::Embedding(not_ready_message(&status)))
     }
 
@@ -729,17 +820,41 @@ where
             return;
         }
         Ok(Err(VaultError::EmbeddingCacheIncompatible(reason))) => {
-            tracing::info!(reason = %reason, "rebuilding incompatible embedding cache");
+            if let Some(corpus) = shared.diagnostic_corpus.as_deref() {
+                tracing::info!(
+                    corpus,
+                    error_category = "cache_incompatible",
+                    "rebuilding incompatible embedding cache"
+                );
+            } else {
+                tracing::info!(reason = %reason, "rebuilding incompatible embedding cache");
+            }
             (None, None)
         }
         Ok(Err(error)) => {
             let message = format!("embedding cache could not be loaded; rebuilding: {error}");
-            tracing::warn!(error = %message, "embedding cache load failed");
+            if let Some(corpus) = shared.diagnostic_corpus.as_deref() {
+                tracing::warn!(
+                    corpus,
+                    error_category = error.diagnostic_category(),
+                    "embedding cache load failed"
+                );
+            } else {
+                tracing::warn!(error = %message, "embedding cache load failed");
+            }
             (None, Some(message))
         }
         Err(error) => {
             let message = format!("embedding cache task failed; rebuilding: {error}");
-            tracing::warn!(error = %message, "embedding cache load failed");
+            if let Some(corpus) = shared.diagnostic_corpus.as_deref() {
+                tracing::warn!(
+                    corpus,
+                    error_category = "worker_failure",
+                    "embedding cache load failed"
+                );
+            } else {
+                tracing::warn!(error = %message, "embedding cache load failed");
+            }
             (None, Some(message))
         }
     };
@@ -942,6 +1057,7 @@ fn record_terminal_failure_message(shared: &RuntimeShared, message: String, tota
             pending_notes,
             last_error: Some(message),
         },
+        shared.diagnostic_corpus.as_deref(),
     );
 }
 
@@ -1218,6 +1334,7 @@ async fn process_batch(
             .sum();
         let mut jobs = Vec::with_capacity(capacity);
         let mut inputs = Vec::with_capacity(capacity);
+        let mut source_paths = Vec::with_capacity(capacity);
         for (note_index, slot) in active.iter_mut().enumerate() {
             let Some(draft) = slot.as_ref() else {
                 continue;
@@ -1241,6 +1358,7 @@ async fn process_batch(
                     continue;
                 }
                 jobs.push((note_index, chunk_index));
+                source_paths.push(draft.work.path.clone());
                 inputs.push((Arc::clone(&draft.prepared), chunk_index));
             }
         }
@@ -1250,6 +1368,7 @@ async fn process_batch(
         let embedder = Arc::clone(model);
         let source_owner = Arc::clone(shared);
         let owner_live = Arc::clone(&shared.live);
+        let authorization = shared.authorization.clone();
         let started = Instant::now();
         let dispatcher = tracing::dispatcher::get_default(Clone::clone);
         let span = tracing::Span::current();
@@ -1269,7 +1388,12 @@ async fn process_batch(
                         .map(|(prepared, chunk)| prepared.chunks[*chunk].text.as_str())
                         .collect::<Vec<_>>();
                     tracing::debug!(pending_inputs = texts.len(), "embedding batch started");
-                    let (count, result) = embedder.embed_next_batch(&texts, &owner_live);
+                    let (count, result) = embedder.embed_next_batch(
+                        &texts,
+                        &owner_live,
+                        authorization.as_ref(),
+                        &source_paths,
+                    );
                     let result = result.and_then(|vectors| {
                         validate_embedding_batch(vectors, count, embedder.dimension())
                     });
@@ -1328,7 +1452,18 @@ async fn process_batch(
                 }
             }
             Err(error) => {
-                tracing::debug!(batch_size = count, duration_ms = started.elapsed().as_millis() as u64, outcome = "failed", error = %error, "embedding batch finished");
+                if let Some(corpus) = shared.diagnostic_corpus.as_deref() {
+                    tracing::debug!(
+                        corpus,
+                        batch_size = count,
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        outcome = "failed",
+                        error_category = error.diagnostic_category(),
+                        "embedding batch finished"
+                    );
+                } else {
+                    tracing::debug!(batch_size = count, duration_ms = started.elapsed().as_millis() as u64, outcome = "failed", error = %error, "embedding batch finished");
+                }
                 let affected = jobs
                     .iter()
                     .take(count)
@@ -1442,11 +1577,19 @@ async fn prepare_work_observed(
             }
             let embedder = Arc::clone(model);
             let previous = previous.clone();
+            if let Some(authorization) = &shared.authorization {
+                drop(authorization.acquire(Some(&path))?);
+            }
             let raw = observed.read_exact_bounded(&path, read_limit).await;
+            let authorization = shared.authorization.clone();
             let index = Arc::clone(&shared.index);
             match raw {
                 Err(error) => Err(error),
                 Ok(raw) => tokio::task::spawn_blocking(move || {
+                    // Waiting for a blocking worker cannot retain an old source grant.
+                    if let Some(authorization) = &authorization {
+                        drop(authorization.acquire(Some(&path))?);
+                    }
                     if !index
                         .read()
                         .unwrap_or_else(|error| error.into_inner())
@@ -1649,6 +1792,18 @@ fn commit_remove(
     store: &Arc<RwLock<EmbeddingStore>>,
     work: &PendingWork,
 ) -> bool {
+    let _authorization = match shared
+        .authorization
+        .as_ref()
+        .map(|authority| authority.acquire(None))
+        .transpose()
+    {
+        Ok(permit) => permit,
+        Err(error) => {
+            record_failure(shared, work.clone(), error, None);
+            return false;
+        }
+    };
     let _lifecycle_guard = shared
         .lifecycle_gate
         .lock()
@@ -1688,6 +1843,18 @@ fn commit_note(
     work: &PendingWork,
     entry: NoteEmbeddingEntry,
 ) -> bool {
+    let _authorization = match shared
+        .authorization
+        .as_ref()
+        .map(|authority| authority.acquire(Some(&work.path)))
+        .transpose()
+    {
+        Ok(permit) => permit,
+        Err(error) => {
+            record_failure(shared, work.clone(), error, None);
+            return false;
+        }
+    };
     let _lifecycle_guard = shared
         .lifecycle_gate
         .lock()
@@ -1725,6 +1892,18 @@ fn commit_note(
 }
 
 fn mark_success(shared: &RuntimeShared, work: &PendingWork) {
+    let _authorization = match shared
+        .authorization
+        .as_ref()
+        .map(|authority| authority.acquire(Some(&work.path)))
+        .transpose()
+    {
+        Ok(permit) => permit,
+        Err(error) => {
+            record_failure(shared, work.clone(), error, None);
+            return;
+        }
+    };
     let _lifecycle_guard = shared
         .lifecycle_gate
         .lock()
@@ -1920,7 +2099,11 @@ async fn persist_store(
         if !source_owner.source_is_live() {
             return Ok(false);
         }
-        cache.publish(&bytes, Some((&live, &lifecycle_gate)))
+        cache.publish_authorized(
+            &bytes,
+            Some((&live, &lifecycle_gate)),
+            source_owner.authorization.as_ref(),
+        )
     })
     .await
     .map_err(|error| VaultError::Embedding(format!("cache write task failed: {error}")))?
@@ -1940,7 +2123,7 @@ fn refresh_status(shared: &RuntimeShared, store: &Arc<RwLock<EmbeddingStore>>) {
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let next = status_for_loaded_state(&state, paths.len(), indexed_notes);
-    replace_status(&mut state, next);
+    replace_status(&mut state, next, shared.diagnostic_corpus.as_deref());
 }
 
 fn status_for_loaded_state(
@@ -2025,7 +2208,11 @@ fn report_progress(shared: &RuntimeShared) {
     );
 }
 
-fn replace_status(state: &mut RuntimeState, next: EmbeddingRuntimeStatus) {
+fn replace_status(
+    state: &mut RuntimeState,
+    next: EmbeddingRuntimeStatus,
+    diagnostic_corpus: Option<&str>,
+) {
     let previous = &state.status;
     let meaningful_transition = previous.phase != next.phase
         || previous.queryable != next.queryable
@@ -2034,6 +2221,16 @@ fn replace_status(state: &mut RuntimeState, next: EmbeddingRuntimeStatus) {
 
     if meaningful_transition {
         match next.phase {
+            EmbeddingPhase::Degraded if diagnostic_corpus.is_some() => tracing::warn!(
+                corpus = diagnostic_corpus,
+                phase = ?next.phase,
+                queryable = next.queryable,
+                indexed_notes = next.indexed_notes,
+                total_notes = next.total_notes,
+                pending_notes = next.pending_notes,
+                error_category = "semantic_runtime",
+                "embedding runtime status changed"
+            ),
             EmbeddingPhase::Degraded => tracing::warn!(
                 phase = ?next.phase,
                 queryable = next.queryable,
@@ -2216,12 +2413,12 @@ mod tests {
                 last_error: Some("embedding API request timed out".into()),
                 ..Default::default()
             };
-            replace_status(&mut state, status.clone());
+            replace_status(&mut state, status.clone(), None);
             status.pending_notes = 4;
-            replace_status(&mut state, status.clone());
+            replace_status(&mut state, status.clone(), None);
             status.last_error =
                 Some("embedding API returned HTTP status 503 Service Unavailable".into());
-            replace_status(&mut state, status);
+            replace_status(&mut state, status, None);
         });
         let output = logs.text_for("changed_error_cause_test");
         assert_eq!(
@@ -2231,6 +2428,206 @@ mod tests {
         );
         assert!(output.contains("embedding API request timed out"));
         assert!(output.contains("503 Service Unavailable"));
+    }
+
+    #[test]
+    fn authenticated_status_logs_keep_private_failure_details_internal() {
+        let logs = captured_logs();
+        let detail = "Private/secret.md provider echoed private-document-body";
+        tracing::info_span!("authenticated_status_error_test").in_scope(|| {
+            let mut state = RuntimeState::default();
+            replace_status(
+                &mut state,
+                EmbeddingRuntimeStatus {
+                    phase: EmbeddingPhase::Degraded,
+                    last_error: Some(detail.into()),
+                    ..Default::default()
+                },
+                Some("synthetic-corpus-id"),
+            );
+            assert_eq!(state.status.last_error.as_deref(), Some(detail));
+        });
+        let output = logs.text_for("authenticated_status_error_test");
+        assert!(output.contains("synthetic-corpus-id"));
+        assert!(output.contains("semantic_runtime"));
+        assert!(!output.contains("Private/secret.md"));
+        assert!(!output.contains("private-document-body"));
+    }
+
+    #[tokio::test]
+    async fn denied_source_never_enters_tokenization_or_inference() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("private.md"),
+            "# Private\nsensitive body",
+        )
+        .unwrap();
+        let root = super::super::fs::VaultRoot::open(directory.path()).unwrap();
+        let cache = CacheFile::new(root.clone(), PathBuf::from(".cache/embeddings.bin"));
+        let model = Arc::new(FakeEmbedder::new());
+        let loader_model = Arc::clone(&model);
+        let runtime = EmbeddingRuntime::spawn_with_authorized_source(
+            Storage::Local(root),
+            test_index(directory.path()).await,
+            cache,
+            TEST_BATCH_SIZE,
+            true,
+            EmbeddingAuthorization::new(|path| {
+                if path.is_some() {
+                    return Err(VaultError::Embedding("source access denied".into()));
+                }
+                Ok(Box::new(()))
+            }),
+            async move { Ok(loader_model as Arc<dyn Embedder>) },
+        );
+        wait_for_status(&runtime, |status| status.phase == EmbeddingPhase::Degraded).await;
+        assert_eq!(model.tokenizations.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(model.calls.load(AtomicOrdering::SeqCst), 0);
+        assert!(!runtime.status().queryable);
+        let cache_path = directory.path().join(".cache/embeddings.bin");
+        if cache_path.exists() {
+            let cache = EmbeddingStore::load(&cache_path).unwrap();
+            assert!(cache.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn authorization_withdrawn_during_inference_prevents_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("one.md"), "# One\nsource body").unwrap();
+        let root = super::super::fs::VaultRoot::open(directory.path()).unwrap();
+        let cache_path = directory.path().join(".cache/embeddings.bin");
+        let cache = CacheFile::new(root.clone(), PathBuf::from(".cache/embeddings.bin"));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let allowed = Arc::new(AtomicBool::new(true));
+        let check = Arc::clone(&allowed);
+        let runtime = EmbeddingRuntime::spawn_with_authorized_source(
+            Storage::Local(root),
+            test_index(directory.path()).await,
+            cache,
+            TEST_BATCH_SIZE,
+            true,
+            EmbeddingAuthorization::new(move |_| {
+                if !check.load(AtomicOrdering::Acquire) {
+                    return Err(VaultError::Embedding("authorization withdrawn".into()));
+                }
+                Ok(Box::new(()))
+            }),
+            async move {
+                Ok(Arc::new(BlockingEmbedder {
+                    identity: FakeEmbedder::new().identity,
+                    started: started_tx,
+                    release: Mutex::new(release_rx),
+                    finished: None,
+                }) as Arc<dyn Embedder>)
+            },
+        );
+        tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .unwrap();
+        // Withdrawal does not wait for the held model/provider call.
+        allowed.store(false, AtomicOrdering::Release);
+        release_tx.send(()).unwrap();
+        wait_for_status(&runtime, |status| status.phase == EmbeddingPhase::Degraded).await;
+        assert_eq!(runtime.status().indexed_notes, 0);
+        assert!(!runtime.status().queryable);
+        assert!(!cache_path.exists());
+    }
+
+    #[tokio::test]
+    async fn authenticated_warming_error_survives_the_transition_to_ready() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("one.md"), "# One\nsource body").unwrap();
+        let root = super::super::fs::VaultRoot::open(directory.path()).unwrap();
+        let cache = CacheFile::new(root.clone(), PathBuf::from(".cache/embeddings.bin"));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let runtime = EmbeddingRuntime::spawn_with_authorized_source(
+            Storage::Local(root),
+            test_index(directory.path()).await,
+            cache,
+            TEST_BATCH_SIZE,
+            true,
+            EmbeddingAuthorization::new(|_| Ok(Box::new(()))),
+            async move {
+                release_rx.await.unwrap();
+                Ok(Arc::new(FakeEmbedder::new()) as Arc<dyn Embedder>)
+            },
+        );
+        let captured = runtime.query_snapshot().err().expect("loader is held");
+        release_tx.send(()).unwrap();
+        wait_for_status(&runtime, |status| status.phase == EmbeddingPhase::Ready).await;
+        assert!(runtime.query_snapshot().is_ok());
+        assert!(matches!(
+            &captured,
+            VaultError::Storage {
+                kind: crate::error::StorageErrorKind::Warming,
+                ..
+            }
+        ));
+        let response = crate::tools::search::authenticated_semantic_tool_error(captured);
+        assert_eq!(response.data.unwrap()["code"], "semantic_warming");
+    }
+
+    #[tokio::test]
+    async fn late_unavailable_note_does_not_reject_an_earlier_dispatch_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("a.md"), "# A\nfirst body").unwrap();
+        std::fs::write(directory.path().join("b.md"), "# B\nlater body").unwrap();
+        let root = super::super::fs::VaultRoot::open(directory.path()).unwrap();
+        let cache = CacheFile::new(root.clone(), PathBuf::from(".cache/embeddings.bin"));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let model = Arc::new(RequestControlledEmbedder::new());
+        *model.planning_gate.lock().unwrap() = Some((started_tx, release_rx));
+        let loader_model = Arc::clone(&model);
+        let later_available = Arc::new(AtomicBool::new(true));
+        let check = Arc::clone(&later_available);
+        let runtime = EmbeddingRuntime::spawn_with_authorized_source(
+            Storage::Local(root),
+            test_index(directory.path()).await,
+            cache,
+            TEST_BATCH_SIZE,
+            true,
+            EmbeddingAuthorization::new(move |path| {
+                if path == Some(Path::new("b.md")) && !check.load(AtomicOrdering::Acquire) {
+                    return Err(VaultError::AccessDenied {
+                        path: "b.md".into(),
+                        visible: false,
+                    });
+                }
+                Ok(Box::new(()))
+            }),
+            async move { Ok(loader_model as Arc<dyn Embedder>) },
+        );
+        // Both notes have been prepared, but the provider's one-input prefix
+        // has not yet been selected. Only the later note loses source access.
+        tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .unwrap();
+        later_available.store(false, AtomicOrdering::Release);
+        release_tx.send(()).unwrap();
+        wait_for_status(&runtime, |status| {
+            status.phase == EmbeddingPhase::Degraded && status.pending_notes == 0
+        })
+        .await;
+        assert_eq!(runtime.status().indexed_notes, 1);
+        assert_eq!(model.calls.load(AtomicOrdering::SeqCst), 1);
+        let inputs = model.inputs.lock().unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert!(inputs[0].contains("first body"));
+        assert!(!inputs[0].contains("later body"));
+        let entries = runtime
+            .query_snapshot()
+            .unwrap()
+            .capture_entries(&HashSet::from([
+                OsString::from("a.md"),
+                OsString::from("b.md"),
+            ]));
+        assert!(entries.contains_key(OsStr::new("a.md")));
+        assert!(!entries.contains_key(OsStr::new("b.md")));
     }
 
     #[tokio::test]
@@ -3537,7 +3934,10 @@ mod tests {
         panic_on_call: AtomicUsize,
         transient: AtomicBool,
         inputs: Mutex<Vec<String>>,
+        planning_gate: Mutex<Option<PlanningGate>>,
     }
+
+    type PlanningGate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 
     impl RequestControlledEmbedder {
         fn new() -> Self {
@@ -3548,6 +3948,7 @@ mod tests {
                 panic_on_call: AtomicUsize::new(usize::MAX),
                 transient: AtomicBool::new(true),
                 inputs: Mutex::new(Vec::new()),
+                planning_gate: Mutex::new(None),
             }
         }
     }
@@ -3571,6 +3972,19 @@ mod tests {
                 max_total_tokens: 512,
                 max_request_bytes: 16 * 1024 * 1024,
             }
+        }
+        fn plan_batch(&self, texts: &[&str]) -> VaultResult<usize> {
+            if let Some((started, release)) = self.planning_gate.lock().unwrap().take() {
+                started.send(()).unwrap();
+                release.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            super::super::embedding_input::plan_batch(
+                texts,
+                self.input_policy(),
+                self.request_limits(),
+                2,
+                |text| self.count_tokens(text),
+            )
         }
         fn embed_batch(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>> {
             assert_eq!(texts.len(), 1);

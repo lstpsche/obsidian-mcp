@@ -65,7 +65,10 @@ pub async fn periodic(
     match params.action.to_ascii_lowercase().as_str() {
         "get" => {
             let date = params.date.map(|s| parse_date(&s)).transpose()?;
-            let content = vault.get_periodic_note(&params.period, date).await?;
+            let content = vault
+                .get_periodic_note(&params.period, date)
+                .await
+                .map_err(|error| periodic_error(vault, error))?;
             super::output::with_text(
                 &PeriodicOutput::Get {
                     content: content.clone(),
@@ -77,7 +80,8 @@ pub async fn periodic(
             let date = params.date.map(|s| parse_date(&s)).transpose()?;
             let path = vault
                 .create_periodic_note(&params.period, date, params.content.as_deref())
-                .await?;
+                .await
+                .map_err(|error| periodic_error(vault, error))?;
             let message = format!("Created: {}", path.display());
             super::output::with_text(
                 &PeriodicOutput::Create {
@@ -91,7 +95,8 @@ pub async fn periodic(
             let limit = params.limit.unwrap_or(10);
             let paths = vault
                 .list_recent_periodic_notes(&params.period, limit)
-                .await?;
+                .await
+                .map_err(|error| periodic_error(vault, error))?;
 
             let items: Vec<PeriodicEntry> = paths
                 .into_iter()
@@ -118,6 +123,24 @@ pub async fn periodic(
             None::<serde_json::Value>,
         )),
     }
+}
+
+fn periodic_error(vault: &Vault, error: crate::error::VaultError) -> rmcp::ErrorData {
+    if vault.is_authenticated()
+        && matches!(
+            error,
+            crate::error::VaultError::InvalidPath(_)
+                | crate::error::VaultError::OutsideVault(_)
+                | crate::error::VaultError::InvalidDateFormat { .. }
+        )
+    {
+        return rmcp::ErrorData::new(
+            ErrorCode::INVALID_REQUEST,
+            "Periodic note configuration cannot be used by this client; contact the vault owner",
+            Some(serde_json::json!({"code": "periodic_configuration"})),
+        );
+    }
+    error.into()
 }
 
 #[cfg(test)]

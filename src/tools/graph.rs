@@ -236,7 +236,7 @@ async fn wikilinks_broken(
                 .collect()
         }
         None => {
-            let all = vault.broken_links()?;
+            let all = vault.catalog_work(|vault| vault.broken_links()).await?;
             all.into_iter()
                 .map(|(source_path, link)| BrokenLink {
                     source_path,
@@ -251,8 +251,10 @@ async fn wikilinks_broken(
 }
 
 async fn wikilinks_orphans(vault: &Vault) -> Result<CallToolResult, rmcp::ErrorData> {
-    let mut disconnected: Vec<OrphanNoteEntry> = vault
-        .orphan_notes()?
+    let (orphans, broken) = vault
+        .catalog_work(|vault| Ok((vault.orphan_notes()?, vault.broken_links()?)))
+        .await?;
+    let mut disconnected: Vec<OrphanNoteEntry> = orphans
         .into_iter()
         .map(|note| OrphanNoteEntry {
             path: note.path,
@@ -267,7 +269,7 @@ async fn wikilinks_orphans(vault: &Vault) -> Result<CallToolResult, rmcp::ErrorD
         .collect();
 
     let mut broken_by_source: HashMap<OsString, HashSet<String>> = HashMap::new();
-    for (source_path, link) in vault.broken_links()? {
+    for (source_path, link) in broken {
         broken_by_source
             .entry(source_path.into_os_string())
             .or_default()
