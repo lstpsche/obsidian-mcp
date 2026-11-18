@@ -499,6 +499,19 @@ A profile is strict JSON tied to the exact endpoint and outgoing model. For exam
 
 For a HuggingFace tokenizer, replace `tokenizer` with `{"kind":"huggingface","path":"tokenizer.json","sha256":"<actual lowercase SHA-256>","add_special_tokens":true}`. The file must export the fully initialized tokenizer, including normalization, added tokens and postprocessing; its special-token behavior must match the provider. Relative paths resolve against the profile directory. Profiles are limited to 1 MiB and tokenizer files to 64 MiB. Unknown fields, mismatched endpoint/model, invalid limits and digest mismatches are configuration errors before inference. `profile_revision` identifies the reviewed deployment contract; it cannot detect a provider secretly replacing model weights under the same alias.
 
+Profiles can include a top-level `request` field for endpoints that support these parameters. Either setting can be supplied independently. When specifying `input_types`, provide both values accepted by the provider.
+
+```json
+{
+  "request": {
+    "dimensions": 2048,
+    "input_types": { "document": "document", "query": "query" }
+  }
+}
+```
+
+The API receives `dimensions` with each request and the corresponding `input_type` for indexed content or search queries. A probe verifies the requested dimension when the model initializes. Leave extra room in `max_input_tokens` and `max_batch_tokens` for any prompts or special tokens the provider adds. Changes to these request parameters invalidate the embedding cache.
+
 Request item, token and serialized-byte limits are enforced independently. Local inference dispatches at most 32 prepared inputs per request, with an aggregate token ceiling of 32 times the loaded per-input capacity. Reconciliation batch size continues to count notes; a note producing many chunks does not multiply the local inference request size. The daemon reads its own provider/profile environment at startup; later client attachments do not change it. Restart that owner after changing the profile or tokenizer. API-only builds include tokenizer support and use the external model without bundling ONNX or downloading model weights.
 
 API dimension probes and search queries retry transient transport failures, HTTP 429 and server errors for at most four attempts within one `OBSIDIAN_EMBEDDING_API_TIMEOUT_SECS` budget, including queueing, waits and requests. Numeric `Retry-After` delays are honored only when another attempt fits that budget; otherwise the request fails with its cause. Permanent HTTP errors and complete invalid responses are not retried; an incomplete response body remains a transport failure. Document requests make one attempt per dispatch; the indexing coordinator owns their backoff and retained progress, waiting at least as long as any numeric provider retry delay. Transient source-read and validated local-inference failures also use managed backoff. Invalid source, configuration and resource failures remain explicit until the source or owner configuration changes. Provider query failures do not select a competing local owner.
@@ -772,7 +785,7 @@ clients retain all supported ownership modes.
 | `OBSIDIAN_EMBEDDING_API_BASE` | No | `https://api.openai.com/v1` | Embedding API base URL (fallback: `OPENAI_BASE_URL`) |
 | `OBSIDIAN_EMBEDDING_API_MODEL` | When api | Fallback: `OPENAI_MODEL` | Model name for embedding API |
 | `OBSIDIAN_EMBEDDING_API_PROFILE` | For custom api | — | Strict JSON tokenizer/capacity profile for the exact endpoint/model; official OpenAI models resolve automatically |
-| `OBSIDIAN_EMBEDDING_DIM` | No | *(probed)* | Override embedding dimension (skips API probe) |
+| `OBSIDIAN_EMBEDDING_DIM` | No | *(probed)* | Override expected API embedding dimension. Skips the probe unless the profile requests `dimensions`, in which case the values must agree |
 | `OBSIDIAN_EMBEDDING_API_TIMEOUT_SECS` | No | `30` | Embedding API request timeout in seconds; integer from 1 to 86400 |
 | `OBSIDIAN_EMBEDDING_BATCH_SIZE` | No | `32` | Maximum notes processed per background reconciliation batch; positive integer, for either embedding backend |
 | `OBSIDIAN_EMBEDDING_CA_CERT` | No | — | Path to PEM CA certificate for API TLS |

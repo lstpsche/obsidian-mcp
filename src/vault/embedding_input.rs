@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[cfg(feature = "embeddings-api")]
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{VaultError, VaultResult};
@@ -216,6 +216,23 @@ pub(crate) struct ApiInputContract {
     pub policy: EmbeddingInputPolicy,
     pub limits: EmbeddingRequestLimits,
     pub counter: TokenCounter,
+    pub request: ApiRequestOptions,
+}
+
+#[cfg(feature = "embeddings-api")]
+#[derive(Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ApiRequestOptions {
+    pub dimensions: Option<usize>,
+    pub input_types: Option<ApiInputTypes>,
+}
+
+#[cfg(feature = "embeddings-api")]
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ApiInputTypes {
+    pub document: String,
+    pub query: String,
 }
 
 #[cfg(feature = "embeddings-api")]
@@ -230,6 +247,8 @@ struct ApiProfile {
     max_input_tokens: usize,
     max_batch_inputs: usize,
     max_batch_tokens: usize,
+    #[serde(default)]
+    request: ApiRequestOptions,
 }
 
 #[cfg(feature = "embeddings-api")]
@@ -253,11 +272,7 @@ impl ApiInputContract {
 
     pub(crate) fn load(base: &str, model: &str, profile_path: Option<&Path>) -> VaultResult<Self> {
         let actual_base = normalize_api_base(base)?;
-        let (tokenizer, max_input_tokens, max_inputs, max_total_tokens, revision) = if let Some(
-            path,
-        ) =
-            profile_path
-        {
+        let (tokenizer, capacity, revision, request) = if let Some(path) = profile_path {
             let bytes = read_bounded(path, MAX_PROFILE_BYTES, "embedding API profile")?;
             let profile: ApiProfile = serde_json::from_slice(&bytes).map_err(|error| {
                 VaultError::EmbeddingConfiguration(format!(
@@ -313,10 +328,13 @@ impl ApiInputContract {
             };
             (
                 tokenizer,
-                profile.max_input_tokens,
-                profile.max_batch_inputs,
-                profile.max_batch_tokens,
+                (
+                    profile.max_input_tokens,
+                    profile.max_batch_inputs,
+                    profile.max_batch_tokens,
+                ),
                 profile.profile_revision,
+                profile.request,
             )
         } else {
             if actual_base != "https://api.openai.com/v1"
@@ -331,12 +349,12 @@ impl ApiInputContract {
             }
             (
                 cl100k_counter()?,
-                8192,
-                2048,
-                300_000,
+                (8192, 2048, 300_000),
                 "openai-embedding-contract-v1".into(),
+                ApiRequestOptions::default(),
             )
         };
+        let (max_input_tokens, max_inputs, max_total_tokens) = capacity;
         if max_input_tokens == 0 || max_inputs == 0 || max_total_tokens < max_input_tokens {
             return Err(VaultError::EmbeddingConfiguration(
                 "embedding API limits must be positive and a request must accommodate one maximum-sized input".into(),
@@ -346,10 +364,34 @@ impl ApiInputContract {
         let mut hash = Sha256::new();
         hash.update(fingerprint);
         hash.update(revision.as_bytes());
+        let mut tokenizer_fingerprint = hash.finalize();
+        if request
+            .input_types
+            .as_ref()
+            .is_some_and(|types| types.document.trim().is_empty() || types.query.trim().is_empty())
+        {
+            return Err(VaultError::EmbeddingConfiguration(
+                "embedding API input types must be nonempty".into(),
+            ));
+        }
+        if request != ApiRequestOptions::default() {
+            let settings = serde_json::to_vec(&request).map_err(|error| {
+                VaultError::EmbeddingConfiguration(format!(
+                    "cannot fingerprint embedding API request options: {error}"
+                ))
+            })?;
+            // Keep the legacy identity for profiles without request options and
+            // separate the revision digest from the serialized request settings.
+            let mut hash = Sha256::new();
+            hash.update(b"embedding-api-request-v1\0");
+            hash.update(tokenizer_fingerprint);
+            hash.update(settings);
+            tokenizer_fingerprint = hash.finalize();
+        }
         Ok(Self {
             policy: EmbeddingInputPolicy {
                 max_input_tokens,
-                tokenizer_fingerprint: hash.finalize().into(),
+                tokenizer_fingerprint: tokenizer_fingerprint.into(),
             },
             limits: EmbeddingRequestLimits {
                 max_inputs,
@@ -357,6 +399,7 @@ impl ApiInputContract {
                 max_request_bytes: MAX_EMBEDDING_REQUEST_BYTES,
             },
             counter,
+            request,
         })
     }
 }
@@ -584,6 +627,38 @@ mod tests {
         value["extra"] = true.into();
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(ApiInputContract::load("http://127.0.0.1:8123/v1", "probe", Some(&path)).is_err());
+    }
+
+    #[cfg(feature = "embeddings-api")]
+    #[test]
+    fn request_settings_cannot_alias_a_profile_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profile.json");
+        let base = "http://127.0.0.1:8123/v1";
+        let mut profile = serde_json::json!({
+            "version": 1,
+            "profile_revision": "test",
+            "api_base": base,
+            "model": "probe",
+            "tokenizer": {"kind": "cl100k_base"},
+            "max_input_tokens": 8,
+            "max_batch_inputs": 2,
+            "max_batch_tokens": 16,
+            "request": {"dimensions": 2}
+        });
+        std::fs::write(&path, serde_json::to_vec(&profile).unwrap()).unwrap();
+        let with_options = ApiInputContract::load(base, "probe", Some(&path)).unwrap();
+
+        // Revision strings can contain literal separators and serialized JSON.
+        profile.as_object_mut().unwrap().remove("request");
+        profile["profile_revision"] =
+            "test\0embedding-api-request-v1\0{\"dimensions\":2,\"input_types\":null}".into();
+        std::fs::write(&path, serde_json::to_vec(&profile).unwrap()).unwrap();
+        let without_options = ApiInputContract::load(base, "probe", Some(&path)).unwrap();
+        assert_ne!(
+            with_options.policy.tokenizer_fingerprint,
+            without_options.policy.tokenizer_fingerprint
+        );
     }
 
     #[cfg(feature = "embeddings-api")]
