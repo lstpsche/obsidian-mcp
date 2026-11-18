@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
+#[cfg(feature = "embeddings-api")]
+use super::embedding_input::ApiRequestOptions;
 use super::embedding_input::{self, EmbeddingInputPolicy, EmbeddingRequestLimits, TokenCounter};
 use crate::config::EmbeddingProvider;
 use crate::error::{VaultError, VaultResult};
@@ -1297,9 +1299,17 @@ enum EmbeddingBackend {
     Api(ApiEmbeddingClient),
 }
 
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum EmbeddingPurpose {
+    Document,
+    Query,
+}
+
 #[cfg(feature = "embeddings-api")]
 struct ApiEmbeddingRequest {
     texts: Vec<String>,
+    purpose: EmbeddingPurpose,
     owner_live: Option<Arc<AtomicBool>>,
     authorization: Option<EmbeddingAuthorization>,
     retry_deadline: Option<std::time::Instant>,
@@ -1324,6 +1334,7 @@ impl ApiEmbeddingClient {
         model: String,
         api_key: zeroize::Zeroizing<String>,
         timeout: std::time::Duration,
+        options: &ApiRequestOptions,
     ) -> VaultResult<Self> {
         let (sender, receiver) =
             std::sync::mpsc::sync_channel::<ApiEmbeddingRequest>(Self::QUEUE_CAPACITY);
@@ -1331,6 +1342,7 @@ impl ApiEmbeddingClient {
         let base_url = Arc::new(base_url);
         let model = Arc::new(model);
         let api_key = Arc::new(api_key);
+        let options = Arc::new(options.clone());
         let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(Self::WORKER_COUNT);
         for worker_index in 0..Self::WORKER_COUNT {
             let client = client.clone();
@@ -1338,6 +1350,7 @@ impl ApiEmbeddingClient {
             let base_url = Arc::clone(&base_url);
             let model = Arc::clone(&model);
             let api_key = Arc::clone(&api_key);
+            let options = Arc::clone(&options);
             let worker = match std::thread::Builder::new()
                 .name(format!("obsidian-mcp-embedding-api-{worker_index}"))
                 .spawn(move || {
@@ -1353,9 +1366,8 @@ impl ApiEmbeddingClient {
                         let result = embed_batch_api_with_policy(
                             &client,
                             base_url.as_str(),
-                            model.as_str(),
                             api_key.as_str(),
-                            &texts,
+                            ApiEmbeddingBody::new(&model, &texts, &options, request.purpose),
                             ApiRequestPolicy {
                                 retry_deadline: request.retry_deadline,
                                 owner_live: request.owner_live.as_ref(),
@@ -1387,13 +1399,13 @@ impl ApiEmbeddingClient {
 
     #[cfg(test)]
     fn embed_batch(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>> {
-        self.request(texts, false, None, None)
+        self.request(texts, EmbeddingPurpose::Document, None, None)
     }
 
     fn request(
         &self,
         texts: &[&str],
-        retry_transient: bool,
+        purpose: EmbeddingPurpose,
         owner_live: Option<&Arc<AtomicBool>>,
         authorization: Option<&EmbeddingAuthorization>,
     ) -> VaultResult<Vec<Vec<f32>>> {
@@ -1401,10 +1413,12 @@ impl ApiEmbeddingClient {
             .sender
             .as_ref()
             .ok_or_else(|| VaultError::Embedding("embedding API worker unavailable".into()))?;
-        let retry_deadline = retry_transient.then(|| std::time::Instant::now() + self.timeout);
+        let retry_deadline = matches!(purpose, EmbeddingPurpose::Query)
+            .then(|| std::time::Instant::now() + self.timeout);
         let (response, receiver) = std::sync::mpsc::channel();
         let mut request = ApiEmbeddingRequest {
             texts: texts.iter().map(|text| (*text).to_string()).collect(),
+            purpose,
             owner_live: owner_live.cloned(),
             authorization: authorization.cloned(),
             retry_deadline,
@@ -1470,7 +1484,7 @@ pub struct EmbeddingModel {
     input_policy: EmbeddingInputPolicy,
     request_limits: EmbeddingRequestLimits,
     counter: TokenCounter,
-    request_overhead: usize,
+    request_overhead: [usize; 2],
 }
 
 impl EmbeddingModel {
@@ -1515,7 +1529,8 @@ impl EmbeddingModel {
     fn embed_with_policy(
         &self,
         texts: &[&str],
-        _retry_transient: bool,
+        purpose: EmbeddingPurpose,
+        authorization: Option<&EmbeddingAuthorization>,
     ) -> VaultResult<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
@@ -1524,16 +1539,16 @@ impl EmbeddingModel {
             texts,
             &self.input_policy,
             self.request_limits,
-            self.request_overhead,
+            self.request_overhead[purpose as usize],
             |text| self.counter.count(text),
         )?;
-        self.dispatch_validated(texts, _retry_transient, None, None)
+        self.dispatch_validated(texts, purpose, None, authorization)
     }
 
     fn dispatch_validated(
         &self,
         texts: &[&str],
-        _retry_transient: bool,
+        _purpose: EmbeddingPurpose,
         owner_live: Option<&Arc<AtomicBool>>,
         authorization: Option<&EmbeddingAuthorization>,
     ) -> VaultResult<Vec<Vec<f32>>> {
@@ -1557,7 +1572,7 @@ impl EmbeddingModel {
             }
             #[cfg(feature = "embeddings-api")]
             EmbeddingBackend::Api(client) => {
-                client.request(texts, _retry_transient, owner_live, authorization)?
+                client.request(texts, _purpose, owner_live, authorization)?
             }
         };
         validate_embedding_batch(vectors, texts.len(), self.dim)
@@ -1606,7 +1621,7 @@ impl EmbeddingModel {
                 input_policy,
                 request_limits,
                 counter,
-                request_overhead: 2,
+                request_overhead: [2; 2],
             })
         })
         .await
@@ -1658,6 +1673,7 @@ impl EmbeddingModel {
                 model.clone(),
                 api_key,
                 timeout,
+                &contract.request,
             )?;
             Self::from_api_client(
                 api_client,
@@ -1681,36 +1697,55 @@ impl EmbeddingModel {
         configured_dimension: Option<usize>,
         authorization: Option<&EmbeddingAuthorization>,
     ) -> VaultResult<Self> {
-        let request_overhead = serde_json::to_vec(
-            &serde_json::json!({"model":model,"input":[],"encoding_format":"float"}),
-        )
-        .map_err(|error| {
-            VaultError::Embedding(format!("cannot encode embedding request: {error}"))
-        })?
-        .len();
+        let mut request_overhead = [0; 2];
+        for purpose in [EmbeddingPurpose::Document, EmbeddingPurpose::Query] {
+            let body = ApiEmbeddingBody::new(&model, &[], &contract.request, purpose);
+            request_overhead[purpose as usize] = body.encode()?.len();
+        }
         embedding_input::validate_batch(
             &["dim"],
             &contract.policy,
             contract.limits,
-            request_overhead,
+            request_overhead[EmbeddingPurpose::Query as usize],
             |text| contract.counter.count(text),
         )?;
 
-        let dim = match configured_dimension {
-            Some(0) => {
+        let requested_dimension = contract.request.dimensions;
+        if let Some(dimension) = requested_dimension {
+            if !(1..=MAX_CACHE_DIMENSION).contains(&dimension) {
+                return Err(VaultError::EmbeddingConfiguration(format!(
+                    "embedding API request dimensions must be in 1..={MAX_CACHE_DIMENSION}"
+                )));
+            }
+            if configured_dimension.is_some_and(|configured| configured != dimension) {
+                return Err(VaultError::EmbeddingConfiguration(
+                    "OBSIDIAN_EMBEDDING_DIM conflicts with the embedding API request dimensions"
+                        .into(),
+                ));
+            }
+        }
+        let dim = match (configured_dimension, requested_dimension) {
+            (Some(0), _) => {
                 return Err(VaultError::Embedding(
                     "OBSIDIAN_EMBEDDING_DIM must be greater than zero".into(),
                 ));
             }
-            Some(d) => {
+            (Some(d), None) => {
                 tracing::info!(dim = d, "using explicit embedding dimension");
                 d
             }
-            None => {
+            _ => {
                 tracing::info!("probing embedding API for dimension…");
                 probe_api_dimension(&api_client, authorization)?
             }
         };
+        if let Some(expected) = requested_dimension
+            && dim != expected
+        {
+            return Err(VaultError::EmbeddingConfiguration(format!(
+                "embedding API returned {dim} dimensions, requested {expected}"
+            )));
+        }
         let identity = EmbeddingSpaceIdentity::api(model.clone(), &base_url, dim, &contract.policy);
         validate_space_identity(&identity)?;
         let endpoint = identity
@@ -1774,13 +1809,13 @@ impl Embedder for EmbeddingModel {
             texts,
             &self.input_policy,
             self.request_limits,
-            self.request_overhead,
+            self.request_overhead[EmbeddingPurpose::Document as usize],
             |text| self.counter.count(text),
         )
     }
 
     fn embed_batch(&self, texts: &[&str]) -> VaultResult<Vec<Vec<f32>>> {
-        self.embed_with_policy(texts, false)
+        self.embed_with_policy(texts, EmbeddingPurpose::Document, None)
     }
 
     fn dispatch_documents(
@@ -1789,7 +1824,12 @@ impl Embedder for EmbeddingModel {
         owner_live: &Arc<AtomicBool>,
         authorization: Option<&EmbeddingAuthorization>,
     ) -> VaultResult<Vec<Vec<f32>>> {
-        self.dispatch_validated(texts, false, Some(owner_live), authorization)
+        self.dispatch_validated(
+            texts,
+            EmbeddingPurpose::Document,
+            Some(owner_live),
+            authorization,
+        )
     }
 
     fn embed_authorized_query(
@@ -1797,24 +1837,15 @@ impl Embedder for EmbeddingModel {
         query: &str,
         authorization: Option<&EmbeddingAuthorization>,
     ) -> VaultResult<Vec<f32>> {
-        embedding_input::validate_batch(
-            &[query],
-            &self.input_policy,
-            self.request_limits,
-            self.request_overhead,
-            |text| self.counter.count(text),
-        )?;
-        let mut vectors = self.dispatch_validated(&[query], true, None, authorization)?;
+        let mut vectors =
+            self.embed_with_policy(&[query], EmbeddingPurpose::Query, authorization)?;
         vectors
             .pop()
             .ok_or_else(|| VaultError::Embedding("embedding query returned no vector".into()))
     }
 
     fn embed_query(&self, query: &str) -> VaultResult<Vec<f32>> {
-        let mut vectors = self.embed_with_policy(&[query], true)?;
-        vectors
-            .pop()
-            .ok_or_else(|| VaultError::Embedding("embedding query returned no vector".into()))
+        self.embed_authorized_query(query, None)
     }
 }
 
@@ -1936,7 +1967,7 @@ fn probe_api_dimension(
     client: &ApiEmbeddingClient,
     authorization: Option<&EmbeddingAuthorization>,
 ) -> Result<usize, VaultError> {
-    let vecs = client.request(&["dim"], true, None, authorization)?;
+    let vecs = client.request(&["dim"], EmbeddingPurpose::Query, None, authorization)?;
     let first = vecs
         .first()
         .ok_or_else(|| VaultError::Embedding("dimension probe returned empty result".into()))?;
@@ -1959,9 +1990,13 @@ fn embed_batch_api(
     embed_batch_api_with_policy(
         client,
         base_url,
-        model,
         api_key,
-        texts,
+        ApiEmbeddingBody::new(
+            model,
+            texts,
+            &ApiRequestOptions::default(),
+            EmbeddingPurpose::Document,
+        ),
         ApiRequestPolicy::default(),
     )
 }
@@ -2005,12 +2040,50 @@ struct ApiRequestPolicy<'a> {
 }
 
 #[cfg(feature = "embeddings-api")]
+#[derive(serde::Serialize)]
+struct ApiEmbeddingBody<'a> {
+    model: &'a str,
+    input: &'a [&'a str],
+    encoding_format: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_type: Option<&'a str>,
+}
+
+#[cfg(feature = "embeddings-api")]
+impl<'a> ApiEmbeddingBody<'a> {
+    fn new(
+        model: &'a str,
+        input: &'a [&'a str],
+        options: &'a ApiRequestOptions,
+        purpose: EmbeddingPurpose,
+    ) -> Self {
+        Self {
+            model,
+            input,
+            encoding_format: "float",
+            dimensions: options.dimensions,
+            input_type: options.input_types.as_ref().map(|types| match purpose {
+                EmbeddingPurpose::Document => types.document.as_str(),
+                EmbeddingPurpose::Query => types.query.as_str(),
+            }),
+        }
+    }
+
+    fn encode(&self) -> VaultResult<Vec<u8>> {
+        serde_json::to_vec(self).map_err(|error| {
+            VaultError::Embedding(format!("cannot encode embedding request: {error}"))
+        })
+    }
+}
+
+#[cfg(feature = "embeddings-api")]
 fn embed_batch_api_with_policy(
     client: &reqwest::blocking::Client,
     base_url: &str,
-    model: &str,
     api_key: &str,
-    texts: &[&str],
+    body: ApiEmbeddingBody<'_>,
     policy: ApiRequestPolicy<'_>,
 ) -> Result<Vec<Vec<f32>>, VaultError> {
     let ApiRequestPolicy {
@@ -2023,11 +2096,6 @@ fn embed_batch_api_with_policy(
         authorization,
     )?);
     let url = format!("{}/embeddings", base_url.trim_end_matches('/'));
-    let body = serde_json::json!({
-        "model": model,
-        "input": texts,
-        "encoding_format": "float",
-    });
 
     let mut attempts = 0;
     loop {
@@ -2035,9 +2103,7 @@ fn embed_batch_api_with_policy(
             .post(&url)
             .header("Authorization", format!("Bearer {api_key}"));
         request = if owner_live.is_some() || authorization.is_some() {
-            let bytes = serde_json::to_vec(&body).map_err(|err| {
-                VaultError::Embedding(format!("cannot encode embedding request: {err}"))
-            })?;
+            let bytes = body.encode()?;
             let size = bytes.len() as u64;
             let input = ScopedRequestBody {
                 bytes: std::io::Cursor::new(bytes),
@@ -2074,7 +2140,7 @@ fn embed_batch_api_with_policy(
                                         "embedding API returned invalid JSON".into(),
                                     )
                                 })?;
-                            return parse_embedding_response(&resp, texts.len());
+                            return parse_embedding_response(&resp, body.input.len());
                         }
                         Err(error) => {
                             let detail = if error.is_timeout() {
@@ -3674,23 +3740,31 @@ mod tests {
             dimension: Option<usize>,
             timeout: std::time::Duration,
         ) -> VaultResult<EmbeddingModel> {
+            api_fixture_model_with_request(base, dimension, timeout, None)
+        }
+
+        fn api_fixture_model_with_request(
+            base: &str,
+            dimension: Option<usize>,
+            timeout: std::time::Duration,
+            request: Option<serde_json::Value>,
+        ) -> VaultResult<EmbeddingModel> {
             let directory = tempfile::tempdir().unwrap();
             let profile = directory.path().join("profile.json");
-            std::fs::write(
-                &profile,
-                serde_json::to_vec(&serde_json::json!({
-                    "version": 1,
-                    "profile_revision": "synthetic-v1",
-                    "api_base": base,
-                    "model": "test-model",
-                    "tokenizer": {"kind":"cl100k_base"},
-                    "max_input_tokens": 512,
-                    "max_batch_inputs": 32,
-                    "max_batch_tokens": 16384
-                }))
-                .unwrap(),
-            )
-            .unwrap();
+            let mut config = serde_json::json!({
+                "version": 1,
+                "profile_revision": "synthetic-v1",
+                "api_base": base,
+                "model": "test-model",
+                "tokenizer": {"kind":"cl100k_base"},
+                "max_input_tokens": 512,
+                "max_batch_inputs": 32,
+                "max_batch_tokens": 16384
+            });
+            if let Some(request) = request {
+                config["request"] = request;
+            }
+            std::fs::write(&profile, serde_json::to_vec(&config).unwrap()).unwrap();
             let contract =
                 embedding_input::ApiInputContract::load(base, "test-model", Some(&profile))?;
             let client = ApiEmbeddingClient::start(
@@ -3699,6 +3773,7 @@ mod tests {
                 "test-model".into(),
                 zeroize::Zeroizing::new("test-key".into()),
                 timeout,
+                &contract.request,
             )?;
             EmbeddingModel::from_api_client(
                 client,
@@ -3708,6 +3783,84 @@ mod tests {
                 dimension,
                 None,
             )
+        }
+
+        #[test]
+        fn api_profile_requests_dimensions_and_purpose_for_indexing_and_search() {
+            let valid = r#"{"data":[{"embedding":[1.0,0.0]}]}"#.to_string();
+            let (base, server) = api_fixture(vec![(200, "0", valid); 4]);
+            let timeout = std::time::Duration::from_secs(2);
+            let mut model = api_fixture_model_with_request(
+                &base,
+                None,
+                timeout,
+                Some(serde_json::json!({
+                    "dimensions": 2,
+                    "input_types": {"document":"document","query":"query"}
+                })),
+            )
+            .unwrap();
+            let legacy_model = api_fixture_model(&base, Some(2), timeout).unwrap();
+            assert_ne!(model.space_identity(), legacy_model.space_identity());
+            let authority = EmbeddingAuthorization::new(|_| Ok(Box::new(())));
+            let live = Arc::new(AtomicBool::new(true));
+            let (count, result) = model.embed_next_batch(
+                &["note body"],
+                &live,
+                Some(&authority),
+                &[PathBuf::from("note.md")],
+            );
+            assert_eq!(count, 1);
+            result.unwrap();
+            model
+                .embed_authorized_query("query body", Some(&authority))
+                .unwrap();
+            let query_body = r#"{"model":"test-model","input":["query body"],"encoding_format":"float","dimensions":2,"input_type":"query"}"#;
+            model.request_limits.max_request_bytes = query_body.len();
+            assert!(matches!(
+                model.plan_batch(&["query body"]),
+                Err(VaultError::SemanticResourceLimit { .. })
+            ));
+            model.embed_query("query body").unwrap();
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), 4);
+            for (body, (input, role)) in requests.iter().zip([
+                ("dim", "query"),
+                ("note body", "document"),
+                ("query body", "query"),
+                ("query body", "query"),
+            ]) {
+                assert_eq!(
+                    *body,
+                    serde_json::json!({
+                        "model": "test-model",
+                        "input": [input],
+                        "encoding_format": "float",
+                        "dimensions": 2,
+                        "input_type": role
+                    })
+                );
+            }
+        }
+
+        #[test]
+        fn api_profile_rejects_a_provider_that_ignores_requested_dimensions() {
+            let valid = r#"{"data":[{"embedding":[1.0,0.0]}]}"#.to_string();
+            let (base, server) = api_fixture(vec![(200, "0", valid)]);
+            let error = api_fixture_model_with_request(
+                &base,
+                Some(3),
+                std::time::Duration::from_secs(2),
+                Some(serde_json::json!({"dimensions":3})),
+            )
+            .err()
+            .unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("returned 2 dimensions, requested 3")
+            );
+            assert_eq!(server.join().unwrap()[0]["dimensions"], 3);
         }
 
         #[test]
@@ -3773,6 +3926,9 @@ mod tests {
             );
             let requests = server.join().unwrap();
             assert_eq!(requests.len(), 5);
+            assert!(requests.iter().all(|request| {
+                request.get("dimensions").is_none() && request.get("input_type").is_none()
+            }));
             assert!(
                 requests[..2]
                     .iter()
@@ -4249,6 +4405,7 @@ mod tests {
                 "model".into(),
                 zeroize::Zeroizing::new("synthetic-key".into()),
                 deadline,
+                &ApiRequestOptions::default(),
             )
             .unwrap();
             let sender = client.sender.as_ref().unwrap();
@@ -4258,6 +4415,7 @@ mod tests {
                 sender
                     .send(ApiEmbeddingRequest {
                         texts: vec!["in flight".into()],
+                        purpose: EmbeddingPurpose::Document,
                         owner_live: None,
                         authorization: None,
                         retry_deadline: None,
@@ -4272,6 +4430,7 @@ mod tests {
             sender
                 .try_send(ApiEmbeddingRequest {
                     texts: vec!["private queued document".into()],
+                    purpose: EmbeddingPurpose::Document,
                     owner_live: Some(Arc::clone(&live)),
                     authorization: None,
                     retry_deadline: None,
@@ -4290,6 +4449,7 @@ mod tests {
             sender
                 .try_send(ApiEmbeddingRequest {
                     texts: vec!["private queued authorization".into()],
+                    purpose: EmbeddingPurpose::Document,
                     owner_live: Some(Arc::new(AtomicBool::new(true))),
                     authorization: Some(authority.clone()),
                     retry_deadline: None,
@@ -4416,6 +4576,7 @@ mod tests {
                 "test-model".to_string(),
                 zeroize::Zeroizing::new("test-key".to_string()),
                 Duration::from_millis(50),
+                &ApiRequestOptions::default(),
             )
             .unwrap();
             let error = probe_api_dimension(&short_client, None).unwrap_err();
@@ -4427,6 +4588,7 @@ mod tests {
                 "test-model".to_string(),
                 zeroize::Zeroizing::new("test-key".to_string()),
                 Duration::from_secs(2),
+                &ApiRequestOptions::default(),
             )
             .unwrap();
             assert_eq!(
