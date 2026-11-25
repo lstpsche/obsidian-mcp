@@ -683,10 +683,15 @@ fn prepare_section(
             end_byte: next_boundary(raw, content_start),
         };
         let block = containing_block(blocks, start);
-        let overlap = preceding_overlap(raw, section, block, input, &prefix, preparation)?;
-        if start < content_start && !preparation.fits(&prefix, raw, overlap, input)? {
+        let mut overlap =
+            preceding_overlap(raw, section, block, start, input, &prefix, preparation)?;
+        if overlap.is_none()
+            && start < content_start
+            && !preparation.fits(&prefix, raw, None, input)?
+        {
             // Keep leading padding in the evidence even when the input needs to skip it.
             input.start_byte = content_start;
+            overlap = preceding_overlap(raw, section, block, start, input, &prefix, preparation)?;
         }
         input = fitting_input_range(
             raw,
@@ -983,14 +988,16 @@ fn preceding_overlap(
     raw: &str,
     section: &Section<'_>,
     block: Option<&MarkdownBlock>,
+    start: usize,
     required: SourceRange,
     prefix: &str,
     preparation: &Preparation<'_>,
 ) -> VaultResult<Option<SourceRange>> {
-    let start = required.start_byte;
-    let Some(block) =
-        block.filter(|block| start > section.range.start_byte && start > block.range.start)
-    else {
+    let Some(block) = block.filter(|block| {
+        start > section.range.start_byte
+            && start > block.range.start
+            && required.start_byte < block.range.end
+    }) else {
         return Ok(None);
     };
     let mut overlap_start = raw.ceil_char_boundary(
@@ -1401,6 +1408,28 @@ mod tests {
         assert_complete(&raw, &note, 48);
         assert_eq!(note.chunks[0].range.start_byte, 0);
         assert!(note.chunks[0].text.contains("# Café"));
+    }
+
+    #[test]
+    fn forced_split_keeps_same_block_overlap_when_omitting_padding() {
+        let padding = " ".repeat(160);
+        let raw = format!("~~~text\n{}\n{padding}tail signal\n~~~\n", "x".repeat(58));
+        let note = prepare(&raw, 80);
+        assert_complete(&raw, &note, 80);
+
+        let tail = note
+            .chunks
+            .iter()
+            .find(|chunk| chunk.text.contains("tail signal"))
+            .unwrap();
+        let content_start = raw.find("tail signal").unwrap();
+        assert!(tail.range.start_byte < content_start);
+        assert!(raw[tail.range.start_byte..content_start].trim().is_empty());
+        let overlap = tail
+            .overlap_range
+            .expect("preceding code in the same block");
+        assert_eq!(overlap.end_byte, tail.range.start_byte);
+        assert!(raw[overlap.start_byte..overlap.end_byte].contains('x'));
     }
 
     #[cfg(feature = "embeddings-api")]
