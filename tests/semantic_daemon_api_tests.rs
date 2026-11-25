@@ -1715,7 +1715,11 @@ async fn automatic_chunking_preserves_tail_evidence_and_revision_checked_context
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("vault");
         std::fs::create_dir(&root).unwrap();
-        let long_note = oversized_note();
+        let long_note = oversized_note().replacen(
+            "---\n# Operations\n",
+            "---\n\n# Operations\nUse this policy when opening a site.\n",
+            1,
+        );
         std::fs::write(root.join("policy.md"), &long_note).unwrap();
         std::fs::write(root.join("brief.md"), "# Brief\nA short unrelated note.\n").unwrap();
         let endpoint = isolated_endpoint(directory.path());
@@ -1751,6 +1755,27 @@ async fn automatic_chunking_preserves_tail_evidence_and_revision_checked_context
             assert_warming(&first);
         }
         server.wait_for_ready_notes(mode, 2).await;
+        for lexical_prefetch in [false, true] {
+            let title_result = server
+                .tool(
+                    "search_semantic",
+                    json!({"query":"operations","top_k":2,"lexical_prefetch":lexical_prefetch}),
+                )
+                .await;
+            let hit = structured_result(&title_result)["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|hit| hit["path"] == "policy.md")
+                .unwrap();
+            assert_eq!(hit["source_status"], "current");
+            assert_eq!(hit["evidence"]["heading_path"], json!(["Operations"]));
+            assert_eq!(
+                hit["evidence"]["range"]["start_byte"],
+                long_note.find("\n# Operations").unwrap()
+            );
+            assert!(hit["snippet"].as_str().unwrap().contains("opening a site"));
+        }
         let response = server
             .tool("search_semantic", json!({"query":"TAIL_SIGNAL","top_k":2}))
             .await;

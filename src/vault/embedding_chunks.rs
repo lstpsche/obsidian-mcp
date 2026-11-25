@@ -250,15 +250,27 @@ fn prepare_budgeted(
         start_byte: body_start,
         end_byte: raw.len(),
     };
-    let context_bytes = context_prefix_bytes(&title, 0, 0);
-    check_limit("embedding context bytes", context_bytes, MAX_CONTEXT_BYTES)?;
-    let prefix_reservation = preparation.memory.reserve(context_bytes)?;
-    let mut prefix = String::with_capacity(context_bytes);
-    prefix.push_str(&title);
-    prefix.push('\n');
-    let full_input = preparation.compose(&prefix, raw, None, body_range)?;
+    let blank_body = raw[body_start..].trim_start().is_empty();
+    let input_range = if blank_body {
+        SourceRange {
+            end_byte: body_start,
+            ..body_range
+        }
+    } else {
+        body_range
+    };
+    let full_input = {
+        let context_bytes = context_prefix_bytes(&title, 0, 0);
+        check_limit("embedding context bytes", context_bytes, MAX_CONTEXT_BYTES)?;
+        let _prefix_reservation = preparation.memory.reserve(context_bytes)?;
+        let mut prefix = String::with_capacity(context_bytes);
+        prefix.push_str(&title);
+        prefix.push('\n');
+        preparation.compose(&prefix, raw, None, input_range)?
+    };
+    let full_tokens = count(&full_input)?;
     let mut chunks = Vec::new();
-    if count(&full_input)? <= max_tokens {
+    if full_tokens <= max_tokens {
         append_chunk(
             &mut chunks,
             full_input,
@@ -270,13 +282,16 @@ fn prepare_budgeted(
             None,
             &preparation,
         )?;
+    } else if blank_body {
+        return Err(VaultError::EmbeddingInputTooLong {
+            tokens: full_tokens,
+            max_tokens,
+        });
     } else {
         // The full-note trial must not stay alive beside the overflowing draft.
         drop(full_input);
-        drop(prefix_reservation);
-        drop(prefix);
         let structure_bytes = parser::semantic_structure_allocation_bound(raw);
-        let workspace = preparation.memory.reserve(structure_bytes)?;
+        let _workspace = preparation.memory.reserve(structure_bytes)?;
         let structure = parser::markdown_structure(raw)?;
         prepare_sections(
             raw,
@@ -286,22 +301,7 @@ fn prepare_budgeted(
             &preparation,
             &mut chunks,
         )?;
-        drop(structure);
-        drop(workspace);
-        validate_coverage(raw, body_range, &chunks)?;
-        let note = PreparedNote {
-            source_revision: source_revision(raw),
-            source_bytes: raw.len(),
-            body_range,
-            title,
-            tags,
-            chunks,
-        };
-        check_limit(BUDGET_RESOURCE, note.staging_bytes(dimension), budget_bytes)?;
-        return Ok(note);
     }
-    drop(prefix_reservation);
-    drop(prefix);
     validate_coverage(raw, body_range, &chunks)?;
     let note = PreparedNote {
         source_revision: source_revision(raw),
@@ -581,7 +581,8 @@ fn prepare_sections(
     let preamble_end = headings
         .first()
         .map_or(body.end_byte, |heading| heading.offset);
-    if preamble_end > body.start_byte || headings.is_empty() {
+    let has_preamble = !raw[body.start_byte..preamble_end].trim_start().is_empty();
+    if has_preamble {
         let range = SourceRange {
             start_byte: body.start_byte,
             end_byte: preamble_end,
@@ -605,16 +606,21 @@ fn prepare_sections(
         for (position, &heading_index) in stack[..stack_len].iter().enumerate() {
             names[position] = headings[heading_index].text.as_str();
         }
+        let start_byte = if index == 0 && !has_preamble {
+            body.start_byte
+        } else {
+            heading.offset
+        };
         let section = Section {
             range: SourceRange {
-                start_byte: heading.offset,
+                start_byte,
                 end_byte: headings
                     .get(index + 1)
                     .map_or(body.end_byte, |next| next.offset),
             },
             heading_path: &names[..stack_len],
             section_range: SourceRange {
-                start_byte: heading.offset,
+                start_byte,
                 end_byte: subtree_ends[index],
             },
             heading_end: heading.end,
@@ -665,41 +671,65 @@ fn prepare_section(
             preparation,
         );
     }
-    if section.range.start_byte == section.range.end_byte {
-        return Err(VaultError::EmbeddingInputTooLong {
-            tokens: (preparation.count)(&entire)?,
-            max_tokens: preparation.max_tokens,
-        });
-    }
     drop(entire);
+    let section_end = section.range.end_byte;
+    let content_end =
+        section.range.start_byte + raw[section.range.start_byte..section_end].trim_end().len();
     let mut start = section.range.start_byte;
-    while start < section.range.end_byte {
+    while start < content_end {
+        let content_start = content_end - raw[start..content_end].trim_start().len();
+        let mut input = SourceRange {
+            start_byte: start,
+            end_byte: next_boundary(raw, content_start),
+        };
         let block = containing_block(blocks, start);
-        let overlap = preceding_overlap(raw, section, block, start, &prefix, preparation)?;
-        let candidate_end = fitting_end(
+        let overlap = preceding_overlap(raw, section, block, input, &prefix, preparation)?;
+        if start < content_start && !preparation.fits(&prefix, raw, overlap, input)? {
+            // Keep leading padding in the evidence even when the input needs to skip it.
+            input.start_byte = content_start;
+        }
+        input = fitting_input_range(
             raw,
-            start,
-            section.range.end_byte,
+            SourceRange {
+                start_byte: start,
+                end_byte: section_end,
+            },
+            input,
             &prefix,
             overlap,
             preparation,
         )?;
-        let end = preferred_end(
+        let candidate_end = input.end_byte;
+        let minimum_cut = if start == section.range.start_byte && section.heading_end < content_end
+        {
+            content_start.max(section.heading_end)
+        } else {
+            content_start
+        };
+        input.end_byte = preferred_end(
             raw,
-            start,
+            input.start_byte,
             candidate_end,
-            section,
+            minimum_cut,
+            section_end,
             blocks,
             &prefix,
             overlap,
             preparation,
         )?;
+        let end = if input.end_byte >= content_end {
+            // Include all remaining padding in the evidence and use the validated input.
+            input.end_byte = candidate_end;
+            section_end
+        } else {
+            input.end_byte
+        };
         let range = SourceRange {
             start_byte: start,
             end_byte: end,
         };
         let block_kind = split_block(blocks, range).map(|block| block.kind);
-        let text = preparation.compose(&prefix, raw, overlap, range)?;
+        let text = preparation.compose(&prefix, raw, overlap, input)?;
         append_chunk(
             chunks,
             text,
@@ -790,34 +820,31 @@ fn vector_reservation(dimension: usize) -> usize {
 }
 
 /// Find a validated advancing prefix without assuming token-count monotonicity.
-fn fitting_end(
+fn fitting_input_range(
     raw: &str,
-    start: usize,
-    section_end: usize,
+    source: SourceRange,
+    minimum: SourceRange,
     prefix: &str,
     overlap: Option<SourceRange>,
     preparation: &Preparation<'_>,
-) -> VaultResult<usize> {
-    let first_end = next_boundary(raw, start);
+) -> VaultResult<SourceRange> {
+    let start = minimum.start_byte;
+    let section_end = source.end_byte;
+    let first_end = minimum.end_byte;
     let initial_bytes = preparation.max_tokens.saturating_mul(4).max(4);
     let mut end = raw
         .floor_char_boundary(start.saturating_add(initial_bytes).min(section_end))
         .max(first_end);
     let mut known_fit = None;
     loop {
-        let tokens = (preparation.count)(&preparation.compose(
-            prefix,
-            raw,
-            overlap,
-            SourceRange {
-                start_byte: start,
-                end_byte: end,
-            },
-        )?)?;
-        if tokens <= preparation.max_tokens {
-            known_fit = Some(end);
+        let range = SourceRange {
+            start_byte: start,
+            end_byte: end,
+        };
+        if preparation.fits(prefix, raw, overlap, range)? {
+            known_fit = Some(range);
             if end == section_end {
-                return Ok(end);
+                return Ok(range);
             }
             let previous_end = end;
             end = raw.floor_char_boundary(
@@ -826,10 +853,10 @@ fn fitting_end(
                     .min(section_end),
             );
             end = end.max(next_boundary(raw, previous_end));
-        } else if let Some(end) = known_fit {
-            return Ok(end);
+        } else if let Some(range) = known_fit {
+            return Ok(range);
         } else if end == first_end {
-            return probe_advancing_prefix(raw, start, section_end, prefix, overlap, preparation);
+            return probe_advancing_prefix(raw, source, minimum, prefix, overlap, preparation);
         } else {
             end = raw
                 .floor_char_boundary(start + (end - start) / 2)
@@ -840,35 +867,37 @@ fn fitting_end(
 
 fn probe_advancing_prefix(
     raw: &str,
-    start: usize,
-    section_end: usize,
+    source: SourceRange,
+    minimum: SourceRange,
     prefix: &str,
     overlap: Option<SourceRange>,
     preparation: &Preparation<'_>,
-) -> VaultResult<usize> {
+) -> VaultResult<SourceRange> {
+    // A tokenizer can merge the whitespace before the first character into a token.
+    let whitespace_start = raw[source.start_byte..minimum.start_byte]
+        .char_indices()
+        .next_back()
+        .map(|(offset, _)| source.start_byte + offset);
+    let first_end = minimum.end_byte;
+    let longer_ends = raw[first_end..source.end_byte]
+        .char_indices()
+        .map(|(offset, character)| first_end + offset + character.len_utf8());
     let mut minimum_tokens = usize::MAX;
-    for (probes, (offset, character)) in raw[start..section_end].char_indices().enumerate() {
-        if probes == MAX_SPLIT_PROBES {
-            return Err(VaultError::SemanticResourceLimit {
-                resource: "embedding split boundary probes".to_owned(),
-                actual: probes + 1,
-                limit: MAX_SPLIT_PROBES,
-            });
+    let mut probes = 0;
+    for end_byte in std::iter::once(first_end).chain(longer_ends) {
+        for start_byte in std::iter::once(minimum.start_byte).chain(whitespace_start) {
+            probes += 1;
+            check_limit("embedding split boundary probes", probes, MAX_SPLIT_PROBES)?;
+            let range = SourceRange {
+                start_byte,
+                end_byte,
+            };
+            let tokens = (preparation.count)(&preparation.compose(prefix, raw, overlap, range)?)?;
+            if tokens <= preparation.max_tokens {
+                return Ok(range);
+            }
+            minimum_tokens = minimum_tokens.min(tokens);
         }
-        let end = start + offset + character.len_utf8();
-        let tokens = (preparation.count)(&preparation.compose(
-            prefix,
-            raw,
-            overlap,
-            SourceRange {
-                start_byte: start,
-                end_byte: end,
-            },
-        )?)?;
-        if tokens <= preparation.max_tokens {
-            return Ok(end);
-        }
-        minimum_tokens = minimum_tokens.min(tokens);
     }
     Err(VaultError::EmbeddingInputTooLong {
         tokens: minimum_tokens,
@@ -881,13 +910,14 @@ fn preferred_end(
     raw: &str,
     start: usize,
     valid_end: usize,
-    section: &Section<'_>,
+    minimum_cut: usize,
+    section_end: usize,
     blocks: &[MarkdownBlock],
     prefix: &str,
     overlap: Option<SourceRange>,
     preparation: &Preparation<'_>,
 ) -> VaultResult<usize> {
-    if valid_end == section.range.end_byte {
+    if valid_end == section_end {
         return Ok(valid_end);
     }
     let last_block = blocks.partition_point(|block| block.range.end <= valid_end);
@@ -912,15 +942,6 @@ fn preferred_end(
             sentence_end = end;
         }
     }
-    let minimum_cut = if start == section.range.start_byte
-        && raw[section.heading_end..section.range.end_byte]
-            .chars()
-            .any(|character| !character.is_whitespace())
-    {
-        section.heading_end
-    } else {
-        start
-    };
     for end in [block_end, sentence_end, line_end, word_end] {
         if end <= minimum_cut || end > valid_end {
             continue;
@@ -962,16 +983,16 @@ fn preceding_overlap(
     raw: &str,
     section: &Section<'_>,
     block: Option<&MarkdownBlock>,
-    start: usize,
+    required: SourceRange,
     prefix: &str,
     preparation: &Preparation<'_>,
 ) -> VaultResult<Option<SourceRange>> {
+    let start = required.start_byte;
     let Some(block) =
         block.filter(|block| start > section.range.start_byte && start > block.range.start)
     else {
         return Ok(None);
     };
-    let first_end = next_boundary(raw, start);
     let mut overlap_start = raw.ceil_char_boundary(
         start
             .saturating_sub(OVERLAP_TOKENS * 8)
@@ -984,15 +1005,7 @@ fn preceding_overlap(
             end_byte: start,
         };
         if (preparation.count)(&raw[overlap_start..start])? <= OVERLAP_TOKENS
-            && preparation.fits(
-                prefix,
-                raw,
-                Some(overlap),
-                SourceRange {
-                    start_byte: start,
-                    end_byte: first_end,
-                },
-            )?
+            && preparation.fits(prefix, raw, Some(overlap), required)?
         {
             return Ok(Some(overlap));
         }
@@ -1031,6 +1044,15 @@ fn validate_coverage(raw: &str, body: SourceRange, chunks: &[PreparedChunk]) -> 
                 "prepared note does not cover the complete body with valid source ranges".into(),
             ));
         }
+        if matches!(chunk.scope, EvidenceScope::Passage)
+            && raw[range.start_byte..range.end_byte]
+                .trim_start()
+                .is_empty()
+        {
+            return Err(VaultError::Embedding(
+                "prepared passage contains only whitespace".into(),
+            ));
+        }
         expected_start = range.end_byte;
     }
     if chunks.is_empty() || expected_start != body.end_byte {
@@ -1064,12 +1086,23 @@ mod tests {
         for chunk in &note.chunks {
             assert!(count(&chunk.text).unwrap() <= limit, "{}", chunk.text);
             assert_eq!(chunk.input_hash, prepared_text_hash(&chunk.text));
+            let prefix_bytes = context_prefix_bytes(
+                &note.title,
+                chunk.heading_path.iter().map(String::len).sum(),
+                chunk.heading_path.len(),
+            );
+            let mut input_start = prefix_bytes;
             if let Some(overlap) = chunk.overlap_range {
                 assert_eq!(overlap.end_byte, chunk.range.start_byte);
                 assert!(
                     count(&raw[overlap.start_byte..overlap.end_byte]).unwrap() <= OVERLAP_TOKENS
                 );
+                input_start += overlap.end_byte - overlap.start_byte + 1;
             }
+            assert_eq!(
+                chunk.text[input_start..].trim(),
+                raw[chunk.range.start_byte..chunk.range.end_byte].trim(),
+            );
         }
     }
 
@@ -1320,8 +1353,8 @@ mod tests {
     }
 
     #[test]
-    fn unicode_headingless_and_whitespace_sources_progress() {
-        for raw in ["🦀漢字".repeat(120), " \r\n\t".repeat(120), "x".repeat(300)] {
+    fn unicode_and_headingless_sources_progress() {
+        for raw in ["🦀漢字".repeat(120), "x".repeat(300)] {
             let note = prepare(&raw, 48);
             assert_complete(&raw, &note, 48);
             assert!(note.chunks.len() > 1);
@@ -1329,8 +1362,88 @@ mod tests {
     }
 
     #[test]
-    fn empty_and_heading_only_notes_remain_searchable() {
-        for raw in ["", "# Only heading\n", "# A\n## B\n# C\n"] {
+    fn blank_preamble_is_part_of_the_first_headed_passage() {
+        for (frontmatter, separator, newline) in [
+            ("---\ntags: [test]\n---\n", "\n", "\n"),
+            ("---\r\ntags: [test]\r\n---\r\n", " \r\n\t\r\n", "\r\n"),
+            ("", "\n\t\n", "\n"),
+        ] {
+            let raw = format!(
+                "{frontmatter}{separator}# Café{newline}Useful context.{newline}## Tail{newline}{}",
+                "body ".repeat(40)
+            );
+            let note = prepare(&raw, 72);
+            assert_complete(&raw, &note, 72);
+            let first = &note.chunks[0];
+            assert_eq!(first.range.start_byte, frontmatter.len());
+            assert_eq!(first.section_range.unwrap().start_byte, frontmatter.len());
+            assert_eq!(first.heading_path, ["Café"]);
+            assert!(first.text.ends_with(&format!(
+                "{separator}# Café{newline}Useful context.{newline}"
+            )));
+        }
+    }
+
+    #[test]
+    fn forced_splits_keep_whitespace_in_evidence_when_it_cannot_fit_in_input() {
+        let content = "x".repeat(44);
+        let raw = format!("{content}\n");
+        let note = prepare(&raw, 48);
+        assert_complete(&raw, &note, 48);
+        assert_eq!(note.chunks.len(), 1);
+        assert_eq!(note.chunks[0].scope, EvidenceScope::Passage);
+        assert_eq!(note.chunks[0].text, format!("n\n{content}"));
+        assert_eq!(note.chunks[0].range.end_byte, raw.len());
+
+        let padding = " \r\n\t\r\n".repeat(120);
+        let raw = format!("{padding}# Café\n\nFirst 🦀.\n{padding}Last é.\n{padding}## Next\nmore");
+        let note = prepare(&raw, 48);
+        assert_complete(&raw, &note, 48);
+        assert_eq!(note.chunks[0].range.start_byte, 0);
+        assert!(note.chunks[0].text.contains("# Café"));
+    }
+
+    #[cfg(feature = "embeddings-api")]
+    #[test]
+    fn forced_split_can_retain_padding_needed_by_the_tokenizer() {
+        let tokenizer = tiktoken_rs::cl100k_base().unwrap();
+        let count = |text: &str| Ok(tokenizer.encode_ordinary(text).len());
+        let input = "n\n 데이터";
+        let limit = count(input).unwrap();
+        for padding in [String::new(), "\r\n".repeat(150)] {
+            let raw = format!("{padding} 데이터\n");
+            let note = prepare_with_counter(Path::new("n.md"), &raw, limit, &count).unwrap();
+            assert_eq!(note.chunks.len(), 1);
+            let chunk = &note.chunks[0];
+            assert_eq!(chunk.scope, EvidenceScope::Passage);
+            assert_eq!(chunk.range, note.body_range);
+            assert_eq!(chunk.text, input);
+        }
+    }
+
+    #[test]
+    fn blank_bodies_use_one_title_embedding() {
+        let whitespace = " \r\n\t\u{2003}".repeat(120);
+        let with_frontmatter = format!("---\ntags: [test]\n---\n{whitespace}");
+        for raw in [
+            "",
+            "---\ntags: [test]\n---\n",
+            &whitespace,
+            &with_frontmatter,
+        ] {
+            let note = prepare(raw, 48);
+            assert_complete(raw, &note, 48);
+            assert_eq!(note.chunks.len(), 1);
+            let chunk = &note.chunks[0];
+            assert_eq!(chunk.scope, EvidenceScope::Note);
+            assert_eq!(chunk.range, note.body_range);
+            assert_eq!(chunk.text, "n\n");
+        }
+    }
+
+    #[test]
+    fn heading_only_notes_remain_searchable() {
+        for raw in ["# Only heading\n", "# A\n## B\n# C\n"] {
             let note = prepare(raw, 128);
             assert_eq!(note.chunks.len(), 1);
             assert_complete(raw, &note, 128);

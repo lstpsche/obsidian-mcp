@@ -112,13 +112,13 @@ Field rules:
 - `source_revision`: lowercase SHA-256 of the exact indexed raw UTF-8 note, including YAML frontmatter; source bytes are never normalized for revision hashing
 - `source_bytes`: byte length of that complete raw revision
 - `source_status`: `current`, `changed` or `unavailable`, after validating the single source buffer used to construct returned context
-- `evidence.scope`: `note` for one fitting whole-body embedding, `passage` for an overflowing note's winning chunk
+- `evidence.scope`: `note` for one fitting whole-body embedding or a blank body's title embedding, `passage` for an overflowing note's winning chunk
 - `evidence.cosine_similarity`: the raw winning cosine; hybrid `score` can be a blended value
 - `evidence.range`: exact primary source span; offsets are raw-note UTF-8 bytes with inclusive start and exclusive end. Contextual title, headings and same-block overlap do not expand this anchor
 - `evidence.heading_path` and optional `section_range`: passage ancestry and enclosing section locators; whole-note evidence does not invent a winning heading
 - `preview`: optional exact `snippet` span and whether it contains the complete primary evidence span; it is not a promise that every relevant rule in the note was returned
 
-The example illustrates field shape rather than the literal contents of a fixture. `snippet` is at most 300 characters and maps exactly to `preview.range`. A matching chunk is a retrieval location; surrounding or distant context can be read through revision-checked MCP note/heading operations. `include_content:true` retains its full raw-note meaning and omits the snippet/preview.
+The example illustrates field shape rather than the literal contents of a fixture. `snippet` is at most 300 characters and maps exactly to `preview.range`. If the preview window contains only whitespace and the evidence has text, the window starts at the first non-whitespace byte in the evidence. A matching chunk is a retrieval location; surrounding or distant context can be read through revision-checked MCP note/heading operations. `include_content:true` retains its full raw-note meaning and omits the snippet/preview.
 
 Supported source and preparation resources are finite: raw notes up to 16 MiB, at most 4,096 chunks per note, 16 KiB contextual prefixes, and overflow-partition structures of at most 4,096 headings/65,536 Markdown blocks. The coordinator bounds owned unpublished preparation/staging to 64 MiB; provider requests and the persistent cache have independent byte/token/count bounds. Resource failure is a meaningful error/degraded status, never permission to silently omit part of a note. See [supported resource ceilings](../../README.md#semantic-limits) for exact cache, vector, split-progress and source-expansion limits. These limits do not add a search mode.
 
