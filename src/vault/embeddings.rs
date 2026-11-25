@@ -2897,7 +2897,11 @@ mod tests {
         input.input_version += 1;
         let mut chunking = expected.clone();
         chunking.chunking_version += 1;
-        for identity in [input, chunking] {
+        let previous_chunking = EmbeddingSpaceIdentity {
+            chunking_version: 1,
+            ..expected.clone()
+        };
+        for identity in [input, previous_chunking, chunking] {
             write_cache_data(&path, &single_entry_cache(identity, "one.md", vec![1.0; 3]));
             assert!(matches!(
                 EmbeddingStore::load_for_space(&path, &expected, 1),

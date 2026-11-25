@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::error::{VaultError, VaultResult};
 
 pub const MAX_EMBEDDING_REQUEST_BYTES: usize = 16 * 1024 * 1024;
-pub const CHUNKING_VERSION: u16 = 1;
+pub const CHUNKING_VERSION: u16 = 2;
 #[cfg(feature = "embeddings-api")]
 const MAX_PROFILE_BYTES: usize = 1024 * 1024;
 #[cfg(feature = "embeddings-api")]

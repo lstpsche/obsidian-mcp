@@ -476,6 +476,8 @@ Uses the shared local semantic daemon by default (`OBSIDIAN_SEMANTIC_MODE=auto`)
 
 Automatic chunking applies to both embedding backends. The server prepares the complete Markdown body after YAML frontmatter, together with its filename title, and counts the final input using the backend's exact tokenizer. A fitting note uses one embedding. An overflowing note is partitioned along Markdown headings and blocks, with further UTF-8-safe splitting where required. Every piece includes its title and ancestor-heading context. No chunking setting or search mode is needed, and note files are never rewritten.
 
+Every passage contains non-whitespace source text. Whitespace padding omitted from an embedding to respect the token limit remains part of an adjacent source range. An empty or whitespace-only body uses a single title embedding with whole-note evidence.
+
 The local backend uses its loaded tokenizer's effective input capacity, normally 512 tokens. That configured boundary is distinct from a model's theoretical maximum. API budgets come from a verified endpoint/model profile. Word counts and vector dimensions cannot establish either budget. Overlong search queries return an invalid-parameter error with the measured and supported token counts rather than silently losing query content.
 
 Only the official `https://api.openai.com/v1` endpoint and exact model IDs `text-embedding-3-small`, `text-embedding-3-large`, and `text-embedding-ada-002` resolve automatically to `cl100k_base` and the documented limits of 8,192 tokens per input, 2,048 inputs and 300,000 aggregate tokens per request. Other endpoints, including OpenRouter and local servers, require `OBSIDIAN_EMBEDDING_API_PROFILE`. Model aliases and generic provider tokenizer labels are not sufficient to infer an exact tokenizer.
@@ -567,6 +569,8 @@ dormant runtimes do not emit idle progress logs.
 Embedding cache schema 2 stores complete per-note chunk collections and is atomically replaced. Reuse requires matching backend, canonical model, vector dimension, tokenizer fingerprint, effective input capacity, preparation/partition policy, and—for API backends—the endpoint fingerprint. Schema-1 prefix embeddings are rebuilt automatically from notes rather than relabeled as complete coverage. The first rebuild embeds more text and may increase API requests, token use and cache size. Progress remains visible as warming/degraded until the current reconciliation completes. The local checkpoint is `{mcp_data}/embeddings/scopes/<scope_id>/embeddings.bin`. The daemon checkpoint is `<semantic-home>/vaults/<vault_id>/scopes/<scope_id>/embeddings.bin`. Scoped indexes rebuild from permitted notes on first use and leave unscoped files intact. Checkpoints contain complete note collections, including when the whole vault is still reconciling.
 
 Compatible cached notes whose complete raw source revision is unchanged skip preparation, tokenization and inference. Changed notes reuse exact unchanged chunk inputs while refreshing source revisions and ranges. A later request failure preserves the previous complete note collection. Supported resource limits produce explicit failures and preserve the prior complete note collection; they never turn oversized input into a partially complete success.
+
+A partition policy update triggers an automatic re-embedding of each affected scope, including notes with unchanged source. This can consume API quota during the one-time rebuild.
 
 <a id="semantic-limits"></a>
 

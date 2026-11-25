@@ -524,14 +524,24 @@ fn preview_range(raw: &str, evidence: SourceRange, query: &str) -> SourceRange {
         .and_then(|regex| regex.find(text).map(|matched| matched.start()));
     let target = found.map_or(0, |position| text[..position].chars().count());
     let start_char = target.saturating_sub(MAX_CHARS / 2);
-    let start = text
+    let mut start = text
         .char_indices()
         .nth(start_char)
         .map_or(text.len(), |(position, _)| position);
-    let end = text[start..]
-        .char_indices()
-        .nth(MAX_CHARS)
-        .map_or(text.len(), |(position, _)| start + position);
+    let end_at_limit = |start| {
+        text[start..]
+            .char_indices()
+            .nth(MAX_CHARS)
+            .map_or(text.len(), |(position, _)| start + position)
+    };
+    let mut end = end_at_limit(start);
+    if text[start..end].trim_start().is_empty() {
+        let content_start = text.len() - text.trim_start().len();
+        if content_start < text.len() {
+            start = content_start;
+            end = end_at_limit(start);
+        }
+    }
     SourceRange {
         start_byte: evidence.start_byte + start,
         end_byte: evidence.start_byte + end,
@@ -696,6 +706,22 @@ mod tests {
         assert_eq!(full.source_revision, source::source_revision(&raw));
         assert!(full.snippet.is_none());
         assert!(full.preview.is_none());
+    }
+
+    #[test]
+    fn whitespace_only_preview_advances_within_the_evidence() {
+        let prefix = "Unrelated text\r\n";
+        let padding = "\r\n\u{2003}".repeat(150);
+        let content = "界".repeat(350);
+        let raw = format!("{prefix}{padding}{content}Outside the passage");
+        let evidence = SourceRange {
+            start_byte: prefix.len(),
+            end_byte: prefix.len() + padding.len() + content.len(),
+        };
+        let preview = preview_range(&raw, evidence, "unmatched");
+        assert_eq!(preview.start_byte, prefix.len() + padding.len());
+        assert!(preview.end_byte <= evidence.end_byte);
+        assert_eq!(&raw[preview.start_byte..preview.end_byte], "界".repeat(300));
     }
 
     #[test]
